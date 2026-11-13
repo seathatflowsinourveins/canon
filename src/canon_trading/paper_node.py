@@ -64,9 +64,10 @@ REQUEST_CEILING = 180
 Alpaca's 200 a minute (UNCALIBRATED, ADRs 0088/0091); `session_window.REQUEST_CEILING` is this one."""
 MAX_ORDER_SUBMIT_RATE = f"{REQUEST_CEILING}/00:01:00"
 """At most `REQUEST_CEILING` submits in any minute. Paper nodes only: the lead's decision of 2026-11-11,
-under the owner's that paper carries no risk limit, so the request gate (Mover's soft line, then the
-ceiling) binds first and the engine's throttle, which denies an over-limit submit, never refuses a sale.
-It was 50, a quarter of Alpaca's 200 (ADR 0049)."""
+under the owner's that paper carries no risk limit. Mover's soft line holds back entries only; since the
+lead's decision of 2026-11-12 a sale meets no gate but this throttle, which denies an over-limit submit
+(Mover sends a denied sale again every `chase_secs`) and does not count cancels, so a chase's cancel is
+not throttled. It was 50, a quarter of Alpaca's 200 (ADR 0049)."""
 MAX_ORDER_MODIFY_RATE = f"{REQUEST_CEILING}/00:01:00"
 """At most `REQUEST_CEILING` modifies in any minute, on the same terms; it was 25 (ADR 0049)."""
 MAX_NOTIONAL_PER_ORDER_USD = Decimal(1000)

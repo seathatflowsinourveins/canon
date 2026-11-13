@@ -923,6 +923,7 @@ def test_a_new_day_context_starts_a_new_watch_clock() -> None:
     slot = mover.Slot(AAA, bar_type(AAA), deque(), deque())
     stand_in: Any = SimpleNamespace(
         settings=SimpleNamespace(entry_arm="registered"),
+        sold={},
         entry_contexts={AAA: old_day},
         _note=lambda _slot, _why: None,
         _say=lambda _text: None,
@@ -1778,13 +1779,10 @@ def test_a_release_that_rests_is_chased_down_to_the_bid_but_not_below_its_cap() 
     assert count == 3
 
 
-def test_a_resting_sale_is_not_chased_at_the_soft_line_and_its_release_still_goes(
-    monkeypatch,
-) -> None:
-    """The lead's backstop of 2026-11-11: near the request ceiling the node stops chases as it stops
-    entries, and lets exits and cancels through. Once the sale is released the adapter's count of the
-    last 60 seconds is over the soft line: the released limit (10.42) is sent and rests above the bid,
-    and it is never canceled and sent again lower, until the run's stop cancels it."""
+def test_a_resting_sale_is_chased_over_the_soft_line_and_fills(monkeypatch) -> None:
+    """The lead's decision of 2026-11-12: sales are exempt from the
+    soft line and stop only at the engine's hard ceiling. With the last 60 seconds far over the soft line,
+    the released limit (10.42) resting above the bid is still sent again at 10.28 and filled."""
     total = {"n": 0}
     s = strategy(chase_secs=5)
 
@@ -1798,10 +1796,11 @@ def test_a_resting_sale_is_not_chased_at_the_soft_line_and_its_release_still_goe
     orders = run(eng, s, ranker(rank((AAA, "0.25"))), tape(AAA, [*RISING, 10.30, 10.30]))
     summary = sides(orders)
     sale = orders[-1].price.as_decimal()
+    flat = not eng.cache.positions_open(strategy_id=MOVER_ID)
     eng.dispose()
-    assert summary == ["BUY LIMIT FILLED", "SELL LIMIT CANCELED"]
-    assert sale == Decimal("10.42")
-    assert any("not chased" in reason for reason in s.dropped), s.dropped
+    assert summary == ["BUY LIMIT FILLED", "SELL LIMIT CANCELED", "SELL LIMIT FILLED"]
+    assert sale == Decimal("10.28") and flat
+    assert not any("soft line" in reason for reason in s.dropped), s.dropped
 
 
 def test_a_chase_inside_the_cap_follows_the_bid_and_fills() -> None:
@@ -2524,6 +2523,8 @@ class Borrowed:
         self.trades = 0
         self.persistence = False
         self.slots: dict = {}
+        self.opening_states: dict = {}
+        self.opening_outcomes: dict = {}
 
     def __getattr__(self, name: str):
         raise RuntimeError(f"Already mutably borrowed: {name}")
@@ -2868,6 +2869,12 @@ class Seam:
     _last_known = Mover._last_known
     _last_print = Mover._last_print
     _position_average = Mover._position_average
+    _entry_trail = Mover._entry_trail
+    _warm_tighten = Mover._warm_tighten
+    _tier_applies = Mover._tier_applies
+    _top_tier = Mover._top_tier
+    _bought = Mover._bought
+    _trail_change = Mover._trail_change
 
     def __init__(self, bid: str, **rows: Any) -> None:
         rows.setdefault("trail_mode", "fixed")
@@ -2888,6 +2895,7 @@ class Seam:
         self.protect_paths = {"held_stop": 0, "unpriced_exit": 0, "trail": 0}
         self.fills: list = []
         self.recent = 0
+        self.baseline_dollar_volume_per_minute: dict = {}
         self.positions: list = []
         self.strategy_id = MOVER_ID
         self.cache = SimpleNamespace(
@@ -3395,3 +3403,64 @@ def test_no_trailing_sell_is_remade_while_upstreams_managed_stop_exits_in_the_se
     assert s.stop_ns
     assert sent_after == {"SELL MARKET ['MARKET_EXIT']"}
     assert flat
+
+
+def test_a_name_sold_while_unranked_keeps_its_sale_state() -> None:
+    """AAA leaves the ranking while it is held, and its sale fills between two steps. The slot is not
+    closed before the sale is recorded, so a later reclaim still names that sale."""
+    eng = engine()
+    s = strategy(reentry_arm="reclaim", cooldown_secs=3600, watch=1)
+    closes = [*RISING, *FALL, *RECLAIM]
+    ranking = ranker(rank((AAA, "0.25")), values={7: rank((BBB, "0.3")), 11: rank((AAA, "0.25"))})
+    orders = run(eng, s, ranking, tape(AAA, closes), tape(BBB, [20.0] * len(closes)))
+    bought = [o.instrument_id for o in orders if o.side == OrderSide.BUY]
+    eng.dispose()
+    assert bought == [AAA, AAA]
+    assert Decimal(s.record()["entries"][1]["reentry"]["sale_price"]) == Decimal("10.45")
+
+
+def test_after_an_exit_it_buys_back_on_a_reclaim_while_the_name_ranks() -> None:
+    """Sold at 10.45 after the fall. A new rising run that closes above the sale's
+    price is a reclaim: a second buy."""
+    eng = engine()
+    s = strategy(reentry_arm="reclaim", cooldown_secs=60)
+    closes = RISING + FALL + RECLAIM
+    orders = run(eng, s, ranker(rank((AAA, "0.25"))), tape(AAA, closes))
+    buys = [o for o in orders if o.side == OrderSide.BUY]
+    second_close = (buys[1].ts_init - T0) // MINUTE if len(buys) > 1 else None
+    eng.dispose()
+    assert len(buys) == 2
+    # the run must end above the sale's price: 10.50 is the first close of the new leg that does
+    assert second_close == len(RISING + FALL) + 6
+
+
+def test_legacy_cooldown_does_not_delay_reclaim_but_sale_price_still_binds() -> None:
+    eng = engine()
+    s = strategy(reentry_arm="reclaim", cooldown_secs=3600)
+    orders = run(eng, s, ranker(rank((AAA, "0.25"))), tape(AAA, RISING + FALL + RECLAIM))
+    buys = [o for o in orders if o.side == OrderSide.BUY]
+    eng.dispose()
+    assert len(buys) == 2
+
+    eng = engine()
+    s = strategy(reentry_arm="reclaim", cooldown_secs=60)
+    below = [9.80, 9.85, 9.90, 9.95, 10.00, 10.05]  # rising, and never back above the sale
+    orders = run(eng, s, ranker(rank((AAA, "0.25"))), tape(AAA, RISING + FALL + below))
+    buys = [o for o in orders if o.side == OrderSide.BUY]
+    eng.dispose()
+    assert len(buys) == 1
+
+
+def test_a_name_unwatched_after_its_sale_keeps_its_sale_price_for_state_reentry() -> None:
+    """Codex's finding P2-5 at 660b37e: AAA is sold, leaves the ranking for a minute (its slot is
+    closed) and returns; the sale's price belongs to the name and still binds its reclaim, while
+    the legacy cooldown value imposes no clock wait."""
+    eng = engine()
+    s = strategy(reentry_arm="reclaim", cooldown_secs=3600, watch=1)
+    closes = [*RISING, *FALL, *RECLAIM]
+    ranking = ranker(rank((AAA, "0.25")), values={12: rank((BBB, "0.3")), 13: rank((AAA, "0.25"))})
+    orders = run(eng, s, ranking, tape(AAA, closes), tape(BBB, [20.0] * len(closes)))
+    bought = [o.instrument_id for o in orders if o.side == OrderSide.BUY]
+    eng.dispose()
+    assert bought == [AAA, AAA]
+    assert Decimal(s.record()["entries"][1]["reentry"]["sale_price"]) == Decimal("10.45")

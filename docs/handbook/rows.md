@@ -48,7 +48,7 @@ on `main`, and open until the record is accepted.
 | `TRAIL` | 0.02 of the entry price, a fixed offset under the highest bid | UNCALIBRATED | `MoverConfig` (ADR 0088) | 2026-11-11 |
 | `CHASE_CAP` | 0.02 under the first sale price, the floor of a sale's re-pricing | UNCALIBRATED | `MoverConfig` (ADR 0088) | 2026-11-11 |
 | `CHASE_SECS` | 5 seconds between a sale's re-sends | UNCALIBRATED | `MoverConfig` (ADR 0088) | 2026-11-11 |
-| `COOLDOWN_SECS` | 300 seconds after a sale before the same name is bought again | UNCALIBRATED | `MoverConfig` (ADR 0088) | 2026-11-11 |
+| `COOLDOWN_SECS` | 300 seconds after a sale before the same name is bought again, under the clock re-entry arm only; a state arm (`REENTRY_ARM`) imposes no time delay | UNCALIBRATED | `MoverConfig` (ADR 0088) | 2026-11-11 |
 | `CANDIDATE_POOL_MULTIPLE` | 3 times the quota | UNCALIBRATED | The owner's requirement | 2026-11-11 |
 | `RISK_PER_TRADE` | 1 per cent | UNCALIBRATED | The owner's requirement (ADR 0083's starting rows). Neither a paper window nor the Mover replay sizes from it: both divide buying power by the slots (ADR 0106, ADR 0101); it remains for a run that asks for `FixedRiskSizer` explicitly (ADR 0088) | 2026-11-11 |
 | `FLOW_CAP` | 5 per cent of the prior five minutes' dollar volume | UNCALIBRATED | The owner's requirement (ADR 0083's starting rows); applied to a paper entry (`MoverConfig.flow_share` of `flow_bars`, ADR 0106), not in the Mover replay (ADR 0101) | 2026-11-11 |
@@ -81,3 +81,14 @@ rows. The defaults remain the fixed trail and the 300-second clock cooldown (the
 | `RATCHET_BASE` | atr; alternate tier | UNCALIBRATED | Source b01f4c4; paired window arm | 2026-11-12 |
 | `HOLD_MOST_SECS` | 60 seconds without a followed price before an unpriced limit exit | UNCALIBRATED | Source b01f4c4; lead's held-stop decision (b), 2026-11-12 | 2026-11-12 |
 | `FLOOR_WAIT_SECS` | 60 seconds at the chase floor with the bid through it before releasing the floor | UNCALIBRATED | Source b01f4c4; lead's chase-floor decision (b), 2026-11-12 | 2026-11-12 |
+| `REENTRY_ARM` | clock by default (existing cooldown plus reclaim); selectable reclaim, turn, vwap | UNCALIBRATED | Source b01f4c4; lead, no primary source; lead's ruling preserves main's clock default | 2026-11-12 |
+| `TURN_K` | 2 consecutive rising closes from the post-sale low; alternates 1, 3 | UNCALIBRATED | Source b01f4c4; lead, no primary source; window selection | 2026-11-12 |
+| `TURN_D` | 1 sold-position trail distance of depth; alternate 2 | UNCALIBRATED | Source b01f4c4; lead, no primary source; window selection | 2026-11-12 |
+| `PART_BOUNDS` | 04:00, 09:30, 16:00 and 20:00 New York: a cached ATR warm uses only bars of the part open at the slot's opening; fixed clock times, no early close | UNCALIBRATED | Source 1a568ec; lead's (a), 2026-11-12 | 2026-11-12 |
+| `WARM_BAR_SPEC` | The last `atr_n + 1` cached `1-MINUTE-LAST-EXTERNAL` bars, at least `atr_n` of them, closed by the slot's opening; no request | UNCALIBRATED | Source 1a568ec; lead's (a), 2026-11-12 | 2026-11-12 |
+| `PROFILE_K` | 2, the multiplier of max(ATR, R) under the profile trail; alternates 1, 3 | UNCALIBRATED | Source 40473e88; lead, no primary source; window selection | 2026-11-12 |
+| `PROFILE_PCTL` | p75 true-range percentile; alternates median, p90 | UNCALIBRATED | Source 40473e88; lead, no primary source; window selection | 2026-11-12 |
+| `PROFILE_FLOOR` | median pullback percentile as the floor F; alternates p75, off | UNCALIBRATED | Source 40473e88; lead, no primary source; window selection | 2026-11-12 |
+| `PROFILE_MULTIPLIERS` | 1, 1, 1 by RDc_1 bucket; alternate 1, 1.25, 1.5, refused by a window while RDc_1 is not built | UNCALIBRATED | Source 40473e88; lead, no primary source; window selection | 2026-11-12 |
+| `RDC_EDGES` | RDc_1 ratios 3 and 10 bound the three multiplier buckets | UNCALIBRATED | Source 40473e88; lead, no primary source; a constant, not a setting | 2026-11-12 |
+| `MIN_RECENT_SESSIONS` | 5 recent sessions in a segment before its row is used, else the symbol is thin by name | UNCALIBRATED | Source 40473e88; lead, no primary source; a constant, not a setting | 2026-11-12 |

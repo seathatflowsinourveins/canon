@@ -4,7 +4,10 @@ The existing test_mover fixtures provide an offline cash venue; no credential or
 """
 
 from collections import deque
+from dataclasses import replace
+from datetime import date
 from decimal import Decimal
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from typing import cast
@@ -19,6 +22,7 @@ from nautilus_trader.model import Quantity
 from nautilus_trader.model import QuoteTick
 
 from canon_trading import mover
+from canon_trading import session_window
 from canon_trading.price_step import down_on_step
 from tests.test_mover import AAA
 from tests.test_mover import BBB
@@ -29,6 +33,7 @@ from tests.test_mover import T0
 from tests.test_mover import Seam
 from tests.test_mover import bar_type
 from tests.test_mover import engine
+from tests.test_mover import entry_day
 from tests.test_mover import rank
 from tests.test_mover import ranker
 from tests.test_mover import run
@@ -182,6 +187,49 @@ def test_trail_settings_cannot_disable_the_bounds(field, value):
         strategy(**{field: value})
 
 
+def test_rows_register_defaults_and_two_alternates_as_uncalibrated():
+    rows = mover.TRAIL_SETTINGS
+    settings = mover.MoverConfig(max_notional=D(100), max_move=D(5))
+    assert settings.trail_mode == "fixed" and settings.cooldown_secs == 300
+    assert settings.reentry_arm == "clock" and settings.turn_k == 2 and settings.turn_d == D(1)
+    assert settings.atr_n == 14 and settings.atr_k == D(1)
+    assert settings.chase_secs == 5 and settings.exit_ticks == 1
+    assert rows["trail_mode"]["arms"] == ("fixed", "atr", "tier", "ratchet", "profile")
+    assert rows["cooldown_secs"]["default"] == 300
+    assert rows["reentry_arm"]["arms"] == ("clock", "reclaim", "turn", "vwap")
+    assert rows["turn_k"]["arms"] == (1, 2, 3) and rows["turn_d"]["arms"] == (D(1), D(2))
+    assert all(
+        rows[name]["source"] == "lead, no primary source"
+        for name in ("reentry_arm", "turn_k", "turn_d")
+    )
+    assert rows["atr_k"]["source"] == rows["spread_floor_m"]["source"] == "lead, no primary source"
+    for field in (
+        "atr_k",
+        "atr_n",
+        "spread_floor_m",
+        "liquidity_tier_cut",
+        "ratchet_r",
+        "ratchet_g",
+    ):
+        assert rows[field]["status"] == "UNCALIBRATED"
+        assert len(rows[field]["alternates"]) == 2
+        assert getattr(settings, field) == rows[field]["default"]
+
+
+def test_window_settings_select_the_registered_rows():
+    default = session_window.WindowConfig()
+    assert default.trail_mode == "fixed" and default.cooldown_secs == 300
+    assert default.reentry_arm == "clock" and default.turn_k == 2 and default.turn_d == D(1)
+    assert default.atr_n == 14 and default.atr_k == D(1)
+    # The trail rows are Mover's: P0a refuses them by name for another strategy.
+    config = session_window.WindowConfig(
+        strategy="Mover", mover=True, trail_mode="ratchet", cooldown_secs=0
+    )
+    assert config.trail_mode == "ratchet" and config.cooldown_secs == 0
+    with pytest.raises(ValueError, match="spread_floor_m"):
+        session_window.WindowConfig(strategy="Mover", mover=True, spread_floor_m=D(0))
+
+
 def test_size_stand_in_reads_the_rankings_per_minute_normal():
     record = {"inputs": {"dvol": 12000000, "dvol_ratio": 2}, "sample": {"elapsed_minutes": 3}}
     assert mover.baseline_per_minute(record) == D(2000000)
@@ -257,6 +305,12 @@ def test_ratchet_over_tier_is_paired_with_the_plain_tier_entry():
     assert entries[0]["ratchet"]["tightened"] is False
     assert entries[1]["ratchet"]["tightened"] is True
     assert D(entries[1]["ratchet"]["to"]) == D("0.001")
+    [change] = entries[1]["trail_changes"]
+    assert (D(change["from"]), D(change["to"]), change["why"]) == (
+        D("0.002"),
+        D("0.001"),
+        "ratchet",
+    )
 
 
 def test_atr_entries_record_the_frozen_offsets_and_paper_limit():
@@ -509,6 +563,169 @@ def test_ratchet_remakes_the_emulated_sale_and_records_when_and_from_what():
     eng.dispose()
 
 
+@pytest.mark.parametrize("cooldown", [0, 60, 300, 3600])
+def test_legacy_cooldown_setting_does_not_delay_the_first_eligible_reclaiming_close(cooldown):
+    eng = engine()
+    s = strategy(reentry_arm="reclaim", cooldown_secs=cooldown, run_bars=1)
+    closes = [10.0, 10.1, 10.2, 10.3, 10.4, 10.0, 10.01, 10.5, 10.6, 10.7, 10.8, 10.9, 11.0]
+    orders = run(eng, s, ranker(rank((AAA, "0.25"))), tape(AAA, closes))
+    buys = [o for o in orders if o.side == OrderSide.BUY]
+    assert len(buys) == 2
+    assert (buys[1].ts_init - T0) // MINUTE == 7
+    assert any("minute close" in note for note in s.record()["entries"][1]["notes"])
+    eng.dispose()
+
+
+def test_reclaim_can_reenter_on_the_first_close_after_its_sale_even_in_the_same_minute():
+    """The minute's intrabar sale fills early; its later rising close already reclaims the sale."""
+    eng = engine()
+    s = strategy(reentry_arm="reclaim", cooldown_secs=0, run_bars=1)
+    closes = [10.0, 10.1, 10.2, 10.3, 10.4, 10.5, 10.6, 10.7, 10.8]
+    data = tape(AAA, closes)
+    # Reuse the tape's QuoteTick class: insert a stop-triggering quote during minute 7,
+    # then recover before that minute closes. State, rather than elapsed time, admits that close.
+    latest = next(x for x in data if hasattr(x, "bid_price"))
+    data.append(
+        type(latest)(
+            AAA,
+            Price.from_str("10.0100"),
+            Price.from_str("10.0300"),
+            Quantity.from_int(10000),
+            Quantity.from_int(10000),
+            T0 + 6 * MINUTE + 10 * SECOND,
+            T0 + 6 * MINUTE + 10 * SECOND,
+        )
+    )
+    orders = run(eng, s, ranker(rank((AAA, "0.25"))), data)
+    buys = [o for o in orders if o.side == OrderSide.BUY]
+    assert len(buys) == 2
+    assert (buys[1].ts_init - T0) // MINUTE == 7
+    reentry = s.record()["entries"][1]["reentry"]
+    assert reentry["arm"] == "reclaim" and D(reentry["reentry_price"]) > D(reentry["sale_price"])
+    eng.dispose()
+
+
+@pytest.mark.parametrize(("k", "minute"), [(1, 11), (2, 12), (3, 13)])
+def test_turn_reenters_on_its_first_k_rises_from_a_deep_low_below_the_sale(k, minute):
+    eng = engine()
+    s = strategy(reentry_arm="turn", turn_k=k, turn_d=D(1), cooldown_secs=3600)
+    closes = RISING + [10.46, 10.0, 10.05, 10.1, 10.15, 10.2, 10.25]
+    orders = run(eng, s, ranker(rank((AAA, "0.25"))), tape(AAA, closes))
+    buys = [o for o in orders if o.side == OrderSide.BUY]
+    assert len(buys) == 2 and (buys[1].ts_init - T0) // MINUTE == minute
+    row = s.record()["entries"][1]["reentry"]
+    assert row["arm"] == "turn" and D(row["low"]) == D("10.0")
+    assert D(row["reentry_price"]) == D(str(buys[1].avg_px)) < D(row["sale_price"])
+    assert row["minutes_between"] == pytest.approx(
+        (buys[1].ts_last - (T0 + 9 * MINUTE - 1)) / MINUTE
+    )
+    # The lead's 09:30 rows: the rule, its fall/rise in the name's distance, and elapsed seconds.
+    distance = D(row["distance"])
+    assert row["rule"] == "turn" and row["fall_from"] == "sale" and distance > 0
+    assert D(row["fall_in_distances"]) == (D(row["sale_price"]) - D("10.0")) / distance
+    assert D(row["rise_in_distances"]) == (D(row["run_close"]) - D("10.0")) / distance
+    entry = s.record()["entries"][1]
+    assert row["secs_since_stop_out"] == pytest.approx(
+        (entry["submitted_ns"] - row["sale_ns"]) / SECOND
+    )
+    eng.dispose()
+
+
+@pytest.mark.parametrize(("depth", "count"), [(D(1), 2), (D(2), 1)])
+def test_turn_depth_is_measured_in_the_sold_positions_actual_trail_distance(depth, count):
+    eng = engine()
+    s = strategy(reentry_arm="turn", turn_k=2, turn_d=depth)
+    orders = run(
+        eng, s, ranker(rank((AAA, "0.25"))), tape(AAA, RISING + [10.46, 10.1, 10.15, 10.2, 10.25])
+    )
+    assert len([o for o in orders if o.side == OrderSide.BUY]) == count
+    if count == 1:
+        assert any("turn depth" in why for why in s.dropped)
+    eng.dispose()
+
+
+def test_turn_low_resets_the_rising_count_and_the_next_sale_resets_the_state():
+    eng = engine()
+    s = strategy(reentry_arm="turn", turn_k=2, turn_d=D(1))
+    closes = RISING + [10.46, 10.0, 10.1, 9.9, 10.0, 10.1, 10.2, 9.8, 9.5, 9.6, 9.7, 9.8]
+    orders = run(eng, s, ranker(rank((AAA, "0.25"))), tape(AAA, closes))
+    buys = [o for o in orders if o.side == OrderSide.BUY]
+    assert [(o.ts_init - T0) // MINUTE for o in buys] == [5, 14, 19]
+    rows = [r["reentry"] for r in s.record()["entries"][1:]]
+    assert [D(r["low"]) for r in rows] == [D("9.9"), D("9.5")]
+    assert rows[0]["sale_price"] != rows[1]["sale_price"]
+    eng.dispose()
+
+
+def test_turn_still_yields_to_rank_eligibility_and_the_request_budget():
+    s = strategy(reentry_arm="turn", turn_k=2)
+    slot = mover.Slot(AAA, bar_type(AAA), deque(maxlen=4), deque(maxlen=5))
+    s.slots[AAA] = slot
+    s.sold[AAA] = (T0, D("10.45"))
+    s.sold_fill_ns[AAA] = T0
+    s.reentry_states[AAA] = mover.ReentryState(
+        T0, D("10.45"), D("0.21"), low=D(10), previous=D("10.1"), rises=2
+    )
+    s.rank_ns, s.rank = T0 + MINUTE, [(AAA, D("0.25"))]
+    ranked = {AAA: (0, D("0.25"))}
+    assert s._refusal(slot, D("10.1"), ranked, 0, T0 + MINUTE) is None
+    unranked = s._refusal(slot, D("10.1"), {}, 0, T0 + MINUTE)
+    capped = s._refusal(slot, D("10.1"), ranked, s.settings.soft_line, T0 + MINUTE)
+    assert unranked is not None and "no longer ranked" in unranked
+    assert capped is not None and "soft line" in capped
+
+
+def test_vwap_reentry_refuses_live_bars_by_name_without_fabricating_a_vwap():
+    eng = engine()
+    s = strategy(reentry_arm="vwap")
+    orders = run(
+        eng,
+        s,
+        ranker(rank((AAA, "0.25"))),
+        tape(AAA, RISING + [10.46, 10.0, 10.1, 10.2, 10.6, 10.7]),
+    )
+    assert len([o for o in orders if o.side == OrderSide.BUY]) == 1
+    assert any("vwap unavailable" in why for why in s.dropped)
+    eng.dispose()
+
+
+@pytest.mark.parametrize("entry_arm", ["bridge", "registered"])
+def test_vwap_tape_reentry_requires_a_close_below_then_the_first_close_above(entry_arm):
+    eng = engine()
+    s = strategy(entry_arm=entry_arm, reentry_arm="vwap", cooldown_secs=3600)
+    closes = RISING + [10.46, 10.0, 9.95, 9.9, 10.0, 10.1]
+    if entry_arm == "registered":
+        s.entry_contexts[AAA] = replace(entry_day(closes, 1000), reference=8.0)
+    # Exact session VWAPs supplied by a tape, keyed by that completed bar's receipt time.
+    # A falling close crosses when the tape's session VWAP falls farther; no rising-run delay.
+    s.session_vwaps[AAA] = {
+        T0 + 10 * MINUTE: D("9.9"),
+        T0 + 11 * MINUTE: D("10.0"),
+        T0 + 12 * MINUTE: D("9.8"),
+    }
+    orders = run(eng, s, ranker(rank((AAA, "0.25"))), tape(AAA, closes))
+    buys = [o for o in orders if o.side == OrderSide.BUY]
+    assert len(buys) == 2 and (buys[1].ts_init - T0) // MINUTE == 12
+    assert s.record()["entries"][1]["reentry"]["arm"] == "vwap"
+    eng.dispose()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("reentry_arm", "guess"),
+        ("turn_k", 0),
+        ("turn_k", 4),
+        ("turn_d", D(0)),
+        ("turn_d", D(3)),
+        ("turn_d", D("NaN")),
+    ],
+)
+def test_reentry_rows_only_select_registered_state_arms(field, value):
+    with pytest.raises(ValueError, match=field):
+        strategy(**{field: value})
+
+
 def test_flow_alternate_and_shipped_atr_default_are_registered_without_changing_defaults():
     rows = mover.TRAIL_SETTINGS
     assert rows["flow_share"]["default"] == D("0.05")
@@ -518,6 +735,29 @@ def test_flow_alternate_and_shipped_atr_default_are_registered_without_changing_
     assert "backtesting.py" in notes and "6 ATR" in notes and "bar frequency" in notes
     assert "note" in notes and "row" in notes
     assert mover.MoverConfig(max_notional=D(100), max_move=D(5)).atr_k == D(1)
+
+
+@pytest.mark.parametrize("k", [1, 2])
+def test_registered_entry_keeps_listing_eligibility_but_turn_uses_its_own_k(k):
+    eng = engine()
+    s = strategy(entry_arm="registered", reentry_arm="turn", turn_k=k)
+    closes = RISING + [10.46, 10.0, 10.05, 10.1, 10.15, 10.2]
+    s.entry_contexts[AAA] = replace(entry_day(closes, 1000), reference=8.0)
+    orders = run(eng, s, ranker(rank((AAA, "0.25"))), tape(AAA, closes))
+    buys = [o for o in orders if o.side == OrderSide.BUY]
+    assert len(buys) == 2 and (buys[1].ts_init - T0) // MINUTE == 10 + k, s.dropped
+    eng.dispose()
+
+
+def test_vwap_cannot_reclaim_a_below_close_from_an_earlier_session():
+    state = mover.ReentryState(T0, D(10), D("0.21"))
+    state.observe(D("9.9"), D(10), date(2025, 11, 10))
+    state.observe(D("10.1"), D(10), date(2025, 11, 11))
+    assert state.crossed_vwap is False
+    state.observe(D("9.9"), D(10), date(2025, 11, 11))
+    state.observe(D("10.1"), None, date(2025, 11, 11))
+    state.observe(D("10.2"), D(10), date(2025, 11, 11))
+    assert state.crossed_vwap is False
 
 
 # --- fix round: the lead's held stop (b) and the high review's findings ----------------------------
@@ -714,6 +954,20 @@ def test_unusable_entry_spread_falls_back_to_the_configured_fixed_plan():
     plan = s._entry_trail(slot, D(10), SimpleNamespace(ask_price=Price.from_str("10.0000")))
     assert (plan.trail, plan.exit_through, plan.chase_cap) == (D("0.03"), D("0.01"), D("0.03"))
     assert plan.bound == "fixed"
+
+
+def test_a_run_seen_before_the_sale_fill_is_refused_by_the_enter_step(monkeypatch):
+    s = strategy(reentry_arm="reclaim", run_bars=1)
+    slot = mover.Slot(AAA, bar_type(AAA), deque(maxlen=4), deque(maxlen=5))
+    s.slots[AAA] = slot
+    s.sold[AAA] = (T0 + MINUTE, D("10.00"))
+    s.sold_fill_ns[AAA] = T0 + MINUTE
+    s.rank_ns, s.rank = T0 + MINUTE, [(AAA, D("0.25"))]
+    monkeypatch.setattr(s, "_working", lambda _slot: False)
+    monkeypatch.setattr(s, "_held", lambda _slot: D(0))
+    slot.run_ns, slot.run_close, slot.run_seen_ns = T0, D("10.50"), T0 + MINUTE - SECOND
+    s._enter(T0 + MINUTE + SECOND, 0)
+    assert any("preceded the sale fill" in why for why in s.dropped)
 
 
 def test_trail_rows_reach_the_mover_through_its_validated_constructor():
@@ -1029,3 +1283,386 @@ def test_l_met_when_the_first_trailing_sell_is_armed_is_a_stop_not_a_retained_tr
     reason = slot.exit_record.trigger_reason
     assert reason is not None and reason.startswith("trailing stop"), reason
     assert slot.entry_record["stopped_out"] is True
+
+
+def test_a_reopened_slot_starts_its_turn_and_crossing_from_the_next_observed_close():
+    # A name unwatched after its sale misses the closes in between: no rise or VWAP side spans the gap.
+    eng = engine()
+    s = strategy(reentry_arm="turn", turn_k=2)
+    eng.add_strategy(s)
+    for name in ("subscribe_quotes", "subscribe_trades", "subscribe_bars"):
+        setattr(s, name, cast(Any, lambda *args, **kwargs: None))  # no engine run, so no feed
+    state = s.reentry_states[AAA] = mover.ReentryState(
+        T0,
+        D("10.45"),
+        D("0.21"),
+        low=D(10),
+        previous=D("10.1"),
+        rises=1,
+        vwap=D("10.05"),
+        below_vwap=True,
+        crossed_vwap=True,
+        vwap_day=date(2026, 11, 12),
+    )
+    s._open_slot(AAA)
+    assert (state.low, state.previous, state.rises) == (None, None, 0)
+    assert (state.vwap, state.below_vwap, state.crossed_vwap) == (None, False, False)
+    assert (state.sale_ns, state.sale_price, state.trail_distance) == (T0, D("10.45"), D("0.21"))
+    state.observe(D("10.2"), None, date(2026, 11, 12))
+    assert (state.low, state.rises) == (D("10.2"), 0)
+    eng.dispose()
+
+
+@pytest.mark.parametrize(("arm", "noted"), [("clock", False), ("turn", True)])
+def test_the_state_reentry_note_is_recorded_only_when_a_state_arm_runs(arm, noted):
+    s = strategy(reentry_arm=arm)
+    assert (mover.RECLAIM_LIMIT in s.record()["trail_notes"]) is noted
+    eng = engine()
+    s = strategy(reentry_arm=arm)
+    run(eng, s, ranker(rank((AAA, "0.25"))), tape(AAA, RISING))
+    assert (mover.RECLAIM_LIMIT in s.record()["entries"][0]["notes"]) is noted
+    eng.dispose()
+
+
+def test_a_paper_window_refuses_the_vwap_arm_by_name():
+    # The tape supplies session VWAPs; a paper window has no live source, so the arm cannot run.
+    with pytest.raises(ValueError, match="reentry_arm vwap"):
+        session_window.WindowConfig(strategy="Mover", mover=True, reentry_arm="vwap")
+    config = session_window.WindowConfig(strategy="Mover", mover=True, reentry_arm="turn")
+    assert config.reentry_arm == "turn"
+    assert strategy(reentry_arm="vwap").settings.reentry_arm == "vwap"  # the tape's replay keeps it
+
+
+def test_the_cooldown_row_names_the_clock_arm():
+    rows = (Path(__file__).parents[1] / "docs/handbook/rows.md").read_text()
+    line = next(row for row in rows.splitlines() if row.startswith("| `COOLDOWN_SECS`"))
+    assert "clock" in line
+
+
+def test_seven_slots_chasing_over_the_soft_line_each_re_price_their_due_sale_without_waiting():
+    """The lead, 2026-11-12: the soft line slows entries only."""
+    seam = Seam("9.90")
+    seam.recent = seam.settings.soft_line + 7  # the count the soft line held chases at, before
+    slots = []
+    for _ in range(7):
+        slot = seam_slot(seam)
+        slot.exiting, slot.floor = True, D("9.50")
+        sale = seam._limit(AAA, OrderSide.SELL, Quantity.from_int(5), Price.from_str("10.00"))
+        seam.orders[sale.client_order_id.value] = sale
+        slot.protect_id = sale.client_order_id
+        slots.append(slot)
+    for slot in slots:
+        seam._protect(slot, D(5), T0 + 100 * SECOND)
+    assert len(seam.canceled) == 7
+    assert not any("soft line" in note for note in seam.dropped)
+
+
+# --- the lead's follow-ups, 2026-11-12: ATR warmed from the cache, tightened once when it warms ---
+
+
+def minute_bars(closes, *, width="0.04"):
+    bars = []
+    for i, close in enumerate(closes):
+        bars.append(
+            Bar(
+                bar_type(AAA),
+                Price.from_str(f"{close:.4f}"),
+                Price.from_str(str(D(f"{close:.4f}") + D(width) / 2)),
+                Price.from_str(str(D(f"{close:.4f}") - D(width) / 2)),
+                Price.from_str(f"{close:.4f}"),
+                Quantity.from_int(1000),
+                T0 + i * MINUTE,
+                T0 + (i + 1) * MINUTE,
+            )
+        )
+    return bars
+
+
+def test_a_slot_warms_its_atr_from_the_cached_minute_bars_newest_first():
+    s = strategy(trail_mode="atr", atr_n=3)
+    slot = mover.Slot(AAA, bar_type(AAA), deque(maxlen=4), deque(maxlen=5))
+    slot.atr = AverageTrueRange(3)
+    bars = minute_bars([10.0, 10.1, 10.2, 10.3, 10.4])
+    s._warm_atr(slot, list(reversed(bars)), T0 + 5 * MINUTE)
+    reference = AverageTrueRange(3)
+    for bar in bars[-4:]:
+        reference.handle_bar(bar)
+    assert slot.atr.initialized and slot.atr.value == pytest.approx(reference.value)
+    assert any("ATR warmed from 4 cached" in note for note in s.notes[AAA])
+
+
+def test_too_few_cached_bars_leave_the_atr_cold_and_bars_after_now_are_not_used():
+    s = strategy(trail_mode="atr", atr_n=3)
+    slot = mover.Slot(AAA, bar_type(AAA), deque(maxlen=4), deque(maxlen=5))
+    slot.atr = AverageTrueRange(3)
+    bars = minute_bars([10.0, 10.1, 10.2, 10.3])
+    s._warm_atr(slot, list(reversed(bars)), T0 + 2 * MINUTE)
+    assert not slot.atr.initialized
+
+
+def test_a_streamed_bar_received_before_its_interval_ends_cannot_warm_the_atr():
+    # Main's parse_bar preserves stream receipt time in ts_init; receipt alone is not a close.
+    s = strategy(trail_mode="atr", atr_n=3)
+    slot = mover.Slot(AAA, bar_type(AAA), deque(maxlen=4), deque(maxlen=5))
+    slot.atr = AverageTrueRange(3)
+    bars = [
+        Bar(
+            bar.bar_type,
+            bar.open,
+            bar.high,
+            bar.low,
+            bar.close,
+            bar.volume,
+            bar.ts_event,
+            bar.ts_event + SECOND,
+        )
+        for bar in minute_bars([10.0, 10.1, 10.2])
+    ]
+    assert s._warm_atr(slot, list(reversed(bars)), T0 + 2 * MINUTE + 30 * SECOND) is False
+    assert not slot.atr.initialized
+
+
+def test_a_slot_opened_in_the_engine_warms_from_bars_the_cache_already_holds():
+    # The name is ranked only from minute 6, after six bars are in the cache; one live bar later it
+    # enters. Without the warm the ATR would hold one live bar, and the entry would be cold.
+    eng = engine()
+    s = strategy(trail_mode="atr", atr_n=3, run_bars=1)
+    late = ranker(rank(), values={6: rank((AAA, "0.25"))})
+    orders = run(
+        eng, s, late, tape(AAA, [10.0, 10.1, 10.0, 10.1, 10.0, 10.1, 10.0, 10.2, 10.3, 10.4, 10.5])
+    )
+    assert orders, "the warmed name entered"
+    entry = s.record()["entries"][0]
+    assert entry["trail_source"] != "cold_atr_fallback" and entry["atr"] is not None
+    assert entry["atr_warm_bars"] == 4
+    assert any("ATR warmed from 4 cached" in note for note in s.notes[AAA])
+    eng.dispose()
+
+
+def test_a_cold_fallback_holding_tightens_once_to_the_warmed_atr_and_records_the_change():
+    eng = engine()
+    s = strategy(trail_mode="atr", atr_n=6, atr_k=D(1))
+    orders = run(eng, s, ranker(rank((AAA, "0.25"))), tape(AAA, RISING + [10.8, 10.9, 11.0, 11.1]))
+    entry = s.record()["entries"][0]
+    assert entry["trail_source"] == "cold_atr_fallback"
+    [change] = entry["trail_changes"]
+    assert D(change["to"]) < D(change["from"]) == D("0.02")
+    assert change["when_ns"] > entry["submitted_ns"] and change["bound"] in ("atr", "spread floor")
+    sells = [o for o in orders if o.side == OrderSide.SELL]
+    assert sells[0].status.name == "CANCELED"
+    assert sells[1].trailing_offset < sells[0].trailing_offset
+    eng.dispose()
+
+
+def test_a_warmed_atr_wider_than_the_fallback_never_widens_the_trail():
+    seam = Seam("10.50", trail_mode="atr")
+    slot = seam_slot(seam)
+    slot.trail_plan = mover.TrailPlan(
+        D("0.02"), D("0.005"), D("0.02"), None, D("0.01"), "fixed", None, "cold_atr_fallback"
+    )
+    slot.atr = AverageTrueRange(3)
+    for bar in minute_bars([10.0, 10.5, 10.0, 10.5], width="1.0"):
+        slot.atr.handle_bar(bar)
+    seam.cache.quote = lambda _: SimpleNamespace(
+        bid_price=Price.from_str("10.5000"), ask_price=Price.from_str("10.5100")
+    )
+    assert mover.Mover._warm_tighten(cast(Any, seam), slot, T0) is False
+    assert slot.trail_plan.trail == D("0.02")
+
+
+def test_a_failed_warm_check_is_retried_on_the_next_step_not_given_up():
+    seam = Seam("10.50", trail_mode="atr")
+    slot = seam_slot(seam)
+    slot.entry_record = {"trail_changes": []}
+    slot.trail_plan = mover.TrailPlan(
+        D("0.02"), D("0.005"), D("0.02"), None, D("0.01"), "fixed", None, "cold_atr_fallback"
+    )
+    slot.atr = AverageTrueRange(3)
+    for bar in minute_bars([10.0, 10.02, 10.0, 10.02], width="0.02"):
+        slot.atr.handle_bar(bar)
+    crossed = SimpleNamespace(
+        bid_price=Price.from_str("10.5000"), ask_price=Price.from_str("10.4900")
+    )
+    seam.cache.quote = lambda _: crossed
+    assert mover.Mover._warm_tighten(cast(Any, seam), slot, T0) is False
+    seam.cache.quote = lambda _: SimpleNamespace(
+        bid_price=Price.from_str("10.5000"), ask_price=Price.from_str("10.5100")
+    )
+    assert mover.Mover._warm_tighten(cast(Any, seam), slot, T0 + SECOND) is True
+    assert slot.trail_plan.trail < D("0.02")
+    assert slot.entry_record is not None
+    [change] = slot.entry_record["trail_changes"]
+    assert change["when_ns"] == T0 + SECOND
+
+
+def test_cached_bars_from_an_earlier_session_part_do_not_warm_the_atr():
+    # T0 is 11:00 New York; bars opening before the regular part's 09:30 start are another part's.
+    s = strategy(trail_mode="atr", atr_n=3)
+    slot = mover.Slot(AAA, bar_type(AAA), deque(maxlen=4), deque(maxlen=5))
+    slot.atr = AverageTrueRange(3)
+    early = T0 - 92 * MINUTE  # 09:28 New York
+    bars = [replace_bar(bar, early) for bar in minute_bars([10.0, 10.1, 10.2, 10.3])]
+    s._warm_atr(slot, list(reversed(bars)), T0)
+    assert not slot.atr.initialized
+
+
+def replace_bar(bar, start):
+    """`bar` moved so the first of `minute_bars` opens at `start`."""
+    shift = start - T0
+    return Bar(
+        bar.bar_type,
+        bar.open,
+        bar.high,
+        bar.low,
+        bar.close,
+        bar.volume,
+        bar.ts_event + shift,
+        bar.ts_init + shift,
+    )
+
+
+def test_a_warmed_plan_never_sells_further_through_or_chases_deeper_than_the_cold_plan():
+    # Review (high) of P1: the warmed trail is tighter, so its sale's offset and chase floor may not widen.
+    seam = Seam("10.50", trail_mode="atr", exit_through=D("0.001"), chase_cap=D("0.005"))
+    slot = seam_slot(seam)
+    slot.entry_record = {"trail_changes": []}
+    slot.trail_plan = mover.TrailPlan(
+        D("0.02"), D("0.001"), D("0.005"), None, D("0.01"), "fixed", None, "cold_atr_fallback"
+    )
+    slot.atr = AverageTrueRange(3)
+    for bar in minute_bars([10.0, 10.1, 10.0, 10.1], width="0.15"):
+        slot.atr.handle_bar(bar)
+    seam.cache.quote = lambda _: SimpleNamespace(
+        bid_price=Price.from_str("10.5000"), ask_price=Price.from_str("10.5100")
+    )
+    assert mover.Mover._warm_tighten(cast(Any, seam), slot, T0) is True
+    plan = slot.trail_plan
+    assert D("0.004") < plan.trail < D("0.02")
+    assert plan.exit_through <= D("0.001") and plan.chase_cap <= D("0.005")
+
+
+def test_a_tier_plan_reselected_after_the_warm_is_not_applied_as_the_warmed_atr():
+    # Review (high) of P1: a baseline that arrived after entry makes the re-selection tier, not ATR.
+    seam = Seam("10.50", trail_mode="tier")
+    seam.baseline_dollar_volume_per_minute[AAA] = D(2_000_000)
+    slot = seam_slot(seam)
+    slot.entry_record = {"trail_changes": []}
+    cold = mover.TrailPlan(
+        D("0.02"), D("0.005"), D("0.02"), None, D("0.01"), "fixed", None, "cold_atr_fallback"
+    )
+    slot.trail_plan = cold
+    slot.atr = AverageTrueRange(3)
+    for bar in minute_bars([10.0, 10.02, 10.0, 10.02], width="0.02"):
+        slot.atr.handle_bar(bar)
+    seam.cache.quote = lambda _: SimpleNamespace(
+        bid_price=Price.from_str("10.5000"), ask_price=Price.from_str("10.5100")
+    )
+    assert mover.Mover._warm_tighten(cast(Any, seam), slot, T0) is False
+    assert slot.trail_plan is cold and slot.entry_record["trail_changes"] == []
+    assert any("tier" in note for note in seam.dropped)
+
+
+def test_a_non_finite_entry_average_falls_back_to_the_protection_anchor():
+    # Review (high) of P1: as `_trail_anchor`, so a NaN average cannot raise in the step timer.
+    seam = Seam("10.50", trail_mode="atr")
+    slot = seam_slot(seam)
+    slot.protection_anchor = D("10.40")
+    cast(Any, seam)._order = lambda _: SimpleNamespace(avg_px=float("nan"))
+    assert mover.Mover._bought(cast(Any, seam), slot) == D("10.40")
+    cast(Any, seam)._order = lambda _: SimpleNamespace(avg_px=0.0)
+    assert mover.Mover._bought(cast(Any, seam), slot) == D("10.40")
+
+
+# --- the lead's ruling of 2026-11-12, 21:01: a recorded tightening hands the trigger over ---------------
+
+
+def sized_cold_holding(sized_loss: str, width: str) -> tuple[Any, Any]:
+    """A budget-sized entry filled at 10.00 on the cold fallback's 0.02 plan, trailing by L, and an
+    ATR warmed from four minutes `width` wide, on a quote 0.01 wide."""
+    seam = RatchetSeam(
+        "10.5000", trail_mode="atr", size_from_budget=True, loss_share=mover.PAPER_LOSS_SHARE
+    )
+    seam.cache.quote = lambda _: SimpleNamespace(
+        bid_price=Price.from_str("10.5000"), ask_price=Price.from_str("10.5100")
+    )
+    slot = seam_slot(seam)
+    slot.entry_record = {"client_order_id": "E-1", "trail_changes": []}
+    slot.trail_plan = slot.initial_trail = mover.TrailPlan(
+        D("0.02"), D("0.005"), D("0.02"), None, D("0.01"), "fixed", None, "cold_atr_fallback"
+    )
+    slot.sized_loss = D(sized_loss)
+    seam._protect(slot, D(5), T0)
+    assert seam.sent[0].trailing_offset == D(sized_loss)
+    slot.atr = AverageTrueRange(3)
+    for bar in minute_bars([10.0, 10.1, 10.0, 10.1], width=width):
+        slot.atr.handle_bar(bar)
+    return seam, slot
+
+
+def test_a_warm_tighten_on_a_sized_entry_remakes_the_sale_at_the_warmed_offset_not_l():
+    """The lead's ruling of 2026-11-12, 21:01: after every remake the working sale trails by the
+    distance the record says. The warmed ATR tightens a sized cold entry's 0.02 plan; the remade sale
+    trails by the warmed plan's offset, not by the 0.20 L it was sized for."""
+    seam, slot = sized_cold_holding("0.20", "0.15")
+    seam._protect(slot, D(5), T0 + SECOND)
+    [change] = slot.entry_record["trail_changes"]
+    plan = slot.trail_plan
+    assert D(change["to"]) == plan.trail < D("0.02")
+    assert len(seam.sent) == 2 and seam.canceled == [seam.sent[0].client_order_id.value]
+    remade = seam.sent[1]
+    assert remade.trailing_offset == mover.offsets(D(10), plan.trail, plan.exit_through)[0]
+    assert remade.trailing_offset < D("0.20")
+    assert slot.exit_record.trail_distance == remade.trailing_offset
+
+
+def test_a_warm_tighten_wider_than_l_in_force_leaves_the_sized_sale_alone():
+    """The lead's ruling of 2026-11-12, 21:01: a tightening only moves the trigger closer. The warmed
+    plan is narrower than the 0.02 fallback but its offset is wider than the 0.05 L in force, so the
+    sale is not remade and nothing is recorded as a change; the check, made once, is spent."""
+    seam, slot = sized_cold_holding("0.05", "0.15")
+    seam._protect(slot, D(5), T0 + SECOND)
+    assert len(seam.sent) == 1 and seam.canceled == []
+    assert slot.trail_plan.trail == D("0.02") and slot.entry_record["trail_changes"] == []
+    assert slot.warm_checked is True
+    assert any("not tighter than L" in note for note in seam.dropped), seam.dropped
+
+
+def test_a_ratchet_on_a_sized_entry_remakes_the_sale_at_the_ratchets_offset_not_l():
+    """The lead's ruling of 2026-11-12, 21:01, for the ratchet S2 already hands over: a sized entry on
+    a 0.004 plan trailing by L = 0.03 ratchets to 0.002, and the remade sale trails by 0.02."""
+    seam, slot = ratchet_seam("10.1100", "10.1200")
+    slot = cast(Any, slot)
+    slot.sized_loss = D("0.03")
+    seam._protect(slot, D(5), T0)
+    assert seam.sent[0].trailing_offset == D("0.03")
+    seam._protect(slot, D(5), T0 + SECOND)
+    assert slot.ratcheted is True and slot.trail_plan.trail == D("0.002")
+    assert len(seam.sent) == 2
+    assert (seam.sent[1].trailing_offset, seam.sent[1].limit_offset) == (D("0.02"), D("0.03"))
+    assert slot.exit_record.trail_distance == D("0.02")
+
+
+def test_a_sized_entrys_fill_records_the_distance_l_puts_in_force_not_the_plans():
+    """The high read of the ruling's fix, item 2: the BUY fill records the exit row's trail distance
+    from the offsets in force. A 0.03 plan on a 10.00 fill is 0.30, but the entry sized for L = 0.50
+    trails by L, which the re-entry turn then reads."""
+    s = strategy()
+    slot = mover.Slot(AAA, bar_type(AAA), deque(maxlen=4), deque(maxlen=5))
+    s.slots[AAA] = slot
+    slot.trail_plan = slot.initial_trail = mover.TrailPlan(
+        D("0.03"), D("0.0075"), D("0.03"), None, None, "atr"
+    )
+    slot.sized_loss = D("0.50")
+    slot.entry_id = ClientOrderId("BUY-1")
+    s.on_order_filled(
+        SimpleNamespace(
+            instrument_id=AAA,
+            client_order_id=slot.entry_id,
+            order_side=OrderSide.BUY,
+            last_qty=Quantity.from_int(5),
+            last_px=Price.from_str("10.0000"),
+            ts_event=T0,
+        )
+    )
+    assert slot.exit_record is not None
+    assert slot.exit_record.trail_distance == D("0.50")

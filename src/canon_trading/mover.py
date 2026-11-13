@@ -51,11 +51,18 @@ A composition of upstream parts (ADR 0083, ADR 0088). What each part is, at Naut
   `AverageTrueRange(period).handle_bar` / `initialized` / `value`
   (`indicators/__init__.pyi:155-185`, `crates/indicators/src/python/volatility/atr.rs`). The engine's
   default is Wilder smoothing with the previous close. Each slot feeds only complete one-minute
-  bars. The dollar-volume tier is a stand-in for size, never market capitalization. `ratchet_base`
+  bars. On opening, a slot warms from `Cache.bars`' newest-first cached EXTERNAL minute bars
+  (`common/__init__.pyi:309`, `crates/common/src/cache/mod.rs:6276-6284`), closed in this session
+  part. The adapter's `parse_bar` stamps streamed bars with receipt time, so their interval end is
+  derived from the open, as that contract requires. A cold-fallback holding may tighten once when
+  its ATR warms. The dollar-volume tier is a stand-in for size, never market capitalization. `ratchet_base`
   pairs ratchet with plain ATR or tier: at r initial trails of gain it tightens once to g of the initial trail, subject to
   the latest spread floor, canceling and remaking the emulator order while retaining its trigger.
   All arms keep PRICE offsets frozen from entry; BASIS_POINTS is supported upstream
   (`docs/concepts/orders/index.md:236`) but would change the offset as the followed price rises.
+  ADR 0096 amendment 10's `profile` uses trail.py's pure arithmetic and T5's strict document,
+  retaining tier at the top liquidity cut. Once per complete slot minute it may tighten through
+  the same trigger-preserving remake path as ratchet; profile and ratchet are separate arms.
   If the entry order has no filled price, `Cache.positions_open` and `Position.avg_px_open`
   (`common/__init__.pyi:568`, `model/__init__.pyi:5868`) supply the held position's average;
   otherwise the current bid anchors protection. Each use is counted by name in the window record.
@@ -106,6 +113,17 @@ orders are accepted as extended hours eligible", so every order there is a DAY l
 `params={"extended_hours": True}` (ADR 0038); "Limit price >=$1.00: Max Decimals= 2", "Limit price <$1.00:
 Max Decimals = 4" (`tick`).
 
+R2's optional opening arm is **lead: the owner's observation**, UNCALIBRATED, no primary source.
+It uses the same turn and per-name trail plan as re-entry/protection: top-tier ranked names only,
+the observed 09:30 open and running minute low, one opening entry per New York session, within M
+minutes and after a fall of at least f trail distances. It is off by default. Its entries use the
+existing sizing, request budget, slot and protection path; subsequent entries use the re-entry arms.
+Its fall is read against its own row f alone, never the re-entry row's d; its turn from the slot's own
+bar series alone. An entry that fills spends the session's opening; one denied, rejected, expired or
+canceled with nothing filled is counted (`opening_outcomes`) and leaves it available.
+- Open (M row): entries run M-1 minutes; the refusal tests the turn bar's close minute, the row says neither.
+- Open (turn row): a wick-only equal low closing below the prior close holds `rises` at 0 until a new low.
+
 What is written here, since no upstream ships it (ADR 0083, gap 3): the rule that reads a rising run from
 bars, the slots, the two persistence confirmations, the re-entry and rotation rules, the chase's price
 and its cap, and the yield of entries to the request budget. Every number of them is a registered row,
@@ -153,10 +171,16 @@ UNCALIBRATED (ADR 0088; the persistence rows are ADR 0119's).
    Candidates are taken best-ranked first while a slot is free, each refused by name
    (`dropped`) when the ranking is older than `rank_max_age_secs`, the name is no longer in it, its move
    is over `max_move` (the no-chase cap), no quote is in the cache, the size comes to nothing, or the
-   requests of the last 60 seconds have reached `soft_line`, which holds entries and chase re-prices. A name sold before uses the clock cooldown and reclaim by default, or a reclaim above its sale. The existing clock cooldown and reclaim are unchanged.
+   requests of the last 60 seconds have reached `soft_line`, which holds entries and instrument requests, never a sale. A name sold before uses the clock cooldown and reclaim by default, or a selected state arm: a reclaim above its sale, a turn from a deep enough low, or a
+   tape-supplied VWAP crossing. The default `clock` keeps the existing cooldown and reclaim; the state arms impose no time delay.
 
-Exits never wait for ranking or entry budgets; chase re-prices wait at `soft_line`. The strategy is long only: a sell is sized from what is
+Exits never wait for the ranking, the budget or `soft_line`; the engine's submit throttle counts their submits, not their cancels. The strategy is long only: a sell is sized from what is
 held, one sell works at a time for a name, and nothing is sold while flat.
+
+The entry switch follows ADR 0115's `arming.read_arming` contract: read the file at each buy
+decision, immediately before the order exists; an off read stops the buy and is recorded by name.
+Sales never read it. The deployment supplies an absolute path and the absent-file rule; the default
+paper configuration names no file and keeps its existing entries.
 
 **Order events.** At the pin, an event that the strategy's own `submit_order`, `cancel_order` or
 `modify_order` publishes reaches its handler while the strategy object is mutably borrowed
@@ -192,15 +216,18 @@ from dataclasses import dataclass
 from dataclasses import field
 from dataclasses import replace
 from datetime import datetime
+from datetime import time
 from datetime import timedelta
 from decimal import ROUND_CEILING
 from decimal import ROUND_FLOOR
 from decimal import Decimal
 from itertools import groupby
 from itertools import pairwise
+from pathlib import Path
 from types import NoneType
 from typing import TYPE_CHECKING
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from alpaca.common.constants import DEFAULT_RETRY_ATTEMPTS
 from canon_alpaca.providers import TRADING_API
@@ -229,6 +256,8 @@ from nautilus_trader.model import TriggerType
 from nautilus_trader.risk import FixedRiskSizer
 from nautilus_trader.trading import Strategy
 
+from .arming import Arming
+from .arming import read_arming
 from .ma_cross import refuse_another_type
 from .ma_cross import refuse_unknown_keywords
 from .movers_rank_signal import MAX_ENTRIES as RANK_MOST
@@ -248,6 +277,11 @@ from .price_step import up_on_step
 from .sizing import REFUSALS as SIZING_REFUSALS
 from .sizing import plan_for_loss
 from .sizing import sized_stop
+from .trail import PROFILE_SETTINGS
+from .trail import profile_distance
+from .trail import profile_record
+from .trail import profile_segment
+from .trail import validate_profile_settings
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -441,6 +475,7 @@ INSTRUMENT_REQUEST_LIMIT = RANK_MOST
 Asset GETs use alpaca-py's existing retry policy; every HTTP attempt is counted by the adapter."""
 INSTRUMENT_REQUEST_RESERVE = DEFAULT_RETRY_ATTEMPTS + 1
 """Reserve all attempts of an outstanding asset GET (alpaca-py common/constants.py:11-13)."""
+NEW_YORK = ZoneInfo("America/New_York")
 CHASES = ("resend",)
 TRIGGERS = (TriggerType.BID_ASK, TriggerType.LAST_PRICE)
 """The triggers the local emulator accepts for an order it holds (concepts/orders/emulated)."""
@@ -455,7 +490,15 @@ TRAIL_CAP_DEFAULT = TRAIL_CAPS[0]
 """What an entry does with a non-fixed trail over `TRAIL_CAP` (the third cap arm, the lead's T3 of
 2026-11-12): `clamp` sets it to the cap and refuses a spread floor over it (the default, as before);
 `refuse` refuses the entry by name; `own` keeps the name's own distance and the size carries it, through
-`sizing.plan_for_loss`, whose 0.10 ceiling still refuses by name. UNCALIBRATED."""
+`sizing.plan_for_loss`, whose 0.10 ceiling still refuses by name. UNCALIBRATED. Known limits,
+counted and left as they are (the lead's notes of 2026-11-12, 21:01), two of `own`: (1) a profile
+re-evaluation is clamped to the cap (`_profile_tighten`), so a holding on its own distance over the cap
+tightens to the cap, not to the profile's own distance; (2) an opening's cold-ATR entry is not raised
+to a spread floor over the fixed trail, as a cold-ATR entry outside the opening is (`_entry_trail`);
+and one of every arm: (3) every tightening (ratchet, warmed ATR, profile) keeps its spread floor as a
+fraction of the average it was taken at, so after a later fill at a lower average a remade sale's
+offset can fall under `spread_floor_m` times that step's spread (a floor of 0.30 taken as 0.03 at
+10.00 sends 0.29 at a 9.60 average); not counted in the record."""
 DISTANCE_UNDER_STEP = "distance_under_step"
 """The Mover's own entry refusal after sizing: L, rounded down onto the entry's step, is nothing (S2)."""
 BID_AT_STOP = "bid_at_stop"
@@ -466,6 +509,13 @@ PAPER_LOSS_SHARE = Decimal("0.02")
 of 2026-11-12, 16:36): the loss at the stop that the budget sizing already accepted at the 0.02 cap, so a
 2% stop sizes to the budget, a wider one sizes down and a tighter one is held at the budget. No new
 number; UNCALIBRATED. Account C and a live node have no default: there the figure is the owner's."""
+PART_BOUNDS = ((4, 0), (9, 30), (16, 0), (20, 0))
+"""New York clock times at which a part of the 24-hour session begins: pre-market, regular, after-hours
+and overnight (`bars_list.PARTS`, and `session_window.session_part` for the overnight 20:00 start)."""
+WARM_BAR_SPEC = "1-MINUTE-LAST-EXTERNAL"
+"""The rank actor's minute bars (`movers_rank_actor.BAR_SPEC`), which the node's cache already holds for
+every ranked name; a slot's ATR warms from them when it opens (the lead's (a), 2026-11-12)."""
+
 HOLD_MOST_SECS = 60
 """The lead's bound (2026-11-12, decision (b)) on a held stop: with no two-sided quote within this many
 seconds of the fill, the holding is sold by limit and counted as an `unpriced_exit`. UNCALIBRATED."""
@@ -476,7 +526,7 @@ TIER_TRAIL = Decimal("0.002")
 TRAIL_SETTINGS: dict[str, dict[str, Any]] = {
     "trail_mode": {
         "default": "fixed",
-        "arms": ("fixed", "atr", "tier", "ratchet"),
+        "arms": ("fixed", "atr", "tier", "ratchet", "profile"),
         "status": "UNCALIBRATED",
     },
     "atr_k": {
@@ -508,6 +558,47 @@ TRAIL_SETTINGS: dict[str, dict[str, Any]] = {
         "status": "UNCALIBRATED",
     },
     "ratchet_base": {"default": "atr", "arms": ("atr", "tier"), "status": "UNCALIBRATED"},
+    "cooldown_secs": {
+        "default": 300,
+        "status": "UNCALIBRATED",
+        "note": "clock keeps the existing cooldown; state arms impose no time delay",
+    },
+    "reentry_arm": {
+        "default": "clock",
+        "arms": ("clock", "reclaim", "turn", "vwap"),
+        "status": "UNCALIBRATED",
+        "source": "lead, no primary source",
+    },
+    "turn_k": {
+        "default": 2,
+        "arms": (1, 2, 3),
+        "status": "UNCALIBRATED",
+        "source": "lead, no primary source",
+    },
+    "turn_d": {
+        "default": Decimal(1),
+        "arms": (Decimal(1), Decimal(2)),
+        "status": "UNCALIBRATED",
+        "source": "lead, no primary source",
+    },
+    "opening_arm": {
+        "default": "off",
+        "arms": ("off", "on"),
+        "status": "UNCALIBRATED",
+        "source": "lead: the owner's observation, no primary source",
+    },
+    "opening_minutes": {
+        "default": 30,
+        "arms": (15, 30),
+        "status": "UNCALIBRATED",
+        "source": "lead: the owner's observation, no primary source",
+    },
+    "opening_f": {
+        "default": Decimal(1),
+        "arms": (Decimal(1), Decimal(2)),
+        "status": "UNCALIBRATED",
+        "source": "lead: the owner's observation, no primary source",
+    },
     "flow_share": {
         "default": Decimal("0.05"),
         "alternates": (Decimal("0.01"),),
@@ -518,6 +609,7 @@ TRAIL_SETTINGS: dict[str, dict[str, Any]] = {
             "https://github.com/QuantConnect/Lean/blob/master/Algorithm.Framework/Execution/VolumeWeightedAveragePriceExecutionModel.py"
         ),
     },
+    **PROFILE_SETTINGS,
 }
 """T1/T2's registered settings; the liquidity cut is baseline dollars per minute, a stand-in for size.
 The clock default retains the cooldown and reclaim check; state arms are window opt-ins."""
@@ -529,11 +621,24 @@ TRAIL_SOURCE_LIMIT = (
     "ATR multiples and the spread floor: lead, no primary source; no outside source agrees on an "
     "ATR multiple or ties a stop to the spread. Both UNCALIBRATED until the tape with measured spreads."
 )
+RECLAIM_LIMIT = (
+    "Re-entry is read on a minute close, by state with no time cooldown: reclaim/turn/vwap; "
+    "lead, no primary source, UNCALIBRATED. Live session vwap unavailable; tape values only."
+)
 SHIPPED_ATR_NOTE = (
     "The one shipped ATR default found is backtesting.py TrailingStrategy's 6 ATR at its bar "
     "frequency (set_trailing_sl(n_atr=6)); this is a note, not a row to fire: "
     "https://kernc.github.io/backtesting.py/doc/backtesting/lib.html#backtesting.lib.TrailingStrategy"
 )
+OPENING_LIMIT = (
+    "Opening arm: lead: the owner's observation; UNCALIBRATED, no primary source. "
+    "Regular session only; the observed 09:30 open and complete minute lows, with the shared turn "
+    "and current per-name trail distance. Missing opening coverage refuses entry."
+)
+OPENING_FIELDS = ("opening_arm", "opening_minutes", "opening_f")
+REGULAR_OPEN_MINUTE = 9 * 60 + 30
+
+
 WORKING = (
     OrderStatus.ACCEPTED,
     OrderStatus.PARTIALLY_FILLED,
@@ -679,6 +784,10 @@ OWN_FIELDS: dict[str, type | tuple[type, ...]] = {
     "ratchet_r": Decimal,
     "ratchet_g": Decimal,
     "ratchet_base": str,
+    "profile_k": Decimal,
+    "profile_pctl": str,
+    "profile_floor": str,
+    "profile_multipliers": tuple,
     "exit_through": Decimal,
     "chase_cap": Decimal,
     "chase_secs": int,
@@ -692,6 +801,12 @@ OWN_FIELDS: dict[str, type | tuple[type, ...]] = {
     "exit_ticks": int,
     "entry_timeout_secs": int,
     "cooldown_secs": int,
+    "reentry_arm": str,
+    "turn_k": int,
+    "turn_d": Decimal,
+    "opening_arm": str,
+    "opening_minutes": int,
+    "opening_f": Decimal,
     "rank_max_age_secs": int,
     "soft_line": int,
     "protect": bool,
@@ -699,8 +814,12 @@ OWN_FIELDS: dict[str, type | tuple[type, ...]] = {
     "extended_hours": bool,
     "wind_down_at": (datetime, NoneType),
     "feed": (str, NoneType),
+    "arming_path": (str, NoneType),
+    "arming_absent_is_on": bool,
 }
 """`MoverConfig`'s own fields and the type each takes."""
+ARMING_FIELDS = ("arming_path", "arming_absent_is_on")
+"""The entry switch's settings: the run record keeps them under `arming`, not among its rows."""
 
 
 class MoverConfig(StrategyConfig):
@@ -744,14 +863,16 @@ class MoverConfig(StrategyConfig):
     Each registered arm needs an explicit `Day` history context in `Mover.entry_contexts`.
 
     T1/T2's `TRAIL_SETTINGS` adds selectable window modes; fixed 0.02 and the clock cooldown
-    remain the defaults. The existing cooldown and reclaim are unchanged.
+    remain the defaults. State arms ignore cooldown_secs only when explicitly selected.
     Turn uses k rising closes from a low at least d actual trail distances below the sale.
     VWAP is tape-only: no live bar VWAP is inferred. Re-entry arms, ATR multiples and the spread floor are
     lead, no primary source; every row is UNCALIBRATED until the tape with measured spreads.
     Non-fixed entries scale exit_through to trail/4 and keep chase_cap at max(trail, chase_cap) (the
     lead's (ii), 2026-11-12), with an unavoidable spread floor (`spread_floor_m >= 1`) and 0.02 cap.
-    An unusable spread selects fixed by name; no quote still refuses entry. An ATR with fewer than
-    `atr_n` complete slot minutes selects fixed as `cold_atr_fallback` (the lead's (ii)). `liquidity_tier_cut`
+    An unusable spread selects fixed by name; no quote still refuses entry. An ATR that is not warm
+    (fewer than `atr_n` minute bars, cached from this part when the slot opened or live since) selects
+    fixed as `cold_atr_fallback` (the lead's (ii)); such a holding tightens once to its warmed ATR's plan,
+    never wider (the lead's (b)). `liquidity_tier_cut`
     is baseline dollars per minute, a stand-in for size; an unknown baseline selects ATR by name.
     `ratchet_base` chooses the paired ATR or tier plan, and r/g tighten it once. All new numeric rows
     and their alternates are UNCALIBRATED. Fixed preserves explicit legacy trail/exit/chase overrides.
@@ -785,6 +906,14 @@ class MoverConfig(StrategyConfig):
         ratchet_r: Decimal = Decimal(2),
         ratchet_g: Decimal = Decimal("0.5"),
         ratchet_base: str = "atr",
+        profile_k: Decimal = Decimal(2),
+        profile_pctl: str = "p75",
+        profile_floor: str = "median",
+        profile_multipliers: tuple[Decimal, Decimal, Decimal] = (
+            Decimal(1),
+            Decimal(1),
+            Decimal(1),
+        ),
         exit_through: Decimal = Decimal("0.005"),
         chase_cap: Decimal = Decimal("0.02"),
         chase_secs: int = 5,
@@ -798,6 +927,12 @@ class MoverConfig(StrategyConfig):
         exit_ticks: int = 1,
         entry_timeout_secs: int = 30,
         cooldown_secs: int = 300,
+        reentry_arm: str = "clock",
+        turn_k: int = 2,
+        turn_d: Decimal = Decimal(1),
+        opening_arm: str = "off",
+        opening_minutes: int = 30,
+        opening_f: Decimal = Decimal(1),
         rank_max_age_secs: int = 90,
         soft_line: int = 140,
         protect: bool = True,
@@ -805,6 +940,8 @@ class MoverConfig(StrategyConfig):
         extended_hours: bool = False,
         wind_down_at: datetime | None = None,
         feed: str | None = None,
+        arming_path: str | None = None,
+        arming_absent_is_on: bool = True,
         **_kwargs: object,
     ) -> None:
         super().__init__()
@@ -845,6 +982,19 @@ class MoverConfig(StrategyConfig):
                 "an entry is sized for; paper A and B take PAPER_LOSS_SHARE of the slot's figure, "
                 "and anywhere else it is the owner's figure, with no default"
             )
+        validate_profile_settings(profile_k, profile_pctl, profile_floor, profile_multipliers)
+        for name in ("reentry_arm", "turn_k", "turn_d", *OPENING_FIELDS):
+            if fields[name] not in TRAIL_SETTINGS[name]["arms"]:
+                raise ValueError(f"{name} must be one of {TRAIL_SETTINGS[name]['arms']}")
+        if opening_arm == "on" and not protect:
+            raise ValueError("opening_arm='on' requires protect=True; no unprotected opening entry")
+        if opening_arm == "on" and extended_hours:
+            raise ValueError("opening_arm='on' is a regular-session arm; extended_hours refuses it")
+        if opening_arm == "on" and bar_spec not in (
+            "1-MINUTE-LAST-EXTERNAL",
+            "1-MINUTE-LAST-INTERNAL",
+        ):
+            raise ValueError("opening_arm='on' requires 1-MINUTE-LAST bars")
         for name in ("atr_k", "spread_floor_m", "liquidity_tier_cut", "ratchet_r"):
             if not fields[name].is_finite() or fields[name] <= 0:
                 raise ValueError(f"{name} must be positive, got {fields[name]}")
@@ -947,6 +1097,8 @@ class MoverConfig(StrategyConfig):
         self.liquidity_tier_cut = liquidity_tier_cut
         self.ratchet_r, self.ratchet_g = ratchet_r, ratchet_g
         self.ratchet_base = ratchet_base
+        self.profile_k, self.profile_pctl = profile_k, profile_pctl
+        self.profile_floor, self.profile_multipliers = profile_floor, profile_multipliers
         self.exit_through = exit_through
         self.chase_cap = chase_cap
         self.chase_secs = chase_secs
@@ -960,6 +1112,12 @@ class MoverConfig(StrategyConfig):
         self.exit_ticks = exit_ticks
         self.entry_timeout_secs = entry_timeout_secs
         self.cooldown_secs = cooldown_secs
+        self.reentry_arm, self.turn_k, self.turn_d = reentry_arm, turn_k, turn_d
+        self.opening_arm, self.opening_minutes, self.opening_f = (
+            opening_arm,
+            opening_minutes,
+            opening_f,
+        )
         self.rank_max_age_secs = rank_max_age_secs
         self.soft_line = soft_line
         self.protect = protect
@@ -967,6 +1125,14 @@ class MoverConfig(StrategyConfig):
         self.extended_hours = extended_hours
         self.wind_down_at = wind_down_at
         self.feed = feed
+        if arming_path is not None and (
+            "\x00" in arming_path or not arming_path or not Path(arming_path).is_absolute()
+        ):
+            raise ValueError(
+                f"arming_path must be an absolute file path, got {arming_path!r}: a relative one "
+                "would be read against whatever folder the node runs in"
+            )
+        self.arming_path, self.arming_absent_is_on = arming_path, arming_absent_is_on
 
     @property
     def persistence(self) -> bool:
@@ -991,6 +1157,8 @@ class TrailPlan:
     """The spread floor as a fraction of the entry, `spread_floor_m` quoted spreads (a row of its own)."""
     measure: Decimal | None = None
     """The name's own distance before the floor and the cap: `atr_k` ATRs, or the tier's fraction."""
+    profile: dict[str, Any] | None = None
+    """Amendment 10's input calculation before the common bounds, including a named thin reason."""
 
 
 @dataclass
@@ -1062,6 +1230,98 @@ class ExitRecord:
         }
 
 
+@dataclass(kw_only=True)
+class TurnState:
+    """T1/T2's turn, shared with R2: consecutive rising closes starting at the observed low.
+
+    Re-entry observes close lows. Opening observes minute lows and anchors the same rising-close
+    sequence to the close of the minute that made that low. An equal low reached only by a wick
+    does not erase a rising close; an equal/new low close still restarts the re-entry turn exactly.
+    """
+
+    low: Decimal | None = None
+    previous: Decimal | None = None
+    rises: int = 0
+    low_close: Decimal | None = None
+
+    def observe_turn(self, close: Decimal, low: Decimal | None = None) -> None:
+        observed = close if low is None else low
+        if self.low is None or observed < self.low or close <= self.low:
+            self.low, self.rises, self.low_close = observed, 0, close
+        elif (
+            self.previous is not None
+            and close > self.previous
+            and (self.rises > 0 or self.previous in (self.low, self.low_close))
+        ):
+            self.rises += 1
+        else:
+            self.rises = 0
+        self.previous = close
+
+    def turn_refusal(
+        self, reference: Decimal | None, distance: Decimal | None, k: int, d: Decimal
+    ) -> str | None:
+        if reference is None or distance is None or self.low is None:
+            return "turn state or trail distance unavailable"
+        depth, required = reference - self.low, d * distance
+        if depth < required:
+            return f"turn depth {depth} is under {d} trail distances ({required})"
+        if self.rises < k:
+            return f"turn needs {k} rising closes from the low; has {self.rises}"
+        return None
+
+
+@dataclass
+class OpeningState(TurnState):
+    """R2 state belongs to the name/session and survives slot removal; no history is invented."""
+
+    day: date
+    open: Decimal
+    low_minute: int
+    last_open_ns: int
+    complete: bool = True
+    used: bool = False
+    order_id: ClientOrderId | None = None
+    """The opening entry still undecided: a fill spends the opening, an end with nothing filled frees it."""
+    turn_ns: int | None = None
+    turn_minute: int | None = None
+
+
+SOLD_THIS_TRADE_DATE = "sold_this_trade_date"
+"""The opening's refusal of a name sold on its own trade date, which the record names."""
+
+
+@dataclass
+class ReentryState(TurnState):
+    """The lead's post-sale state, kept by name across slots; no clock-based brake.
+
+    Only complete closes after the sale count. A turn starts at the lowest observed close and
+    needs consecutive rises from that low. A tape VWAP must belong to this exact completed bar;
+    a missing value clears the crossing, so stale or future VWAPs cannot admit an entry.
+    """
+
+    sale_ns: int
+    sale_price: Decimal | None
+    trail_distance: Decimal | None
+    vwap: Decimal | None = None
+    below_vwap: bool = False
+    crossed_vwap: bool = False
+    vwap_day: date | None = None
+
+    def observe(self, close: Decimal, vwap: Decimal | None, day: date) -> None:
+        self.observe_turn(close)
+        if day != self.vwap_day:
+            self.below_vwap, self.vwap_day = False, day
+        self.vwap = vwap if vwap is not None and vwap.is_finite() and vwap > 0 else None
+        self.crossed_vwap = self.vwap is not None and self.below_vwap and close > self.vwap
+        self.below_vwap = self.vwap is not None and close < self.vwap
+
+    def restart(self) -> None:
+        """A reopened slot missed the closes in between: its low, rises and VWAP side start again."""
+        self.low, self.previous, self.rises = None, None, 0
+        self.vwap, self.below_vwap, self.crossed_vwap = None, False, False
+
+
 def baseline_per_minute(record: dict[str, Any]) -> Decimal | None:
     """The startup ranking's existing normal / clock minutes, without another history read.
 
@@ -1078,6 +1338,39 @@ def baseline_per_minute(record: dict[str, Any]) -> Decimal | None:
     if any(not v.is_finite() or v <= 0 for v in (dollars, ratio, minutes)):
         return None
     return dollars / ratio / minutes
+
+
+def part_opened_ns(now_ns: int) -> int:
+    """When the session part open at `now_ns` began, by `PART_BOUNDS` in New York."""
+    at = datetime.fromtimestamp(now_ns / SECOND_NS, NEW_YORK)
+    starts = [
+        datetime.combine(at.date() - timedelta(days=back), time(hour, minute), NEW_YORK)
+        for back in (0, 1)
+        for hour, minute in PART_BOUNDS
+    ]
+    return int(max(start for start in starts if start <= at).timestamp()) * SECOND_NS
+
+
+def bar_opened_ns(bar: Bar) -> int:
+    """A minute bar's open: an INTERNAL bar's ts_init less a minute, an adapter EXTERNAL bar's ts_event.
+    The one rule for `on_bar`, `_registered_run` and the cached warm."""
+    return bar.ts_init - 60 * SECOND_NS if bar.bar_type.is_internally_aggregated() else bar.ts_event
+
+
+def opening_ended(
+    states: dict[InstrumentId, OpeningState], outcomes: dict[str, int], event: Any, outcome: str
+) -> None:
+    """Count how an opening entry ended (the lead's ruling on review finding (8), 2026-11-12). Its
+    first fill spends the opening; an end with nothing filled (denied, rejected, expired, or canceled,
+    as the entry's time-out cancels it) frees the session's opening again. A function of plain values,
+    so an order event handler can call it while the strategy is borrowed."""
+    state = states.get(event.instrument_id)
+    if state is None or state.order_id != event.client_order_id:
+        return
+    outcomes[outcome] = outcomes.get(outcome, 0) + 1
+    state.order_id = None
+    if outcome != "filled":
+        state.used = False
 
 
 def quoted_spread(quote: Any) -> Decimal | None:
@@ -1139,6 +1432,13 @@ class Slot:
     trail_plan: TrailPlan | None = None
     initial_trail: TrailPlan | None = None
     ratcheted: bool = False
+    tightened: bool = False
+    """A recorded tightening (ratchet, warmed ATR or profile) has taken the trigger from L: the tighter
+    plan's trail places it from then on (the lead's ruling of 2026-11-12, 21:01)."""
+    warm_checked: bool = False
+    """Whether a cold-fallback holding has been compared once with its warmed ATR (the lead's (b))."""
+    atr_warm_bars: int = 0
+    """How many cached minute bars warmed the ATR when the slot opened (the lead's (a)); 0 for none."""
     entry_record: dict[str, Any] | None = None
     exit_record: ExitRecord | None = None
     last_bid: Decimal | None = None
@@ -1156,12 +1456,16 @@ class Slot:
     """An emulated trailing sell has been placed for this holding: a later hold counts from its own start."""
     last_sale: Decimal | None = None
     """The price of this holding's last plain sale: a remake with no bid is never priced above it."""
+    run_open_ns: int | None = None
+    """Open of the complete minute, including the New York session date of a tape VWAP."""
     run_ns: int | None = None
     """When the last rising run completed (the bar's `ts_event`), until an entry has been decided on."""
     run_close: Decimal | None = None
     run_seen_ns: int | None = None
     """When the node had the bar that completed the run (its `ts_init`): the qualifying market event as
     the strategy can know it, from which an entry's delay is measured (`mover_window.entry_diagnostics`)."""
+    run_arm: str | None = None
+    """Only the opening candidate sets this; the off path preserves existing records."""
     entry_id: ClientOrderId | None = None
     entry_cancel_ns: int = 0
     protect_id: ClientOrderId | None = None
@@ -1210,6 +1514,37 @@ class Slot:
     """The watch-start minute belongs to this New York day, and resets with a new day."""
     subscribed_ns: int = 0
     """When the slot started receiving bars; its first internal minute may be partial."""
+    profile_evaluated_ns: int | None = None
+    """Open of the last complete minute considered for tightening, never the one-second step."""
+
+
+def l_in_force(slot: Slot, bought: Decimal) -> Decimal | None:
+    """L while it places the trailing sell's trigger: the entry was sized for it (S2), it has room
+    under `bought`, and no recorded tightening has taken the trigger (`Slot.tightened`); else None,
+    and the plan's trail places it (the lead's ruling of 2026-11-12, 21:01)."""
+    if slot.tightened or fill_trigger(bought, slot.sized_loss) is None:
+        return None
+    return slot.sized_loss
+
+
+def offsets_in_force(
+    slot: Slot, bought: Decimal, trail: Decimal, exit_through: Decimal
+) -> tuple[Decimal, Decimal]:
+    """The offsets the working sale trails by (`offsets`): L's while L is in force, else the plan's.
+    `_trail` sends these, and each tightening is taken only when it is closer than these. A tightening
+    is taken against L at the average of its step, so once one has, the plan's trailing offset at a
+    later, higher average is held at L, never over it (the high read of the ruling's fix, item 1)."""
+    distance = l_in_force(slot, bought)
+    loss = slot.sized_loss
+    if (
+        distance is None
+        and slot.tightened
+        and loss is not None
+        and fill_trigger(bought, loss) is not None
+        and offsets(bought, trail, exit_through)[0] > loss
+    ):
+        distance = loss
+    return offsets(bought, trail, exit_through, distance=distance)
 
 
 class Mover(Strategy):
@@ -1283,6 +1618,10 @@ class Mover(Strategy):
         self.protect_paths = {"held_stop": 0, "unpriced_exit": 0, "trail": 0}
         """How each held stop ended: sold through its level, sold after `HOLD_MOST_SECS`, or released."""
         self.refused: list[tuple[str, str]] = []
+        self.opening_refused: dict[str, str] = {}
+        self.opening_outcomes: dict[str, int] = {}
+        """How each opening entry ended: `filled` (the opening is spent), or `denied`, `rejected`,
+        `expired` or `canceled` with nothing filled (the session's opening stays available)."""
         self.dropped: list[str] = []
         """Why each candidate entry was not sent, for the run's report."""
         self.sizing_refusals: dict[str, int] = dict.fromkeys(
@@ -1312,8 +1651,19 @@ class Mover(Strategy):
         self.sold: dict[InstrumentId, tuple[int, Decimal | None]] = {}
         """When each name was last sold, and at what price: the name's, until its next sale, so that
         neither a slot closed and opened again nor an entry that never filled loses its sale state."""
+        self.sold_fill_ns: dict[InstrumentId, int] = {}
+        """The actual last sale fill, retained across unwatching for state and elapsed-minute records."""
+        self.reentry_states: dict[InstrumentId, ReentryState] = {}
+        self.opening_states: dict[InstrumentId, OpeningState] = {}
+        self.session_vwaps: dict[InstrumentId, dict[int, Decimal]] = {}
+        """Tape-supplied session VWAPs keyed by completed bar ts_init. Live composition leaves empty;
+        no OHLC substitute, rolling approximation or last-known VWAP is used for this state arm."""
         self.baseline_dollar_volume_per_minute: dict[InstrumentId, Decimal] = {}
         """The ranking's startup normal, supplied by composition: a stand-in for size, not market cap."""
+        self.trail_profile: dict[str, Any] | None = None
+        """The strict T5 document, supplied by composition; profile refuses entries without it."""
+        self.rdc_1: dict[InstrumentId, Decimal] = {}
+        """Composition's latest RDc_1 ratios; absent ratios explicitly take profile's first bucket."""
         self.notes: dict[InstrumentId, list[str]] = {}
         """What was noted of each name, for the run's report; kept when its slot is closed."""
         self.entries_sent: list[dict[str, Any]] = []
@@ -1321,12 +1671,17 @@ class Mover(Strategy):
         bar that qualified it (`qualified_ns`) and that bar's close, and the order's creation time
         (`submitted_ns`), both on the node's clock. A window reads its diagnostics from these and its
         own bars (`mover_window.entry_diagnostics`)."""
+        self.entries_off: list[dict[str, Any]] = []
+        """Each buy decision the entry switch stopped: its time, name, kind and what was read."""
+        self.arming_warned: dict[InstrumentId, str] = {}
+        """The read each name was last warned of; a change of what is read warns again."""
+        self.arming_warnings: list[tuple[str, str]] = []
         self.winding_down = False
         self.sent: deque[tuple[int, int]] = deque()
         """(time, the adapter's request total) at each step of the last 60 seconds."""
         self.recent = 0
         """The adapter's requests over the last 60 seconds plus outstanding instrument-GET reserves,
-        which `soft_line` holds entries, instrument requests and chases against."""
+        which `soft_line` holds entries and instrument requests against."""
 
     # --- handlers that only store what they are given (module header, "Order events") ---------------
 
@@ -1399,6 +1754,8 @@ class Mover(Strategy):
                 event.last_qty.as_decimal() * event.last_px.as_decimal(),
             )
         )
+        if event.order_side == OrderSide.BUY:
+            opening_ended(self.opening_states, self.opening_outcomes, event, "filled")
 
         slot = self.slots.get(event.instrument_id)
         if slot is None:
@@ -1414,11 +1771,24 @@ class Mover(Strategy):
             row.bought_notional += quantity * event.last_px.as_decimal()
             row.final_fill_ns = None
             plan = slot.trail_plan
-            row.trail_distance = offsets(
+            # the distance the sale trails by: L's while L is in force (the high read of the
+            # ruling's fix, item 2), so a sale already due at the next step keeps it in the record
+            row.trail_distance = offsets_in_force(
+                slot,
                 row.bought_notional / row.quantity,
                 self.settings.trail if plan is None else plan.trail,
                 self.settings.exit_through if plan is None else plan.exit_through,
             )[0]
+            reentry = None if slot.entry_record is None else slot.entry_record.get("reentry")
+            if reentry is not None:
+                reentry["reentry_price"] = str(row.bought_notional / row.quantity)
+                if reentry["minutes_between"] is None:
+                    reentry["minutes_between"] = (event.ts_event - reentry["sale_ns"]) / (
+                        60 * SECOND_NS
+                    )
+            opening = None if slot.entry_record is None else slot.entry_record.get("opening")
+            if opening is not None:
+                opening["entry_price"] = str(row.bought_notional / row.quantity)
             if slot.last_bid is not None:
                 row.peak = max(row.peak or slot.last_bid, slot.last_bid)
         elif slot.exit_record is not None:
@@ -1427,6 +1797,13 @@ class Mover(Strategy):
             row.notional += quantity * event.last_px.as_decimal()
             if row.filled >= row.quantity:
                 row.final_fill_ns = event.ts_event
+                if self.settings.reentry_arm != "clock":
+                    sale = row.notional / row.filled
+                    self.sold[event.instrument_id] = (event.ts_event, sale)
+                    self.sold_fill_ns[event.instrument_id] = event.ts_event
+                    self.reentry_states[event.instrument_id] = ReentryState(
+                        event.ts_event, sale, row.trail_distance
+                    )
 
     def _trading_account(self, venue: Any) -> Any:
         """The venue's account as the portfolio holds it."""
@@ -1494,9 +1871,17 @@ class Mover(Strategy):
 
     def on_order_denied(self, event: Any) -> None:
         self.refused.append((event.client_order_id.value, str(event.reason)))
+        opening_ended(self.opening_states, self.opening_outcomes, event, "denied")
 
     def on_order_rejected(self, event: Any) -> None:
         self.refused.append((event.client_order_id.value, str(event.reason)))
+        opening_ended(self.opening_states, self.opening_outcomes, event, "rejected")
+
+    def on_order_expired(self, event: Any) -> None:
+        opening_ended(self.opening_states, self.opening_outcomes, event, "expired")
+
+    def on_order_canceled(self, event: Any) -> None:
+        opening_ended(self.opening_states, self.opening_outcomes, event, "canceled")
 
     def on_quote(self, quote: Any) -> None:
         self.quotes += 1
@@ -1527,11 +1912,23 @@ class Mover(Strategy):
     def record(self) -> dict[str, Any]:
         """What a run's report keeps of the strategy, in plain values: its rows, the ranking it last
         had, each fill, each order refused, the orders the emulator released, and each slot's notes."""
-        return {
+        record = {
             "rows": {
-                name: str(getattr(self.settings, name))
+                # Multi-value rows keep their shape in JSON, with each decimal written as text.
+                name: [str(part) for part in value]
+                if isinstance(value, tuple)
+                else {str(key): str(part) for key, part in value.items()}
+                if isinstance(value, dict)
+                else str(value)
                 for name in OWN_FIELDS
                 if name != "max_shares" or not self.settings.size_from_budget
+                if name not in ARMING_FIELDS
+                and (self.settings.opening_arm != "off" or name not in OPENING_FIELDS)
+                for value in (getattr(self.settings, name),)
+            },
+            "arming": {
+                "path": self.settings.arming_path,
+                "absent_is_on": self.settings.arming_absent_is_on,
             },
             "persistence_arms": {
                 arm: {
@@ -1544,6 +1941,7 @@ class Mover(Strategy):
                     ("high", self.settings.high_count),
                 )
             },
+            "entries_off": [dict(row) for row in self.entries_off],
             "rank": format_rank(self.rank),
             "rank_ns": self.rank_ns,
             "rankings": [dict(ranking) for ranking in self.rankings],
@@ -1573,7 +1971,7 @@ class Mover(Strategy):
             "protection_fallbacks": dict(self.protection_fallbacks),
             "protect_paths": dict(self.protect_paths),
             "sell_triggers": dict(self.sell_triggers),
-            "trail_notes": [PAPER_TRAIL_LIMIT, TRAIL_SOURCE_LIMIT, SHIPPED_ATR_NOTE],
+            "trail_notes": self._trail_notes(),
             "exits": [row.record() for row in self.exits],
             "notes": {str(i): list(notes) for i, notes in self.notes.items()},
             "entries": [dict(entry) for entry in self.entries_sent],
@@ -1587,6 +1985,10 @@ class Mover(Strategy):
                 for instrument, context in self.entry_contexts.items()
             },
         }
+        if self.settings.opening_arm != "off":
+            record["opening_refused"] = dict(self.opening_refused)
+            record["opening_outcomes"] = dict(self.opening_outcomes)
+        return record
 
     # --- start, bars, the step -------------------------------------------------------------------------
 
@@ -1614,12 +2016,51 @@ class Mover(Strategy):
         self.live_bars += 1
         if slot.atr is not None:
             slot.atr.handle_bar(bar)
+        slot.run_open_ns = bar_opened_ns(bar)
         close = bar.close.as_decimal()
+        if self.settings.opening_arm == "on":
+            if slot.run_arm == "opening":
+                # A run not decided on before this bar stays opening-only, never a bridge run.
+                slot.run_ns = slot.run_close = slot.run_seen_ns = None
+            slot.run_arm = None
+            self._sync_opening(slot, bar.ts_init)
+            self._observe_opening(slot, bar)
         before = slot.closes[-1] if slot.closes else None
         slot.closes.append(close)
         slot.dollars.append(close * bar.volume.as_decimal())
+        if (
+            self.settings.trail_mode == "profile"
+            and not self.winding_down
+            and (self.settings.protect or slot.exiting)
+            # as on the step path: while upstream's market exit runs it alone sells
+            and not self.is_exiting()
+        ):
+            order = self._order(slot.protect_id)
+            if order is not None and order.is_emulated and (held := self._held(slot)) > 0:
+                # Each complete minute takes the existing protection path even if several bars
+                # arrive before the next timer step. The per-slot bar mark prevents step repeats.
+                self._protect(slot, held, bar.ts_init)
+        state = self.reentry_states.get(slot.instrument_id)
+        row = slot.exit_record
+        if (
+            state is not None
+            and bar.ts_init > state.sale_ns
+            and (row is None or row.filled >= row.quantity)
+        ):
+            state.observe(
+                close,
+                self.session_vwaps.get(slot.instrument_id, {}).get(bar.ts_init),
+                datetime.fromtimestamp(slot.run_open_ns / SECOND_NS, NEW_YORK).date(),
+            )
         if self.settings.entry_arm != "bridge":
             self._registered_run(slot, bar)
+            self._opening_run(slot, bar)
+            return
+        if slot.instrument_id in self.sold and self.settings.reentry_arm in ("turn", "vwap"):
+            # Turn's k and VWAP's crossing replace the first entry's rising-run length; the entry
+            # check still enforces state, ranking, eligibility, free slots and request budget.
+            slot.run_ns, slot.run_close, slot.run_seen_ns = bar.ts_event, close, bar.ts_init
+            self._opening_run(slot, bar)  # name sale refusals without replacing the re-entry run
             return
         rising = 0  # the closes in a row, to this one, each above the one before
         for later, earlier in pairwise(reversed(slot.closes)):
@@ -1638,6 +2079,129 @@ class Mover(Strategy):
                 f"{slot.instrument_id}: run building, {rising} of {wanted} rising closes "
                 f"({close}{after})"
             )
+        self._opening_run(slot, bar)
+
+    def _sync_opening(self, slot: Slot, now: int) -> None:
+        """Observe this part's opening minutes from the node's cached bars of the slot's own series
+        (`slot.bar_type`, no request), oldest first; `Cache.bars` returns newest first at the
+        NautilusTrader pin. Minutes already observed are not observed twice.
+
+        One series decides the turn, the one the slot trades on (the lead's ruling on review finding
+        (2), 2026-11-12): another source's bar for the same minute (the rank actor's EXTERNAL bars when
+        the slot trades INTERNAL) never stands in for the slot's own. An INTERNAL slot opened after
+        09:30 has no 09:30 bar of its series, so it has no opening coverage and enters by no opening.
+        """
+        if self.settings.opening_arm != "on" or self.settings.extended_hours:
+            return
+        cached = self.cache.bars(slot.bar_type)
+        state = self.opening_states.get(slot.instrument_id)
+        today = datetime.fromtimestamp(now / SECOND_NS, NEW_YORK).date()
+        start = int(datetime.combine(today, time(9, 30), NEW_YORK).timestamp()) * SECOND_NS
+        since = state.last_open_ns if state is not None and state.day == today else start - 1
+        fresh = []
+        for bar in cached or []:
+            opened = bar_opened_ns(bar)
+            if opened <= since:
+                break
+            if bar.ts_init <= now:
+                fresh.append((opened, bar))
+        for opened, bar in reversed(fresh):
+            self._observe_opening(slot, bar, opened)
+
+    def _observe_opening(self, slot: Slot, bar: Bar, opened_ns: int | None = None) -> None:
+        """Observe complete minutes from the actual 09:30 bar; a gap invalidates this session.
+
+        Upstream rc8 aggregation.rs:1735 stamps INTERNAL bars' close in ts_init; EXTERNAL Alpaca
+        bars use their open in ts_event (model/__init__.pyi:112-141; adapter parse_bar).
+        `opened_ns` is the bar's open, the slot's `run_open_ns` for its own bars.
+        """
+        if opened_ns is None:
+            opened_ns = slot.run_open_ns
+        if self.settings.extended_hours or opened_ns is None:
+            return
+        if bar.bar_type.is_internally_aggregated() and opened_ns < slot.subscribed_ns:
+            return  # a partial first INTERNAL minute, as `_registered_run` skips it: no 09:30 open
+        opened = datetime.fromtimestamp(opened_ns / SECOND_NS, NEW_YORK)
+        minute = opened.hour * 60 + opened.minute
+        if not REGULAR_OPEN_MINUTE <= minute < REGULAR_OPEN_MINUTE + self.settings.opening_minutes:
+            return
+        state = self.opening_states.get(slot.instrument_id)
+        if state is not None and state.day != opened.date():
+            del self.opening_states[slot.instrument_id]
+            state = None
+        if state is None:
+            if minute != REGULAR_OPEN_MINUTE:
+                self._note(slot, f"{slot.instrument_id}: opening: no complete 09:30 open observed")
+                return
+            state = OpeningState(
+                opened.date(), bar.open.as_decimal(), minute, opened_ns - 60 * SECOND_NS
+            )
+            self.opening_states[slot.instrument_id] = state
+        if opened_ns <= state.last_open_ns:
+            return  # no duplicate or out-of-order minute can count as another rising close
+        if opened_ns != state.last_open_ns + 60 * SECOND_NS:
+            state.complete = False
+            self._note(slot, f"{slot.instrument_id}: opening: missing minute coverage since 09:30")
+        state.last_open_ns = opened_ns
+        low, close = bar.low.as_decimal(), bar.close.as_decimal()
+        if state.low is None or low < state.low or close <= state.low:
+            state.low_minute = minute  # the minute `observe_turn` anchors the turn to
+        state.observe_turn(close, low)
+        state.turn_ns, state.turn_minute = bar.ts_init, minute
+
+    def _opening_refusal(self, slot: Slot, now: int) -> str | None:
+        settings = self.settings
+        state = self.opening_states.get(slot.instrument_id)
+        current = datetime.fromtimestamp(now / SECOND_NS, NEW_YORK)
+        minute = current.hour * 60 + current.minute
+        if settings.opening_arm != "on" or settings.extended_hours or not settings.protect:
+            return "opening is off or outside the protected regular-session arm"
+        if not REGULAR_OPEN_MINUTE <= minute < REGULAR_OPEN_MINUTE + settings.opening_minutes:
+            return "opening window has ended"
+        if state is None or state.day != current.date() or not state.complete:
+            return "opening has no complete coverage from 09:30"
+        if state.used:
+            return "opening entry already used this session"
+        if not self._top_tier(slot):
+            return "opening requires the top liquidity tier"
+        if (sold := self.sold.get(slot.instrument_id)) is not None:
+            from .movers_rank_actor import trade_date
+
+            # the lead (2026-11-12): the trade date, with its 20:00 rollover, as the carry and the
+            # baselines use; a name sold on it comes back only through the re-entry arm. Checked
+            # last here, so a record of it names an opening only the sale refused (the ranking and
+            # the fall are the entry check's, later).
+            if trade_date(self.sold_fill_ns.get(slot.instrument_id, sold[0])) == state.day:
+                return SOLD_THIS_TRADE_DATE
+        return None
+
+    def _top_tier(self, slot: Slot) -> bool:
+        """Whether the name's baseline dollar volume per minute is known, finite and at the tier cut."""
+        baseline = self.baseline_dollar_volume_per_minute.get(slot.instrument_id)
+        return (
+            baseline is not None
+            and baseline.is_finite()
+            and baseline >= self.settings.liquidity_tier_cut
+        )
+
+    def _opening_run(self, slot: Slot, bar: Bar) -> None:
+        if self.settings.opening_arm != "on":
+            return
+        state = self.opening_states.get(slot.instrument_id)
+        if state is None or state.turn_ns != bar.ts_init or state.rises < self.settings.turn_k:
+            return
+        if (why := self._opening_refusal(slot, bar.ts_init)) is not None:
+            if why == SOLD_THIS_TRADE_DATE:  # named even when the re-entry arm holds the run
+                self.opening_refused[str(slot.instrument_id)] = why
+            return
+        if slot.run_ns is not None:
+            return  # an existing arm keeps its qualifying close
+        slot.run_ns, slot.run_close, slot.run_seen_ns = (
+            bar.ts_event,
+            bar.close.as_decimal(),
+            bar.ts_init,
+        )
+        slot.run_arm = "opening"
 
     def _registered_run(self, slot: Slot, bar: Bar) -> None:
         """Use the study's listing clock, rising run and extension rule on this bar's known prefix."""
@@ -1646,13 +2210,11 @@ class Mover(Strategy):
         slot.run_ns = slot.run_close = slot.run_seen_ns = None
         arm = self.settings.entry_arm
         rows = entry_study.ARMS[arm]
+        if slot.instrument_id in self.sold and self.settings.reentry_arm == "turn":
+            rows = replace(rows, run_bars=self.settings.turn_k)
         # At the pin internal time bars' ts_init is the close regardless of ts_event configuration
         # (aggregation.rs:1735); adapter EXTERNAL bars' ts_event is their open (parse_bar).
-        opened_ns = (
-            bar.ts_init - entry_study.MINUTE_NS
-            if bar.bar_type.is_internally_aggregated()
-            else bar.ts_event
-        )
+        opened_ns = bar_opened_ns(bar)
         opened = datetime.fromtimestamp(opened_ns / SECOND_NS, entry_study.NEW_YORK)
         minute = opened.hour * 60 + opened.minute
         context = self.entry_contexts.get(slot.instrument_id)
@@ -1701,7 +2263,13 @@ class Mover(Strategy):
                 f"(move {seen[-1].move:.1%}, volume ratio {ratio})",
             )
             return
-        for index, run, listed_at in entry_study.entry_runs(day, rows, start=slot.entry_start):
+        runs = entry_study.entry_runs(day, rows, start=slot.entry_start)
+        if slot.instrument_id in self.sold and self.settings.reentry_arm == "vwap":
+            listed_at = entry_study.first_listed(seen)
+            assert listed_at is not None  # the latest minute is listed above
+            # VWAP's crossing replaces the run, while the shared extension/no-chase checks remain.
+            runs = iter([(len(day.bars) - 1, (day.bars[-1],), listed_at)])
+        for index, run, listed_at in runs:
             if index != len(day.bars) - 1:
                 continue
             why = entry_study.entry_refusal(day, rows, index, run, listed_at)
@@ -1962,11 +2530,56 @@ class Mover(Strategy):
             else AverageTrueRange(self.settings.atr_n),
             subscribed_ns=self.clock.timestamp_ns(),
         )
+        if (state := self.reentry_states.get(instrument_id)) is not None:
+            state.restart()  # only closes this slot observes count toward a turn or a crossing
+        slot = self.slots[instrument_id]
+        if slot.atr is not None:
+            # The lead's (a), 2026-11-12: warm from the minute bars this node's cache already holds
+            # for the name, the rank actor's EXTERNAL bars, with no request. A slot's own INTERNAL bars
+            # are not used: the first of each subscription is a partial minute. `Cache.bars` gives
+            # None for a bar type it holds none of (crates/common/src/python/cache.rs at the pin).
+            cached = self.cache.bars(BarType.from_str(f"{instrument_id}-{WARM_BAR_SPEC}"))
+            self._warm_atr(slot, cached or [], slot.subscribed_ns)
+        self._sync_opening(slot, slot.subscribed_ns)
         # Quotes and trades first, on the feed: the data engine hands the client only an instrument's
         # first subscription (ADR 0055), and the emulator's own subscription names no feed.
         self.subscribe_quotes(instrument_id, params=self.feed_params)
         self.subscribe_trades(instrument_id, params=self.feed_params)
         self.subscribe_bars(bar_type)
+
+    def _trail_notes(self) -> list[str]:
+        """The record's limits; the state re-entry note only when a state arm runs."""
+        reentry = [] if self.settings.reentry_arm == "clock" else [RECLAIM_LIMIT]
+        return [PAPER_TRAIL_LIMIT, TRAIL_SOURCE_LIMIT, *reentry, SHIPPED_ATR_NOTE]
+
+    def _warm_atr(self, slot: Slot, bars_newest_first: list[Bar], now: int) -> bool:
+        """Feed the slot's ATR the last `atr_n + 1` cached bars closed by `now`, oldest first.
+
+        Only bars that opened in the session part open at `now` count, so no range spans a session
+        gap. `Cache.bars` returns the newest bar first (NautilusTrader, crates/common/src/cache/mod.rs
+        at the pin). A streamed EXTERNAL bar's ts_init is its receipt time (`canon_alpaca.data.parse_bar`),
+        so its interval must also have ended by `now`. With fewer than `atr_n` such bars the ATR stays
+        cold and the entry's fixed fallback applies (the lead's (ii)).
+        """
+        if slot.atr is None:
+            return False
+        n = self.settings.atr_n
+        since = part_opened_ns(now)
+        closed = [
+            bar
+            for bar in bars_newest_first
+            if bar.ts_init <= now and since <= bar_opened_ns(bar) <= now - 60 * SECOND_NS
+        ][: n + 1]
+        if len(closed) < n:
+            return False
+        for bar in reversed(closed):
+            slot.atr.handle_bar(bar)
+        slot.atr_warm_bars = len(closed)
+        self.notes.setdefault(slot.instrument_id, []).append(
+            f"{slot.instrument_id}: ATR warmed from {len(closed)} cached one-minute bars "
+            f"({closed[0].bar_type}), no request"
+        )
+        return slot.atr.initialized
 
     def _close_slot(self, slot: Slot) -> None:
         del self.slots[slot.instrument_id]
@@ -2053,8 +2666,38 @@ class Mover(Strategy):
                 self.cancel_order(order.client_order_id)
             return
         if slot.was_held and not self._working(slot):
-            price = None if order is None or order.avg_px is None else Decimal(str(order.avg_px))
+            row = slot.exit_record
+            price = (
+                (None if order is None or order.avg_px is None else Decimal(str(order.avg_px)))
+                if self.settings.reentry_arm == "clock"
+                else (
+                    row.notional / row.filled
+                    if row is not None and row.filled
+                    else None
+                    if order is None or order.avg_px is None
+                    else Decimal(str(order.avg_px))
+                )
+            )
             self.sold[slot.instrument_id] = (now, price)
+            sale_fills = [
+                at
+                for cid, side, _, _, at in self.fills
+                if order is not None
+                and cid == order.client_order_id.value
+                and side == OrderSide.SELL.name
+            ]
+            filled_ns = (
+                row.final_fill_ns
+                if row is not None and row.final_fill_ns is not None
+                else max(sale_fills, default=now)
+            )
+            self.sold_fill_ns[slot.instrument_id] = filled_ns
+            if (
+                state := self.reentry_states.get(slot.instrument_id)
+            ) is None or state.sale_ns != filled_ns:
+                self.reentry_states[slot.instrument_id] = ReentryState(
+                    filled_ns, price, None if row is None else row.trail_distance
+                )
             slot.was_held = False
             slot.exiting = False
             slot.floor = slot.trail_trigger = slot.trail_limit = None
@@ -2069,7 +2712,8 @@ class Mover(Strategy):
             slot.entry_cancel_ns = slot.priced_ns = 0
             slot.run_ns = slot.run_close = slot.run_seen_ns = None
             slot.trail_plan = slot.initial_trail = None
-            slot.ratcheted, slot.entry_record = False, None
+            slot.ratcheted, slot.tightened, slot.entry_record = False, False, None
+            slot.profile_evaluated_ns = None
             slot.exit_record = None
             slot.protection_anchor = slot.held_stop = slot.held_since = None
             slot.floor_since, slot.floor_released = None, False
@@ -2133,9 +2777,11 @@ class Mover(Strategy):
             else:
                 self._trail(slot, held, now)
         elif order.is_emulated:
-            tightened = False
-            if self.settings.trail_mode == "ratchet" and not slot.ratcheted:
+            tightened = self._warm_tighten(slot, now)
+            if self.settings.trail_mode == "ratchet" and not slot.ratcheted and not tightened:
                 tightened = self._ratchet(slot, now)
+            elif self.settings.trail_mode == "profile" and not tightened:
+                tightened = self._profile_tighten(slot, now)
             # No order is modified. A trailing sell that no longer covers what is held is canceled,
             # and one for all of it is made from the trigger this one had reached.
             if (order.quantity.as_decimal() != held or tightened) and not order.is_pending_cancel:
@@ -2290,13 +2936,14 @@ class Mover(Strategy):
             return
         instrument = self._instrument(slot.instrument_id)
         plan = slot.trail_plan
-        trailing, limit = offsets(
+        trailing, limit = offsets_in_force(
+            slot,
             bought,
+            # L until a recorded tightening (ratchet, warmed ATR or profile) takes the trigger: the
+            # tighter trail then places it; with no room for L under the fill, the trail of the fill,
+            # as before S2, never a trigger at zero
             self.settings.trail if plan is None else plan.trail,
             self.settings.exit_through if plan is None else plan.exit_through,
-            # L until a ratchet tightens the plan: the tighter trail then places the trigger; with no
-            # room for L under the fill, the trail of the fill, as before S2, never a trigger at zero
-            distance=None if slot.ratcheted or anchor is None else slot.sized_loss,
         )
         if slot.exit_record is not None:
             slot.exit_record.trail_distance = trailing
@@ -2362,7 +3009,8 @@ class Mover(Strategy):
             anchor = self._held_anchor(slot)
             if anchor is not None:
                 plan = slot.trail_plan
-                distance = offsets(
+                distance = offsets_in_force(
+                    slot,
                     anchor,
                     self.settings.trail if plan is None else plan.trail,
                     self.settings.exit_through if plan is None else plan.exit_through,
@@ -2405,12 +3053,14 @@ class Mover(Strategy):
         """S2 under #320's held stop: an entry sized for L holds its stop L under the average fill,
         rounded up onto the step (`fill_trigger`), the level its trailing sell would start from, and
         follows the average as the entry fills further, as a trailing sell remade for all that is held
-        would; a trigger a trailed sale had reached still holds it up. A ratchet's tighter trail, or no
-        room for L, keeps #320's level at the trail's distance."""
-        if slot.sized_loss is None or slot.ratcheted:
+        would; a trigger a trailed sale had reached still holds it up. A recorded tightening's trail, or
+        no room for L, keeps #320's level at the trail's distance (`l_in_force`)."""
+        if slot.sized_loss is None:
             return
         anchor = self._held_anchor(slot)
-        at_l = None if anchor is None else fill_trigger(anchor, slot.sized_loss)
+        if anchor is None or l_in_force(slot, anchor) is None:
+            return
+        at_l = fill_trigger(anchor, slot.sized_loss)
         if at_l is None:
             return
         reached = None if slot.trail_trigger is None else stop_trigger_price(slot.trail_trigger)
@@ -2531,7 +3181,9 @@ class Mover(Strategy):
         self, slot: Slot, order: Any, held: Decimal, now: int, floor: Decimal | None
     ) -> None:
         """Re-price a sell limit that still rests after `chase_secs`: `exit_ticks` through the bid, not
-        below `floor`, and only downwards. A re-price waits at the entry soft line."""
+        below `floor`, and only downwards. The soft line does not hold it. `chase_secs` paces it, and
+        the engine's submit throttle (`paper_node.REQUEST_CEILING` on a paper node, else the run's own
+        rate) counts the remade sale but not the cancel, so a chase is two requests to Alpaca."""
         if not order.is_open or order.is_pending_update or order.is_pending_cancel:
             return
         if order.leaves_qty.as_decimal() < held:
@@ -2563,14 +3215,8 @@ class Mover(Strategy):
             price = through
         if price >= order.price.as_decimal():
             return
-        if self.recent >= self.settings.soft_line:
-            # the lead's backstop (ADR 0083): near the ceiling a re-price waits, the sale keeps working
-            self._note(
-                slot,
-                f"{slot.instrument_id}: sale not chased while the last 60 s's requests are at the "
-                f"soft line of {self.settings.soft_line}",
-            )
-            return
+        # Sales are exempt from the soft line and stop only at the engine's hard ceiling (the lead's
+        # decision of 2026-11-12; ADR 0091: no new bound on the sale path).
         slot.priced_ns = now
         self.cancel_order(
             order.client_order_id
@@ -2679,12 +3325,18 @@ class Mover(Strategy):
         candidates.sort(key=lambda slot: ranked.get(slot.instrument_id, (RANK_MOST, 0))[0])
         for slot in candidates:
             run_close, seen = slot.run_close, slot.run_seen_ns
-            slot.run_ns = slot.run_close = slot.run_seen_ns = None  # a run is decided on once
-            if slot.was_held or self._working(slot) or self._held(slot):
-                continue
-            why = self._refusal(slot, run_close, ranked, recent, now)
-            if why is None:
-                why = self._buy(slot, ranked[slot.instrument_id][1], seen, run_close)
+            try:
+                if slot.was_held or self._working(slot) or self._held(slot):
+                    continue
+                why = self._refusal(slot, run_close, ranked, recent, now)
+                if why is None:
+                    why = self._buy(slot, ranked[slot.instrument_id][1], seen, run_close)
+            finally:
+                # Preserve C0's override contracts: arm and run state are plain slot data, never a
+                # new keyword sent through a replay subclass's _buy or _refusal override. A run is
+                # decided on once: its fields are cleared after the decision, so `_refusal` reads them.
+                slot.run_arm = None
+                slot.run_ns = slot.run_close = slot.run_seen_ns = None
             if why is not None:
                 self.dropped.append(f"{slot.instrument_id}: {why}")
                 self._say(f"{slot.instrument_id}: no entry: {why}")
@@ -2709,23 +3361,51 @@ class Mover(Strategy):
         recent: int,
         now: int,
     ) -> str | None:
-        """Why this candidate is not entered now, or None."""
+        """Why this candidate is not entered now, or None. The slot keeps its run through this
+        decision, preserving C0's five-argument override contract."""
         settings = self.settings
         if not self._fresh(now):
             if self.rank_malformed:
                 return "the last ranking was malformed"
             return "the ranking is stale" if self.rank_ns else "no ranking yet"
+        opening = slot.run_arm == "opening"
+        seen = slot.run_seen_ns
         if slot.instrument_id not in ranked:
             return "no longer ranked"
         move = ranked[slot.instrument_id][1]
         if move > settings.max_move:
             return f"moved {move}, over the no-chase cap of {settings.max_move}"
-        if slot.instrument_id in self.sold:
+        if opening and (why := self._opening_refusal(slot, now)) is not None:
+            return why
+        if slot.instrument_id in self.sold and not opening:
             sold_ns, sold_px = self.sold[slot.instrument_id]
-            if now - sold_ns < settings.cooldown_secs * SECOND_NS:
-                return "inside the cooldown after its sale"
-            if sold_px is not None and run_close is not None and run_close <= sold_px:
-                return f"its run closed at {run_close}, not above the sale at {sold_px}"
+            if settings.reentry_arm == "clock":
+                if now - sold_ns < settings.cooldown_secs * SECOND_NS:
+                    return "inside the cooldown after its sale"
+                if sold_px is not None and run_close is not None and run_close <= sold_px:
+                    return f"its run closed at {run_close}, not above the sale at {sold_px}"
+            else:
+                filled_ns = self.sold_fill_ns.get(slot.instrument_id, sold_ns)
+                if seen is not None and seen <= filled_ns:
+                    return "its qualifying close preceded the sale fill"
+                state = self.reentry_states.get(slot.instrument_id)
+                if settings.reentry_arm == "reclaim":
+                    if sold_px is None:
+                        return "reclaim sale price unavailable"
+                    if run_close is None or run_close <= sold_px:
+                        return f"its run closed at {run_close}, not above the sale at {sold_px}"
+                elif settings.reentry_arm == "turn":
+                    if state is None:
+                        return "turn state or trail distance unavailable"
+                    why = state.turn_refusal(
+                        state.sale_price, state.trail_distance, settings.turn_k, settings.turn_d
+                    )
+                    if why is not None:
+                        return why
+                elif state is None or state.vwap is None:
+                    return "vwap unavailable"
+                elif not state.crossed_vwap:
+                    return "vwap needs a close below then the first close above"
         if self._busy() >= settings.slots:
             return "no slot is free"
         if settings.entries is not None and self._entered() >= settings.entries:
@@ -2755,6 +3435,7 @@ class Mover(Strategy):
         """Send the entry; return why not, if it was not sent. `seen` and `run_close` are the
         qualifying bar's `ts_init` and close, kept with the entry for the run's record."""
         settings = self.settings
+        opening = slot.run_arm == "opening"
         if (
             settings.share_caps is not None
             and slot.instrument_id not in settings.share_caps
@@ -2774,9 +3455,39 @@ class Mover(Strategy):
         except ValueError as e:
             return str(e)
         try:
-            plan = self._entry_trail(slot, price, quote)
+            plan = self._entry_trail(slot, price, quote, now=self.clock.timestamp_ns())
         except ValueError as error:
             return str(error)
+        opening_record = None
+        # the opening's low, distance and fall, for its re-entry row
+        measured: tuple[Decimal, Decimal, Decimal] | None = None
+        if opening:
+            state = self.opening_states[slot.instrument_id]
+            distance = offsets(price, plan.trail, plan.exit_through)[0]
+            # The fall is the opening's own row, f, alone; the re-entry row's d is never read here
+            # (the lead's ruling on review finding (3), 2026-11-12). The turn's k is shared.
+            why = state.turn_refusal(state.open, distance, settings.turn_k, settings.opening_f)
+            if why is not None:
+                return f"opening: {why}"
+            assert state.low is not None
+            fall = (state.open - state.low) / distance
+            measured = (state.low, distance, fall)
+            opening_record = {
+                "day": state.day.isoformat(),
+                "open": str(state.open),
+                "low": str(state.low),
+                "low_minute": state.low_minute,
+                "fall_in_trail_distances": str(fall),
+                "trail_distance": str(distance),
+                "trail_source": plan.source or plan.bound,
+                "turn_minute": state.turn_minute,
+                "turn_ns": state.turn_ns,
+                "entry_limit": str(price),
+                "entry_price": None,
+                "M": settings.opening_minutes,
+                "f": str(settings.opening_f),
+                "k": settings.turn_k,
+            }
         if plan.note is not None:
             self._note(slot, f"{slot.instrument_id}: {plan.note}")
         # budget sizing refuses a trail with no room by name (`plan_for_loss`) and a bid at the
@@ -2937,11 +3648,6 @@ class Mover(Strategy):
                 "quantity": str(quantity),
                 "notional": str(quantity.as_decimal() * price),
             }
-            self._say(
-                f"{slot.instrument_id}: size for a loss of {planned_loss} USD at the stop {entry_stop}: "
-                f"{loss_shares} shares; budget {entry_budget} USD ({budget_shares} shares), flow cap "
-                f"{flow_shares} shares from {flow_dollars} USD, binding {binding}, quantity {quantity}"
-            )
         else:
             free = account.balance_free(instrument.quote_currency)
             if free is None:
@@ -2965,6 +3671,19 @@ class Mover(Strategy):
             )
         if not quantity.is_positive():
             return f"the size from risk came to nothing at {price}"
+        # ADR 0115: read at this buy decision, after every other check and before the order or
+        # sizing log exists. Main's startup share and position caps remain fixed; no sale reads it.
+        switch = self._arming_read()
+        if not switch.armed:
+            return self._switch_off(slot, switch)
+        self._switch_armed()
+        if sizing is not None:
+            self._say(
+                f"{slot.instrument_id}: size for a loss of {sizing['planned_loss']} USD at the stop "
+                f"{sizing['stop']}: {sizing['loss_shares']} shares; budget {sizing['budget_notional']} "
+                f"USD ({sizing['budget_shares']} shares), flow cap {sizing['flow_shares']} shares from "
+                f"{sizing['flow_dollars']} USD, binding {sizing['binding']}, quantity {quantity}"
+            )
         order = self.order_factory.limit(
             slot.instrument_id,
             OrderSide.BUY,
@@ -2976,7 +3695,8 @@ class Mover(Strategy):
         slot.entry_cancel_ns = 0
         slot.trail_plan = slot.initial_trail = plan
         slot.sized_loss = distance
-        slot.ratcheted = False
+        slot.ratcheted = slot.tightened = slot.warm_checked = False
+        slot.profile_evaluated_ns = slot.run_open_ns
         slot.last_bid = bid
         slot.entry_record = {
             "client_order_id": order.client_order_id.value,
@@ -2996,6 +3716,8 @@ class Mover(Strategy):
             "own_measure": None if plan.measure is None else str(plan.measure),
             "trail_source": plan.source or plan.bound,
             "stopped_out": False,
+            "arming": switch.read,
+            "reentry": self._reentry_row(slot, measured, run_close, order),
             "exit_through": str(plan.exit_through),
             "chase_cap": str(plan.chase_cap),
             "baseline_dollar_volume_per_minute": (
@@ -3005,9 +3727,18 @@ class Mover(Strategy):
             ),
             "liquidity_basis": "baseline dollar volume per minute, a stand-in for size",
             "ratchet": {"tightened": False, "when_ns": None, "from": None, "to": None},
-            "notes": [PAPER_TRAIL_LIMIT, TRAIL_SOURCE_LIMIT, SHIPPED_ATR_NOTE]
-            + ([] if plan.note is None else [plan.note]),
+            "trail_changes": [],
+            "atr_warm_bars": slot.atr_warm_bars,
+            "profile": None if plan.profile is None else profile_record(plan.profile),
+            "notes": self._trail_notes() + ([] if plan.note is None else [plan.note]),
         }
+        if opening_record is not None:
+            slot.entry_record.update(arm="opening", opening=opening_record)
+            slot.entry_record["notes"].append(OPENING_LIMIT)
+            state = self.opening_states[slot.instrument_id]
+            state.used, state.order_id = True, order.client_order_id
+        if settings.trail_mode == "profile":
+            slot.entry_record["profile_skips"] = []
         self.entries_sent.append(slot.entry_record)
         self.notes.setdefault(slot.instrument_id, []).append(f"entered at move {move}")
         self._say(
@@ -3022,10 +3753,101 @@ class Mover(Strategy):
         self.submit_order(order, params=self.submit_params)
         return None
 
-    def _entry_trail(self, slot: Slot, price: Decimal, quote: Any | None) -> TrailPlan:
+    def _reentry_row(
+        self,
+        slot: Slot,
+        opening: tuple[Decimal, Decimal, Decimal] | None,
+        run_close: Decimal | None,
+        order: Any,
+    ) -> dict[str, Any] | None:
+        """An entry's re-entry row, for a name this run (or its carry) has sold; else None.
+
+        The lead's rows for the 09:30 firing (2026-11-12): the rule that fired (`opening`, or the
+        re-entry arm), the fall and the rise it measured in the distance it measured them in, and the
+        seconds from the sale's fill to this entry's submit. The two rules measure from different
+        points, which `fall_from` names: the re-entry arm from the sale price, to the lowest minute
+        close, in the sale's trail distance; the opening (`opening` is its low, distance and fall) from
+        its open, to the lowest minute low, in the entry's trail distance. `secs_since_stop_out` counts
+        from the name's last full sale, whatever sold it (`exits` gives the reason).
+        """
+        sold = self.sold.get(slot.instrument_id)
+        if sold is None:
+            return None
+        sale_ns = self.sold_fill_ns.get(slot.instrument_id, sold[0])
+        sale_price = sold[1]
+        state = self.reentry_states.get(slot.instrument_id)
+        distance: Decimal | None
+        if opening is not None:
+            low, distance, fall = opening
+        else:
+            low = None if state is None else state.low
+            distance = None if state is None else state.trail_distance
+            fall = (
+                None
+                if sale_price is None or low is None or not distance
+                else (sale_price - low) / distance
+            )
+        rise = (
+            None
+            if run_close is None or low is None or not distance
+            else (run_close - low) / distance
+        )
+        return {
+            "arm": self.settings.reentry_arm,
+            "rule": "opening" if opening is not None else self.settings.reentry_arm,
+            "fall_from": "open" if opening is not None else "sale",
+            "sale_ns": sale_ns,
+            "sale_price": None if sale_price is None else str(sale_price),
+            "low": None if low is None else str(low),
+            "run_close": None if run_close is None else str(run_close),
+            "distance": None if distance is None else str(distance),
+            "fall_in_distances": None if fall is None else str(fall),
+            "rise_in_distances": None if rise is None else str(rise),
+            "secs_since_stop_out": (order.init_event.ts_init - sale_ns) / SECOND_NS,
+            "reentry_price": None,
+            "minutes_between": None,
+        }
+
+    def _switch_off(self, slot: Slot, switch: Arming) -> str:
+        """Record a buy the switch stopped, and warn once per name for each thing read while off."""
+        self.entries_off.append(
+            {
+                "when_ns": self.clock.timestamp_ns(),
+                "instrument_id": str(slot.instrument_id),
+                "kind": "opening"
+                if slot.run_arm == "opening"
+                else "reentry"
+                if slot.instrument_id in self.sold
+                else "entry",
+                "read": switch.read,
+            }
+        )
+        if self.arming_warned.get(slot.instrument_id) != switch.read:
+            self.arming_warned[slot.instrument_id] = switch.read
+            self.arming_warnings.append((str(slot.instrument_id), switch.read))
+            self.log.warning(f"{slot.instrument_id}: no entry while the switch reads {switch.read}")
+        return f"the entry switch reads {switch.read}"
+
+    def _switch_armed(self) -> None:
+        """An armed read, for any name, ends the off period: the next stop of every name is warned."""
+        self.arming_warned.clear()
+
+    def _arming_read(self) -> Arming:
+        """The entry switch now (`arming.read_arming`); nothing is cached between decisions."""
+        path = self.settings.arming_path
+        return read_arming(
+            None if path is None else Path(path),
+            absent_is_on=self.settings.arming_absent_is_on,
+        )
+
+    def _entry_trail(
+        self, slot: Slot, price: Decimal, quote: Any | None, *, now: int | None = None
+    ) -> TrailPlan:
         """Freeze T1 at entry. An impossible spread floor refuses the entry by name; an unusable spread or
         a cold ATR selects the configured fixed plan, by name."""
         settings = self.settings
+        if settings.trail_mode == "profile" and self.trail_profile is None:
+            raise ValueError("profile document is missing; no profile entry is allowed")
         atr = None if slot.atr is None or not slot.atr.initialized else Decimal(str(slot.atr.value))
         if quote is None:
             raise ValueError("no quote yet")
@@ -3054,16 +3876,49 @@ class Mover(Strategy):
             raise ValueError("the spread floor exceeds the 0.02 cap; no entry satisfies both")
         baseline = self.baseline_dollar_volume_per_minute.get(slot.instrument_id)
         base = settings.ratchet_base if settings.trail_mode == "ratchet" else settings.trail_mode
-        tier = base == "tier" and baseline is not None and baseline >= settings.liquidity_tier_cut
+        tier = self._tier_applies(slot)
+        if atr is None and slot.run_arm == "opening":
+            # The coordinator's rule for R2: a cold-ATR opening entry uses the fixed plan, a top-tier
+            # name included, recorded as cold_atr_fallback; it tightens once the ATR warms (b).
+            return TrailPlan(
+                trail=settings.trail,
+                exit_through=settings.exit_through,
+                chase_cap=settings.chase_cap,
+                atr=None,
+                spread=spread,
+                bound="fixed",
+                note=f"ATR has fewer than {settings.atr_n} complete one-minute bars: opening uses the "
+                "fixed trail",
+                source="cold_atr_fallback",
+                floor=floor,
+            )
         note = (
             "baseline dollar volume per minute is unknown: tier uses ATR, a stand-in for size"
             if base == "tier" and baseline is None
             else None
         )
+        calculation = None
+        source = None
+        thin = None
         if tier:
             selected, bound = TIER_TRAIL, "tier"
+            if base == "profile":
+                source = "tier"
         else:
-            if atr is None:
+            if base == "profile":
+                assert self.trail_profile is not None
+                calculation = profile_distance(
+                    self.trail_profile,
+                    slot.instrument_id.symbol.value,
+                    profile_segment(self.clock.timestamp_ns() if now is None else now),
+                    None if atr is None else atr / price,
+                    self.rdc_1.get(slot.instrument_id),
+                    **{name: getattr(settings, name) for name in PROFILE_SETTINGS},
+                )
+                thin = calculation["reason"]
+            if calculation is not None and thin is None:
+                selected, bound, source = calculation["distance"], "profile", "profile"
+            elif atr is None:
                 # Coordinator's (ii), 2026-11-12: a cold ATR enters on the fixed plan, named, rather
                 # than waiting `atr_n` live minutes from the slot's opening; no history is requested.
                 cold = f"ATR has fewer than {settings.atr_n} complete one-minute bars: fixed trail fallback"
@@ -3081,6 +3936,7 @@ class Mover(Strategy):
                         + ("" if note is None else f"; {note}"),
                         source="cold_atr_fallback",
                         floor=floor,
+                        profile=calculation,
                     )
                 return TrailPlan(
                     trail=settings.trail,
@@ -3090,10 +3946,15 @@ class Mover(Strategy):
                     spread=spread,
                     bound="fixed",
                     note=cold if note is None else f"{cold}; {note}",
+                    # categorical, as the warm check reads it; a thin reason is in the calculation
                     source="cold_atr_fallback",
                     floor=floor,
+                    profile=calculation,
                 )
-            selected, bound = settings.atr_k * atr / price, "atr"
+            else:
+                selected, bound = settings.atr_k * atr / price, "atr"
+                if thin is not None:
+                    source = "atr"  # categorical; the thin reason is in the calculation
         measure = selected
         if floor >= selected:
             selected, bound = floor, "spread floor"
@@ -3122,21 +3983,237 @@ class Mover(Strategy):
             spread=spread,
             bound=bound,
             note=note,
+            source=source,
             floor=floor,
             measure=measure,
+            profile=calculation,
         )
+
+    def _profile_tighten(self, slot: Slot, now: int) -> bool:
+        """Consider each complete minute once, then use ratchet's existing cancel/remake path.
+
+        Known limit: offsets remain PRICE offsets from the holding's entry anchor, as in every
+        arm; they do not grow with the followed price. ATR uses this minute's close as its price
+        basis, and the latest spread floor is converted at the frozen anchor. A thin update leaves
+        the plan alone. Top-tier tier protection and ratchet never combine with this arm.
+        """
+        opened = slot.run_open_ns
+        if opened is None or (
+            slot.profile_evaluated_ns is not None and opened <= slot.profile_evaluated_ns
+        ):
+            return False
+        slot.profile_evaluated_ns = opened
+        current = slot.trail_plan
+        anchor = slot.protection_anchor
+        if (
+            current is None
+            or current.source == "tier"
+            # a top-tier name keeps tier: an opening's cold-ATR entry is fixed until its ATR warms
+            or self._top_tier(slot)
+        ):
+            return False  # not a profile holding, so there is no tighten to skip
+        if slot.exiting:
+            return self._profile_skip(slot, now, opened, "the sale is being chased")
+        if self.trail_profile is None:
+            return self._profile_skip(slot, now, opened, "no profile document")
+        if anchor is None:
+            return self._profile_skip(slot, now, opened, "no protection anchor")
+        if not slot.closes:
+            return self._profile_skip(slot, now, opened, "no complete minute's close")
+        quote = self.cache.quote(slot.instrument_id)
+        spread = None if quote is None else quoted_spread(quote)
+        if spread is None:
+            return self._profile_skip(slot, now, opened, "no usable quoted spread")
+        floor = self.settings.spread_floor_m * spread / anchor
+        if floor > TRAIL_CAP:
+            return self._profile_skip(
+                slot, now, opened, f"the spread floor exceeds the {TRAIL_CAP} cap"
+            )
+        atr = None if slot.atr is None or not slot.atr.initialized else Decimal(str(slot.atr.value))
+        try:
+            calculation = profile_distance(
+                self.trail_profile,
+                slot.instrument_id.symbol.value,
+                profile_segment(opened),
+                None if atr is None else atr / slot.closes[-1],
+                self.rdc_1.get(slot.instrument_id),
+                **{name: getattr(self.settings, name) for name in PROFILE_SETTINGS},
+            )
+        except (ValueError, ArithmeticError, RuntimeError) as error:
+            # Raised from the step timer or a bar this would stop every slot; it is named instead.
+            self._note(slot, f"{slot.instrument_id}: profile not re-evaluated: {error}")
+            return self._profile_skip(slot, now, opened, f"profile not re-evaluated: {error}")
+        if calculation["reason"] is not None:
+            return self._profile_skip(slot, now, opened, f"profile: {calculation['reason']}")
+        selected, bound = calculation["distance"], "profile"
+        if floor >= selected:
+            selected, bound = floor, "spread floor"
+        if selected > TRAIL_CAP:
+            selected, bound = TRAIL_CAP, "0.02 cap"
+        before = offsets_in_force(slot, anchor, current.trail, current.exit_through)[0]
+        after = offsets(anchor, selected, selected / 4)[0]
+        increment = self._instrument(slot.instrument_id).price_increment.as_decimal()
+        if selected >= current.trail:
+            return self._profile_skip(slot, now, opened, "not narrower than the trail in force")
+        if after >= before and l_in_force(slot, anchor) is not None:
+            # narrower than the plan but not closer than L in force: taking it would loosen the sale
+            # (the lead's ruling of 2026-11-12, 21:01)
+            return self._profile_skip(slot, now, opened, f"not narrower than L's {before} in force")
+        if before - after < increment:
+            return self._profile_skip(
+                slot, now, opened, "narrower by less than one price increment"
+            )
+        plan = replace(
+            current,
+            trail=selected,
+            exit_through=selected / 4,
+            chase_cap=max(selected, self.settings.chase_cap),
+            atr=atr,
+            spread=spread,
+            bound=bound,
+            source="profile",
+            profile=calculation,
+        )
+        slot.trail_plan, slot.tightened = plan, True
+        self._trail_change(
+            slot,
+            now,
+            current.trail,
+            plan,
+            f"profile segment {calculation['segment']}",
+            profile_record(calculation),
+        )
+        return True
+
+    def _profile_skip(self, slot: Slot, now: int, minute_ns: int, reason: str) -> bool:
+        """Record why this evaluated minute left the trail as it was (the lead's rule); returns False."""
+        if slot.entry_record is not None:
+            slot.entry_record.setdefault("profile_skips", []).append(
+                {"when_ns": now, "minute_ns": minute_ns, "reason": reason}
+            )
+        return False
+
+    def _trail_change(
+        self,
+        slot: Slot,
+        now: int,
+        before: Decimal,
+        plan: TrailPlan,
+        why: str,
+        profile: dict[str, Any] | None = None,
+    ) -> None:
+        """Keep one change of a holding's trail. A profile change carries the calculation it was made
+        from, and the entry's `profile` is set to it, so the record's calculation is the one in force;
+        the calculation at entry stays in `profile_at_entry`."""
+        if slot.entry_record is not None:
+            change = {
+                "when_ns": now,
+                "from": str(before),
+                "to": str(plan.trail),
+                "bound": plan.bound,
+                "atr": None if plan.atr is None else str(plan.atr),
+                "why": why,
+            }
+            if profile is not None:
+                change["profile"] = profile
+                slot.entry_record.setdefault("profile_at_entry", slot.entry_record.get("profile"))
+                slot.entry_record["profile"] = dict(profile)
+            slot.entry_record.setdefault("trail_changes", []).append(change)
+
+    def _tier_applies(self, slot: Slot) -> bool:
+        """The tier trail is selected: a tier base and a known baseline at or over the cut."""
+        settings = self.settings
+        base = settings.ratchet_base if settings.trail_mode == "ratchet" else settings.trail_mode
+        return base in ("tier", "profile") and self._top_tier(slot)
+
+    def _warm_tighten(self, slot: Slot, now: int) -> bool:
+        """Once a cold-fallback holding's ATR warms, re-select its trail; take it only if tighter.
+
+        The lead's (b), 2026-11-12: the trail may tighten to the warmed ATR's plan and never widens.
+        The comparison is made once, on the first step with a fill price, a usable quoted spread and a
+        plan; until then it is retried each step. Each change is recorded with its time in the entry's
+        `trail_changes`; the caller cancels and remakes the emulated sale, as for the ratchet.
+        """
+        plan = slot.trail_plan
+        if (
+            slot.warm_checked
+            or plan is None
+            or plan.source != "cold_atr_fallback"
+            or slot.atr is None
+            or not slot.atr.initialized
+        ):
+            return False
+        bought = self._bought(slot)
+        quote = self.cache.quote(slot.instrument_id)
+        if bought is None or bought <= 0 or quote is None or quoted_spread(quote) is None:
+            return False  # retried next step
+        try:
+            warmed = self._entry_trail(slot, bought, quote, now=now)
+        except ValueError as error:
+            self._note(slot, f"{slot.instrument_id}: warmed ATR not applied yet: {error}")
+            return False
+        slot.warm_checked = True
+        if self._tier_applies(slot):  # by the selection, since a spread floor can cover the bound
+            self._note(
+                slot,
+                f"{slot.instrument_id}: the plan re-selected once the ATR warmed is tier, not the "
+                f"warmed ATR's; {plan.trail} kept",
+            )
+            return False
+        # Never wider: the sale's offset through its trigger and the chase floor keep the cold plan's
+        # bounds when the warmed plan's are wider (selected / 4 and max(selected, chase_cap)).
+        warmed = replace(
+            warmed,
+            exit_through=min(warmed.exit_through, plan.exit_through),
+            chase_cap=min(warmed.chase_cap, plan.chase_cap),
+        )
+        if warmed.trail >= plan.trail:
+            self._note(
+                slot,
+                f"{slot.instrument_id}: the plan re-selected with the warmed ATR ({warmed.bound} "
+                f"{warmed.trail}) is not tighter than {plan.trail}; kept",
+            )
+            return False
+        in_force = offsets_in_force(slot, bought, plan.trail, plan.exit_through)
+        candidate = offsets(bought, warmed.trail, warmed.exit_through)
+        if l_in_force(slot, bought) is not None and not candidate < in_force:
+            # narrower than the plan but not closer than L in force: taking it would loosen the sale
+            # (the lead's ruling of 2026-11-12, 21:01)
+            self._note(
+                slot,
+                f"{slot.instrument_id}: the plan re-selected with the warmed ATR ({warmed.bound} "
+                f"{warmed.trail}) is not tighter than L {in_force[0]} in force; kept",
+            )
+            return False
+        slot.trail_plan, slot.tightened = warmed, True
+        if not slot.ratcheted:
+            slot.initial_trail = warmed
+        self._trail_change(
+            slot,
+            now,
+            plan.trail,
+            warmed,
+            f"ATR warmed while held; bound {warmed.bound}",
+            None if warmed.profile is None else profile_record(warmed.profile),
+        )
+        return True
+
+    def _bought(self, slot: Slot) -> Decimal | None:
+        """The holding's purchase price for re-selecting its trail: the entry's average fill, else the
+        protection anchor."""
+        entry = self._order(slot.entry_id)
+        if entry is not None and entry.avg_px is not None:
+            filled = Decimal(str(entry.avg_px))
+            if filled.is_finite() and filled > 0:  # as `_trail_anchor`: no other average anchors
+                return filled
+        return slot.protection_anchor
 
     def _ratchet(self, slot: Slot, now: int) -> bool:
         """Tighten once only while the original emulated sale works; caller cancels and remakes it."""
         initial = slot.initial_trail
-        entry = self._order(slot.entry_id)
         quote = self.cache.quote(slot.instrument_id)
         followed = self._followed(slot)
-        bought = (
-            Decimal(str(entry.avg_px))
-            if entry is not None and entry.avg_px is not None
-            else slot.protection_anchor
-        )
+        bought = self._bought(slot)
         if initial is None or bought is None or quote is None or followed is None:
             return False
         spread = quoted_spread(quote)
@@ -3147,21 +4224,16 @@ class Mover(Strategy):
             return False
         current = slot.trail_plan or initial
         # The offsets in force are `_trail`'s: L under the fill while it has room and nothing has
-        # ratcheted (the landing review of this fix on S2, finding 5), else the plan's.
-        in_force = offsets(
-            bought,
-            current.trail,
-            current.exit_through,
-            distance=None
-            if slot.ratcheted or fill_trigger(bought, slot.sized_loss) is None
-            else slot.sized_loss,
-        )
+        # tightened (the landing review of this fix on S2, finding 5), else the plan's.
+        in_force = offsets_in_force(slot, bought, current.trail, current.exit_through)
         if not offsets(bought, plan.trail, plan.exit_through) < in_force:
             # Rounded, the candidate's trigger and then its limit are no closer than those in force:
             # the one ratchet is kept for a later step that can tighten (Astra second read of #316,
             # finding 2).
             return False
-        slot.trail_plan, slot.ratcheted = plan, True
+        before = slot.trail_plan.trail if slot.trail_plan is not None else initial.trail
+        slot.trail_plan, slot.ratcheted, slot.tightened = plan, True, True
+        self._trail_change(slot, now, before, plan, "ratchet")
         if slot.entry_record is not None:
             slot.entry_record["ratchet"] = {
                 "tightened": True,

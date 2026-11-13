@@ -179,7 +179,8 @@ def test_seven_mover_slots_at_full_turnover_are_never_throttled_by_the_engine() 
     slots at Mover's real cadence (entry, sale, buy-back and flat ending, and a re-priced sale every
     six seconds: 14 submits a slot) send 98 submits in one minute, spread over it; none is denied.
     What holds entries back is the request count: Mover's soft line sits under the window's request
-    ceiling, which is the submit limit, and every submit is at least one request."""
+    ceiling, which is the submit limit, and every submit is at least one request. Sales are exempt from
+    the soft line (the lead's decision of 2026-11-12) and meet only this throttle."""
     from canon_trading import mover
     from canon_trading import session_window
 

@@ -21,6 +21,7 @@ from .early_entry_study import Rows
 from .mover import OWN_FIELDS
 from .mover import PERSISTENCE_FIELDS
 from .mover import MoverConfig
+from .trail import PROFILE_SETTINGS
 
 BARS_REPLAY_FIXED_ROWS: dict[str, Any] = {
     "trail_mode": "fixed",
@@ -34,6 +35,15 @@ BARS_REPLAY_FIXED_ROWS: dict[str, Any] = {
     "trail_cap": "clamp",
     "planned_loss": None,
     "loss_share": None,
+    **{name: row["default"] for name, row in PROFILE_SETTINGS.items()},
+    "reentry_arm": "clock",
+    "turn_k": 2,
+    "turn_d": Decimal(1),
+    "opening_arm": "off",
+    "opening_minutes": 30,
+    "opening_f": Decimal(1),
+    "arming_path": None,
+    "arming_absent_is_on": True,
 }
 """Window-only settings excluded from bars trial keys; the study does not tune these rows. The cap arm
 and the planned loss (S2) act only on a non-fixed trail and on budget sizing, neither of which the bars
@@ -41,11 +51,12 @@ replay runs, so a trial's key is what it was before them."""
 
 
 def check_bars_replay_modes(settings: MoverConfig) -> None:
-    """The bars contract covers only the pre-port fixed trail and clock re-entry, by name."""
+    """Bars replay keeps the fixed trail, clock re-entry, the opening off and no deployment arming
+    file, by name."""
     if settings.size_from_budget:
         # the replay sizes buying_power / slots; budget sizing and its planned loss are the window's
         raise ValueError("bars replay refuses size_from_budget=True; it sizes buying_power / slots")
-    for name in ("trail_mode",):
+    for name in ("trail_mode", "reentry_arm", "opening_arm", "arming_path", "arming_absent_is_on"):
         value = getattr(settings, name)
         if value != BARS_REPLAY_FIXED_ROWS[name]:
             raise ValueError(
