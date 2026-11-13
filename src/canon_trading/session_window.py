@@ -268,6 +268,9 @@ from nautilus_trader.model import StrategyId
 from nautilus_trader.model import TimeInForce
 
 from . import price_step
+from .mover import PAPER_LOSS_SHARE
+from .mover import TRAIL_CAP_DEFAULT
+from .mover import TRAIL_CAPS
 from .mover import TRAIL_SETTINGS
 from .mover import Mover
 from .mover import MoverConfig
@@ -521,6 +524,15 @@ ACCOUNT_ENV = "CANON_PAPER_ACCOUNT"
 """The paper account a run's task read the pair of, by the name `paper:check` gives it: `windows` (account B),
 set by `paper:session` beside its reads of B's pair (`mise.toml`; ADR 0069). A name, never a key."""
 PAPER_ACCOUNTS = ("windows", "tests")
+TRAIL_ARMS: dict[str, dict[str, Any]] = {
+    "F2": {"trail_mode": "fixed", "trail_cap": "clamp", "atr_k": Decimal(1)},
+    "OWN1": {"trail_mode": "atr", "trail_cap": "own", "atr_k": Decimal(1)},
+    "OWN3": {"trail_mode": "atr", "trail_cap": "own", "atr_k": Decimal(3)},
+}
+"""The three trail arms a Mover window may name (the lead's rotation of 2026-11-12, registered before any
+result): F2 the fixed 2% trail; OWN1 and OWN3 ATR mode at k 1 and 3 over the spread floor, with the cap
+arm `own`. All sized by `sizing.plan_for_loss` at the same planned loss. UNCALIBRATED; source the lead,
+no primary source. Which arm a window runs is the lead's rotation, not a default."""
 SCHEDULED_ENV = "CANON_PAPER_SCHEDULED"
 """`1` only in a run the schedule started: the launchd agent's plist sets it (launchd.plist(5),
 EnvironmentVariables), so a run of the runner or the task by hand does not have it (ADR 0050)."""
@@ -730,7 +742,13 @@ class WindowConfig:
     """Additional qualified startup names watched by Mover, beyond its held slots."""
     baseline_path: Path | None = None
     """ADR 0087's baseline file; None selects catalog/movers-baseline/<feed>.json for the part."""
+    arm: str | None = None
+    """A name of `TRAIL_ARMS`, written to the record and the heartbeat; its rows must be the window's."""
     trail_mode: str = "fixed"
+    trail_cap: str = TRAIL_CAP_DEFAULT
+    """What `Mover` does with a non-fixed trail over the 0.02 cap (`mover.TRAIL_CAPS`): `clamp`, main's
+    behaviour, by default; `own`, the name's own distance with a smaller size, is an arm a window names
+    (the lead's rotation of 2026-11-12: F2, OWN1, OWN3). UNCALIBRATED."""
     atr_k: Decimal = Decimal(1)
     atr_n: int = 14
     spread_floor_m: Decimal = Decimal(2)
@@ -749,6 +767,7 @@ class WindowConfig:
         MoverConfig(
             max_notional=Decimal(1),
             max_move=Decimal(1),
+            trail_cap=self.trail_cap,
             **{name: getattr(self, name) for name in TRAIL_SETTINGS},
         )
         check_limit(self.request_limit_per_minute)
@@ -779,6 +798,19 @@ class WindowConfig:
             for name, row in TRAIL_SETTINGS.items():
                 if getattr(self, name) != row["default"]:
                     raise ValueError(f"{name} is {MOVER}'s trail row; {self.strategy} has none")
+            if self.trail_cap != TRAIL_CAP_DEFAULT:
+                raise ValueError(f"trail_cap is {MOVER}'s trail row; {self.strategy} has none")
+            if self.arm is not None:
+                raise ValueError(f"arm {self.arm} is {MOVER}'s trail arm; {self.strategy} has none")
+        if self.arm is not None:
+            if (rows := TRAIL_ARMS.get(self.arm)) is None:
+                raise ValueError(f"arm must be one of {tuple(TRAIL_ARMS)}, got {self.arm!r}")
+            if wrong := [
+                f"{n} {getattr(self, n)} not {v}" for n, v in rows.items() if getattr(self, n) != v
+            ]:
+                raise ValueError(
+                    f"arm {self.arm} does not match the window's rows: {', '.join(wrong)}"
+                )
         if type(self.spares) is not int or self.spares < 0:
             raise ValueError(f"spares must be a nonnegative whole number, got {self.spares!r}")
         if (
@@ -1410,6 +1442,19 @@ def mover_allocation(trading: TradingClient, slots: int) -> MoverAllocation:
     return MoverAllocation(buying_power, cash, slots, entry_notional)
 
 
+def window_loss_share(account: str) -> Decimal:
+    """The share of the slot's startup figure each `Mover` entry's planned loss is measured from
+    (`mover.share_loss`): `PAPER_LOSS_SHARE` on paper accounts A and B (`PAPER_ACCOUNTS`), the lead's
+    ruling of 2026-11-12. Any other account (C, a live node, or one not named) has no default, since
+    there the figure is the owner's: the window is refused by name before any node is built."""
+    if account not in PAPER_ACCOUNTS:
+        raise WindowRefused(
+            f"no planned loss for the account {account!r}: outside paper accounts A and B the loss "
+            "an entry is sized for is the owner's figure, and none is given"
+        )
+    return PAPER_LOSS_SHARE
+
+
 def window_node(
     config: WindowConfig,
     *,
@@ -1424,6 +1469,7 @@ def window_node(
     entry_contexts: Mapping[InstrumentId, Day] | None = None,
     entry_notional: Decimal | None = None,
     reference_reader: ReferenceReader | None = None,
+    loss_share: Decimal | None = None,
 ) -> tuple[LiveNode, SessionMaCross | Mover | CachedData, PositionCap | tuple[PositionCap, ...]]:
     """The node, Alpaca's clients, the native risk limits and runtime checks, with the strategy and its
     position caps (one monitor, or a tuple for several names). They are returned too: the node does not
@@ -1456,6 +1502,10 @@ def window_node(
             )
         if entry_notional is None:
             raise RuntimeError("a Mover node requires its startup account entry figure")
+        if loss_share is None:
+            raise RuntimeError(
+                "a Mover node requires its loss share (`window_loss_share`): there is no default"
+            )
         order_cap = entry_notional * OUTER_BOUND_MULTIPLE
         prices = {InstrumentId.from_str(f"{p.symbol}.{VENUE}"): p.price for p in pick.picks}
         instruments = tuple(prices)
@@ -1472,6 +1522,8 @@ def window_node(
             entry_contexts=entry_contexts,
             entry_notional=entry_notional,
             size_from_budget=True,
+            loss_share=loss_share,
+            trail_cap=config.trail_cap,
             rank_max_age_secs=RANK_MAX_AGE_SECS,
             trail_rows={name: getattr(config, name) for name in TRAIL_SETTINGS},
         )
@@ -1602,6 +1654,8 @@ class WindowReport:
     """The part of the session the window ran in: `regular`, `pre-market`, `after-hours`, `overnight`."""
     strategy: str = DEFAULT_STRATEGY
     """The strategy the window ran, a name of `WINDOW_STRATEGIES`."""
+    arm: str | None = None
+    """The trail arm the window named (`TRAIL_ARMS`), or None."""
     feed: str = ""
     """The feed the strategy streamed and warmed up on (ADR 0055)."""
     overnight: str = ""
@@ -2765,6 +2819,7 @@ def run_window(
     reference_notes: list[str] = []
     entry_contexts: dict[InstrumentId, Day] = {}
     allocation: MoverAllocation | None = None
+    loss_share: Decimal | None = None
     window_symbols = (config.symbol,)
     if config.mover:  # chosen once, before the node is built (ADR 0083's dated line of 2026-11-11)
         at = clock.timestamp + timedelta(seconds=time.monotonic() - read_at)
@@ -2779,6 +2834,9 @@ def run_window(
                 "open and the last completed session are not known"
             )
         if config.strategy == MOVER:
+            # before the allocation and baseline reads and any node: outside paper A and B there is
+            # no default (the lead, 16:36)
+            loss_share = window_loss_share(paper_account())
             from .movers_rank import NO_BASELINE
             from .movers_rank import read_baselines
 
@@ -2825,7 +2883,7 @@ def run_window(
         window_symbols = (pick.symbol,)  # `Mover`'s path below widens it to every priced name
         mover["feed"] = feed
         if allocation is not None:
-            mover["allocation"] = allocation.record()
+            mover["allocation"] = {**allocation.record(), "loss_share": str(loss_share)}
         if row.bridge_reason:
             mover["fallback"] = {
                 "part": part,
@@ -2970,6 +3028,7 @@ def run_window(
         shortened=shortened,
         part=part,
         strategy=config.strategy,
+        arm=config.arm,
         feed=feed,
         overnight=overnight,
         no_shorting=no_shorting,
@@ -3011,6 +3070,7 @@ def run_window(
             entry_contexts=entry_contexts,
             entry_notional=None if allocation is None else allocation.entry_notional,
             reference_reader=reference_reader,
+            loss_share=loss_share,
         )
         cache = node.cache
         startup_requests = endpoint_counts()
@@ -4514,6 +4574,32 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--spares", type=int, default=MOVER_SPARES, help="extra Mover roster names")
     parser.add_argument(
+        "--trail-mode",
+        choices=TRAIL_SETTINGS["trail_mode"]["arms"],
+        default=TRAIL_SETTINGS["trail_mode"]["default"],
+        help=f"{MOVER}'s trail: fixed (default), atr over the spread floor, tier or ratchet",
+    )
+    parser.add_argument(
+        "--trail-cap",
+        choices=TRAIL_CAPS,
+        default=TRAIL_CAP_DEFAULT,
+        help=f"{MOVER}'s arm for a trail over the 0.02 cap: clamp (default), refuse, or own (the "
+        "name's distance, sized down)",
+    )
+    parser.add_argument(
+        "--atr-k",
+        type=Decimal,
+        choices=(TRAIL_SETTINGS["atr_k"]["default"], *TRAIL_SETTINGS["atr_k"]["alternates"]),
+        default=TRAIL_SETTINGS["atr_k"]["default"],
+        help=f"{MOVER}'s ATR multiple under --trail-mode atr: a registered row, 1 (default), 2 or 3",
+    )
+    parser.add_argument(
+        "--arm",
+        choices=tuple(TRAIL_ARMS),
+        help=f"{MOVER}'s trail arm, named in the record and the heartbeat; refused unless the trail "
+        "flags give its rows",
+    )
+    parser.add_argument(
         "--baseline-path", type=Path, help="default: catalog/movers-baseline/<feed>.json"
     )
     parser.add_argument("--log-dir", type=Path, help="default: `default_log_dir()`")
@@ -4538,6 +4624,12 @@ def _args(argv: Sequence[str] | None) -> argparse.Namespace:
             f"--slots are {MOVER}'s, so they need --strategy or --regular-strategy {MOVER}, or "
             "--mover outside the regular session"
         )
+    for flag in _trail_flags_given(args):
+        if not runs_mover:
+            parser.error(
+                f"{flag} is {MOVER}'s, so it needs --strategy or --regular-strategy {MOVER}, or "
+                "--mover outside the regular session"
+            )
     if args.log_dir is None:
         args.log_dir = default_log_dir()
     elif not args.log_dir.is_absolute():
@@ -4557,6 +4649,20 @@ def _heard(log_dir: Path, outcome: str) -> None:
 def _heard_failed(log_dir: Path, error: BaseException) -> None:
     """The heartbeat for a failed run (`_heard`)."""
     _heard(log_dir, f"failed: {type(error).__name__}: {error}")
+
+
+def _trail_flags_given(args: argparse.Namespace) -> list[str]:
+    """Mover's trail flags given away from their defaults, each as `flag value`."""
+    return [
+        f"{flag} {given}"
+        for flag, given, default in (
+            ("--trail-mode", args.trail_mode, TRAIL_SETTINGS["trail_mode"]["default"]),
+            ("--trail-cap", args.trail_cap, TRAIL_CAP_DEFAULT),
+            ("--atr-k", args.atr_k, TRAIL_SETTINGS["atr_k"]["default"]),
+            ("--arm", args.arm, None),
+        )
+        if given != default
+    ]
 
 
 def _main(args: argparse.Namespace) -> int:
@@ -4588,8 +4694,25 @@ def _main(args: argparse.Namespace) -> int:
             slots=args.slots if args.strategy == MOVER else None,
             spares=args.spares,
             baseline_path=args.baseline_path,
+            # Mover's rows; another strategy keeps the defaults, which `WindowConfig` checks
+            trail_mode=args.trail_mode if args.strategy == MOVER else "fixed",
+            trail_cap=args.trail_cap if args.strategy == MOVER else TRAIL_CAP_DEFAULT,
+            atr_k=args.atr_k if args.strategy == MOVER else TRAIL_SETTINGS["atr_k"]["default"],
+            arm=args.arm if args.strategy == MOVER else None,
         )
-        write_heartbeat(args.log_dir, f"a {session} window of {args.strategy}")
+        # an auto schedule's part that runs another strategy runs none of Mover's trail flags; it
+        # says so, rather than drop them unseen (AGENTS.md rule 5)
+        unrun = [] if args.strategy == MOVER else _trail_flags_given(args)
+        if unrun:
+            print(
+                f"paper:session: {', '.join(unrun)} not run: this {session} window runs {args.strategy}"
+            )
+        write_heartbeat(
+            args.log_dir,
+            f"a {session} window of {args.strategy}"
+            + ("" if config.arm is None else f", arm {config.arm}")
+            + ("" if not unrun else f"; {', '.join(unrun)} not run"),
+        )
         report = run_window(config, trading=trading, market=market, market_read_at=market_read_at)
     except WindowSkipped as e:
         print(f"paper:session: skipped: {e}")

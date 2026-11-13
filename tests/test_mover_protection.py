@@ -298,6 +298,8 @@ def test_window_records_protection_and_names_a_diagnostic_failure(
     from tests.test_session_window import mover_pick
     from tests.test_session_window import quiet_window
 
+    monkeypatch.setenv(session_window.ACCOUNT_ENV, "windows")  # a Mover window sizes on A or B only
+
     class DiagnosticMover:
         """Window seam: an observed clock without starting a node or opening a connection."""
 

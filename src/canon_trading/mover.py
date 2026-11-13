@@ -19,7 +19,18 @@ A composition of upstream parts (ADR 0083, ADR 0088). What each part is, at Naut
   divided by configured slots. Free cash read at entry clamps that startup figure, and a missing free
   balance refuses the entry by name. `flow_share` of the last `flow_bars` bars' dollar volume caps that
   size; each entry records both caps and which bound it. An explicit global max_shares can tighten the
-  entry; the per-name share and position monitor follow its resolved current limit.
+  entry; the per-name share and position monitor follow its resolved current limit. Within those bounds
+  the entry is sized for a planned loss at its trail's stop by `sizing.plan_for_loss` (S2, the lead's
+  requirements of 2026-11-12), the one call site: `planned_loss`, or `loss_share` of the startup figure
+  measured on Alpaca's step (`share_loss`), so a 2% trail buys the figure's shares, a wider one fewer and
+  a tighter one no more. The loss per share it was sized for, L (the planned entry less the stop it
+  returns), is the one value sized and sent: the trailing sell's trigger is L under the average fill,
+  rounded up onto the step, then L under the highest price since (the lead's S2 property of 2026-11-12,
+  17:21). L bounds the loss at the trigger, and a gap through the trigger is not bounded: each exit's
+  trigger is kept beside its fill (`sell_triggers`, `fills`), so the loss past L can be measured from
+  the record per exit and per window (17:43). Each refusal is counted by its name and each bound that held by its name in
+  the record. `trail_cap` (`TRAIL_CAPS`) says what a non-fixed trail over the
+  0.02 cap does: clamp (the default), refuse, or keep the name's own distance (`own`).
   **Legacy risk sizing** is `FixedRiskSizer.calculate(entry, stop_loss, equity, risk, hard_limit=...)`
   (`python/nautilus_trader/risk/__init__.pyi:16-29`; `crates/risk/src/sizing.rs:39-117`): `risk` of the
   account's total balance over the distance from the entry to the lowest price the first sale is planned
@@ -230,6 +241,9 @@ from .price_step import exit_price
 from .price_step import stop_trigger_price
 from .price_step import tick
 from .price_step import up_on_step
+from .sizing import REFUSALS as SIZING_REFUSALS
+from .sizing import plan_for_loss
+from .sizing import sized_stop
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -431,8 +445,23 @@ REFUSED = (OrderStatus.DENIED, OrderStatus.REJECTED)
 UNLOCKED = (OrderStatus.INITIALIZED, OrderStatus.SUBMITTED)
 """An order's states before the venue has taken it, so before the account locks its cash."""
 TRAIL_CAP = Decimal("0.02")
-"""The widest a non-fixed trail may be, as a fraction of the price; a spread floor over it refuses the
-entry by name (the lead's (ii), 2026-11-12). UNCALIBRATED."""
+"""The cap on a non-fixed trail (the lead's (ii), 2026-11-12), applied as `trail_cap` says. UNCALIBRATED."""
+TRAIL_CAPS = ("clamp", "refuse", "own")
+TRAIL_CAP_DEFAULT = TRAIL_CAPS[0]
+"""What an entry does with a non-fixed trail over `TRAIL_CAP` (the third cap arm, the lead's T3 of
+2026-11-12): `clamp` sets it to the cap and refuses a spread floor over it (the default, as before);
+`refuse` refuses the entry by name; `own` keeps the name's own distance and the size carries it, through
+`sizing.plan_for_loss`, whose 0.10 ceiling still refuses by name. UNCALIBRATED."""
+DISTANCE_UNDER_STEP = "distance_under_step"
+"""The Mover's own entry refusal after sizing: L, rounded down onto the entry's step, is nothing (S2)."""
+BID_AT_STOP = "bid_at_stop"
+"""The Mover's own entry refusal after sizing, counted with `sizing.REFUSALS`: the bid is at or under the
+stop the entry was sized against, so the first trailing sell would trigger at once (S2)."""
+PAPER_LOSS_SHARE = Decimal("0.02")
+"""The planned loss on paper accounts A and B, as a share of the slot's startup figure (the lead's ruling
+of 2026-11-12, 16:36): the loss at the stop that the budget sizing already accepted at the 0.02 cap, so a
+2% stop sizes to the budget, a wider one sizes down and a tighter one is held at the budget. No new
+number; UNCALIBRATED. Account C and a live node have no default: there the figure is the owner's."""
 HOLD_MOST_SECS = 60
 """The lead's bound (2026-11-12, decision (b)) on a held stop: with no two-sided quote within this many
 seconds of the fill, the holding is sold by limit and counted as an `unpriced_exit`. UNCALIBRATED."""
@@ -554,9 +583,12 @@ def chase_floor(first: Decimal, chase_cap: Decimal) -> Decimal:
     return up_on_step(first * (1 - chase_cap))
 
 
-def offsets(entry: Decimal, trail: Decimal, exit_through: Decimal) -> tuple[Decimal, Decimal]:
-    """The trailing offset and the limit offset, as prices. The trailing offset is `trail` of the entry
-    up to the entry's step: it places the trigger, which the emulator keeps to itself. The limit offset
+def offsets(
+    entry: Decimal, trail: Decimal, exit_through: Decimal, *, distance: Decimal | None = None
+) -> tuple[Decimal, Decimal]:
+    """The trailing offset and the limit offset, as prices. The trailing offset is `distance` when the
+    entry was sized for one (S2's L, already on the step), else `trail` of the entry up to the entry's
+    step: it places the trigger, which the emulator keeps to itself. The limit offset
     is that plus `exit_through` of the entry, up to a whole cent and a cent over the trailing offset at
     least: it places the released limit, the one price that reaches the venue. This preserves cents
     when the highest bid is in cents, including across a dollar between steps. A fractional-cent
@@ -566,9 +598,35 @@ def offsets(entry: Decimal, trail: Decimal, exit_through: Decimal) -> tuple[Deci
     release up to a cent lower than `exit_through` asks, included in `planned_stop` for legacy sizing.
     """
     step = tick(entry)
-    trailing = max((entry * trail).quantize(step, rounding=ROUND_CEILING), step)
+    trailing = (
+        max((entry * trail).quantize(step, rounding=ROUND_CEILING), step)
+        if distance is None
+        else distance
+    )
     limit = (trailing + entry * exit_through).quantize(CENT, rounding=ROUND_CEILING)
     return trailing, max(limit, (trailing + SUB_DOLLAR).quantize(CENT, rounding=ROUND_CEILING))
+
+
+def fill_trigger(fill: Decimal, distance: Decimal | None) -> Decimal | None:
+    """A trailing sell's trigger `distance` (S2's L) under the average `fill`, rounded up onto Alpaca's
+    step (`up_on_step`) so a share never loses more than L at it; None with no L or no room under the
+    fill. The lead's S2 property of 2026-11-12, 17:21: the stop is L under the fill, never under the
+    entry's limit."""
+    if distance is None or fill - distance <= 0:
+        return None
+    return up_on_step(fill - distance)
+
+
+def share_loss(entry: Decimal, figure: Decimal, share: Decimal | None) -> Decimal:
+    """The loss the budget sizing accepted at a `share` stop, measured on Alpaca's step: the figure's
+    whole shares at `entry` times what each loses at that stop (`sizing.sized_stop`, the one stop
+    computation `plan_for_loss` sizes against). A figure under one share prices no loss,
+    which the caller refuses as `size_zero`. A trail of `share` then sizes to the figure exactly, a wider one
+    sizes down and a tighter one is held at the figure (the lead's ruling of 2026-11-12, option 2 of
+    L6's question). Nothing is sent at this stop: it prices the loss only."""
+    if share is None:
+        raise ValueError("no planned loss and no loss share")
+    return (figure // entry) * (entry - sized_stop(entry, share))
 
 
 def planned_stop(
@@ -607,6 +665,9 @@ OWN_FIELDS: dict[str, type | tuple[type, ...]] = {
     "entry_arm": str,
     "trail": Decimal,
     "trail_mode": str,
+    "trail_cap": str,
+    "planned_loss": (Decimal, NoneType),
+    "loss_share": (Decimal, NoneType),
     "atr_k": Decimal,
     "atr_n": int,
     "spread_floor_m": Decimal,
@@ -710,6 +771,9 @@ class MoverConfig(StrategyConfig):
         entry_arm: str = "registered",
         trail: Decimal = Decimal("0.02"),
         trail_mode: str = "fixed",
+        trail_cap: str = TRAIL_CAP_DEFAULT,
+        planned_loss: Decimal | None = None,
+        loss_share: Decimal | None = None,
         atr_k: Decimal = Decimal(1),
         atr_n: int = 14,
         spread_floor_m: Decimal = Decimal(2),
@@ -763,6 +827,20 @@ class MoverConfig(StrategyConfig):
             raise ValueError(f"trail must be a fraction under 1, got {trail}")
         if trail_mode not in TRAIL_SETTINGS["trail_mode"]["arms"]:
             raise ValueError(f"trail_mode must be one of {TRAIL_SETTINGS['trail_mode']['arms']}")
+        if trail_cap not in TRAIL_CAPS:
+            raise ValueError(f"trail_cap must be one of {TRAIL_CAPS}, got {trail_cap!r}")
+        if planned_loss is not None and (not planned_loss.is_finite() or planned_loss <= 0):
+            raise ValueError(f"planned_loss must be a positive amount, got {planned_loss}")
+        if loss_share is not None and (not loss_share.is_finite() or not 0 < loss_share < 1):
+            raise ValueError(f"loss_share must be a fraction over 0 and under 1, got {loss_share}")
+        if planned_loss is not None and loss_share is not None:
+            raise ValueError("give planned_loss or loss_share, not both")
+        if size_from_budget and planned_loss is None and loss_share is None:
+            raise ValueError(
+                "planned_loss or loss_share is required with size_from_budget: the loss at the stop "
+                "an entry is sized for; paper A and B take PAPER_LOSS_SHARE of the slot's figure, "
+                "and anywhere else it is the owner's figure, with no default"
+            )
         for name in ("atr_k", "spread_floor_m", "liquidity_tier_cut", "ratchet_r"):
             if not fields[name].is_finite() or fields[name] <= 0:
                 raise ValueError(f"{name} must be positive, got {fields[name]}")
@@ -821,6 +899,12 @@ class MoverConfig(StrategyConfig):
                 "high_count hold the level at the fixed trail's distance, and a trail plan's "
                 "distance, tighten and chase cap are not carried into it (ADR 0119)"
             )
+        if (breach_count > 1 or high_count > 1) and size_from_budget:
+            raise ValueError(
+                "size_from_budget is refused with persistence: breach_count and high_count hold the "
+                "level at the fixed trail's distance from the fill, and the loss per share the budget "
+                "sized for (S2's L) is not carried into it"
+            )
         if (breach_count > 1 or high_count > 1) and not protect:
             raise ValueError(
                 "protect=False is refused with persistence: breach_count and high_count confirm "
@@ -851,6 +935,9 @@ class MoverConfig(StrategyConfig):
             self.run_bars = early_entry_study.ARMS[entry_arm].run_bars
         self.trail = trail
         self.trail_mode = trail_mode
+        self.trail_cap = trail_cap
+        self.planned_loss = planned_loss
+        self.loss_share = loss_share
         self.atr_k, self.atr_n = atr_k, atr_n
         self.spread_floor_m = spread_floor_m
         self.liquidity_tier_cut = liquidity_tier_cut
@@ -896,6 +983,10 @@ class TrailPlan:
     note: str | None = None
     source: str | None = None
     """Where the trail came from when that is not its bound: `cold_atr_fallback` (the lead's (ii))."""
+    floor: Decimal | None = None
+    """The spread floor as a fraction of the entry, `spread_floor_m` quoted spreads (a row of its own)."""
+    measure: Decimal | None = None
+    """The name's own distance before the floor and the cap: `atr_k` ATRs, or the tier's fraction."""
 
 
 @dataclass
@@ -1003,7 +1094,7 @@ def ratchet_trail(
 ) -> TrailPlan | None:
     """The lead's T1 ratchet rule, paired with ATR or tier; no widening or spread-floor exemption.
     A plan that fell back to fixed (cold ATR or unusable spread) keeps its configured offsets."""
-    if initial.bound == "fixed":
+    if initial.bound == "fixed" or initial.source == "cold_atr_fallback":
         return None
     if followed - bought < settings.ratchet_r * initial.trail * bought:
         return None
@@ -1089,6 +1180,15 @@ class Slot:
     """The confirming print's price: a later recovery cannot lift the position's chase floor."""
     observed_ns: int = 0
     """Only strictly newer print times are read; duplicates, older prints and timers never count."""
+    sized_loss: Decimal | None = None
+    """L, the loss per share the entry was sized for (`sizing.plan_for_loss`): the planned entry less its
+    stepped stop, on Alpaca's step. The trailing sell holds its trigger L under the fill, then L under the
+    highest price since, so the distance sized and the distance sent are one value (the lead's S2
+    property of 2026-11-12, 17:21)."""
+    exit_trigger: Decimal | None = None
+    """The trigger this exit was decided at: the one the emulator released the trailing sell at, the one
+    already met when a limit sold for it, or the confirmed level a persistence breach crossed. Every sale
+    sent for the exit, re-sent or chased, records it beside its own client order ID (`sell_triggers`)."""
     priced_ns: int = 0
     was_held: bool = False
     entry_start: int | None = None
@@ -1134,6 +1234,18 @@ class Mover(Strategy):
         """The ranking the log last named: its time, its value and the malformed ones counted then."""
         self.released: set[str] = set()
         """Client order IDs the emulator has released, as `on_order_released` saw them."""
+        self.sell_triggers: dict[str, str] = {}
+        """Each sell's last trigger by client order ID: the trigger a trailing sell was sent with or had
+        reached when the emulator released it, or the trigger already met that a limit sell was sent
+        for. With `fills` it is how far each exit's fill fell past its trigger, the loss over L a gap
+        made (the lead's ruling of 2026-11-12 17:43); it is the record's figure, nothing measures it
+        here. The emulator releases a triggered sell as a limit
+        with no trigger (`crates/execution/src/order_emulator/emulator.rs:1398-1402`), its release
+        names the bid (`:1424-1427`), and its trailing moves go to the risk engine, not the strategy
+        (`:1657-1686`, `:1823-1827`), so the step reads the trigger from the released order's events,
+        which the transform keeps (`:1404`)."""
+        self.sell_triggers_read: set[str] = set()
+        """Released orders already read: a released sell's trigger is final at its release."""
         self.fills: list[tuple[str, str, str, str, int]] = []
         """Each fill as its event gave it: client order ID, side, quantity, price, time. The session's
         reflection reads a sale's counterfactuals (held on, flat, managed) from these and the tape."""
@@ -1160,6 +1272,12 @@ class Mover(Strategy):
         self.refused: list[tuple[str, str]] = []
         self.dropped: list[str] = []
         """Why each candidate entry was not sent, for the run's report."""
+        self.sizing_refusals: dict[str, int] = dict.fromkeys(
+            (*SIZING_REFUSALS, DISTANCE_UNDER_STEP, BID_AT_STOP), 0
+        )
+        """Each `sizing.plan_for_loss` refusal, counted by its own name (the lead's S2 requirement)."""
+        self.sizing_bindings: dict[str, int] = {}
+        """Each bound that held a sized entry (`held_by`), counted: the budget binding is counted apart."""
         self.quotes = 0
         self.trades = 0
         self.live_bars = 0
@@ -1240,6 +1358,16 @@ class Mover(Strategy):
             self.instrument_responses[str(response.correlation_id)] = response.failure_reason
 
     def on_order_filled(self, event: Any) -> None:
+        if (
+            event.order_side == OrderSide.SELL
+            and event.client_order_id.value not in self.sell_triggers
+        ):
+            # a sale the Mover did not send, upstream's market exit at the wind-down or the managed
+            # stop (`crates/trading/src/strategy/mod.rs:1131`, `:1749`), gets the exit's trigger here,
+            # from plain attributes, so a gapped exit closed that way is still in the record
+            slot = self.slots.get(event.instrument_id)
+            if slot is not None and slot.exit_trigger is not None:
+                self.sell_triggers[event.client_order_id.value] = str(slot.exit_trigger)
         self.fills.append(
             (
                 event.client_order_id.value,
@@ -1418,12 +1546,15 @@ class Mover(Strategy):
             "instrument_request_limit": INSTRUMENT_REQUEST_LIMIT,
             "instrument_request_reserve": INSTRUMENT_REQUEST_RESERVE,
             "dropped": list(self.dropped),
+            "sizing_refusals": dict(self.sizing_refusals),
+            "sizing_bindings": dict(self.sizing_bindings),
             "rank_faults": self.rank_faults,
             "fills": [list(fill) for fill in self.fills],
             "refused": [list(refused) for refused in self.refused],
             "released": sorted(self.released),
             "protection_fallbacks": dict(self.protection_fallbacks),
             "protect_paths": dict(self.protect_paths),
+            "sell_triggers": dict(self.sell_triggers),
             "trail_notes": [PAPER_TRAIL_LIMIT, TRAIL_SOURCE_LIMIT, SHIPPED_ATR_NOTE],
             "exits": [row.record() for row in self.exits],
             "notes": {str(i): list(notes) for i, notes in self.notes.items()},
@@ -1601,6 +1732,7 @@ class Mover(Strategy):
         # Reserve every possible retry while the asynchronous GET is outstanding. Its actual HTTP
         # attempts already enter requests_sent through the provider's existing transport, not here.
         self.recent = recent + self._instrument_reserve()
+        self._read_released_triggers()
         for slot in list(self.slots.values()):
             self._manage(slot, now)
         if self.winding_down:
@@ -1613,6 +1745,7 @@ class Mover(Strategy):
         `manage_stop` upstream's market exit has already run before this is called."""
         if self.clock.timer_names().count(STEP_TIMER):
             self.clock.cancel_timer(STEP_TIMER)
+        self._read_released_triggers()
         if self.manage_stop_set:
             return
         for slot in self.slots.values():
@@ -1620,6 +1753,27 @@ class Mover(Strategy):
                 self.cancel_all_orders(slot.instrument_id)
 
     # --- reading the cache ---------------------------------------------------------------------------
+
+    def _read_released_triggers(self) -> None:
+        """Keep, for each sell the emulator released, the last trigger its events carry: the one it was
+        released at, final then, so each is read once, in the step, since an order-event handler here
+        reads no cache. The exit it decides keeps that trigger for every sale sent after it."""
+        for cid in sorted(self.released - self.sell_triggers_read):
+            self.sell_triggers_read.add(cid)
+            order = self._order(ClientOrderId(cid))
+            if order is None or order.side != OrderSide.SELL:
+                continue
+            trigger = None
+            for event in order.events():
+                price = getattr(event, "trigger_price", None)
+                if price is not None:
+                    trigger = price
+            if trigger is None:
+                continue
+            self.sell_triggers[cid] = str(trigger)
+            for slot in self.slots.values():
+                if slot.protect_id is not None and slot.protect_id.value == cid:
+                    slot.exit_trigger = Decimal(str(trigger))
 
     def _order(self, client_order_id: ClientOrderId | None) -> Any | None:
         """The cached order (one seam, so a test can stand in for the cache)."""
@@ -1885,7 +2039,7 @@ class Mover(Strategy):
             self.sold[slot.instrument_id] = (now, price)
             slot.was_held = False
             slot.exiting = False
-            slot.floor = slot.trail_trigger = None
+            slot.floor = slot.trail_trigger = slot.sized_loss = slot.exit_trigger = None
             slot.trail_high = None
             slot.observations.clear()
             slot.high_observations.clear()
@@ -1950,6 +2104,7 @@ class Mover(Strategy):
                 if order.trigger_price is not None:
                     reached = order.trigger_price.as_decimal()
                     slot.trail_trigger = max(reached, slot.trail_trigger or reached)
+                    self.sell_triggers[order.client_order_id.value] = str(reached)
                 self.cancel_order(order.client_order_id)
                 # The emulator cancels its own order before the call returns, so the cancel is seen
                 # terminal here and the new sell follows in this step, not a second later.
@@ -2026,6 +2181,7 @@ class Mover(Strategy):
                 if len(breaches) >= self.settings.breach_count:
                     slot.exiting = True
                     slot.breach_price = price
+                    slot.exit_trigger = slot.trail_trigger
                     slot.observations.clear()
                     self._say(
                         f"{slot.instrument_id}: breach confirmed at {stamp}, trigger "
@@ -2061,14 +2217,30 @@ class Mover(Strategy):
         # the reached trigger on Alpaca's step, one value for the check below and for the remade sell
         reached = slot.trail_trigger
         kept = None if reached is None else stop_trigger_price(reached)
+        origin = None if reached is None else f"reached {reached}"
+        anchor = fill_trigger(bought, slot.sized_loss)
+        if anchor is not None and (kept is None or anchor > kept):
+            # L under the average fill, rounded up onto the step so a share never loses more than L;
+            # the emulator then moves the trigger only up from it (`crates/execution/src/trailing.rs:61`,
+            # `:100`), and a remade sell keeps the higher of it and the trigger reached
+            kept, origin = anchor, f"{slot.sized_loss} under the fill {bought}"
         if kept is not None and at <= kept:
             # the market is at the trigger the canceled sell had reached: its sale is due now
             slot.exiting, slot.trail_trigger = True, None
-            self._mark_exit(slot, now, at, "retained trigger")
+            # a reached trigger is retained; with none, or with L under the fill above it, the stop L
+            # under the fill is met as the sale is armed
+            retained = reached is not None and kept == stop_trigger_price(reached)
+            met = (
+                "retained trigger"
+                if retained
+                else "trailing stop (L under the fill, met when armed)"
+            )
+            self._mark_exit(slot, now, at, met)
             self._say(
-                f"{slot.instrument_id}: at {at}, the trigger {kept} (reached {reached}) is met; "
+                f"{slot.instrument_id}: at {at}, the trigger {kept} ({origin}) is met; "
                 "selling by limit"
             )
+            slot.exit_trigger = kept
             self._limit_sell(slot, held, now, slot.floor)
             return
         instrument = self._instrument(slot.instrument_id)
@@ -2077,13 +2249,16 @@ class Mover(Strategy):
             bought,
             self.settings.trail if plan is None else plan.trail,
             self.settings.exit_through if plan is None else plan.exit_through,
+            # L until a ratchet tightens the plan: the tighter trail then places the trigger; with no
+            # room for L under the fill, the trail of the fill, as before S2, never a trigger at zero
+            distance=None if slot.ratcheted or anchor is None else slot.sized_loss,
         )
         if slot.exit_record is not None:
             slot.exit_record.trail_distance = trailing
         self._say(
             f"{slot.instrument_id}: trailing SELL {held}, its trigger {trailing} under the highest "
             f"{'bid' if trigger == TriggerType.BID_ASK else 'trade'}, its limit {limit} under it"
-            + ("" if kept is None else f", from the trigger {kept} (reached {reached}) on the step")
+            + ("" if kept is None else f", from the trigger {kept} ({origin}) on the step")
         )
         order = self.order_factory.trailing_stop_limit(
             slot.instrument_id,
@@ -2100,6 +2275,8 @@ class Mover(Strategy):
         )
         slot.protect_id = order.client_order_id
         slot.trailed = True
+        if kept is not None:
+            self.sell_triggers[order.client_order_id.value] = str(kept)
         slot.priced_ns = (
             now  # the trigger is kept: a remake that is refused starts the next from it
         )
@@ -2146,12 +2323,14 @@ class Mover(Strategy):
                 f"{slot.instrument_id}: no followed price; holding a stop at {slot.held_stop}",
             )
         self._ensure_exit(slot, held)
+        self._held_at_l(slot)
         last, source = self._last_known(slot)
         if slot.held_stop is not None and last is not None and last <= slot.held_stop:
             slot.exiting = True
             self._mark_exit(slot, now, last, f"held stop ({source})")
             if slot.entry_record is not None:
                 slot.entry_record["held_stop_trigger"] = source
+            slot.exit_trigger = slot.held_stop  # before `_end_hold` clears it
             self._end_hold(slot, now, "held_stop")
             self._limit_sell(slot, held, now, slot.floor, anchor=last)
             return
@@ -2161,6 +2340,26 @@ class Mover(Strategy):
             self._mark_exit(slot, now, last, "unpriced_exit")
             self._end_hold(slot, now, "unpriced_exit")
             self._limit_sell(slot, held, now, slot.floor, anchor=anchor)
+
+    def _held_at_l(self, slot: Slot) -> None:
+        """S2 under #320's held stop: an entry sized for L holds its stop L under the average fill,
+        rounded up onto the step (`fill_trigger`), the level its trailing sell would start from, and
+        follows the average as the entry fills further, as a trailing sell remade for all that is held
+        would; a trigger a trailed sale had reached still holds it up. A ratchet's tighter trail, or no
+        room for L, keeps #320's level at the trail's distance."""
+        if slot.sized_loss is None or slot.ratcheted:
+            return
+        anchor = self._held_anchor(slot)
+        at_l = None if anchor is None else fill_trigger(anchor, slot.sized_loss)
+        if at_l is None:
+            return
+        reached = None if slot.trail_trigger is None else stop_trigger_price(slot.trail_trigger)
+        slot.held_stop = at_l if reached is None else max(at_l, reached)
+        slot.protection_anchor = anchor
+        if slot.exit_record is not None:
+            slot.exit_record.trail_distance = slot.sized_loss
+        if slot.entry_record is not None:
+            slot.entry_record["held_stop_level"] = str(slot.held_stop)
 
     def _end_hold(self, slot: Slot, now: int, path: str) -> None:
         """Record how the held stop ended and for how long it held; clear it."""
@@ -2311,7 +2510,8 @@ class Mover(Strategy):
         *,
         anchor: Decimal | None = None,
     ) -> None:
-        """A plain DAY limit for what is held, `exit_ticks` through the bid, not below `floor`.
+        """A plain DAY limit for what is held, `exit_ticks` through the bid, not below `floor`; the exit's
+        trigger (`Slot.exit_trigger`), when it has one, is kept beside this sale in the record.
 
         An unarmable trail supplies its known anchor so that no quote still leaves a working sale.
         """
@@ -2338,6 +2538,8 @@ class Mover(Strategy):
             time_in_force=TimeInForce.DAY,
         )
         slot.protect_id = order.client_order_id
+        if slot.exit_trigger is not None:
+            self.sell_triggers[order.client_order_id.value] = str(slot.exit_trigger)
         slot.priced_ns = now
         self._say(f"{slot.instrument_id}: SELL {held} limit {price} (floor {floor})")
         self.submit_order(order, params=self.submit_params)
@@ -2502,20 +2704,28 @@ class Mover(Strategy):
             return str(error)
         if plan.note is not None:
             self._note(slot, f"{slot.instrument_id}: {plan.note}")
-        stop = planned_stop(price, plan.trail, plan.exit_through, plan.chase_cap)
-        if stop <= 0:
+        # budget sizing refuses a trail with no room by name (`plan_for_loss`) and a bid at the
+        # first trigger by name (`BID_AT_STOP`); the planned stop and its two checks are the legacy path's
+        stop = (
+            None
+            if settings.size_from_budget
+            else planned_stop(price, plan.trail, plan.exit_through, plan.chase_cap)
+        )
+        if stop is not None and stop <= 0:
             return f"no room for the trail under {price}"
         bid_price = getattr(quote, "bid_price", None)
         bid = None if bid_price is None else bid_price.as_decimal()
         if bid is None or bid <= 0:
             return "no positive bid to check against the planned stop"
-        if bid < stop:
+        if stop is not None and bid < stop:
             return (
                 f"the bid {bid} is under the planned stop {stop} of an entry at {price}: the quote "
                 "is wider than the plan"
             )
         precision = instrument.price_precision
         sizing: dict[str, str | bool | None] | None = None
+        entry_stop: Decimal | None = None
+        distance: Decimal | None = None
         if settings.size_from_budget:
             free = account.balance_free(instrument.quote_currency)
             if free is None:
@@ -2538,7 +2748,8 @@ class Mover(Strategy):
             unreported = self._unreported_buys(account) if reported else Decimal(0)
             query_wait = self._query_wait_secs(account) if reported else 0.0
             spendable = free.as_decimal() - unlocked - unreported
-            entry_budget = min(settings.max_notional, spendable)
+            # no cash left to spend is a budget of nothing, refused below as size_zero
+            entry_budget = max(min(settings.max_notional, spendable), Decimal(0))
             budget_shares = entry_budget // price
             flow_dollars = sum(slot.dollars, Decimal(0))
             flow_shares = settings.flow_share * flow_dollars // price
@@ -2552,8 +2763,12 @@ class Mover(Strategy):
                 if settings.max_notional <= spendable
                 else "free_balance"
             )
+            # the share bounds, apart from the budget: what upstream takes as its hard limit with it
+            share_cap = flow_shares
             if settings.max_shares is not None and Decimal(settings.max_shares) < cap:
                 cap, binding, held_by = Decimal(settings.max_shares), "max_shares", "max_shares"
+            if settings.max_shares is not None:
+                share_cap = min(share_cap, Decimal(settings.max_shares))
             # the name's start-time share cap bounds the entry and is never rewritten, so a price
             # that drifted since the start does not trip the monitor and a trip means a real fault
             # (the lead's change of 2026-11-12, ultra review of the composition, finding 14)
@@ -2562,9 +2777,65 @@ class Mover(Strategy):
             )
             if start_cap is not None and Decimal(start_cap) < cap:
                 cap, binding, held_by = Decimal(start_cap), "cap_bound", "start_cap"
-            if cap < 1:
-                return f"the budget or flow cap leaves no share at {price}"
-            quantity = instrument.make_qty(int(cap))
+            if start_cap is not None:
+                share_cap = min(share_cap, Decimal(start_cap))
+            # S2: the one call that sizes an entry for its planned loss and gives the stop it was sized
+            # from; entry less that stop is L, the distance `_trail` holds under the fill, one value
+            planned_loss = settings.planned_loss
+            if planned_loss is None:  # MoverConfig refuses size_from_budget without one of the two
+                planned_loss = share_loss(price, settings.max_notional, settings.loss_share)
+            if planned_loss <= 0:  # the slot's figure buys no share at this price
+                self.sizing_refusals["size_zero"] += 1
+                return (
+                    f"sizing refused: size_zero (the figure {settings.max_notional} USD buys no share "
+                    f"at {price})"
+                )
+            try:
+                sized = plan_for_loss(
+                    instrument=instrument,
+                    entry=Price.from_str(f"{price:.{precision}f}"),
+                    distance=plan.trail,
+                    planned_loss=planned_loss,
+                    flow_cap=share_cap,
+                    budget=entry_budget,
+                )
+            except (ValueError, TypeError) as error:
+                name = str(error)
+                if name not in SIZING_REFUSALS:
+                    # upstream's own error, not a refusal: named, not counted, and the step goes on
+                    # to its other candidates rather than lose them
+                    return f"sizing failed, not a refusal: {type(error).__name__}: {error}"
+                self.sizing_refusals[name] += 1
+                return (
+                    f"sizing refused: {name} (trail {plan.trail}, planned loss {planned_loss} USD, "
+                    f"budget {entry_budget} USD, share cap {share_cap}, at {price})"
+                )
+            quantity, entry_stop = sized
+            # L on the entry's step, down: where the stop crosses $1 its sub-dollar step leaves a
+            # residue a cent-priced bid cannot trail by, and down keeps the loss within the plan
+            distance = (price - entry_stop).quantize(tick(price), rounding=ROUND_FLOOR)
+            if distance <= 0:
+                self.sizing_refusals[DISTANCE_UNDER_STEP] += 1
+                return (
+                    f"the distance {price - entry_stop} sized for an entry at {price} is under its "
+                    f"step {tick(price)}: no trail can hold it"
+                )
+            # a fill at the ask holds its first trigger L under it (`fill_trigger`, the one
+            # computation `_trail` makes): a bid already there would sell at once
+            ask = quote.ask_price.as_decimal()
+            at_ask = fill_trigger(ask, distance)
+            if at_ask is None or bid <= at_ask:
+                self.sizing_refusals[BID_AT_STOP] += 1
+                return (
+                    f"the bid {bid} is at or under {at_ask}, the distance {distance} sized for an "
+                    f"entry at {price} under the ask {ask}: the quote is wider than the trail"
+                )
+            # upstream's hard limit is `cap` (budget, flow, max_shares, start cap), so a quantity under
+            # it was held by the planned loss; loss_shares is the record's figure of that bound
+            loss_shares = planned_loss // (price - entry_stop)
+            if quantity.as_decimal() < cap:
+                binding = held_by = "planned_loss"
+            self.sizing_bindings[held_by] = self.sizing_bindings.get(held_by, 0) + 1
             sizing = {
                 "startup_budget_notional": str(settings.max_notional),
                 "free_cash": str(free.as_decimal()),
@@ -2576,6 +2847,12 @@ class Mover(Strategy):
                 "flow_dollars": str(flow_dollars),
                 "flow_shares": str(flow_shares),
                 "start_cap": None if start_cap is None else str(start_cap),
+                "planned_loss": str(planned_loss),
+                "trail": str(plan.trail),
+                "stop": str(entry_stop),
+                "loss_shares": str(loss_shares),
+                "loss_per_share": str(distance),
+                "loss_at_stop": str(quantity.as_decimal() * distance),
                 "binding": binding,
                 "held_by": held_by,
                 # None: no start-up roster to be in or outside of
@@ -2586,14 +2863,15 @@ class Mover(Strategy):
                 "notional": str(quantity.as_decimal() * price),
             }
             self._say(
-                f"{slot.instrument_id}: size budget {entry_budget} USD "
-                f"({budget_shares} shares), flow cap {flow_shares} shares from {flow_dollars} USD, "
-                f"binding {sizing['binding']}, quantity {quantity}"
+                f"{slot.instrument_id}: size for a loss of {planned_loss} USD at the stop {entry_stop}: "
+                f"{loss_shares} shares; budget {entry_budget} USD ({budget_shares} shares), flow cap "
+                f"{flow_shares} shares from {flow_dollars} USD, binding {binding}, quantity {quantity}"
             )
         else:
             free = account.balance_free(instrument.quote_currency)
             if free is None:
                 return "no free balance to size from"
+            assert stop is not None  # the legacy path computed its planned stop above
             cap = min(settings.max_notional, free.as_decimal()) // price
             if len(slot.dollars) > 0:
                 cap = min(cap, (settings.flow_share * sum(slot.dollars)) // price)
@@ -2622,6 +2900,7 @@ class Mover(Strategy):
         slot.entry_id = order.client_order_id
         slot.entry_cancel_ns = 0
         slot.trail_plan = slot.initial_trail = plan
+        slot.sized_loss = distance
         slot.ratcheted = False
         slot.last_bid = bid
         slot.entry_record = {
@@ -2637,6 +2916,9 @@ class Mover(Strategy):
             "atr": None if plan.atr is None else str(plan.atr),
             "spread": None if plan.spread is None else str(plan.spread),
             "trail_bound": plan.bound,
+            "trail_cap": settings.trail_cap,
+            "spread_floor": None if plan.floor is None else str(plan.floor),
+            "own_measure": None if plan.measure is None else str(plan.measure),
             "trail_source": plan.source or plan.bound,
             "stopped_out": False,
             "exit_through": str(plan.exit_through),
@@ -2654,8 +2936,13 @@ class Mover(Strategy):
         self.entries_sent.append(slot.entry_record)
         self.notes.setdefault(slot.instrument_id, []).append(f"entered at move {move}")
         self._say(
-            f"{slot.instrument_id}: BUY {quantity} limit {price} (bid {bid}, planned stop {stop}, "
-            f"move {move})"
+            f"{slot.instrument_id}: BUY {quantity} limit {price} (bid {bid}, "
+            + (
+                f"planned stop {stop}"
+                if slot.sized_loss is None
+                else f"sized for {slot.sized_loss} a share, the trigger that far under the fill"
+            )
+            + f", move {move})"
         )
         self.submit_order(order, params=self.submit_params)
         return None
@@ -2670,26 +2957,25 @@ class Mover(Strategy):
         spread = quoted_spread(quote)
         if settings.trail_mode == "fixed":
             return TrailPlan(
-                settings.trail,
-                settings.exit_through,
-                settings.chase_cap,
-                atr,
-                spread,
-                "fixed",
-                None,
+                trail=settings.trail,
+                exit_through=settings.exit_through,
+                chase_cap=settings.chase_cap,
+                atr=atr,
+                spread=spread,
+                bound="fixed",
             )
         if spread is None:
             return TrailPlan(
-                settings.trail,
-                settings.exit_through,
-                settings.chase_cap,
-                atr,
-                None,
-                "fixed",
-                "no usable quoted spread (missing/zero bid, crossed or locked): fixed trail fallback",
+                trail=settings.trail,
+                exit_through=settings.exit_through,
+                chase_cap=settings.chase_cap,
+                atr=atr,
+                spread=None,
+                bound="fixed",
+                note="no usable quoted spread (missing/zero bid, crossed or locked): fixed trail fallback",
             )
         floor = settings.spread_floor_m * spread / price
-        if floor > TRAIL_CAP:
+        if floor > TRAIL_CAP and (settings.trail_cap != "own" or not settings.size_from_budget):
             raise ValueError("the spread floor exceeds the 0.02 cap; no entry satisfies both")
         baseline = self.baseline_dollar_volume_per_minute.get(slot.instrument_id)
         base = settings.ratchet_base if settings.trail_mode == "ratchet" else settings.trail_mode
@@ -2706,25 +2992,64 @@ class Mover(Strategy):
                 # Coordinator's (ii), 2026-11-12: a cold ATR enters on the fixed plan, named, rather
                 # than waiting `atr_n` live minutes from the slot's opening; no history is requested.
                 cold = f"ATR has fewer than {settings.atr_n} complete one-minute bars: fixed trail fallback"
+                if settings.trail_cap == "own" and floor > settings.trail:
+                    # `own` drops the cap's refusal of a spread floor over it, so the floor still
+                    # bounds the fallback from below: the distance is the larger of the two (T3)
+                    return TrailPlan(
+                        trail=floor,
+                        exit_through=floor / 4,
+                        chase_cap=max(floor, settings.chase_cap),
+                        atr=None,
+                        spread=spread,
+                        bound="spread floor",
+                        note=f"{cold}, raised to the spread floor"
+                        + ("" if note is None else f"; {note}"),
+                        source="cold_atr_fallback",
+                        floor=floor,
+                    )
                 return TrailPlan(
-                    settings.trail,
-                    settings.exit_through,
-                    settings.chase_cap,
-                    None,
-                    spread,
-                    "fixed",
-                    cold if note is None else f"{cold}; {note}",
-                    "cold_atr_fallback",
+                    trail=settings.trail,
+                    exit_through=settings.exit_through,
+                    chase_cap=settings.chase_cap,
+                    atr=None,
+                    spread=spread,
+                    bound="fixed",
+                    note=cold if note is None else f"{cold}; {note}",
+                    source="cold_atr_fallback",
+                    floor=floor,
                 )
             selected, bound = settings.atr_k * atr / price, "atr"
+        measure = selected
         if floor >= selected:
             selected, bound = floor, "spread floor"
         if selected > TRAIL_CAP:
-            selected, bound = TRAIL_CAP, "0.02 cap"
+            if settings.trail_cap == "own" and not settings.size_from_budget:
+                # only `plan_for_loss` carries a trail over the cap, its 0.10 ceiling refusing past it
+                raise ValueError(
+                    f"the trail {selected} ({bound}) is over the 0.02 cap, and trail_cap own needs "
+                    "size_from_budget to size it; refused"
+                )
+            if settings.trail_cap == "refuse":
+                raise ValueError(
+                    f"the trail {selected} ({bound}) is over the 0.02 cap; refused (trail_cap refuse)"
+                )
+            if settings.trail_cap == "clamp":
+                selected, bound = TRAIL_CAP, "0.02 cap"
+            # `own`: the name's own distance stands, and the entry's size carries it (`_buy`)
         # Coordinator's (ii), 2026-11-12: the chase keeps the configured depth under a narrow trail,
         # so a gap through the trigger is chased to a fill, not left resting above the market.
         chase = max(selected, settings.chase_cap)
-        return TrailPlan(selected, selected / 4, chase, atr, spread, bound, note)
+        return TrailPlan(
+            trail=selected,
+            exit_through=selected / 4,
+            chase_cap=chase,
+            atr=atr,
+            spread=spread,
+            bound=bound,
+            note=note,
+            floor=floor,
+            measure=measure,
+        )
 
     def _ratchet(self, slot: Slot, now: int) -> bool:
         """Tighten once only while the original emulated sale works; caller cancels and remakes it."""

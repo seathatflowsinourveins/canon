@@ -61,6 +61,7 @@ from canon_trading import mover
 from canon_trading import mover_window
 from canon_trading import movers_rank
 from canon_trading.mover import EXTENDED_HOURS
+from canon_trading.mover import PAPER_LOSS_SHARE
 from canon_trading.mover import RANK_SIGNAL
 from canon_trading.mover import Mover
 from canon_trading.mover import MoverConfig
@@ -241,6 +242,9 @@ def strategy(**changes: object) -> Recording:
         "order_id_tag": "001",
     }
     settings.update(changes)
+    if settings.get("size_from_budget") and not {"planned_loss", "loss_share"} & set(changes):
+        # the paper row (the lead's ruling of 2026-11-12): the loss at a 2% stop of the slot's figure
+        settings["loss_share"] = PAPER_LOSS_SHARE
     return Recording(MoverConfig(**settings))
 
 
@@ -1087,6 +1091,7 @@ def test_budget_composition_does_not_freeze_a_global_share_cap_at_the_initial_pr
         slots=1,
         entry_notional=Decimal(1000),
         size_from_budget=True,
+        loss_share=PAPER_LOSS_SHARE,
     )
     assert strategy.settings.max_shares is None
     assert strategy.settings.share_caps == {AAA: 50}
@@ -1108,6 +1113,7 @@ def test_a_budget_entry_after_a_30_percent_price_fall_is_clamped_to_its_start_ti
         protect=False,
     )
     s.settings.size_from_budget = True
+    s.settings.loss_share = PAPER_LOSS_SHARE
     s.position_caps = {AAA: cap}
     eng.add_strategy(cap)
     orders = run(eng, s, ranker(rank((AAA, "0.25"))), tape(AAA, RISING))
@@ -1144,6 +1150,7 @@ def test_an_entry_with_no_roster_records_which_bound_held_and_no_roster_flag(
         protect=False,
     )
     s.settings.size_from_budget = True
+    s.settings.loss_share = PAPER_LOSS_SHARE
     orders = run(eng, s, ranker(rank((AAA, "0.25"))), tape(AAA, RISING))
     eng.dispose()
     assert [o.side for o in orders][:1] == [OrderSide.BUY]
@@ -1170,6 +1177,7 @@ def test_a_forced_20x_sizing_fault_is_clamped_and_trips_the_monitor_if_it_gets_p
         protect=False,
     )
     s.settings.size_from_budget = True
+    s.settings.loss_share = PAPER_LOSS_SHARE
     s.position_caps = {AAA: cap}
     eng.add_strategy(cap)
     orders = run(eng, s, ranker(rank((AAA, "0.25"))), tape(AAA, RISING))
@@ -2854,6 +2862,7 @@ class Seam:
     _ensure_exit = Mover._ensure_exit
     _mark_exit = Mover._mark_exit
     _hold = Mover._hold
+    _held_at_l = Mover._held_at_l
     _end_hold = Mover._end_hold
     _held_anchor = Mover._held_anchor
     _last_known = Mover._last_known
@@ -2873,6 +2882,7 @@ class Seam:
         self.notes: dict = {}
         self.dropped: list[str] = []
         self.exits: list = []
+        self.sell_triggers: dict[str, str] = {}
         self.protection_fallbacks = {"position average price": 0, "current bid": 0}
         self.protect_paths = {"held_stop": 0, "unpriced_exit": 0, "trail": 0}
         self.fills: list = []
@@ -3142,6 +3152,7 @@ def test_a_reported_account_is_queried_on_each_fill_and_buys_since_its_report_ar
             strategy_id=MOVER_ID,
             order_id_tag="001",
             size_from_budget=True,
+            loss_share=PAPER_LOSS_SHARE,
             entries=2,
             cooldown_secs=0,
         )

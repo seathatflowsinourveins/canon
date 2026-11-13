@@ -125,11 +125,28 @@ def test_unknown_or_unusable_distance_is_refused_by_name(
         )
 
 
+@pytest.mark.parametrize("planned_loss", [Decimal("0.49"), Decimal("0.00000000000000000001")])
+def test_a_planned_loss_under_one_shares_loss_is_refused_apart_from_size_zero(
+    instrument: Equity, planned_loss: Decimal
+) -> None:
+    """Review finding 4 (/code-review high, S2): `size_zero` named both no whole share under the caps
+    and a planned loss under one share's loss at the stop, so a count could not tell them apart."""
+    from canon_trading.sizing import size_for_loss
+
+    with pytest.raises(ValueError, match="^loss_under_one_share$"):
+        size_for_loss(
+            instrument=instrument,
+            entry=Price.from_str("10.0000"),
+            distance=Decimal("0.05"),
+            planned_loss=planned_loss,
+            flow_cap=Decimal(1000),
+            budget=Decimal(10000),
+        )
+
+
 @pytest.mark.parametrize(
     ("planned_loss", "flow_cap", "budget"),
     [
-        (Decimal("0.49"), Decimal(1000), Decimal(10000)),
-        (Decimal("0.00000000000000000001"), Decimal(1000), Decimal(10000)),
         (Decimal(100), Decimal("0.99"), Decimal(10000)),
         (Decimal(100), Decimal(1000), Decimal("9.99")),
         (Decimal(100), Decimal(0), Decimal(10000)),
@@ -167,7 +184,7 @@ def test_scale_size_equivalence_grid_and_a_three_share_slot_at_six_percent_gives
         # Floor the entire ratio in increments, never a rounded cap / distance first.
         expected = min(slot_quantity, slot_quantity * cap // (distance * increment) * increment)
         if expected == 0:
-            with pytest.raises(ValueError, match="^size_zero$"):
+            with pytest.raises(ValueError, match="^loss_under_one_share$"):
                 size_for_loss(
                     instrument=instrument,
                     entry=Price.from_str("10.0000"),
@@ -413,14 +430,12 @@ def test_a_distance_computed_by_division_is_sized_not_refused(
     assert quantity.as_decimal() == Decimal(expected)
 
 
-@pytest.mark.parametrize(
-    ("entry", "stop"), [("1.12", "1.00"), ("0.0005", "0.0004"), ("0.0001", "0")]
-)
+@pytest.mark.parametrize(("entry", "stop"), [("1.12", "1.00"), ("0.0005", "0.0004")])
 def test_a_stop_stepped_past_the_ceiling_is_refused_by_name(
     instrument: Equity, entry: str, stop: str
 ) -> None:
     # Second review, findings 2 and 3: a tenth under 1.12 is 1.008, which steps to 1.00, a 10.7%
-    # stop; 0.0005 steps to 0.0004, 20%; 0.0001 steps to 0, no stop at all.
+    # stop; 0.0005 steps to 0.0004, 20%.
     from canon_trading.sizing import size_for_loss
 
     with pytest.raises(ValueError, match="^distance_over_ceiling$"):
@@ -523,7 +538,7 @@ def test_a_loss_per_share_the_default_context_would_round_is_refused_not_sized(
     # Rounded toward the larger loss, the stop as sent is 9.49 and a share loses 0.51.
     from canon_trading.sizing import size_for_loss
 
-    with pytest.raises(ValueError, match="^size_zero$"):
+    with pytest.raises(ValueError, match="^loss_under_one_share$"):
         size_for_loss(
             instrument=instrument,
             entry=Price.from_str("10.0000"),
@@ -647,7 +662,17 @@ def test_the_loss_at_the_stop_as_sent_never_exceeds_the_planned_loss(instrument:
                 budget=Decimal(10**12),
             ).as_decimal()
         except ValueError as e:
-            assert str(e) in {"size_zero", "distance_over_ceiling"}, (entry, fraction, loss, e)
+            assert str(e) in {
+                "size_zero",
+                "loss_under_one_share",
+                "distance_over_ceiling",
+                "stop_zero",
+            }, (
+                entry,
+                fraction,
+                loss,
+                e,
+            )
             continue
         sized += 1
         with localcontext() as context:
@@ -659,3 +684,56 @@ def test_the_loss_at_the_stop_as_sent_never_exceeds_the_planned_loss(instrument:
         assert quantity * per_share <= planned, (entry, fraction, loss, quantity)
         assert (quantity + 1) * per_share > planned, (entry, fraction, loss, quantity)
     assert sized > 200
+
+
+@pytest.mark.parametrize(
+    ("entry", "distance"), [("0.0001", "0.10"), ("0.0001", "0.05"), ("0.0001", "0.01")]
+)
+def test_a_stop_stepped_down_to_zero_is_refused_as_its_own_name(
+    instrument: Equity, entry: str, distance: str
+) -> None:
+    # The lead's requirement for S2 (2026-11-12): each refusal is counted by its own name, and a stop
+    # that steps down to zero is no stop at all, not one past the ceiling.
+    from canon_trading.sizing import size_for_loss
+
+    with pytest.raises(ValueError, match="^stop_zero$"):
+        size_for_loss(
+            instrument=instrument,
+            entry=Price.from_str(entry),
+            distance=Decimal(distance),
+            planned_loss=Decimal(100),
+            flow_cap=Decimal(1000),
+            budget=Decimal(100000),
+        )
+
+
+def test_the_plan_returns_the_stop_it_was_sized_against(instrument: Equity) -> None:
+    # The lead's requirement for S2 (2026-11-12): the stop sized and the stop sent are one value, so
+    # the plan hands the caller that stop with the quantity; 10.42 less 3% is 10.1074, sent at 10.10.
+    from canon_trading.sizing import plan_for_loss
+
+    plan = plan_for_loss(
+        instrument=instrument,
+        entry=Price.from_str("10.42"),
+        distance=Decimal("0.03"),
+        planned_loss=Decimal(100),
+        flow_cap=Decimal(1000),
+        budget=Decimal(100000),
+    )
+
+    assert plan.stop == Decimal("10.10")
+    assert plan.quantity.as_decimal() == Decimal(100) // (Decimal("10.42") - plan.stop)
+
+
+def test_every_refusal_name_is_listed_for_counting() -> None:
+    # The Mover counts each refusal by its name; a name raised here and missing from REFUSALS would
+    # go uncounted, so the two are one set.
+    import re
+    from pathlib import Path
+
+    from canon_trading import sizing
+
+    text = Path(sizing.__file__).read_text()
+    raised = set(re.findall(r'ValueError\("([a-z_]+)"\)', text))
+    raised |= {"flow_cap_invalid", "budget_invalid"}  # raised as f"{name}_invalid"
+    assert set(sizing.REFUSALS) == raised

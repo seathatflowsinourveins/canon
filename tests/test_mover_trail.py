@@ -862,3 +862,51 @@ def test_the_trail_constants_and_slot_fields_carry_their_own_docstrings():
         if is_text(before) and is_text(after)
     ]
     assert doubled == []
+
+
+def test_a_sized_entrys_held_stop_is_l_under_the_fill_and_its_sale_keeps_that_trigger():
+    """S2 under #320's held stop: an entry sized for a loss per share L holds its stop L under the fill,
+    rounded up onto the step (`mover.fill_trigger`), the level its trailing sell would start from, not
+    the trail's fraction of the fill. The sale a print through it sends has that level beside it in the
+    record (`sell_triggers`), as every other exit's sale does."""
+    seam, slot = held()
+    slot.sized_loss = D("0.30")
+    seam._protect(slot, D(5), T0)
+    assert seam.sent == [] and slot.held_stop == mover.fill_trigger(D("10.00"), D("0.30")) == D(
+        "9.70"
+    )
+    seam.cache.trade = lambda _: SimpleNamespace(price=Price.from_str("9.6900"))
+    seam._protect(slot, D(5), T0 + 5 * SECOND)
+    assert len(seam.sent) == 1 and slot.exit_record.trigger_reason == "held stop (last trade)"
+    assert D(seam.sell_triggers[seam.sent[0].client_order_id.value]) == D("9.70")
+
+
+def test_a_sized_entrys_held_stop_follows_l_under_the_average_as_the_entry_fills_further():
+    """Review of S2 over #320, finding 1: a later fill of the same entry moves the average, and the held
+    stop follows L under it, as a trailing sell remade for all that is held would; the exit row's
+    distance is L, the distance the held stop holds (finding 2)."""
+    seam, slot = held()
+    seam.orders["E-1"].avg_px = 9.90
+    slot.sized_loss = D("0.30")
+    slot.exit_record = mover.ExitRecord(AAA, "E-1", D(5))
+    seam._protect(slot, D(2), T0)
+    assert slot.held_stop == D("9.60")
+    seam.orders["E-1"].avg_px = 9.95
+    seam._protect(slot, D(5), T0 + SECOND)
+    assert seam.sent == [] and slot.held_stop == D("9.65")
+    assert slot.exit_record.trail_distance == D("0.30")
+
+
+def test_l_met_when_the_first_trailing_sell_is_armed_is_a_stop_not_a_retained_trigger():
+    """Review of S2 over #320, finding 3: with nothing reached, a bid already at L under the fill when the
+    sale is first armed is the stop L, not a retained trigger, and the entry is stopped out."""
+    seam = Seam("9.69")
+    slot = seam_slot(seam)
+    slot.sized_loss = D("0.30")
+    slot.exit_record = mover.ExitRecord(AAA, "E-1", D(3))
+    slot.entry_record = {"client_order_id": "E-1", "stopped_out": False}
+    seam._protect(slot, D(3), T0)
+    assert [o.kind for o in seam.sent] == ["LIMIT"] and slot.exiting
+    reason = slot.exit_record.trigger_reason
+    assert reason is not None and reason.startswith("trailing stop"), reason
+    assert slot.entry_record["stopped_out"] is True

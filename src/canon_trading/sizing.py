@@ -15,7 +15,7 @@ Verified at v2.0.0rc8, nautilus-trader@d53849b216e2, read 2026-11-12:
 * unit_batch_size=1 is upstream's default (crates/risk/src/python/sizing.rs:171-180).
   Pass it explicitly; retain commission_rate=0, exchange_rate=1 and units=1. Upstream's
   instrument maximum still applies (crates/risk/src/sizing.rs:106-116).
-* The stop sized against is the one Alpaca is sent: price_step.stop_trigger_price rounds the
+* The stop sized against is on Alpaca's step, as a sent trigger is: price_step.stop_trigger_price rounds the
   trigger down onto Alpaca's step (ADR 0030), and the entry must already be on that step.
 
 The fractional distance ceiling is ADR 0096 amendment 11's registered 0.10; its scale_size
@@ -30,6 +30,7 @@ from decimal import Decimal
 from decimal import InvalidOperation
 from decimal import Overflow
 from decimal import localcontext
+from typing import NamedTuple
 
 from nautilus_trader.model import HIGH_PRECISION
 from nautilus_trader.model import Equity
@@ -50,6 +51,40 @@ QUANTITY_MAX = Decimal(34_028_236_692_093) if HIGH_PRECISION else Decimal(18_446
 # below is directed toward the larger loss or the smaller size; a result too large traps.
 _LOSS = Context(prec=28, rounding=ROUND_CEILING, traps=[InvalidOperation, Overflow])
 _STOP = Context(prec=28, rounding=ROUND_FLOOR, traps=[InvalidOperation, Overflow])
+REFUSALS = (
+    "distance_unknown",
+    "distance_over_ceiling",
+    "stop_zero",
+    "entry_invalid",
+    "entry_off_step",
+    "planned_loss_invalid",
+    "planned_loss_precision",
+    "flow_cap_invalid",
+    "budget_invalid",
+    "loss_under_one_share",
+    "size_zero",
+)
+"""Every name a `ValueError` from `plan_for_loss` carries, so a caller can count each one apart."""
+
+
+def sized_stop(entry: Decimal, distance: Decimal) -> Decimal:
+    """The stop a long entry at `entry` is sized against at `distance`, a fraction of entry: entry less
+    that fraction, the fraction rounded up and the trigger rounded down onto Alpaca's step
+    (`price_step.stop_trigger_price`, ADR 0030), in this module's own context. `plan_for_loss` sizes
+    against it, and a caller that prices a planned loss at a share of entry calls it too, so the two
+    stops are one computation."""
+    with localcontext(_LOSS):
+        unstepped = entry * distance
+    with localcontext(_STOP):
+        return stop_trigger_price(entry - unstepped)
+
+
+class LossPlan(NamedTuple):
+    """A size and the stop it was sized against. Entry less that stop is the loss per share L the size
+    carries; a caller that protects the entry holds its trigger L under the fill (Mover, S2)."""
+
+    quantity: Quantity
+    stop: Decimal
 
 
 def size_for_loss(
@@ -61,10 +96,32 @@ def size_for_loss(
     flow_cap: Decimal,
     budget: Decimal,
 ) -> Quantity:
-    """Size a long equity entry, flooring to whole shares and refusing by ValueError name.
+    """`plan_for_loss`'s quantity alone, for a caller that sends no stop of its own."""
+    return plan_for_loss(
+        instrument=instrument,
+        entry=entry,
+        distance=distance,
+        planned_loss=planned_loss,
+        flow_cap=flow_cap,
+        budget=budget,
+    ).quantity
 
-    distance is the positive stop distance as a fraction of entry. The stop sized against is the
-    one Alpaca is sent: entry less that fraction, rounded down onto its step by
+
+def plan_for_loss(
+    *,
+    instrument: Equity,
+    entry: Price,
+    distance: Decimal | None,
+    planned_loss: Decimal,
+    flow_cap: Decimal,
+    budget: Decimal,
+) -> LossPlan:
+    """Size a long equity entry, flooring to whole shares and refusing by ValueError name, and return
+    the stop it was sized against with it, so the loss per share the size carries (entry less that
+    stop) is one value for the caller to protect with (the lead's S2 property of 2026-11-12).
+
+    distance is the positive stop distance as a fraction of entry. The stop sized against is entry
+    less that fraction, rounded down onto its step by
     price_step.stop_trigger_price, so shares times entry less that stop never exceed planned_loss.
     planned_loss and budget are amounts in the instrument's quote currency; flow_cap is shares.
     All three amounts are explicit: callers resolve their own account, slot and flow limits.
@@ -72,10 +129,11 @@ def size_for_loss(
 
     An instrument that is not an Equity raises TypeError instrument_invalid. Missing, nonfinite
     or nonpositive distance refuses as distance_unknown; one strictly above 0.10, or a stop that
-    lands past it or at zero once stepped down, refuses as distance_over_ceiling. An entry off
-    Alpaca's step refuses as entry_off_step. A bound or upstream batch that leaves no whole share
-    refuses as size_zero. Other invalid inputs, a planned loss over Money's maximum among them,
-    are named <input>_invalid. A planned loss Money cannot hold at its native precision refuses
+    lands past it once stepped down, refuses as distance_over_ceiling; one that steps down to zero
+    refuses as stop_zero. An entry off Alpaca's step refuses as entry_off_step. A planned loss under
+    one share's loss at the stop refuses as loss_under_one_share; a bound or upstream batch that
+    leaves no whole share refuses as size_zero. Other invalid inputs, a planned loss over Money's
+    maximum among them, are named <input>_invalid. A planned loss Money cannot hold at its native precision refuses
     as planned_loss_precision; the caller rounds its own amount. A cap past upstream's
     QUANTITY_MAX does not bind. Arithmetic runs in this module's own 28-digit context, never the
     caller's, and each rounding goes toward the larger loss or the smaller size.
@@ -108,11 +166,11 @@ def size_for_loss(
         # The stop Alpaca is sent is the trigger rounded down onto its step (price_step, ADR 0030), so a
         # share loses entry less that stop, never the unstepped fraction of entry. A distance computed by
         # division has 28 digits: its loss rounds up and the trigger down, a stop no higher than exact.
-        with localcontext(_LOSS):
-            unstepped = price * distance
-        stop = stop_trigger_price(price - unstepped)
+        stop = sized_stop(price, distance)
         loss_per_share = price - stop  # both on a 4-decimal step: exact
-        if stop <= 0 or loss_per_share > price * DISTANCE_CEILING:
+        if stop <= 0:
+            raise ValueError("stop_zero")
+        if loss_per_share > price * DISTANCE_CEILING:
             raise ValueError("distance_over_ceiling")
 
         # hard_limit is positive upstream (sizing.rs:61-63); refuse an empty cap before calling it.
@@ -123,8 +181,10 @@ def size_for_loss(
             budget_binds = budget < hard_limit * price
         if budget_binds:
             hard_limit = min(hard_limit, budget // price)
-        if hard_limit < 1 or planned_loss < loss_per_share:
+        if hard_limit < 1:
             raise ValueError("size_zero")
+        if planned_loss < loss_per_share:
+            raise ValueError("loss_under_one_share")
 
         stop_loss = Price.from_decimal(stop)
         try:
@@ -143,4 +203,4 @@ def size_for_loss(
     # A sub-share positive risk size batches to zero (sizing.rs:98-103), never a filled-in size.
     if not quantity.is_positive():
         raise ValueError("size_zero")
-    return quantity
+    return LossPlan(quantity, stop)
