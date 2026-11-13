@@ -54,6 +54,18 @@ joined and the task ended in `_disconnect`, each wait bounded by a deadline on t
 task drain at disconnect; a wait that runs out fails the disconnect, logged with its reason. Hooks not overridden here
 raise `NotImplementedError`.
 
+An acceptance the stream brings carries the order's `submitted_at`, as the HTTP answer's does: the
+field is required on alpaca-py's `Order` (c42add7c0a70, trading/models.py:226,269), which a trade update
+holds beside its own `timestamp` (:778-779), and NautilusTrader keeps `OrderAccepted.ts_event` as the
+order's `ts_accepted` (d53849b216e2, crates/model/src/orders/mod.rs:1042-1046). Fills and endings keep
+the update's own time. So an acceptance can be dated before an event already applied (the node's own
+submitted time when its clock runs ahead of Alpaca's, or a refused cancel that came first), as the
+engine's own reconciliation dates one from the venue's report (crates/execution/src/engine/mod.rs:1751).
+Two routes are not covered. A fill that arrives while a cancel or modify is pending and before any
+acknowledgement generates the fill alone, and the engine then dates the acceptance with the fill
+(orders/mod.rs:1413-1415). After a replace, the acceptance carries the replacement's `submitted_at`;
+whether Alpaca gives a replacement its own or its predecessor's is UNVERIFIED.
+
 Instruments at connect: the provider's instruments are handed to the node unless its cache already holds
 them, which it does for whatever the data client loaded, since the node connects data clients and fills
 the cache first (`crates/live/src/node/mod.rs:35-48` at `nautilus-trader@d53849b216e2`). Each instrument
@@ -3174,7 +3186,7 @@ class AlpacaExecutionClient(ExecutionClient):
                 f"Alpaca trade update {event} for {client_order_id} is not mapped in this slice; ignored",
             )
             return
-        self._accept(order, venue_order_id, ts_event)
+        self._accept(order, venue_order_id, dt_to_unix_nanos(alpaca_order.submitted_at))
         if event in FILL_EVENTS:
             await self._fill(order, record, update, venue_order_id, ts_event)
             return  # `_fill` ends the order once its fills reach its quantity
