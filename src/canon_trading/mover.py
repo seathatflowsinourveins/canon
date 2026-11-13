@@ -46,7 +46,10 @@ A composition of upstream parts (ADR 0083, ADR 0088). What each part is, at Naut
   never down, and at the trigger the emulator releases a `LIMIT` through the risk engine. A release
   keeps the submit command's params (`crates/execution/src/order_emulator/emulator.rs:1368` and
   `:1522-1531`; upstream's test of it, `:4513`, covers stop orders), so the `extended_hours` mark is given
-  once, on the submit.
+  once, on the submit. Every protective LIMIT sell carries it, including protection armed in the
+  regular session; the entry's mark still follows `extended_hours`. On paper, one marked DAY limit sell
+  sent in the regular session was accepted and filled (2026-11-13); whether Alpaca keeps one working
+  across 16:00 and overnight is UNVERIFIED.
   T1 (owner/lead, 2026-11-12) selects a fixed entry-price offset, or rc8's
   `AverageTrueRange(period).handle_bar` / `initialized` / `value`
   (`indicators/__init__.pyi:155-185`, `crates/indicators/src/python/volatility/atr.rs`). The engine's
@@ -4333,7 +4336,7 @@ class Mover(Strategy):
             now  # the trigger is kept: a remake that is refused starts the next from it
         )
         self._sale_sent(slot, order, now, kept)
-        self.submit_order(order, params=self.submit_params)
+        self.submit_order(order, params=dict(EXTENDED_HOURS))
 
     def _remade(self, slot: Slot) -> None:
         """Mark the trailing sale `_trail` just sent in place of one canceled for a changed holding or
@@ -4752,7 +4755,7 @@ class Mover(Strategy):
         slot.priced_ns = now
         self._say(f"{slot.instrument_id}: SELL {held} limit {price} (floor {floor})")
         self._sale_sent(slot, order, now, slot.exit_trigger)
-        self.submit_order(order, params=self.submit_params)
+        self.submit_order(order, params=dict(EXTENDED_HOURS))
 
     def _sell_out(self, slot: Slot, held: Decimal, now: int) -> None:
         """The wind-down outside the session: withdraw the entry and the trailing sell, then sell what
