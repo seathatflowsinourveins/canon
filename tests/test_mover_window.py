@@ -925,3 +925,178 @@ def test_a_window_with_the_filter_off_has_no_trade_condition_field(monkeypatch) 
     report = {"mover": {"http_requests": {"to_node_start": {}, "to_window_end": {}}}}
     session_window._snapshot_requests(report)
     assert "trade_conditions" not in report["mover"]
+
+
+@pytest.mark.parametrize("part", ["regular", "pre-market", "after-hours", "overnight"])
+@pytest.mark.parametrize("liquidity", ["original", "thin", "liquid", "cash_falls"])
+def test_selected_tier_account_sizing_trades_and_flattens_in_each_part(
+    part, liquidity, alpaca_bars, monkeypatch, tmp_path
+):
+    """Real BacktestEngine replay; generated trade/quote timing follows test_mover's trade_tape."""
+    budget = Decimal(12500 if liquidity in {"original", "cash_falls"} else 211000)
+    cash = 2 * budget
+    entry_cash = Decimal(5000) if liquidity == "cash_falls" else cash
+    account = SimpleNamespace(
+        get_account=lambda: SimpleNamespace(buying_power=str(4 * budget), cash=str(cash))
+    )
+    allocation = session_window.mover_allocation(cast(TradingClient, account), 2)
+    risk_calls = []
+    real_risk_sizer = mover_module.FixedRiskSizer
+
+    def risk_sizer(*args):
+        risk_calls.append(args)
+        return real_risk_sizer(*args)
+
+    monkeypatch.setattr(mover_module, "FixedRiskSizer", risk_sizer)
+    instrument = alpaca_bars.equity("LLL")
+    start = Decimal("0.700") if liquidity == "thin" else Decimal(10)
+    starts = datetime(2025, 11, 10, 16, tzinfo=UTC)
+    minute = 60_000_000_000
+    ts_start = int(starts.timestamp() * 1_000_000_000)
+    strategy, ranking, cap = mover_parts(
+        instrument.id,
+        # the tape's first price: since the ultra review of the composition (finding 14) a price that
+        # fell after the start leaves the cap where it was, which test_mover's clamp cases cover
+        price=start,
+        move=Decimal("0.25"),
+        computed_at=starts - timedelta(minutes=3),
+        ends=starts + timedelta(minutes=20),
+        entry_notional=allocation.entry_notional,
+        extended=part != "regular",
+        feed=session_window.MOVER_PARTS[part].feed,
+        slots=allocation.slots,
+        wind_down_at=starts + timedelta(minutes=18),
+        market_exit_interval_ms=1000,
+        market_exit_max_attempts=60,
+        trail_rows={"trail_mode": "tier"},
+    )
+    # T1/T2's selected tier row: the window installs each name's baseline normal (session_window);
+    # without one the tape's 12 minutes cannot warm ATR's 14 and nothing enters.
+    strategy.baseline_dollar_volume_per_minute[instrument.id] = Decimal(2_000_000)
+    eng = BacktestEngine(
+        BacktestEngineConfig(
+            trader_id=TraderId("TESTER-001"),
+            risk_engine=RiskEngineConfig(
+                **risk_limits(
+                    instrument.id,
+                    max_notional_per_order=allocation.entry_notional * OUTER_BOUND_MULTIPLE,
+                )
+            ),
+        )
+    )
+    eng.add_venue(
+        instrument.id.venue,
+        OmsType.NETTING,
+        AccountType.CASH,
+        [Money(float(entry_cash), USD)],
+        fee_model=MakerTakerFeeModel(maker_rate=Decimal(0), taker_rate=Decimal(0)),
+        bar_execution=False,
+    )
+    eng.add_instrument(instrument)
+    closes = [10.00, 10.10, 10.20, 10.30, 10.40, 10.50, 10.60, 10.70, 10.46, 10.00, 9.90, 9.80]
+    if liquidity == "thin":
+        closes = [
+            0.700,
+            0.705,
+            0.710,
+            0.715,
+            0.720,
+            0.725,
+            0.730,
+            0.735,
+            0.710,
+            0.690,
+            0.680,
+            0.670,
+        ]
+    volume = {"original": 100_000, "thin": 6842, "liquid": 1_000_000, "cash_falls": 100_000}[
+        liquidity
+    ]
+    # The tape runs on past the wind-down (minute 18), flat at its last close: a gap through the
+    # trail deeper than the 0.02 chase floor rests at the floor for FLOOR_WAIT_SECS before it follows
+    # the bid (the lead's chase_cap = max(trail, 0.02) and floor release, 2026-11-12).
+    closes = closes + [closes[-1]] * 8
+    # T1/T2 refuses an entry whose spread floor (2 quoted spreads) exceeds the 0.02 cap, so the
+    # sub-dollar tape quotes a tenth of a cent each side rather than a cent (2.8% of 0.70).
+    half = 0.01 if closes[0] >= 1 else 0.001
+    data = []
+    for i, close in enumerate(closes):
+        ts_close = ts_start + (i + 1) * minute
+        data.append(
+            TradeTick(
+                instrument.id,
+                Price(close, 4),
+                Quantity.from_int(volume),
+                AggressorSide.BUY,
+                TradeId(f"T-{i}"),
+                ts_close - 2,
+                ts_close - 2,
+            )
+        )
+        data.append(
+            QuoteTick(
+                instrument.id,
+                Price(close - half, 4),
+                Price(close + half, 4),
+                Quantity.from_int(1_000_000),
+                Quantity.from_int(1_000_000),
+                ts_close - 1,
+                ts_close - 1,
+            )
+        )
+    eng.add_data(data)
+    eng.add_strategy(strategy)
+    eng.add_actor(ranking)
+    eng.add_strategy(cap)
+    try:
+        eng.run()
+        orders = eng.cache.orders(strategy_id=MOVER_ID)
+        buys = [order for order in orders if order.side.name == "BUY"]
+        assert len(buys) == 1
+        buy = buys[0]
+        assert buy.price is not None
+        price = buy.price.as_decimal()
+        # The composition's Mover enters on the fourth bar after the ranking reaches its slot, at that
+        # close's ask (one cent over the close); the flow cap reads those four bars' dollar volume.
+        [at] = [
+            i for i, close in enumerate(closes) if Decimal(str(close)) + Decimal(str(half)) == price
+        ]
+        flow_dollars = sum(Decimal(str(close)) for close in closes[at - 3 : at + 1]) * volume
+        budget_shares = min(budget, entry_cash) // price
+        flow_shares = strategy.settings.flow_share * flow_dollars // price
+        expected = int(min(budget_shares, flow_shares))
+        assert not risk_calls, (
+            f"FixedRiskSizer used: {buy.filled_qty} shares instead of the budget's {expected}"
+        )
+        assert buy.filled_qty.as_decimal() == Decimal(expected)
+        assert strategy.settings.max_shares is None
+        assert cap.max_position == allocation.entry_notional // start >= Decimal(expected)
+        assert buy.filled_qty.as_decimal() * buy.price.as_decimal() > Decimal(500)
+        assert not eng.cache.positions_open(strategy_id=MOVER_ID)
+        assert strategy.refused == [] and cap.tripped is None
+        assert all(order.status.name != "DENIED" for order in orders)
+        report = session_window.WindowReport(
+            "regular" if part == "regular" else "extended",
+            "LLL",
+            started="flow-budget-test",
+            mover={"run": strategy.record()},
+        )
+        session_window.write_record(tmp_path, report)
+        saved = json.loads((tmp_path / "latest.json").read_text())
+        [entry] = saved["mover"]["run"]["entries"]
+        sizing = entry["sizing"]
+        assert entry["client_order_id"] == buy.client_order_id.value
+        assert Decimal(sizing["budget_notional"]) == min(budget, entry_cash)
+        assert Decimal(sizing["budget_shares"]) == min(budget, entry_cash) // buy.price.as_decimal()
+        assert Decimal(sizing["startup_budget_notional"]) == budget
+        assert Decimal(sizing["free_cash"]) == entry_cash
+        assert Decimal(sizing["flow_dollars"]) == flow_dollars
+        assert Decimal(sizing["flow_shares"]) == (
+            strategy.settings.flow_share * flow_dollars // buy.price.as_decimal()
+        )
+        assert sizing["binding"] == ("flow" if liquidity == "thin" else "budget")
+        assert sizing["quantity"] == str(expected)
+        if liquidity == "thin":
+            assert flow_shares < budget_shares and expected == 1352
+    finally:
+        eng.dispose()

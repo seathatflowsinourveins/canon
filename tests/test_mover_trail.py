@@ -6,10 +6,13 @@ The existing test_mover fixtures provide an offline cash venue; no credential or
 from collections import deque
 from decimal import Decimal
 from types import SimpleNamespace
+from typing import Any
+from typing import cast
 
 import pytest
 from nautilus_trader.indicators import AverageTrueRange
 from nautilus_trader.model import Bar
+from nautilus_trader.model import ClientOrderId
 from nautilus_trader.model import OrderSide
 from nautilus_trader.model import Price
 from nautilus_trader.model import Quantity
@@ -273,6 +276,88 @@ def test_atr_entries_record_the_frozen_offsets_and_paper_limit():
     eng.dispose()
 
 
+@pytest.mark.parametrize("average", ["10.00", None, "0", "NaN", "Infinity"])
+def test_missing_entry_price_protects_from_cache_average_then_bid_and_counts_each_use(average):
+    seam = Seam("10.50")
+    slot = seam_slot(seam, bought=None)
+    if average is not None:
+        seam.positions = [SimpleNamespace(signed_qty=D(5), avg_px_open=D(average))]
+    source = "position average price" if average == "10.00" else "current bid"
+    anchor = D("10.00") if average == "10.00" else D("10.50")
+    seam._protect(slot, D(5), T0)
+    assert len(seam.sent) == 1 and seam.sent[0].is_emulated
+    assert seam.sent[0].trailing_offset == mover.offsets(anchor, D("0.02"), D("0.005"))[0]
+    seam.refuse(seam.sent[0])
+    seam._protect(slot, D(5), T0 + 5 * SECOND)
+    assert len(seam.sent) == 2
+    assert seam.protection_fallbacks[source] == 2
+    assert sum(seam.protection_fallbacks.values()) == 2
+
+
+def test_a_fill_with_no_known_entry_still_has_a_working_sale(monkeypatch):
+    eng = engine()
+    s = strategy()
+    trail = s._trail
+
+    def lose_entry(slot, held, now):
+        slot.entry_id = None
+        trail(slot, held, now)
+
+    monkeypatch.setattr(s, "_trail", lose_entry)
+    orders = run(eng, s, ranker(rank((AAA, "0.25"))), tape(AAA, RISING))
+    buy = next(o for o in orders if o.side == OrderSide.BUY)
+    sales = [o for o in orders if o.side == OrderSide.SELL]
+    assert buy.filled_qty.is_positive()
+    assert len(sales) == 1 and sales[0].quantity == buy.filled_qty
+    assert s.record()["protection_fallbacks"] == {"position average price": 1, "current bid": 0}
+    eng.dispose()
+
+
+def test_missing_trade_for_a_held_position_holds_a_stop_instead_of_selling_at_once():
+    """The lead's (b): no followed price makes a held stop from the cache average, not a sale."""
+    seam = Seam("10.50", trigger=mover.TriggerType.LAST_PRICE)
+    seam.cache.trade = lambda _: None
+    seam.positions = [SimpleNamespace(signed_qty=D(5), avg_px_open=D("10.00"))]
+    slot = seam_slot(seam, bought=None)
+    seam._protect(slot, D(5), T0)
+    assert seam.sent == [] and not slot.exiting
+    assert slot.held_stop == D("10.00") - mover.offsets(D("10.00"), D("0.02"), D("0.005"))[0]
+
+
+def test_missing_quote_for_a_held_position_sells_from_its_cache_average_after_60_s():
+    seam = Seam("10.50")
+    seam.cache.quote = lambda _: None
+    seam.positions = [SimpleNamespace(signed_qty=D(5), avg_px_open=D("10.00"))]
+    slot = seam_slot(seam, bought=None)
+    seam._protect(slot, D(5), T0)
+    seam._protect(slot, D(5), T0 + 59 * SECOND)
+    assert seam.sent == []
+    seam._protect(slot, D(5), T0 + 60 * SECOND)
+    assert len(seam.sent) == 1 and seam.sent[0].is_open
+    assert seam.sent[0].price == Price.from_str("9.9900")
+    seam.refuse(seam.sent[0])
+    seam._protect(slot, D(5), T0 + 65 * SECOND)
+    assert len(seam.sent) == 2 and seam.sent[1].is_open
+
+
+def test_cached_position_anchor_is_weighted_and_excludes_other_strategies():
+    seam = Seam("10.50")
+    requests = []
+
+    def positions(**kwargs):
+        requests.append(kwargs)
+        return [
+            SimpleNamespace(signed_qty=D(2), avg_px_open=D(10)),
+            SimpleNamespace(signed_qty=D(3), avg_px_open=D(11)),
+        ]
+
+    seam.cache.positions_open = positions
+    slot = seam_slot(seam, bought=None)
+    seam._protect(slot, D(5), T0)
+    assert seam.sent[0].trailing_offset == mover.offsets(D("10.6"), D("0.02"), D("0.005"))[0]
+    assert requests == [{"instrument_id": AAA, "strategy_id": seam.strategy_id}]
+
+
 @pytest.mark.parametrize(
     ("baseline", "bound", "fraction"), [(1000000, "tier", "0.002"), (999999, "atr", "0.004")]
 )
@@ -293,6 +378,82 @@ def test_window_record_notes_state_both_uncalibrated_limits_even_without_an_entr
     assert "tight stops look better on paper than live" in notes
     assert "no outside source" in notes and "ATR multiple" in notes and "spread" in notes
     assert "lead, no primary source" in notes and "UNCALIBRATED" in notes
+
+
+def test_exit_record_uses_release_event_and_all_partial_fills_across_reprices():
+    s = strategy()
+    slot = mover.Slot(AAA, bar_type(AAA), deque(maxlen=4), deque(maxlen=5))
+    s.slots[AAA] = slot
+    slot.entry_record = {"client_order_id": "BUY-1", "stopped_out": False}
+    s._ensure_exit(slot, D(5))
+    slot.protect_id = ClientOrderId("SELL-1")
+    s.on_quote(SimpleNamespace(instrument_id=AAA, bid_price=Price.from_str("11.0000")))
+    s.on_order_released(
+        SimpleNamespace(
+            instrument_id=AAA,
+            client_order_id=slot.protect_id,
+            released_price=Price.from_str("10.0000"),
+            ts_event=T0,
+        )
+    )
+    s.on_order_filled(
+        SimpleNamespace(
+            instrument_id=AAA,
+            client_order_id=slot.protect_id,
+            order_side=OrderSide.SELL,
+            last_qty=Quantity.from_int(2),
+            last_px=Price.from_str("9.9000"),
+            ts_event=T0 + SECOND,
+        )
+    )
+    partial = s.record()["exits"][0]
+    assert partial["final_fill_ns"] is None and partial["trigger_to_final_fill_ms"] is None
+    # A later chase order completes this same exit; the original trigger must survive it.
+    slot.protect_id = ClientOrderId("SELL-2")
+    s.on_order_filled(
+        SimpleNamespace(
+            instrument_id=AAA,
+            client_order_id=slot.protect_id,
+            order_side=OrderSide.SELL,
+            last_qty=Quantity.from_int(3),
+            last_px=Price.from_str("9.8000"),
+            ts_event=T0 + 7 * SECOND,
+        )
+    )
+    (row,) = s.record()["exits"]
+    assert row["trigger_ns"] == T0 and D(row["trigger_price"]) == D(10)
+    assert row["final_fill_ns"] == T0 + 7 * SECOND and row["trigger_to_final_fill_ms"] == 7000
+    assert D(row["fill_vwap"]) == D("9.84")
+    assert D(row["slip_fraction"]) == D("0.016") and D(row["slip_dollars"]) == D("0.80")
+    assert D(row["peak_giveback_dollars"]) == D("5.80")
+    assert slot.entry_record["stopped_out"] is True
+
+
+def test_exit_timing_is_recorded_when_the_emulator_releases_and_fills_between_steps():
+    eng = engine()
+    s = strategy()
+    run(eng, s, ranker(rank((AAA, "0.25"))), tape(AAA, RISING + [10.46, 10.0, 9.9]))
+    (row,) = s.record()["exits"]
+    fills = [f for f in s.fills if f[1] == "SELL"]
+    assert row["trigger_ns"] == T0 + 9 * MINUTE - 1
+    assert row["final_fill_ns"] == max(f[4] for f in fills)
+    assert row["trigger_to_final_fill_ms"] == 0
+    assert D(row["trigger_price"]) == D("10.45")
+    quantity = sum((D(f[2]) for f in fills), D(0))
+    vwap = sum((D(f[2]) * D(f[3]) for f in fills), D(0)) / quantity
+    assert D(row["fill_vwap"]) == vwap
+    assert D(row["peak_price"]) == D("10.69")
+    assert D(row["peak_giveback_dollars"]) == (D("10.69") - vwap) * quantity
+    assert s.record()["entries"][0]["stopped_out"] is True
+    eng.dispose()
+
+
+def test_exit_record_retains_a_zero_trigger_observation_without_dividing_by_zero():
+    row = mover.ExitRecord(
+        AAA, "BUY-1", D(1), filled=D(1), notional=D(10), trigger_ns=T0, trigger_price=D(0)
+    )
+    record = row.record()
+    assert record["trigger_price"] == "0" and record["slip_fraction"] is None
 
 
 def test_chase_uses_the_entry_plans_scaled_cap():
@@ -352,6 +513,83 @@ def held(bid="0", **rows):
     return seam, slot
 
 
+def test_one_sided_quote_at_fill_makes_no_sale_and_leaves_a_working_held_stop():
+    seam, slot = held()
+    seam._protect(slot, D(5), T0)
+    distance = mover.offsets(D("10.00"), D("0.02"), D("0.005"))[0]
+    assert seam.sent == [] and not slot.exiting
+    assert slot.held_stop == D("10.00") - distance
+    assert slot.entry_record["protect_path"] == "held_stop"
+
+
+def test_a_print_through_the_held_stop_sells_at_once_and_names_its_source():
+    seam, slot = held()
+    seam._protect(slot, D(5), T0)
+    seam.cache.trade = lambda _: SimpleNamespace(price=Price.from_str("9.7900"))
+    seam._protect(slot, D(5), T0 + 5 * SECOND)
+    assert len(seam.sent) == 1 and seam.sent[0].price == Price.from_str("9.7800")
+    assert slot.exiting and slot.exit_record.trigger_reason == "held stop (last trade)"
+    assert slot.entry_record["protect_path"] == "held_stop"
+    assert slot.entry_record["held_stop_secs"] == 5
+    assert slot.entry_record["held_stop_trigger"] == "last trade"
+
+
+def test_with_no_trade_feed_the_held_stop_is_checked_on_the_minute_close():
+    seam, slot = held()
+    slot.closes = deque([D("9.90")], maxlen=4)
+    seam._protect(slot, D(5), T0)
+    assert seam.sent == []
+    slot.closes.append(D("9.70"))
+    seam._protect(slot, D(5), T0 + MINUTE)
+    assert len(seam.sent) == 1 and slot.exit_record.trigger_reason == "held stop (minute close)"
+
+
+def test_no_two_sided_quote_within_60_s_sells_by_limit_and_counts_an_unpriced_exit():
+    seam, slot = held()
+    seam._protect(slot, D(5), T0)
+    seam._protect(slot, D(5), T0 + 59 * SECOND)
+    assert seam.sent == []
+    seam._protect(slot, D(5), T0 + 60 * SECOND)
+    assert len(seam.sent) == 1 and seam.sent[0].is_open
+    assert slot.exit_record.trigger_reason == "unpriced_exit"
+    assert slot.entry_record["protect_path"] == "unpriced_exit"
+    assert slot.entry_record["held_stop_secs"] == 60
+    assert seam.protect_paths["unpriced_exit"] == 1
+
+
+def test_a_two_sided_quote_releases_the_held_stop_into_the_normal_trail():
+    seam, slot = held()
+    seam._protect(slot, D(5), T0)
+    seam.bid = "10.10"
+    seam._protect(slot, D(5), T0 + 10 * SECOND)
+    assert len(seam.sent) == 1 and seam.sent[0].kind == "TRAILING"
+    assert slot.held_stop is None
+    assert slot.entry_record["protect_path"] == "trail"
+    assert slot.entry_record["held_stop_secs"] == 10
+
+
+def test_a_trail_with_no_price_at_all_is_noted_and_retried_not_raised():
+    """High review: an anchorless trail raised from the step timer and stopped every slot."""
+    seam = Seam("0", trigger=mover.TriggerType.LAST_PRICE)
+    seam.cache.trade = lambda _: SimpleNamespace(price=Price.from_str("10.0000"))
+    slot = seam_slot(seam, bought=None)
+    seam._protect(slot, D(5), T0)
+    assert seam.sent == []
+    assert any("no entry, position average price" in n for n in seam.dropped)
+
+
+def test_ratchet_tightens_from_the_protection_anchor_when_the_entry_price_is_unknown():
+    seam = Seam("10.50", trail_mode="ratchet")
+    seam.cache.quote = lambda _: SimpleNamespace(
+        bid_price=Price.from_str("10.5000"), ask_price=Price.from_str("10.5100")
+    )
+    slot = seam_slot(seam, bought=None)
+    slot.protection_anchor = D("10.00")
+    slot.initial_trail = mover.TrailPlan(D("0.02"), D("0.005"), D("0.02"), None, None, "atr", None)
+    assert mover.Mover._ratchet(cast(Any, seam), slot, T0) is True
+    assert slot.trail_plan is not None and slot.trail_plan.trail < D("0.02")
+
+
 def test_unusable_entry_spread_falls_back_to_the_configured_fixed_plan():
     s, slot, _ = warmed("atr", trail=D("0.03"), exit_through=D("0.01"), chase_cap=D("0.03"))
     plan = s._entry_trail(slot, D(10), SimpleNamespace(ask_price=Price.from_str("10.0000")))
@@ -392,6 +630,16 @@ def test_a_replay_expected_to_enter_does_enter_under_the_default_rows():
     assert len(buys) == 1 and buys[0].filled_qty.is_positive()
     assert len(s.record()["entries"]) == 1
     eng.dispose()
+
+
+def test_exit_record_states_the_slip_beyond_the_trail_level_in_percent():
+    """The lead, 2026-11-12: per exit, the fill against the trigger level, in percent."""
+    row = mover.ExitRecord(
+        AAA, "BUY-1", D(10), filled=D(10), notional=D(98), trigger_ns=T0, trigger_price=D(10)
+    )
+    assert D(row.record()["slip_beyond_trail_pct"]) == D(2)
+    row.trigger_price = None
+    assert row.record()["slip_beyond_trail_pct"] is None
 
 
 def test_a_cold_atr_entry_records_its_trail_source_and_a_warm_one_its_bound():
@@ -443,3 +691,174 @@ def test_the_startup_baseline_reads_a_record_whose_sample_or_inputs_are_null():
     record = {"inputs": {"dvol": 600, "dvol_ratio": 2}, "sample": None, "elapsed_minutes": 3}
     assert mover.baseline_per_minute(record) == D(100)
     assert mover.baseline_per_minute({"inputs": None, "sample": None}) is None
+
+
+def test_an_exit_still_unfilled_at_the_wind_down_records_that_it_waited_and_for_how_long():
+    """Coordinator, 2026-11-12: a gap deeper than the chase floor waits for the wind-down; say so."""
+    s = strategy()
+    waiting, untriggered, sold = (
+        mover.ExitRecord(AAA, "BUY-1", D(10), trigger_ns=T0, trigger_reason="trailing stop"),
+        mover.ExitRecord(BBB, "BUY-2", D(10)),
+        mover.ExitRecord(AAA, "BUY-3", D(10), filled=D(10), trigger_ns=T0, final_fill_ns=T0 + 1),
+    )
+    for instrument, row in ((AAA, waiting), (BBB, untriggered)):
+        slot = mover.Slot(instrument, bar_type(instrument), deque(maxlen=4), deque(maxlen=5))
+        slot.exit_record = row
+        s.slots[instrument] = slot
+    s.exits.extend([waiting, untriggered, sold])
+    s._wind_down(cast(Any, SimpleNamespace(ts_event=T0 + 5 * MINUTE)))
+    assert s.winding_down
+    record = waiting.record()
+    assert record["waited_for_wind_down"] is True and record["wind_down_wait_minutes"] == 5
+    for row in (untriggered, sold):
+        assert row.record()["waited_for_wind_down"] is False
+        assert row.record()["wind_down_wait_minutes"] is None
+
+
+def test_a_sale_resting_at_its_floor_for_60_s_drops_the_floor_and_follows_the_bid():
+    """The lead's (b), 2026-11-12: a gap deeper than the chase floor no longer waits for the wind-down."""
+    seam = Seam("9.50")
+    slot = seam_slot(seam)
+    slot.exiting, slot.floor = True, D("9.80")
+    slot.exit_record = mover.ExitRecord(AAA, "E-1", D(5), trigger_ns=T0, trigger_price=D("9.95"))
+    sale = seam._limit(AAA, OrderSide.SELL, Quantity.from_int(5), Price.from_str("9.80"))
+    seam.orders[sale.client_order_id.value] = sale
+    slot.protect_id = sale.client_order_id
+    seam._protect(slot, D(5), T0 + 100 * SECOND)
+    seam._protect(slot, D(5), T0 + 159 * SECOND)
+    assert seam.canceled == []
+    seam._protect(slot, D(5), T0 + 160 * SECOND)
+    assert seam.canceled == [sale.client_order_id.value]
+    sale.is_closed, sale.is_open = True, False
+    seam._protect(slot, D(5), T0 + 161 * SECOND)
+    assert seam.sent[-1].price == Price.from_str("9.4900") and slot.floor is None
+    record = slot.exit_record.record()
+    assert record["floor_released"] is True and record["floor_wait_secs"] == 60
+
+
+def test_a_chased_sale_with_no_bid_is_remade_from_the_last_price_never_back_up_at_the_entry():
+    """Fix-round review: with no positive bid the remake fell back to the entry's average fill."""
+    seam, slot = held()
+    seam._protect(slot, D(5), T0)
+    seam.cache.trade = lambda _: SimpleNamespace(price=Price.from_str("9.7900"))
+    seam._protect(slot, D(5), T0 + 5 * SECOND)  # through the held stop: sold from 9.79
+    first = seam.sent[-1]
+    assert first.price == Price.from_str("9.7800")
+    seam.refuse(first)
+    seam.cache.trade = lambda _: None
+    seam._protect(slot, D(5), T0 + 11 * SECOND)  # resent with no bid and no trade
+    assert len(seam.sent) == 2
+    assert seam.sent[-1].price.as_decimal() <= first.price.as_decimal()
+
+
+def test_a_hold_that_begins_after_the_holding_was_trailed_counts_its_60_s_from_its_own_start():
+    """Fix-round review: a quote gap long after the fill sold at once as an unpriced exit."""
+    seam, slot = held(bid="10.10")
+    seam.fills.append(("E-1", OrderSide.BUY.name, "5", "10.00", T0))
+    slot.entry_id = SimpleNamespace(value="E-1")
+    seam.orders["E-1"].client_order_id = slot.entry_id
+    seam._protect(slot, D(5), T0)
+    assert seam.sent[-1].kind == "TRAILING"
+    seam.refuse(seam.sent[-1])
+    seam.bid = "0"
+    seam._protect(slot, D(5), T0 + 10 * MINUTE)
+    assert len(seam.sent) == 1 and not slot.exiting
+    seam._protect(slot, D(5), T0 + 10 * MINUTE + 59 * SECOND)
+    assert len(seam.sent) == 1
+    seam._protect(slot, D(5), T0 + 11 * MINUTE)
+    assert len(seam.sent) == 2 and slot.exit_record.trigger_reason == "unpriced_exit"
+
+
+def test_the_floor_wait_restarts_when_the_bid_recovers_above_the_floor():
+    """Fix-round review: a later dip released the floor without 60 s at it."""
+    seam = Seam("9.50")
+    slot = seam_slot(seam)
+    slot.exiting, slot.floor = True, D("9.80")
+    sale = seam._limit(AAA, OrderSide.SELL, Quantity.from_int(5), Price.from_str("9.80"))
+    seam.orders[sale.client_order_id.value] = sale
+    slot.protect_id = sale.client_order_id
+    seam._protect(slot, D(5), T0 + 100 * SECOND)  # at the floor, bid through it
+    seam.bid = "9.95"
+    seam._protect(slot, D(5), T0 + 130 * SECOND)  # recovered: no longer through
+    seam.bid = "9.50"
+    seam._protect(slot, D(5), T0 + 165 * SECOND)  # 65 s after the first sighting, 0 s after this
+    assert seam.canceled == []
+
+
+def test_a_held_stop_sale_marks_the_entry_stopped_out():
+    seam, slot = held()
+    seam._protect(slot, D(5), T0)
+    seam.cache.trade = lambda _: SimpleNamespace(price=Price.from_str("9.7900"))
+    seam._protect(slot, D(5), T0 + 5 * SECOND)
+    assert slot.entry_record["stopped_out"] is True
+
+
+# --- the landing review of P0b (high) --------------------------------------------------------------
+
+
+def test_a_held_stop_after_a_reached_trigger_holds_at_that_trigger_on_alpacas_step():
+    """A trailed holding whose sale was canceled at a reached 11.765 trigger, then held on a one-sided
+    quote, keeps that trigger (rounded down to 11.76, main's price-step rule), not the fill less the
+    trail."""
+    seam, slot = held()
+    slot.trailed, slot.trail_trigger = True, D("11.765")
+    seam._protect(slot, D(5), T0)
+    assert seam.sent == [] and slot.held_stop == D("11.76")
+    seam.cache.trade = lambda _: SimpleNamespace(price=Price.from_str("11.7000"))
+    seam._protect(slot, D(5), T0 + 5 * SECOND)
+    assert len(seam.sent) == 1 and slot.exit_record.trigger_reason == "held stop (last trade)"
+
+
+def test_a_sale_is_not_chased_and_its_floor_not_released_while_the_bid_is_zero():
+    seam = Seam("0")
+    slot = seam_slot(seam)
+    slot.exiting, slot.floor = True, D("9.80")
+    slot.exit_record = mover.ExitRecord(AAA, "E-1", D(5), trigger_ns=T0, trigger_price=D("9.95"))
+    sale = seam._limit(AAA, OrderSide.SELL, Quantity.from_int(5), Price.from_str("9.90"))
+    seam.orders[sale.client_order_id.value] = sale
+    slot.protect_id = sale.client_order_id
+    for secs in (100, 160, 230):
+        seam._protect(slot, D(5), T0 + secs * SECOND)
+    assert seam.canceled == []
+    sale.price = Price.from_str("9.80")
+    for secs in (300, 361, 430):
+        seam._protect(slot, D(5), T0 + secs * SECOND)
+    assert seam.canceled == [] and slot.floor == D("9.80") and not slot.floor_released
+
+
+def test_a_one_sided_quote_leaves_the_last_positive_bid():
+    s = strategy()
+    slot = mover.Slot(AAA, bar_type(AAA), deque(maxlen=4), deque(maxlen=5))
+    s.slots[AAA] = slot
+    s.on_quote(SimpleNamespace(instrument_id=AAA, bid_price=Price.from_str("10.0000")))
+    s.on_quote(SimpleNamespace(instrument_id=AAA, bid_price=Price.from_str("0")))
+    assert slot.last_bid == D("10.0000")
+
+
+def test_the_trail_constants_and_slot_fields_carry_their_own_docstrings():
+    import ast
+    import inspect
+
+    tree = ast.parse(inspect.getsource(mover))
+    body = tree.body
+    documented = {}
+    for i, node in enumerate(body[:-1]):
+        nxt = body[i + 1]
+        if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name):
+            is_doc = isinstance(nxt, ast.Expr) and isinstance(nxt.value, ast.Constant)
+            documented[node.targets[0].id] = nxt.value.value if is_doc else None
+    assert "held stop" in str(documented["HOLD_MOST_SECS"])
+    assert "chase floor" in str(documented["FLOOR_WAIT_SECS"])
+    assert documented["TRAIL_CAP"] is not None
+
+    def is_text(stmt):
+        return isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Constant)
+
+    doubled = [
+        (cls.name, after.lineno)
+        for cls in body
+        if isinstance(cls, ast.ClassDef) and cls.name in ("Slot", "ExitRecord")
+        for before, after in zip(cls.body, cls.body[1:], strict=False)
+        if is_text(before) and is_text(after)
+    ]
+    assert doubled == []

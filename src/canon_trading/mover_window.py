@@ -404,6 +404,7 @@ def mover_parts(
     market_exit_max_attempts: int,
     slots: int = 1,
     entry_notional: Decimal = ENTRY_NOTIONAL_USD,
+    trail_rows: Mapping[str, Any] | None = None,
 ) -> tuple[Mover, FixedRank, PositionCap]:
     """`Mover` on the one name a window chose, the actor that publishes that choice as the ranking, and
     the position cap at the shares the largest entry buys at `price`. `move` is the name's move from its
@@ -427,6 +428,7 @@ def mover_parts(
         rank_max_age_secs=max(1, math.ceil((ends - computed_at).total_seconds())),
         entry_notional=entry_notional,
         size_from_budget=True,
+        trail_rows=trail_rows,
     )
     ranking = FixedRank()
     ranking.value = format_rank([(instrument_id, move)])
