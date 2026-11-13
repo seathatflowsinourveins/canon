@@ -65,6 +65,10 @@ paper, pre-market and after-hours so far (Sessions, feeds and what paper has sho
 | Overnight eligibility | An overnight window starts only on an asset Alpaca marks `overnight_tradable` and not `overnight_halted`, read raw (alpaca-py 0.45.0's `Asset` has no such field), as a boolean (the 24/5 page's "boolean attributes") or a value of `attributes` (the asset reference; what paper showed), else refused by name | Alpaca's 24/5 page: "Assets tradable in the overnight session can be identified via the `overnight_tradable` attribute" |
 | Data in the record | The quotes, trades and live bars that reached the strategy, and the adapter's own stream lines from the node's log; failed when the stream delivered no quote and no trade, or the adapter logged a stream error; a quiet market (quotes, no bar) is ok | No upstream: the adapter reports a refused or ended stream only in the log (ADR 0055) |
 
+2026-11-13: for a node that carries a long across session parts, ADR 0146 (proposed) amends the row "A
+window's length and schedule": such a node runs its feed's whole span, 04:00-20:00 on `sip` and
+20:00-04:00 on `boats`, not at most 60 minutes. Every other window keeps the bound.
+
 **Sessions, feeds and what paper has shown** (`session_window.SESSION_FEEDS`), and what each firing of the
 schedule (ADR 0050, `--session auto`) does in each, New York time. A part where the feeds were probed on
 paper and none delivered has no feed and is skipped, naming the probe and its date, as the lead decided on
