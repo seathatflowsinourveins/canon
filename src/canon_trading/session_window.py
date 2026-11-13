@@ -3081,6 +3081,14 @@ def run_window(
                     f"{part}'s {slots_in_use} slots plus {config.spares} spares exceed the "
                     f"ranking interface's {MOVER_CHECKS} names"
                 )
+    # Decide before the account, baseline and ranking reads: a three-minute stream sample on the
+    # closing feed would otherwise keep this firing busy beyond 20:00/04:00, delaying the next feed.
+    # Session bounds are Alpaca Calendar.session_open/session_close (alpaca-py c42add7c0a70,
+    # alpaca/trading/models.py:427-446); the existing end margin and wind-down still apply.
+    now = clock.timestamp.astimezone(NEW_YORK)
+    seconds, shortened = window_seconds(config.minutes, (end_of_session - now).total_seconds())
+    if seconds <= FLATTEN_SECS + 1:
+        raise WindowSkipped(f"under {FLATTEN_SECS + END_MARGIN_SECS} s left in the session")
     try:  # the slow average's bars and the spare ones, in the bar type's own interval
         history_from = warm_up_start(
             part,
@@ -3333,10 +3341,6 @@ def run_window(
             reference_read, reference_notes, REFERENCES_BEFORE_NODE_SECS
         )
 
-    now = clock.timestamp.astimezone(NEW_YORK)
-    seconds, shortened = window_seconds(config.minutes, (end_of_session - now).total_seconds())
-    if seconds <= FLATTEN_SECS + 1:
-        raise WindowSkipped(f"under {FLATTEN_SECS + END_MARGIN_SECS} s left in the session")
     # Absolute times, taken from Alpaca's clock: start-up eats into the window, not into the wind-down.
     ends = clock.timestamp.astimezone(UTC) + timedelta(seconds=seconds)
     seconds -= time.monotonic() - read_at  # what the reads since the clock read have left
@@ -4893,7 +4897,9 @@ def resolve_session(
     open now and `strategy` runs in it (`WINDOW_STRATEGIES`), in a part with a feed for the window: for a
     `mover` window one of `MOVER_PARTS` (`no_mover_form`), whatever `SESSION_FEEDS` gives the part's
     other windows, so a part with no mover data row has nothing to run rather than a refusal at every
-    firing; else nothing. The schedule fires on a timer and leaves this choice to Alpaca's clock."""
+    firing; else nothing. An extended part without room for the end margin and wind-down is skipped
+    before preflight, so its ranking sample cannot delay the next feed's firing. The schedule fires on
+    a timer and leaves this choice to Alpaca's clock."""
     if clock.is_open:
         return "regular", "Alpaca's clock says the regular session is open"
     if "extended" not in (runs := WINDOW_STRATEGIES[strategy]).sessions:
@@ -4904,14 +4910,141 @@ def resolve_session(
             "the regular session is closed and extended windows are not on (EXTENDED_READY)",
         )
     try:
-        _, part = session_part("extended", clock, calendar)
+        ends, part = session_part("extended", clock, calendar)
         if not mover:
             window_feed(part)
     except RuntimeError as e:  # `WindowSkipped` among them: a part with no feed (`SESSION_FEEDS`)
         return None, str(e)
     if mover and (no_form := no_mover_form(part)) is not None:
         return None, f"the regular session is closed, and {no_form}"
+    if (ends - clock.timestamp).total_seconds() <= END_MARGIN_SECS + FLATTEN_SECS + 1:
+        return None, f"under {FLATTEN_SECS + END_MARGIN_SECS} s left in the session"
     return "extended", f"outside the regular session, in its {part} part"
+
+
+HANDOVER_POLICY_ENV = "CANON_FEED_HANDOVER"
+"""Stream-limit branch: serial (b), the default; overlap (a) requires a preparation process.
+
+The paper task holds B's account and market-data stream locks for this entire process.
+Overlap cannot be enabled by removing either execution lock (ADR 0069).
+"""
+
+
+NOT_MEASURED = "seconds a holding is without an armed stop"
+
+
+class FeedHandoverLog(logging.Handler):
+    """Measure the stream gap at a feed change from the SDK's lifecycle log, not a stop request:
+    one data stream's stop to the next one's authentication, usually the Mover's ranking sample in
+    the next window. It is not `NOT_MEASURED`, which this does not observe.
+
+    Contract: alpaca-py c42add7c0a70, alpaca/data/live/websocket.py:224-230 logs
+    `connected to` after authentication; :267-269 closes the websocket on stop,
+    then :515-518 logs `data stream stopped`. CPython b703b2c5e704,
+    Doc/library/logging.rst:604-635,1008: a handler receives serialized LogRecords
+    with their creation time. This measures those observations, not order re-arm.
+    State is observability only: no holding, quantity, order or credential is saved, and a
+    failure here is said on stderr and never changes the window's exit code. A state file that
+    cannot be read is overwritten by the next observation.
+    """
+
+    def __init__(self, log_dir: Path) -> None:
+        super().__init__(logging.INFO)
+        self.log_dir = log_dir
+        self.feeds: dict[int, str] = {}
+        self.error: str | None = None
+
+    def emit(self, record: logging.LogRecord) -> None:
+        message = record.getMessage()
+        connected = re.fullmatch(
+            r"connected to wss://stream\.data\.alpaca\.markets/(?:v2|v1beta1)/(sip|boats)",
+            message,
+        )
+        if record.thread is None or (connected is None and message != "data stream stopped"):
+            return
+        try:
+            state_path = self.log_dir / "feed-stream-state.json"
+            if connected is not None:
+                feed = connected[1]
+                self.feeds[record.thread] = feed
+                previous = self._previous(state_path)
+                if previous is not None and previous["feed"] != feed:
+                    elapsed = record.created - previous["at_epoch"]
+                    gap = (
+                        round(elapsed, 6)
+                        if previous["state"] == "closed" and math.isfinite(elapsed) and elapsed >= 0
+                        else None
+                    )
+                    measured = {
+                        "policy": "serial",
+                        "from_feed": previous["feed"],
+                        "to_feed": feed,
+                        "metric": "stream_stopped_to_stream_authenticated",
+                        "not_measured": NOT_MEASURED,
+                        "gap_seconds": gap,
+                        "stopped_at_epoch": previous["at_epoch"] if gap is not None else None,
+                        "authenticated_at_epoch": record.created,
+                        "status": "measured"
+                        if gap is not None
+                        else "UNVERIFIED: no observed close or the wall clock moved backwards",
+                    }
+                    write_atomically(self.log_dir / "feed-stream-gap.json", json.dumps(measured))
+                    print(
+                        f"feed-stream-gap: {previous['feed']} -> {feed} policy=serial "
+                        f"gap_seconds={gap if gap is not None else 'UNVERIFIED'} "
+                        "metric=stream_stopped_to_stream_authenticated, "
+                        f"not the {NOT_MEASURED}",
+                        flush=True,
+                    )
+                state = "open"
+            else:
+                feed = self.feeds.pop(record.thread, None)
+                if feed is None:  # a stream never observed authenticated proves no close
+                    return
+                state = "closed"
+            self.log_dir.mkdir(parents=True, exist_ok=True)
+            write_atomically(
+                state_path,
+                json.dumps({"feed": feed, "state": state, "at_epoch": record.created}),
+            )
+        except (OSError, ValueError, TypeError, KeyError) as error:
+            self._failed(error)
+
+    def _previous(self, state_path: Path) -> dict | None:
+        """The last observation, or None when there is none or it cannot be read; an unreadable one
+        is said and then overwritten by this observation."""
+        if not state_path.exists():
+            return None
+        try:
+            previous = json.loads(state_path.read_text())
+            if (
+                not isinstance(previous, dict)
+                or not {"feed", "state", "at_epoch"} <= previous.keys()
+            ):
+                raise ValueError("the state file does not hold feed, state and at_epoch")
+        except (OSError, ValueError) as error:
+            self._failed(error)
+            return None
+        return previous
+
+    def _failed(self, error: Exception) -> None:
+        self.error = f"feed-stream-gap measurement failed: {type(error).__name__}: {error}"
+        print(self.error, file=sys.stderr, flush=True)
+
+
+@contextlib.contextmanager
+def feed_handover_log(log_dir: Path) -> Generator[FeedHandoverLog]:
+    handler = FeedHandoverLog(log_dir)
+    logger = logging.getLogger(STREAM_LOGGER)
+    level = logger.level
+    logger.setLevel(logging.INFO)
+    logger.addHandler(handler)
+    try:
+        yield handler
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(level)
+        handler.close()
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -4923,9 +5056,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     except RuntimeError as e:  # no folder for the records: nothing is read or written
         print(f"paper:session: {e}", file=sys.stderr)
         return 1
+    policy = os.environ.get(HANDOVER_POLICY_ENV, "serial")
+    if policy != "serial":
+        reason = (
+            "overlap requires a separate data-only preparation process before B's account and "
+            "stream locks; this runner has no such path"
+            if policy == "overlap"
+            else f"{HANDOVER_POLICY_ENV} must be serial or overlap, got {policy!r}"
+        )
+        print(f"paper:session: refused: {reason}", file=sys.stderr)
+        return 1
     code = 1
     try:
-        with window_signals():
+        with feed_handover_log(args.log_dir), window_signals():
             code = _main(args)
             if (
                 _SIGNALS.first is not None
