@@ -15,6 +15,7 @@
   },
   "showThinkingSummaries": true,
   "syncClaudeAiSkills": false,
+  "syncClaudeAiPlugins": false,
   "disableClaudeAiConnectors": true,
   "autoCompactWindow": 300000,
   "statusLine": {
