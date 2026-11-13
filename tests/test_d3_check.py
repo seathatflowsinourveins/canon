@@ -14,6 +14,7 @@ import subprocess
 import sys
 from decimal import ROUND_FLOOR
 from decimal import Decimal
+from decimal import localcontext
 from itertools import product
 from pathlib import Path
 from typing import Any
@@ -94,7 +95,7 @@ def record() -> dict[str, Any]:
                                 "sent_ns": 2_000_000_000,
                                 "trailing_offset": "0.20",
                                 "limit_offset": "0.25",
-                                "distance": "0.20",
+                                "distance_in_force": "0.20",
                                 "kept_trigger": "9.80",
                                 "spread": "0.05",
                                 "outcome": "filled",
@@ -354,7 +355,7 @@ def test_named_drops_supply_refusals_when_structured_rows_are_absent(record):
     assert any("dropped" in p for p in term(result, "A1").paths)
 
 
-def test_new_refusals_supersede_dropped(record):
+def test_refusal_rows_and_dropped_are_both_read(record):
     run = record["mover"]["run"]
     run["refusals"] = [
         {
@@ -367,10 +368,12 @@ def test_new_refusals_supersede_dropped(record):
             "last_ns": 10,
         }
     ]
-    run["dropped"] = ["not the refusal channel"]
+    run["dropped"] = ["AAA.ALPACA: a note, not a named refusal"]
     result = checker().check(record)
     assert term(result, "A1").status == "met"
-    assert not any("dropped" in p for p in term(result, "A1").paths)
+    # mover.py:4004: the two lists hold different refusals, so `dropped` is read beside the rows
+    assert any("dropped" in p for p in term(result, "A1").paths)
+    assert term(result, "A1").counts["named_refusals"] == 1
 
 
 WRITER_REFUSAL = {"when_ns": 10, "instrument_id": "AAA.ALPACA", "decisions": 1, "last_ns": 10}
@@ -764,7 +767,7 @@ def test_every_remake_is_checked_and_first_bad_value_is_kept(record):
 def test_missing_sale_then_bad_sale_still_fails(record):
     sales = record["mover"]["run"]["exits"][0]["sales"]
     sales.append(dict(sales[0], trailing_offset="0.10"))
-    del sales[0]["distance"]
+    del sales[0]["distance_in_force"]
     assert term(checker().check(record), "A3").status == "failed"
 
 
@@ -1485,3 +1488,427 @@ def test_an_empty_or_multiline_http_replace_refusal_breaks_a7(record, reason):
     result = checker().check(record)
     assert term(result, "A7").status == "failed"
     assert (result.summary, result.exit_code) == ("breaks", 1)
+
+
+def test_an_exit_that_understates_the_bought_shares_fails_a5(record):
+    change(record, [*EXIT, "quantity"], "4")
+    change(record, [*EXIT, "filled_quantity"], "4")
+    result = checker().check(record)
+    assert term(result, "A5").status == "failed"
+    assert (result.summary, result.exit_code) == ("breaks", 1)
+
+
+@pytest.mark.parametrize(
+    "arm,summary,code", [("F2", "practice (finding: A5)", 5), ("OWN1", "breaks", 1)]
+)
+def test_a_bought_holding_with_no_exit_fails_a5_whatever_its_fill_clock(record, arm, summary, code):
+    record["arm"] = arm
+    record["mover"]["run"]["fills"][0][4] = None
+    record["mover"]["run"]["exits"] = []
+    result = checker().check(record)
+    assert term(result, "A5").status == "failed"
+    assert (result.summary, result.exit_code) == (summary, code)
+
+
+def test_an_unread_exit_quantity_leaves_an_open_remainder_not_shown_in_a5(record):
+    del record["mover"]["run"]["exits"][0]["filled_quantity"]
+    change(record, [*EXIT, "final_fill_ns"], None)
+    record["mover"]["result"]["by_instrument"]["SYN.ALPA"]["open_shares"] = "5"
+    record["mover"]["result"]["flat"] = None
+    result = checker().check(record)
+    a5 = term(result, "A5")
+    assert a5.status == "not shown"
+    assert a5.first_failure is None
+    assert term(result, "A6").status == "failed"  # the recorded open five still breach flatness
+
+
+@pytest.mark.parametrize(
+    "arm,summary,code", [("F2", "practice (finding: A2)", 5), ("OWN1", "breaks", 1)]
+)
+def test_an_oversized_entry_claiming_max_shares_fails_a2(record, arm, summary, code):
+    record["arm"] = arm
+    sizing = record["mover"]["run"]["entries"][0]["sizing"]
+    sizing.update(quantity="50", notional="500", held_by="max_shares")
+    if arm == "OWN1":
+        matched_spread(record["mover"]["run"]["entries"][0])
+    result = checker().check(record)
+    assert term(result, "A2").status == "failed"
+    assert (result.summary, result.exit_code) == (summary, code)
+
+
+def test_a_wrong_trailing_offset_fails_a3_without_a_limit_offset(record):
+    record["arm"] = "F2"
+    sale = record["mover"]["run"]["exits"][0]["sales"][0]
+    sale.update(trailing_offset="0.10", limit_offset=None, distance_in_force="0.20")
+    result = checker().check(record)
+    assert term(result, "A3").status == "failed"
+    assert (result.summary, result.exit_code) == ("practice (finding: A3)", 5)
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        {"reason": "floor_over_cap", "distance": None, "cap": "0.02", "when_ns": 10},
+        {"reason": "distance_over_cap", "distance": "0.01", "cap": "0.02", "when_ns": 10},
+        {"reason": "reentry_max", "reentry_max": None, "reentries": 0, "when_ns": 10},
+        {"reason": "reentry_max", "reentry_max": 3, "reentries": 1, "when_ns": 10},
+    ],
+)
+def test_a_refusal_row_with_null_or_contradictory_numbers_is_not_shown(record, row):
+    record["mover"]["run"]["refusals"] = [row]
+    assert term(checker().check(record), "A1").status == "not shown"
+
+
+def test_a_planless_buy_with_an_unread_clock_leaves_a1_and_a2_not_shown(record):
+    record["mover"]["run"]["entries"] = []
+    record["mover"]["run"]["fills"][0][4] = None
+    result = checker().check(record)
+    assert term(result, "A1").status == "not shown"
+    assert term(result, "A2").status == "not shown"
+
+
+@pytest.mark.parametrize("structured", [False, True])
+@pytest.mark.parametrize("fixed", [False, True])
+def test_the_venues_sub_penny_rejection_fails_a7(record, structured, fixed):
+    # mover.py:1484-1494 names Alpaca's own rejection of an off-step price as off_step.
+    reason = (
+        "invalid limit_price 290.123. sub-penny increment does not fulfill minimum pricing criteria"
+    )
+    run = record["mover"]["run"]
+    run["refused"] = [["bad-sell", reason]]
+    record["denials"] = {"bad-sell": reason}
+    record["orders"]["bad-sell"] = ["OrderRejected"]
+    if structured:
+        run["order_refusals"] = [
+            {"client_order_id": "bad-sell", "by": "venue", "cause": "off_step", "reason": reason}
+        ]
+    else:
+        del run["order_refusals"]
+    if fixed:
+        record["arm"] = "F2"
+    result = checker().check(record)
+    assert term(result, "A7").status == "failed"
+    expected = ("practice (finding: A7)", 5) if fixed else ("breaks", 1)
+    assert (result.summary, result.exit_code) == expected
+
+
+@pytest.mark.parametrize("fixed", [False, True])
+@pytest.mark.parametrize("offset", ["0.20", "0.10"])
+def test_a3_reads_the_writers_distance_in_force(record, fixed, offset):
+    # mover.py:2225: each sale row keeps the distance in force as `distance_in_force`.
+    sale = record["mover"]["run"]["exits"][0]["sales"][0]
+    sale["trailing_offset"] = offset
+    if fixed:
+        record["arm"] = "F2"
+    result = checker().check(record)
+    failed = offset != "0.20"
+    assert term(result, "A3").status == ("failed" if failed else "met")
+    if fixed:
+        expected = ("practice (finding: A3)", 5) if failed else ("practice", 0)
+    else:
+        expected = ("breaks", 1) if failed else ("counts", 0)
+    assert (result.summary, result.exit_code) == expected
+
+
+def test_a2_sizes_on_the_recorded_widened_fraction(record):
+    # mover.py:4351-4364,4409: L rounded under the floor is widened onto the entry step and the
+    # size taken again on `sized_trail`; the plan's own `trail` is kept beside it.
+    run = record["mover"]["run"]
+    entry = run["entries"][0]
+    entry.update(trail="0.016", spread="0.008", spread_floor="0.016")
+    entry["sizing"].update(
+        planned_loss="2.00",
+        trail="0.016",
+        sized_trail="0.02",
+        stop="0.98",
+        loss_per_share="0.02",
+        quantity="100",
+        notional="100",
+        budget_notional="1000",
+        flow_shares="1000",
+    )
+    run["fills"][0][2:4] = ["100", "1.00"]
+    run["fills"][1][2:4] = ["100", "0.98"]
+    exit_row = run["exits"][0]
+    exit_row.update(quantity="100", filled_quantity="100", trigger_price="0.98")
+    exit_row["sales"][0].update(
+        trailing_offset="0.02", limit_offset="0.025", distance_in_force="0.02", kept_trigger="0.98"
+    )
+    a2 = term(checker().check(record), "A2")
+    assert a2.status == "met", (a2.first_failure, a2.notes)
+
+
+def test_a2_refuses_a_widened_fraction_the_writer_would_not_give(record):
+    entry = record["mover"]["run"]["entries"][0]
+    entry["sizing"]["sized_trail"] = "0.03"
+    a2 = term(checker().check(record), "A2")
+    assert a2.status == "failed"
+
+
+@pytest.mark.parametrize("has_cap_refusal", [False, True])
+def test_structured_refusals_do_not_hide_separate_named_drops(record, has_cap_refusal):
+    # mover.py:2336,2343 write both lists; :4004 keeps a structured refusal out of `dropped`.
+    run = record["mover"]["run"]
+    run["refusals"] = (
+        [
+            {
+                "when_ns": 10,
+                "instrument_id": "CAP.ALPA",
+                "reason": "floor_over_cap",
+                "distance": "0.03",
+                "cap": "0.02",
+                "decisions": 1,
+                "last_ns": 10,
+            }
+        ]
+        if has_cap_refusal
+        else []
+    )
+    run["dropped"] = [
+        "SYN.ALPA: no quote yet",
+        "OTHER.ALPA: profile segment must be an index from 0 to 95",
+        "SYN.ALPA: ATR has fewer than 14 complete one-minute bars: fixed trail fallback",
+    ]
+    a1 = term(checker().check(record), "A1")
+    assert a1.status == "met"
+    assert a1.counts["named_refusals"] == 2 + int(has_cap_refusal)
+
+
+def test_an_unreadable_holding_quantity_does_not_invent_a_missing_exit(record):
+    run = record["mover"]["run"]
+    run["fills"][1][2] = "5"
+    run["exits"][0].update(filled_quantity=None, final_fill_ns=None)
+    record["mover"]["result"]["by_instrument"]["SYN.ALPA"]["open_shares"] = "5"
+    record["mover"]["result"]["flat"] = False
+    record["left"] = ["SYN"]
+    record["result"] = "failed: not left flat"
+    result = checker().check(record)
+    a5 = term(result, "A5")
+    assert a5.status == "not shown", (a5.first_failure, a5.notes)
+    assert a5.first_failure is None
+    assert term(result, "A6").status == "failed"
+
+
+def _second_holding(run: dict[str, Any], **row: Any) -> None:
+    held = copy.deepcopy(run["exits"][0])
+    held.update(trigger_ns=190_000_000_000, final_fill_ns=191_000_000_000, **row)
+    held["sales"][0]["client_order_id"] = "sell-2"
+    run["exits"].append(held)
+
+
+@pytest.mark.parametrize("late_row_id", ["buy-2", None])
+def test_a_late_buy_fill_on_the_names_current_exit_row_is_not_a_short_exit(record, late_row_id):
+    # mover.py:2061-2062,2076-2080: a canceled entry can still fill, and a BUY fill adds to the
+    # name's current exit row, labelled by the slot's entry (:3201-3209) or by none after a flat.
+    run = record["mover"]["run"]
+    fills = [["buy-1", "BUY", "10", "10.00", 1_000_000_000]]
+    fills.append(["sell-1", "SELL", "10", "9.80", 91_000_000_000])
+    if late_row_id is not None:
+        second = copy.deepcopy(run["entries"][0])
+        second["client_order_id"] = late_row_id
+        run["entries"].append(second)
+        fills.append([late_row_id, "BUY", "10", "10.00", 100_000_000_000])
+    fills.append(["buy-1", "BUY", "3", "10.00", 101_000_000_000])
+    shares = "3" if late_row_id is None else "13"
+    fills.append(["sell-2", "SELL", shares, "9.80", 191_000_000_000])
+    run["fills"] = fills
+    _second_holding(run, entry_client_order_id=late_row_id, quantity=shares, filled_quantity=shares)
+    a5 = term(checker().check(record), "A5")
+    # a row with no entry ID is still missing evidence, so it is not shown; neither case fails
+    assert a5.status == ("met" if late_row_id else "not shown"), (a5.first_failure, a5.notes)
+    assert a5.first_failure is None
+
+
+def test_an_unreadable_fill_side_leaves_the_bought_shares_not_shown(record):
+    run = record["mover"]["run"]
+    run["fills"][0][2] = "5"
+    run["fills"].insert(1, ["buy-1", None, "5", "10.00", 1_000_000_001])
+    a5 = term(checker().check(record), "A5")
+    assert a5.status == "not shown"
+    assert a5.first_failure is None
+
+
+def test_an_unread_exit_on_another_name_does_not_hide_an_open_remainder(record):
+    record["mover"]["result"]["by_instrument"]["SYN.ALPA"]["open_shares"] = "4"
+    run = record["mover"]["run"]
+    _second_holding(run, instrument_id="OTH.ALPA", entry_client_order_id="buy-9")
+    del run["exits"][1]["quantity"]
+    a5 = term(checker().check(record), "A5")
+    assert a5.status == "failed"
+    assert a5.first_failure["reason"] == "exit records leave 0 shares"
+
+
+def test_a2_refuses_a_widened_fraction_when_the_plans_distance_held_the_floor(record):
+    # mover.py:4351-4355: the writer widens only an L rounded down under price * spread floor;
+    # here L is 0.04 over a floor of 0.0103, so a widened `sized_trail` is not the writer's.
+    entry = record["mover"]["run"]["entries"][0]
+    price = Decimal("1.03")
+    with localcontext() as context:
+        context.prec, context.rounding = 28, ROUND_FLOOR
+        widened = Decimal("0.05") / price
+    entry.update(trail="0.039", spread_floor="0.01", spread=str(Decimal("0.01") * price / 2))
+    entry["sizing"].update(
+        trail="0.039",
+        sized_trail=str(widened),
+        stop="0.98",
+        loss_per_share="0.05",
+        quantity="40",
+        notional=str(40 * price),
+        planned_loss="2.00",
+    )
+    run = record["mover"]["run"]
+    run["fills"][0][2] = run["fills"][1][2] = "40"
+    run["exits"][0].update(quantity="40", filled_quantity="40")
+    run["exits"][0]["sales"][0].update(trailing_offset="0.05", distance_in_force="0.05")
+    result = checker().check(record)
+    a2 = term(result, "A2")
+    assert a2.status == "failed"
+    assert a2.first_failure["path"].endswith('["sized_trail"]')
+    assert result.summary != "counts"
+
+
+def test_an_exit_row_on_another_name_than_its_entry_fails_a5(record):
+    # mover.py:3201-3209: an exit row's ID is its own slot's entry, so its name is the entry's.
+    run = record["mover"]["run"]
+    _second_holding(run, instrument_id="OTH.ALPA", entry_client_order_id="buy-1")
+    record["mover"]["result"]["by_instrument"]["OTH.ALPA"] = {"open_shares": "0"}
+    result = checker().check(record)
+    assert term(result, "A5").status == "failed"
+    assert result.summary != "counts"
+
+
+def test_a_held_name_with_no_buy_is_not_counted(record):
+    run = record["mover"]["run"]
+    _second_holding(run, instrument_id="OTH.ALPA", entry_client_order_id="buy-9")
+    record["mover"]["result"]["by_instrument"]["OTH.ALPA"] = {"open_shares": "0"}
+    result = checker().check(record)
+    assert term(result, "A5").status in ("failed", "not shown")
+    assert result.summary != "counts"
+
+
+def test_an_unread_fill_does_not_hide_a_proven_shortfall(record):
+    run = record["mover"]["run"]
+    run["exits"][0].update(quantity="7", filled_quantity="7")
+    run["fills"].insert(1, ["buy-7", None, "5", "10.00", 1_000_000_001])
+    a5 = term(checker().check(record), "A5")
+    assert a5.status == "failed"
+    assert a5.first_failure["reason"] == "exit records hold 7 of 10 shares bought"
+
+
+def test_a_late_fill_of_an_entry_canceled_before_filling_is_placed_by_its_entry(record):
+    # mover.py:4515 records every entry sent; :2076-2080 adds the late fill to the name's row.
+    run = record["mover"]["run"]
+    second = copy.deepcopy(run["entries"][0])
+    second["client_order_id"] = "buy-2"
+    run["entries"].append(second)
+    run["fills"] = [
+        ["buy-2", "BUY", "10", "10.00", 100_000_000_000],
+        ["buy-1", "BUY", "3", "10.00", 101_000_000_000],
+        ["sell-1", "SELL", "13", "9.80", 191_000_000_000],
+    ]
+    run["exits"][0].update(entry_client_order_id="buy-2", quantity="13", filled_quantity="13")
+    a5 = term(checker().check(record), "A5")
+    assert a5.status == "met", (a5.first_failure, a5.notes)
+
+
+def test_a_record_with_sized_trail_takes_no_cross_dollar_floor_tolerance(record):
+    # #351 put `sized_trail` and the widen-or-refuse step (mover.py:4351-4373) in one change.
+    entry = record["mover"]["run"]["entries"][0]
+    entry.update(
+        trail="0.039", spread_floor="0.039", spread=str(Decimal("0.039") * Decimal("1.03") / 2)
+    )
+    entry["sizing"].update(
+        trail="0.039",
+        sized_trail="0.039",
+        stop="0.9898",
+        loss_per_share="0.04",
+        quantity="50",
+        notional=str(50 * Decimal("1.03")),
+        planned_loss="2.00",
+    )
+    run = record["mover"]["run"]
+    run["fills"][0][2] = run["fills"][1][2] = "50"
+    run["exits"][0].update(quantity="50", filled_quantity="50")
+    result = checker().check(record)
+    assert term(result, "A1").status == "failed"
+    assert result.summary != "counts"
+
+
+def _named_entry(record: dict[str, Any], cid: str, name: str | None) -> dict[str, Any]:
+    entry = copy.deepcopy(record["mover"]["run"]["entries"][0])
+    entry["client_order_id"] = cid
+    if name is None:
+        del entry["instrument_id"]
+    else:
+        entry["instrument_id"] = name
+    return entry
+
+
+def _exit_row(record: dict[str, Any], cid: str, name: str | None, shares: int) -> dict[str, Any]:
+    row = copy.deepcopy(record["mover"]["run"]["exits"][0])
+    row.update(entry_client_order_id=cid, quantity=str(shares), filled_quantity=str(shares))
+    if name is None:
+        del row["instrument_id"]
+    else:
+        row["instrument_id"] = name
+    return row
+
+
+def test_one_entrys_exit_rows_on_two_names_fail_a5_whatever_its_entry_records(record):
+    # mover.py:3201-3209: one entry's rows are all on its own slot's name.
+    run = record["mover"]["run"]
+    run["entries"] = [
+        _named_entry(record, "buy-1", None),
+        _named_entry(record, "buy-2", "SYN.ALPA"),
+        _named_entry(record, "buy-3", "OTH.ALPA"),
+    ]
+    run["fills"] = [[f"buy-{n}", "BUY", "10", "10.00", n * 1_000_000_000] for n in (1, 2, 3)]
+    run["fills"].append(["sell-1", "SELL", "20", "9.80", 91_000_000_000])
+    run["exits"] = [
+        _exit_row(record, "buy-1", "SYN.ALPA", 10),
+        _exit_row(record, "buy-1", "OTH.ALPA", 10),
+    ]
+    record["mover"]["result"]["by_instrument"]["OTH.ALPA"] = {"open_shares": "0"}
+    result = checker().check(record)
+    assert term(result, "A5").status == "failed"
+    assert result.summary != "counts"
+
+
+@pytest.mark.parametrize("unnamed_first", [True, False])
+def test_an_exit_row_on_another_name_fails_a5_whatever_the_row_order(record, unnamed_first):
+    run = record["mover"]["run"]
+    run["entries"] = [
+        _named_entry(record, "buy-1", "SYN.ALPA"),
+        _named_entry(record, "buy-2", "SYN.ALPA"),
+    ]
+    run["fills"] = [
+        ["buy-1", "BUY", "10", "10.00", 1_000_000_000],
+        ["buy-2", "BUY", "10", "10.00", 2_000_000_000],
+        ["sell-1", "SELL", "20", "9.80", 91_000_000_000],
+    ]
+    first = [_exit_row(record, "buy-1", None, 5), _exit_row(record, "buy-1", "OTH.ALPA", 5)]
+    second = [_exit_row(record, "buy-2", "SYN.ALPA", 5), _exit_row(record, "buy-2", "OTH.ALPA", 5)]
+    run["exits"] = first + second if unnamed_first else second + first
+    record["mover"]["result"]["by_instrument"]["OTH.ALPA"] = {"open_shares": "0"}
+    a5 = term(checker().check(record), "A5")
+    assert a5.status == "failed"
+    assert a5.first_failure["reason"] == "an exit row of an entry on SYN.ALPA"
+
+
+def test_an_unnamed_exit_row_placed_by_its_entry_does_not_hide_a_shortfall(record):
+    run = record["mover"]["run"]
+    run["entries"] = [
+        _named_entry(record, "buy-1", "SYN.ALPA"),
+        _named_entry(record, "buy-2", "OTH.ALPA"),
+    ]
+    run["fills"] = [
+        ["buy-1", "BUY", "10", "10.00", 1_000_000_000],
+        ["sell-1", "SELL", "6", "9.80", 91_000_000_000],
+        ["buy-2", "BUY", "10", "10.00", 2_000_000_000],
+        ["sell-2", "SELL", "10", "9.80", 92_000_000_000],
+    ]
+    run["exits"] = [_exit_row(record, "buy-1", "SYN.ALPA", 6), _exit_row(record, "buy-2", None, 10)]
+    record["mover"]["result"]["by_instrument"]["OTH.ALPA"] = {"open_shares": "0"}
+    a5 = term(checker().check(record), "A5")
+    assert a5.status == "failed"
+    assert a5.first_failure["reason"] == "exit records hold 6 of 10 shares bought"

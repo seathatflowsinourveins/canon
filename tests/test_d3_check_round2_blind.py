@@ -122,7 +122,7 @@ def record() -> Record:
                                 "sent_ns": 2_000_000_000,
                                 "trailing_offset": "0.20",
                                 "limit_offset": "0.25",
-                                "distance": "0.20",
+                                "distance_in_force": "0.20",
                                 "kept_trigger": "9.80",
                                 "spread": "0.05",
                                 "outcome": "filled",
@@ -193,7 +193,7 @@ def cross_dollar(record: Record) -> None:
     exit_row["sales"][0].update(
         trailing_offset="0.01",
         limit_offset="0.015",
-        distance="0.01",
+        distance_in_force="0.01",
         kept_trigger="1.00",
         spread="0.005",
     )
