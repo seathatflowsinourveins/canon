@@ -1,7 +1,7 @@
 """Paper proof, in the regular session, of what happens when Alpaca elects a trailing stop the adapter
-placed: a stop one cent under the mark is left to trigger, and the test reads how Alpaca books the sale
-and whether the fill reaches the node's order (ADR 0129, the gap "the venue ID and order type a fill
-arrives under after the election", and its condition (b)).
+placed: a stop just over the smallest trail Alpaca takes is left to trigger, and the test reads how
+Alpaca books the sale and whether the fill reaches the node's order (ADR 0129, the gap "the venue ID and
+order type a fill arrives under after the election", and its condition (b)).
 
 Contract: Alpaca's trailing stop (`https://docs.alpaca.markets/us/docs/orders-at-alpaca.md`, "Trailing
 Stop Orders": `trail_price`, "a dollar value away from the highest water mark", and "Once the stop price
@@ -12,7 +12,7 @@ NautilusTrader's `TRAILING_STOP_MARKET` order with a `PRICE` offset, which the a
 arrives, or what position intent that order carries. Both are read here.
 
 What is shown, through the proof's execution-only node (`tests/test_paper_venue_trailing_stop.py`): on a
-long of one share adopted at start, a DAY trailing stop of one cent is accepted and left alone. Required:
+long of one share adopted at start, a DAY trailing stop at that trail is accepted and left alone. Required:
 Alpaca fills one share, the node's own order ends `FILLED` with one `OrderFilled`, and the account holds
 none of the share afterwards. A fill Alpaca lists that the node's order did not get is condition (b),
 and is the first thing the verdict names (`verdict`). Recorded, not required: each sell Alpaca lists for
@@ -21,8 +21,12 @@ or is replaced by another order, and whether it carries the stop's own client or
 (`record`) carries no venue order ID, no client order ID, no price and no time; it is printed whatever
 ends the run, a failure of the node included.
 
-One cent is the tightest trail a whole-cent price has, and Alpaca documents no smallest trail: a refusal
-ends the walk by name. A stop not elected in `ELECT_SECS` is canceled and the test fails saying nothing
+Alpaca has a smallest trail, observed 2026-11-13 on paper, not documented: a trail of one cent was
+refused with 422, code 42210000, "trail_price must be >= 0.1% of the stock price", and the orders page
+as fetched that day states none (ADR 0129, Evidence). The trail is therefore
+a thousandth of what the adopted share cost, up to the cent, and a cent more (`tight`), since the price
+Alpaca measures against is its own and may stand above the share's; a refusal still ends the walk by
+name. A stop not elected in `ELECT_SECS` is canceled and the test fails saying nothing
 was shown; one that fills while that cancel is on its way is an election all the same. The sale is a
 market order, the first this repository's tests have left Alpaca to make.
 
@@ -38,6 +42,7 @@ from __future__ import annotations
 import time
 from datetime import UTC
 from datetime import datetime
+from decimal import ROUND_CEILING
 from decimal import Decimal
 from typing import Any
 
@@ -58,10 +63,13 @@ pytestmark = seam.pytestmark
 AAPL = seam.AAPL
 ONE = 1
 """The election case holds one share: the stop is left to sell it."""
-TIGHT = Decimal("0.01")
-"""One cent under the mark: the first print a cent under the highest since the order elects it."""
-ELECT_SECS = 120.0
-"""How long the stop is left to trigger before the walk cancels it. UNCALIBRATED."""
+SMALLEST = Decimal("0.001")
+"""The smallest `trail_price` Alpaca takes, as a share of the stock price: read from its refusal of a
+smaller one on paper on 2026-11-13 (the module's header). Which price it measures is UNVERIFIED."""
+CENT = Decimal("0.01")
+ELECT_SECS = 600.0
+"""How long the stop is left to trigger before the walk cancels it: the price has to come a thousandth
+off its highest since the order. UNCALIBRATED."""
 SETTLED_SECS = 20.0
 """How long the read after the node waits for Alpaca's listing to show a filled sell: the listing lags
 an order's events (`paper.READ_SECS`). UNCALIBRATED."""
@@ -72,9 +80,16 @@ LISTED = 50
 """The most orders one read asks for: the test's own are a buy and a sell or two."""
 
 
+def tight(price: Decimal) -> Decimal:
+    """The tightest trail to ask for on a share that cost `price`: `SMALLEST` of it, up to the cent,
+    and a cent more, which keeps it over Alpaca's bound while its price is within ten dollars of ours."""
+    return (price * SMALLEST).quantize(CENT, rounding=ROUND_CEILING) + CENT
+
+
 class Elected(paper.Trailer):
-    """The proof's trailer with a trail of one cent on a long of one share, left alone: the walk ends
-    when the node's order ends, and cancels it if `ELECT_SECS` pass first. Nothing is replaced."""
+    """The proof's trailer with a trail a cent over the smallest Alpaca takes on a long of one share,
+    left alone: the walk ends when the node's order ends, and cancels it if `ELECT_SECS` pass first.
+    Nothing is replaced."""
 
     def __init__(self, config: StrategyConfig) -> None:
         super().__init__(config)
@@ -85,6 +100,10 @@ class Elected(paper.Trailer):
         if type(event).__name__ == "OrderCancelRejected":
             self.cancel_refusals.append(str(event.reason))
 
+    def _trail(self) -> Decimal:
+        """`tight` for the dearest share adopted (the adoption's own read, `seen["average"]`)."""
+        return tight(max(Decimal(average) for average in self.seen["average"]))
+
     def _sell(self, quantity: Any) -> Any:
         instrument = self.cache.instrument(AAPL)
         assert instrument is not None, f"{AAPL} is not in the cache"
@@ -92,7 +111,7 @@ class Elected(paper.Trailer):
             AAPL,
             OrderSide.SELL,
             instrument.make_qty(quantity),
-            TIGHT,
+            self._trail(),
             trailing_offset_type=TrailingOffsetType.PRICE,
             time_in_force=TimeInForce.DAY,
         )
@@ -208,6 +227,20 @@ def settled_sells(
         time.sleep(SETTLED_STEP)
 
 
+def settled_held(trading: Any, strategy: Any, seconds: float = SETTLED_SECS) -> Decimal:
+    """What is held after the node ended. After a fill at the node it is read until it shows none or
+    `seconds` have passed, since Alpaca's position may lag its order listing (UNVERIFIED either way;
+    the wait costs nothing when it does not), and what was last seen is returned. A walk that did not
+    fill is read once: its share is still held, and the cleaning sells it."""
+    deadline = time.monotonic() + seconds
+    while True:
+        quantity = seam.held(trading)
+        filled = strategy.seen.get("the node's order ended") == "FILLED"
+        if not filled or quantity == 0 or time.monotonic() >= deadline:
+            return quantity
+        time.sleep(SETTLED_STEP)
+
+
 def record(part: str, strategy: Any, sells: list[dict[str, str]], still_held: object) -> list[str]:
     """What the run prints: the walk's outcome, what the node's order did, Alpaca's sells and what is
     held afterwards. Nothing the seam keeps that names an order or a price is in it."""
@@ -233,7 +266,9 @@ def verdict(
 ) -> list[str]:
     """What is wrong with a finished run, each by name, or nothing. A fill Alpaca lists that the
     node's order did not get comes first: ADR 0129's condition (b), whatever the walk says of itself.
-    How Alpaca lists the sale (one row or two, under which order) is recorded and never judged."""
+    How Alpaca lists the sale (one row or two, under which order) is recorded and never judged. A
+    passing run is flat by the election alone: nothing held when the node ended, and nothing the
+    cleaning then had to cancel or sell."""
     at_node = strategy.seen.get("the node's order ended") == "FILLED"
     at_alpaca = any(sell.get("status") == "filled" for sell in sells)
     failed = [sell["failed"] for sell in sells if "failed" in sell]
@@ -260,6 +295,14 @@ def verdict(
         problems.append(f"{still_held} share(s) still held after the node's order filled")
     if cleaned["orders"] != 0:
         problems.append(f"the cleaning found {cleaned['orders']} open order(s)")
+    if cleaned["positions"] != 0 and still_held == 0:
+        # the holding above is read before the cleaning. A position the cleaning then found and sold
+        # (the two reads disagree: a read that flapped, or shares bought meanwhile) means the account
+        # was made flat by the cleaning's sale, and that is no proof of the election
+        problems.append(
+            "the cleaning found a position to close although none was held when the node ended: the "
+            "run is not shown flat by the election alone"
+        )
     return problems
 
 
@@ -286,7 +329,7 @@ def test_paper_a_tight_trailing_stop_is_left_to_trigger_and_its_fill_reaches_the
                 # read whatever ended the node: the sale may have happened all the same
                 own = strategy.own[-1].value if strategy.own else ""
                 sells = settled_sells(trading, since, own)
-            still_held = seam.held(trading)
+            still_held = settled_held(trading, strategy)
     finally:
         print("\n" + "\n".join(record(part, strategy, sells, still_held)))
     assert still_held is not None

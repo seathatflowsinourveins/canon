@@ -121,3 +121,16 @@ ten fields as list lines, in this order, each with a value:
 * status: open
 * supersedes: none
 * source: lead
+
+### L0007: A stop Alpaca holds at its smallest trail was elected 41 seconds after it was placed
+
+* area: exits
+* session: 2026-11-13
+* result: One paper election, one share, regular session, long-only test account: a venue trailing stop a thousandth of the price wide was accepted, followed the mark and was elected 41 seconds after it was placed; Alpaca booked the sale on the stop's own order and one fill reached the node's order. The first attempt, a trail of one cent, was refused: Alpaca takes no trail under a thousandth of the price, a bound its orders page does not state.
+* evidence: docs/adr/0129-alpaca-holds-a-trailing-stop-for-a-long-behind-an-adapter-setting-that-is-off.md, Confirmation, and tests/test_paper_venue_trailing_stop_election.py
+* lesson: A stop held by the venue at a distance near its smallest trail is an exit within the minute on a liquid name, not protection for a holding; and a paper test that judges an election must fail when its own cleaning made the account flat, or a cleanup sale reads as the election.
+* change: The election paper test fails when its cleaning had to close a position, reads the holding after a fill until it shows none, and asks for a trail just over Alpaca's smallest; ADR 0129 records the reads.
+* next: The same reads after a replace and for a partial election; a count of elections over a span under the default arm before any distance this near is used for a standing holding.
+* status: open
+* supersedes: none
+* source: review
