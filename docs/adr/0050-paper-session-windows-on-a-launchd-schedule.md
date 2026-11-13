@@ -44,8 +44,8 @@ login keychain without a dialog is UNVERIFIED until its first firing. A firing w
 
 ### Consequences
 
-* Good: once installed, a window starts about two minutes after the last one ends (70 s after a firing ends, from
-  2026-11-13; every 35 minutes as first decided) while the Mac is awake and a session is open, with
+* Good: once installed, a firing starts 70 s after the last one ends (from 2026-11-13; every 35 minutes as
+  first decided), and a Mover window's start follows its stream sample, some minutes in all (UNVERIFIED) while the Mac is awake and a session is open, with
   no one starting it, each on the newest `main`; extended sessions only once `EXTENDED_READY` is on.
 * Since 2026-11-11 the windows run on paper account B and the paper tests on account A, each under its
   own lock, and both take a stream lock last, since Alpaca allows a user one market-data stream connection
@@ -250,8 +250,11 @@ universe landed. The plist `scripts/automation` writes runs `--session auto --mi
 --regular-strategy Mover` an interval after each firing ends (above), and each firing reads the switch from the
 main it clones. The interval goes from 600 s to 70 s with this change, by the lead's ruling of 2026-11-13 that
 account B be idle about a minute between two scheduled windows, not ten: above the 60 s gap, so the firing
-after a window is not skipped. With a firing's clone, sync and imports, a window then follows the last within
-about two minutes while a session is open. The new interval reaches the machine only through the maintenance
+after a window is not skipped. A firing then starts 70 s after the last ends. A Mover window starts later still: after the clone,
+sync and imports, `choose_mover` samples the stream for three minutes, to the clock minute plus a 10 s
+grace (`sample_stream`), about 130 to 190 s, before the reads and the node that come before its
+`started` record. How long account B is idle in all is UNVERIFIED until measured (a second reader of
+#350, 2026-11-13). The new interval reaches the machine only through the maintenance
 agent's install from main (ADR 0065), which rewrites and reloads the plist; until then the installed one keeps
 600 s. A closed session's firing then checks the clock about every 70 s, some 1,200 a day where there were
 144, each a fetch of main and one clock call holding account B's lock for a few seconds. The status row's
@@ -259,8 +262,9 @@ overdue bound, two intervals and 300 s, becomes about 7 minutes. This change lan
 scheduled window, which passes no trail flag, runs that default. A firing launchd starts after this landing is
 UNVERIFIED until the first one. Limits:
 
-* **Account B is idle between windows** for the interval and a firing's start-up, about two minutes. That
-  is UNVERIFIED until the first firings at 70 s have run.
+* **Account B is idle between windows** for the 70 s interval, a firing's start-up and, for a Mover window,
+  its stream sample of about 130 to 190 s: some minutes, UNVERIFIED until the first firings at 70 s have
+  run.
 * **How a proof takes its turn.** A run by hand waits for account B's lock as a firing does, polling for at
   most `lockwait` (900 s). It has no priority over another waiter: a firing, another run by hand, or the
   maintenance agent's boundary waiter (ADR 0065). Whichever poll first finds the lock free takes it. A

@@ -77,7 +77,16 @@ mkdir -p "$TMP/python"; ln -s "$TOML_PY" "$TMP/python/python3"
 PATH="$TMP/python:$PATH"
 
 t_pass() { pass=$((pass+1)); echo "  pass  $1"; }
-t_fail() { fail=$((fail+1)); echo "  FAIL  $1"; }
+t_fail() { fail=$((fail+1)); echo "  FAIL  $1"; ran_out; }
+# ran_out: after the first failed check of a run that named its output (RUN_OUT, set by sched and the start-up
+# case), its last 15 lines, once per run, on lines scripts/ci keeps for a failed test (it keeps FAIL lines)
+RUN_OUT=""; RUN_SHOWN=""
+ran_out() {
+  [ -n "$RUN_OUT" ] && [ "$RUN_SHOWN" != "$RUN_OUT" ] || return 0
+  RUN_SHOWN=$RUN_OUT
+  echo "  FAIL  | its run's own output, last 15 lines ($RUN_OUT):"
+  tail -n 15 "$RUN_OUT" 2>/dev/null | sed 's/^/  FAIL  | /'
+}
 # skip <case> <why>: the case checked nothing here; under CANON_TEST_ALLOWED_SKIPS one not named there fails.
 # A case name holds no " (", which scripts/ci reads as the start of the reason.
 skip()   {
@@ -755,9 +764,9 @@ if command -v plutil >/dev/null 2>&1; then
   fi
   PP="$TMP/agents/local.canon.paper-session.plist"
   pargs=""
-  for i in 0 1 2 3 4 5 6 7 8 9 10 11 12; do pargs="$pargs|$(plutil -extract "ProgramArguments.$i" raw -o - "$PP" 2>/dev/null)"; done
-  check "rehearsal writes the paper session agent: the runner, its clone and origin, --session auto --minutes 25 --mover, and Mover named for the regular session" \
-        test "$pargs" = "|/bin/bash|$AH/canon/paper-session.sh|$B/mise|$CK|$OURL|--session|auto|--minutes|25|--mover|--regular-strategy|Mover|"
+  for i in 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14; do pargs="$pargs|$(plutil -extract "ProgramArguments.$i" raw -o - "$PP" 2>/dev/null)"; done
+  check "rehearsal writes the paper session agent: the runner, its clone and origin, --session auto --minutes 25 --mover, Mover named for the regular session, and the dated baselines in the automation folder" \
+        test "$pargs" = "|/bin/bash|$AH/canon/paper-session.sh|$B/mise|$CK|$OURL|--session|auto|--minutes|25|--mover|--regular-strategy|Mover|--baseline-dir|$AH/canon/movers-baseline|"
   check "... the runner installed beside the watchdog" cmp -s "$ROOT/home/.claude/canon/paper-session.sh" "$AH/canon/paper-session.sh"
   check "... and its clone at origin's main, detached, marked as made by it" \
         eval '[ "$(git -C "$CK" rev-parse HEAD)" = "$(git -C "$O" rev-parse main)" ] && ! git -C "$CK" symbolic-ref -q HEAD >/dev/null && [ "$(git -C "$CK" config canon.paperCheckout)" = true ]'
@@ -1343,7 +1352,8 @@ else
     [ -z "${6:-}" ] || ed+=(-e "s/^lockwait=[0-9]*\$/lockwait=$6/")
     moved=$(sed "${ed[@]}" <<<"$moved")
     if [ -z "$body" ] || [[ "$moved" == *getconf* ]] || [[ "$moved" != *"$ld/"* ]] || [[ "$moved" == *"{{"* ]] || [[ "$moved" != *"deadline=$3"* ]] \
-       || { [ -n "${6:-}" ] && [[ "$moved" != *"lockwait=$6"* ]]; }; then
+       || { [ -n "${6:-}" ] && [[ "$moved" != *"lockwait=$6"* ]]; } \
+       || { [[ "$body" == *$'\n'sync=* ]] && [[ "$moved" != *$'\n'"sync=${4:-1}"$'\n'* ]]; }; then
       return 1
     fi
     # CLAUDE_CONFIG_DIR: where paper:session keeps its window records, so no run here writes under the real one
@@ -1430,11 +1440,13 @@ EOF
   if owner paper:session "$LD" 40 2 && grep -q '^sync=2$' "$LD/mise.toml"; then
     standin "$LD" "" hang
     s0=$(date +%s)
+    RUN_OUT="$LD/out"
     (cd "$LD" && exec env -i HOME="$HOME" MISE_CEILING_PATHS="$TMPP" PATH="$LD/bin:/usr/bin:/bin" "$LMISE" run owner > "$LD/out" 2>&1); orc=$?
     took=$(( $(date +%s) - s0 ))
     /usr/bin/lockf -k -t 0 "$LD/canon-paper-windows.lock" true 2>/dev/null; free=$?
     check "paper:session, a start-up that hangs: the task fails at its start-up bound (${took} s of a 40 s deadline), no window started, the lock free" \
-          eval '[ "$orc" != 0 ] && [ "$took" -lt 35 ] && [ -s "$LD/sync.pid" ] && ! kill -0 "$(cat "$LD/sync.pid")" 2>/dev/null && [ ! -e "$LD/uv.pid" ] && [ "$free" = 0 ] && grep -q "start-up" "$LD/out"'
+          eval '[ "$orc" != 0 ] && [ "$took" -lt 35 ] && [ -s "$LD/sync.pid" ] && ! kill -0 "$(cat "$LD/sync.pid")" 2>/dev/null && [ ! -e "$LD/uv.pid" ] && [ "$free" = 0 ] && grep -q "^paper:session: the start-up (uv making the environment uv.lock.s) failed or took over 2 s; no window was started" "$LD/out"'
+    RUN_OUT=""
     reap "$LD"
   else
     t_fail "paper:session's body has a start-up bound, sync=, that the test can shorten"
@@ -1449,8 +1461,10 @@ EOF
   # SD (the folder), src (the exit code) and took
   sched() {
     local n=$1 v=$2 lock=$3 mark=CANON_PAPER_SCHEDULED=1 hp=""; [ "$4" = scheduled ] || mark=CANON_NOT_SCHEDULED=1; shift 4
-    SD="$TMP/schedule-$n"; mkdir -p "$SD/bin" "$SD/canon"
-    owner paper:session "$SD" 40 1 "$SD" 2 || { src=owner; took=0; return 0; }
+    SD="$TMP/schedule-$n"; mkdir -p "$SD/bin" "$SD/canon"; RUN_OUT="$SD/out"
+    # SYNC: paper:session's start-up bound, 30 s unless a case names one, so a loaded machine's slow start-up
+    # (scripts/ci runs checks in parallel) decides no case; the refusal for time has its own case
+    owner paper:session "$SD" 40 "${SYNC:-30}" "$SD" 2 || { src=owner; took=0; return 0; }
     # NOKEYS: both keychain items empty, as mise renders a missing one
     [ -z "${NOKEYS:-}" ] || sed -i.bak 's/= "stand-in"$/= ""/' "$SD/mise.toml"
     # GAPS, LOCKW: a shorter gap and lock wait; MARK: a window ended just now (its marker in the log folder)
@@ -1523,8 +1537,10 @@ EOF
   # exit, which the task still returns. SUV is the
   # stand-in window: it notes whether an earlier record was already kept when it started, writes a record, a
   # record by hand, a log, a record and a log over 1 MB and a heartbeat, and ends 3.
+  # Its start-up step (uv's sync, `uv run ... /usr/bin/true`) takes 2 s, as a loaded machine's can: the checks
+  # below hold whatever the load, under sched's start-up bound (a refusal for time is its own case, after).
   # shellcheck disable=SC2016  # the stand-in's own text, expanded when it runs
-  win='case "$*" in *" /usr/bin/true") exit 0 ;; esac
+  win='case "$*" in *" /usr/bin/true") sleep 2; exit 0 ;; esac
 while [ $# -gt 0 ]; do [ "$1" != --log-dir ] || d=$2; shift; done
 [ ! -e "$CLAUDE_CONFIG_DIR/canon/watch/windows/window-0.json" ] || echo yes > "$d/../kept-at-start"
 mkdir -p "$d/by-hand"; echo r > "$d/window-1.json"; echo h > "$d/by-hand/window-2.json"; echo l > "$d/window-1.log"; echo f > "$d/last-firing.json"
@@ -1550,6 +1566,7 @@ exit 3'
         eval '[ "$src" = 3 ] && grep -q "^paper:session: the window records could not be copied to $SD/config/canon/watch/windows" "$SD/out" && [ -s "$SD/canon-paper-session/window-1.json" ]'
   check "from a terminal the window is still exec'd, so a signal reaches uv and the window as before the copy" \
         eval 'grep -Eq "^    exec uv run --locked .* python -m canon_trading\.session_window " <<<"$(task_part paper:session run)"'
+  RUN_OUT=""  # the cases below are not sched's
   # Two accounts, two locks (ADR 0069), run under mise with both bodies sharing one lock folder: a window that
   # runs holds account B's lock and the stream lock, and a paper test on account A runs meanwhile, at once
   AB="$TMP/two-accounts"; mkdir -p "$AB/locks" "$AB/s" "$AB/t" "$AB/w" "$AB/b"
