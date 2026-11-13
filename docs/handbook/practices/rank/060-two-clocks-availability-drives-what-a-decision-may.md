@@ -1,0 +1,1 @@
+* Two clocks: availability drives what a decision may use, acquisition is provenance, and each ranking record carries its latency labels: publication, receipt and generation from the ranking, entry-eligible and submission from the strategy (ADR 0107, ADR 0088). The receipt label holds the bar's `ts_init`, not a measured arrival, which stays UNVERIFIED (ADR 0087).

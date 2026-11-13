@@ -76,6 +76,25 @@ pair: `mise run paper:check protect` and `mise run paper:account protect`, recor
 stored the pair): `mise run paper:check protect` found both items in the login keychain, and
 `mise run paper:account protect` was answered by the account.
 
+**Amendment, 2026-11-13 — the standing protector's task is admitted on C.** The "Everything else" row
+said the tasks that trade on C come with the standing protector and its account record. `mise run
+paper:protector protect`, the standing protector's task (the lead's 24/5 plan of 2026-11-13, Decision D
+and unit 10; ADR 0146 for protection around the clock), not yet on `main`, is admitted beside
+`paper:account protect` and `paper:protect protect`, on the owner's requirement of 2026-11-13, as the
+lead restates it, that C's holding has its exit in every session, and on custody's line that the owner's
+fill is recognised at once and protected (`docs/handbook/philosophy.md`, What never changes); its
+account record is the evidence its unit lands with. It sells only to protect a long it finds,
+reduce-only and for the uncovered quantity only; it never opens or adds to a position, never cancels,
+resizes or adopts an order it did not send, and freezes a symbol with a foreign quantity. It takes
+`--row OWN1|OWN3` and refuses F2 and IEX by name. On C it runs only after its proof on account A and
+only with the lead's go by name (`--lead-go "protect <row>"`), and it and `paper:protect protect` never
+send on C at once (one writer per account). These terms are `UNVERIFIED` until the task lands with its
+tests. A standing runner (the plan's unit U-g, not yet on `main`) may start it back to back across the
+session parts: each start reads the level book, its hold file and its inbox in that step; on C it starts
+nothing without the lead's standing go, by name, in a file it reads at every start; it stops at the
+first start that finds a hold; the owner's word outranks both. No other task gains C's pair, and no task
+reads two pairs.
+
 ## Evidence
 
 Read 2026-11-12.

@@ -1,0 +1,1 @@
+* After a sale the slot goes to a reclaim of the same name or to another ranked name of the window's roster (ADR 0088, ADR 0091); the requirement's retry band and rotation band are not yet built, and the requirement alone states them (roadmap step 7).

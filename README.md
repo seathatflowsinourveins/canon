@@ -134,7 +134,7 @@ mise run paper:close windows  # cancel and close only what our nodes opened on a
                         # any symbol with something else in it is frozen and named
 ```
 
-There are two paper accounts that trade ([ADR 0069](docs/adr/0069-two-paper-accounts.md)), and a third, account C (`protect`), whose pair `paper:store protect` holds and only `paper:account protect` and `paper:protect protect` read (ADR 0114, ADR 0142): account A, the default,
+There are two paper accounts that trade ([ADR 0069](docs/adr/0069-two-paper-accounts.md)), and a third, account C (`protect`), whose pair `paper:store protect` holds and only `paper:account protect`, `paper:protect protect` and, once it lands, `paper:protector protect` read (ADR 0114, ADR 0142): account A, the default,
 whose pair only `paper:test`, the data-only `paper:data`, `paper:long-only tests`, `paper:account tests`, `paper:close tests` and `paper:protect tests` read, and account B
 (`windows`), whose pair only `paper:session` and its schedule, `paper:long-only windows`, `paper:account windows` and `paper:close windows` read. Each account has its own lock, so a test and a window do not wait for each other; the two
 pairs each have their own market-data stream lock too (ADR 0069), so a paper test that streams and a window

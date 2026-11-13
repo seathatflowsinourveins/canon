@@ -1,0 +1,1 @@
+* The complete universe and every unknown row stay in the generation, the top 20 is a projection only, an unknown is unknown and not zero, and `sip` and `boats` figures stay apart (ADR 0087, ADR 0107).

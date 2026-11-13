@@ -54,7 +54,7 @@ pass begins, so a firing killed in its pass (the task's timeout) is counted too.
 waited, or failed before it knew its night, leaves the last night's record as the latest: its exit
 code and its heartbeat say what it found, and they clear with the next firing that works.
 
-**Sessions.** `MIN_SESSIONS` is a registered row (`docs/handbook/rows.md`), and it counts New York
+**Sessions.** `MIN_SESSIONS` is a registered row (`docs/handbook/rows/`), and it counts New York
 days on which every bar type of the plan has a bar (`new_york_days`), not the gate's T. A session
 day of the ledger is a UTC day (ADR 0035 term 3), so the last after-hours hour of a New York
 winter day, 19:00 to 20:00, books on the next UTC day and a Friday's makes a one-hour Saturday

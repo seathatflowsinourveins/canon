@@ -135,28 +135,28 @@ ten fields as list lines, in this order, each with a value:
 * supersedes: none
 * source: lead
 
-### L0008: A display shared the record's process and could have ended it
-
-* area: data
-* session: 2026-11-13
-* result: The screener board was built to write from inside the recorder's own screener poll, and its first version let a failed board write raise out of the poll loop, which would have ended a recorder batch of up to 80 polls for a file only a person reads; the review also found the reader crashed on a malformed board with Stale's exit code
-* evidence: tests/test_movers_screener_board.py, the cases a replace failure preserves the previous board and is not silent and any failure of the board write leaves the polling going; tests/test_screener_board.py, the case a malformed board is named on the first line with its own exit
-* lesson: A display added to a recording process is held to the record's terms: it may fail, by name, but never stop or change what is recorded; and the vendor's lists it shows are labelled as the vendor's and kept out of every trading input by a test
-* change: a board write failure of any kind is named on stderr and the poll goes on; the reader names a malformed board with exit 3; the board says it is display only, and a test holds that no ranking, entry, re-entry or protection module loads it (src/canon_trading/screener_board.py)
-* next: The lead's ruling on session_window's fallback to Alpaca's gainers for a mover window (ADR 0083), which the display-only term reaches and this unit does not change
-* status: open
-* supersedes: none
-* source: lead
-
-### L0009: A position had no exit in five different ways in one day
+### L0008: The account read could not show what a protective stop did once it ended, and its first fix was proven against no bound
 
 * area: exits
 * session: 2026-11-13
-* result: Across the day a long was left with no working exit by an entry cap applied to a found holding, by a start margin before the close, by a distance over the sizing ceiling, and by entry paths the Mover leaves unchecked; each was found case by case, after the fact, with no standing check that every shape still has its exit
-* evidence: the pytest mark no_position_without_its_exit (pytest.toml), its cases in tests/test_protect.py and tests/test_mover.py
-* lesson: The rule that every position has its exit is held by a set of cases, one per shape seen, that every protection unit runs green; a gap not yet closed is a strict expected failure, so its fix shows up as the set turning red until the mark is lifted
-* change: the set's first version, the found-holding shapes green and the open gaps strict expected failures; a review that finds a new way a position had no exit adds its case to the set in the same pull request
-* next: Each open gap's own unit, which lifts its case's expected failure when it lands
+* result: The paper account read showed only open orders, so a protective stop that had sold or been canceled left no trace in it; the first fix walked 92 days of order history and its proof read took about four of its five allowed minutes, which was judged a pass because it ended; on a busier paper account the same walk met the timeout; bounded to the trade date's submissions, the read listed the date's ended orders in about a second
+* evidence: `src/canon_trading/custody.py` and `tests/test_custody.py`; the paper reads' output, kept outside the repository
+* lesson: A read's proof is judged against its stated bound, its duration included, on an account with a full day's history; a walk the venue cannot bound by the event's time is bounded by the date, with what it leaves out named on its output, and a read that is killed must say it did not finish
+* change: the account read prints the ended orders submitted in the trade date after the flat read, says when its walk did not finish, and names that an order submitted earlier is not listed
+* next: Read an earlier-date protective stop's sale from the venue's fill activities, a next unit
+* status: adopted
+* supersedes: none
+* source: review
+
+### L0009: The default window sells on one quote because persistence is refused on its arm
+
+* area: exits
+* session: 2026-11-13
+* result: The default paper window's trailing stop, triggered on the bid, elects on the first quote at its level, because the strategy refuses a breach count above one unless the trigger is the trade print, the trail is fixed, the size is not from the budget and protection is on; on paper account B, 31 of 34 windows exited by the trailing stop, 8 of them within 60 seconds of the first fill
+* evidence: ADR 0119's amendment of 2026-11-13; the by-hand window records, kept outside the repository
+* lesson: A rule the handbook states (a breach is a count over a span, never one quote) has to be checked against the default arm as it runs, not only against the arm its tests built
+* change: ADR 0119 amended to count spaced two-sided quotes under the default arm, its rows uncalibrated, nothing lifted in code yet
+* next: A failing test on shaped quote tapes, then the paper count per arm of exits by the stop, exits within 60 seconds and re-entries
 * status: open
 * supersedes: none
-* source: lead
+* source: review
