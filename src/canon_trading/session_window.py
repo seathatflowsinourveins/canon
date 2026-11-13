@@ -2063,8 +2063,8 @@ the feed's latency (tens of milliseconds)."""
 
 
 def clock_notes(run: dict[str, Any]) -> dict[str, Any]:
-    """Name beside the Mover's record the prints whose venue times exceeded the ahead-of-receipt bound,
-    when any did, and the clocks' difference, when its median passes `CLOCK_NOTE_MOST_MS` either way.
+    """Name beside the Mover's record the prints whose venue times exceeded the ahead bound, measured
+    against their name's quotes (`mover.print_time`), when any did, and the clocks' difference, when its median passes `CLOCK_NOTE_MOST_MS` either way.
     The prints ahead could not be ordered; the difference is the one the lead reads."""
     notes: dict[str, Any] = {}
     ahead = run.get("prints_stamped_ahead") or {}

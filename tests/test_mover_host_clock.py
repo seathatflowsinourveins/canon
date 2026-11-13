@@ -202,3 +202,29 @@ def test_the_window_names_the_clocks_difference_past_two_seconds(median: int, no
     clock = {"venue_minus_receipt_ms": {"median": median, "least": median, "most": median}}
     run = {"prints_stamped_ahead": {}, "host_clock": clock}
     assert session_window.clock_notes(run) == ({"host_clock": clock} if noted else {})
+
+
+def test_one_quote_reported_late_moves_no_print_into_ahead() -> None:
+    """A name's reference is the median of its latest quotes, so one quote reported 6 s late does not
+    class the prints after it as ahead (code-review-high-host-clock-v4/2)."""
+    seam, slot, filled, last = held(60 * SECOND)
+    for k in range(3):
+        seam.on_quote(quoted(filled + k * 100 * MS, 60 * SECOND, slot.instrument_id))
+    late = quoted(filled + 300 * MS, 60 * SECOND, slot.instrument_id)
+    late.ts_init += 6 * SECOND
+    seam.on_quote(late)
+    deliver(seam, last, received("10.2000", filled + 2 * SECOND, 60 * SECOND, slot.instrument_id))
+    assert slot.newest_print is not None and slot.newest_print.price == D("10.20")
+    assert seam.prints_ahead == {}
+
+
+def test_with_the_clocks_agreeing_a_late_quote_moves_no_persistence_stamp() -> None:
+    """With the clocks agreeing, a print's persistence stamp is its venue time, as on main, whatever
+    its name's quotes' delays (code-review-high-host-clock-v4/1)."""
+    seam, slot, filled, last = held(0)
+    for k in range(5):
+        late = quoted(filled + k * 100 * MS, 0, slot.instrument_id)
+        late.ts_init += 150 * MS
+        seam.on_quote(late)
+    deliver(seam, last, received("10.1000", filled + 2 * SECOND, 0, slot.instrument_id))
+    assert slot.stamp_seen == filled + 2 * SECOND
