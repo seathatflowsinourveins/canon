@@ -56,6 +56,12 @@ if [ "$1 $2 $3" = "run --locked ty" ] && [ -z "$dir" ]; then
 fi
 if [ "$1 $2 $3 $4" = "run --locked pytest --collect-only" ]; then
   [ -z "${FAKE_COLLECT_FAIL:-}" ] || { echo "ERROR collecting tests/test_x.py"; exit 2; }
+  # real pytest's form under --no-fold-skipped, printed only when the skip summary is asked for
+  if [ -n "${FAKE_COLLECT_SKIP:-}" ]; then
+    for a in "$@"; do
+      case "$a" in -r*s*) echo "SKIPPED tests/test_opt.py - Skipped: could not import 'optional_dep'" ;; esac
+    done
+  fi
   echo "2 tests collected"; exit 0
 fi
 if [ "$1 $2 $3" = "run --locked pytest" ]; then
@@ -373,9 +379,19 @@ check "and the commit fails"                       test "$RC" = 1
 case_stagedapart() {
 apart_copy stagedapart
 runci --staged
-check "a project apart is collected at commit"     test "$(grep -cx -- '--directory apart run --locked pytest --collect-only -q' "$C.uv.log")" = 1
+check "a project apart is collected at commit"     test "$(grep -cx -- '--directory apart run --locked pytest --collect-only -q -rfEs --no-fold-skipped' "$C.uv.log")" = 1
 check "with its line"                              has '^  ok    pytest collection in apart$'
 check "its full pytest is left to the landing"     has '^  skip  pytest in apart \(not run here; the hosted required check runs it\)$'
+}
+# A skip during collection (an import skipped for a missing module, say) is shown at commit, as the full
+# pytest shows its skips: pytest --collect-only -q alone prints none, so the run asks for the skip summary.
+case_collectskips() {
+apart_copy collectskips
+FAKE_COLLECT_SKIP=1 runci --staged
+check "collection with a skip passes"              test "$RC" = 0
+check "the root's collection shows its skip"       line_after '^  ok    pytest collection$' '^        SKIPPED tests/test_opt.py - Skipped: could not import'
+check "a project apart's collection shows its skip" line_after '^  ok    pytest collection in apart$' '^        SKIPPED tests/test_opt.py - Skipped: could not import'
+check "the root's collection asks for its skips"   test "$(grep -cx -- 'run --locked pytest --collect-only -q -rfEs --no-fold-skipped' "$C.uv.log")" = 1
 }
 case_landingall() {
 fresh landingall
@@ -862,7 +878,7 @@ for mode in --staged --landing plain; do
     check "P3 $mode invokes full pytest once" test "$(grep -c '^run --locked pytest ' "$C.uv.log")" = 1
     check "P3 $mode does not replace pytest with collection" test "$(grep -cE -- '(^| )(--collect-only|--collectonly|--co)( |$)' "$C.uv.log")" = 0
   elif [ "$mode" = --landing ]; then
-    check "P3 --landing collects pytest only" test "$(grep -c '^run --locked pytest --collect-only -q$' "$C.uv.log")" = 1
+    check "P3 --landing collects pytest only" test "$(grep -cx 'run --locked pytest --collect-only -q -rfEs --no-fold-skipped' "$C.uv.log")" = 1
   fi
 done
 }
@@ -1018,7 +1034,7 @@ done
 }
 
 # Every case above works in its own copy, so they run concurrently; their output prints in this order.
-CASES="yaml noflows shell staged untracked tests testdir testgone notes skipsum died symlink deleted deleted2 lockfail fastfirst fastorder fastnamed commitscope collectfail stagedlock stagedtool stagedapart landingall landingmac fullall apart apartlock hookenv parallel order missing pathorder strayconfig longfail slots nice priority prioritycapacity"
+CASES="yaml noflows shell staged untracked tests testdir testgone notes skipsum died symlink deleted deleted2 lockfail fastfirst fastorder fastnamed commitscope collectfail stagedlock stagedtool stagedapart collectskips landingall landingmac fullall apart apartlock hookenv parallel order missing pathorder strayconfig longfail slots nice priority prioritycapacity"
 CASES="$CASES commitfast commitmodes commitslowfailure commitfastfailure commitpytest commitcanon commitshellfailure"
 for c in $CASES; do ( "case_$c" ) >"$TMP/out.$c" 2>&1 & done
 wait

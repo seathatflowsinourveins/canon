@@ -16,7 +16,8 @@ does not belong in the gate?
 
 ## Decision Drivers
 
-* The gate stays fast: seconds here, about a minute on GitHub.
+* The gate stays fast: seconds here, about a minute on GitHub. (2026-11-13: no longer true on GitHub; see
+  Consequences.)
 * What blocks must be reproducible. A model's judgement is not.
 * Changes here are written by agents and merge without a person, so an independent reading has to happen
   before the merge (ADR 0015 rule 5).
@@ -67,7 +68,8 @@ Rules:
    `adopt-upstream` is the path. `watch`, with GitHub's agentic workflows.
 6. **A hosted watch.** `.github/workflows/watch.yml` runs `scripts/canon check` and `outdated` once a day
    on GitHub, so a re-pointed release tag is caught while the development machine sleeps (ADR 0011).
-7. **Converged, and not taken:** caching, because the whole run takes about half a minute; a matrix,
+7. **Converged, and not taken:** caching, because the whole run takes about half a minute (true on
+   2026-11-10; for the run's length now, see Consequences); a matrix,
    because the same script already runs on macOS here and on Linux there; release automation (at least
    19/28), because nothing is released. A workflow that merges bot pull requests is rare (at most 3/28);
    ADR 0016 stands, and a Dependabot change to a workflow now lands with a note like any other.
@@ -77,6 +79,9 @@ Rule 2's list of what needs a review and option 2's "where a defect costs most" 
 ### Consequences
 
 * Good: the gate stays about a minute, and review happens where it can still change the code.
+  (2026-11-13: the first half no longer holds. The hosted `checks` job took 18 min 46 s and 19 min 09 s
+  (ADR 0138). The workflow's tool cache is still off (`cache: false` on `mise-action`), and a cache of
+  check results stays deferred under ADR 0097; whether a tool cache would now pay is not weighed here.)
 * Bad: the `review` note is the lander's own statement, like `signoff`. It shows that a review was
   claimed, not what it read, and its depth is the author's choice. One model family reads its own work (ADR 0043 since adds a second).
   GitHub switches a schedule off after 60 days without activity in a public repository;
@@ -131,3 +136,6 @@ Read 2026-11-10. "Lane" means a research subagent fetched the page and a model s
 * ADR 0043, 2026-11-10 — supersedes rule 4: the second family's reviewer runs on the owner's own sign-in,
   which Codex keeps in its own home or the OS credential store, not a key stored in this repository or a workflow; ADR 0043 states
   that an unsandboxed worker can reach it. A pointer line was added to rule 4.
+* ADR 0138, read 2026-11-13 — two hosted `checks` jobs of 18 min 46 s and 19 min 09 s, setup included;
+  `.github/workflows/ci.yml`, read the same day — `mise-action` runs with `cache: false`. The dated notes in
+  the drivers, rule 7 and Consequences rest on these.

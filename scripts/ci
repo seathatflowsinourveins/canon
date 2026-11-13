@@ -374,7 +374,9 @@ else
   job "ty type check"                    tool uv run --locked ty check
   # at commit, pytest's collection is a fast check too: every test file imports and every test is found,
   # as NautilusTrader's hook does (its python-test-collection)
-  [ "$QUICK" -eq 0 ] || job "pytest collection"  tool uv run --locked pytest --collect-only -q
+  # the skip summary is asked for: --collect-only -q alone prints a collection-time skip (a module
+  # skipped for a missing import) nowhere. A skip mark or a setup skip shows only in the full pytest.
+  [ "$QUICK" -eq 0 ] || job --skips "pytest collection"  tool uv run --locked pytest --collect-only -q -rfEs --no-fold-skipped
   # all are reaped here, so their process IDs leave PIDS: stop_jobs must not signal a reused one
   wait "${PIDS[@]}"; PIDS=()
   for ((j = fast_from; j <= n; j++)); do [ "$(cat "$WORK/$j.rc" 2>/dev/null)" = 0 ] || py_ok=0; done
@@ -469,7 +471,7 @@ elif [ "${#APART[@]}" -gt 0 ]; then
     fi
     if [ -z "$why" ]; then
       job "ty type check in $p"            tool uv --directory "$p" run --locked ty check
-      [ "$QUICK" -eq 0 ] || job "pytest collection in $p"  tool uv --directory "$p" run --locked pytest --collect-only -q
+      [ "$QUICK" -eq 0 ] || job --skips "pytest collection in $p"  tool uv --directory "$p" run --locked pytest --collect-only -q -rfEs --no-fold-skipped
       landing_only --skips "pytest in $p"  tool uv --directory "$p" run --locked pytest -q -rfEs --no-fold-skipped
     else
       for label in "ty type check in $p" "pytest in $p"; do skip_line "$label ($why)"; done
