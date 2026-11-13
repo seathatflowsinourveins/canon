@@ -6,13 +6,12 @@ Writer references below are at 16d02e1f:
   :1195-1205: exits; :1739-1746: fill tuples; :1916-1930: settings rows.
 * session_window.py:3244: mover.run; :1087-1156: mover.result; :1722-1751,
   :3375-3407: closing evidence; :4581-4601: order events and denial reasons.
-* A3's sales and the two new refusal lists implement a prospective record
-  contract, not a writer present at this base. `sales[].distance` is the
-  distance in force, in price units, compared to `trailing_offset`; the exact
-  spelling of that future field remains UNVERIFIED until its writer lands. Null trailing
-  AND limit offsets explicitly describe a plain limit, not a trailing remake.
-  No writer at this base produces `exits[].sales`: A3 is not shown on real
-  records, so a per-symbol window cannot count until a writer records sales.
+* Since #351 (mover.py at 42f2aa58) the writer records A3's sales and both refusal
+  lists: `_sale_sent` (:2199-2240) gives each sale `distance_in_force`, in price
+  units, compared to `trailing_offset`; `refusal_row` (:1546-1556) each
+  `order_refusals` row; :4179-4188 each `refusals` row, which :4004 keeps out of
+  `dropped`. Null trailing AND limit offsets describe a plain limit, not a trailing
+  remake. A record written before #351 has no sales, so A3 is not shown on it.
 
 Sizing implements the recorded equity specialization of pinned NautilusTrader
 d53849b216e2, crates/risk/src/sizing.rs:74-116 (loss/distance, caps, whole-share
@@ -79,13 +78,14 @@ SIXTY_SECONDS_NS = 60_000_000_000
 # off_step: execution.py:1012-1020 formats this LOCAL denial. With legacy records
 # it proves no venue refusal; structured rows explicitly supply `by`.
 REFUSAL_PATTERNS = (
-    ("wash_trade", r"\bpotential wash trade detected\b"),
+    ("wash_trade", r"\bpotential wash trade detected\b", False),
     (
         "refused_replace",
         (
             r"^Alpaca (?:rejected the (?:replace \(trade update\)|replacement order \S+"
             r"(?: \(trade update\))?)|refused the replace \(\d{3}\): [\s\S]*)$"
         ),
+        False,
     ),
     (
         "off_step",
@@ -93,8 +93,13 @@ REFUSAL_PATTERNS = (
             r"(?:limit|stop) price [0-9.eE+\-]+ has more than [24] decimals, "
             r"which Alpaca rejects for a price (?:at or above|below) \$1\.00"
         ),
+        True,
     ),
+    # mover.py:1484-1494 (`refusal_cause`): Alpaca's own rejection of an off-step price.
+    ("off_step", r"\bsub-penny increment does not fulfill minimum pricing criteria\b", False),
 )
+"""Each cause, its text, and whether that text is the adapter's own denial before the venue, so a
+legacy row with no `by` is placed by its text: only the adapter's text is before the venue."""
 
 
 def json_path(path: KeyPath) -> str:
@@ -307,6 +312,10 @@ def _opening_floor(t: Term, entry: KeyPath) -> tuple[bool, bool]:
         return True, False
     if distance <= 0 or floor_dollars - distance > _tick(price):
         return False, False
+    # mover.py:4351-4373 (#351): a writer that records `sized_trail` widens an L under the floor
+    # onto the step or refuses the entry, so only a record written before it may fall short.
+    if t.optional((*entry, "sizing", "sized_trail")) is not ABSENT:
+        return False, False
     # Only cross-dollar rounding may fall short, by at most the entry's tick.
     # mover.py:3600-3602 floors L on that tick; A2 independently checks its exact value.
     stop = t.number((*entry, "sizing", "stop"))
@@ -428,17 +437,24 @@ def _a1_refusals(t: Term) -> None:
                 row = (*new, index)
                 reason = t.text((*row, "reason"))
                 if reason in TRAIL_CAP_REFUSALS:
-                    t.read((*row, "distance"))
-                    t.read((*row, "cap"))
+                    cap = t.number((*row, "cap"))
+                    if cap <= 0 or t.number((*row, "distance")) <= cap:
+                        t.unknown((*row, "distance"), "distance over a positive cap not shown")
                 elif reason == "reentry_max":
-                    t.read((*row, "reentry_max"))
-                    t.read((*row, "reentries"))
+                    most = t.number((*row, "reentry_max"))
+                    made = t.number((*row, "reentries"))
+                    if most < 0 or most != most.to_integral_value() or made < most:
+                        t.unknown(
+                            (*row, "reentries"), "re-entries at the recorded maximum not shown"
+                        )
                 else:
                     t.unknown((*row, "reason"), f"not a refusal reason the writer gives: {reason}")
                 t.stamp((*row, "when_ns"))
                 t.counts["named_refusals"] += 1
-        return
-    t.notes.append("no refusal rows; A1 reads recorded entries and any named drops")
+    else:
+        t.notes.append("no refusal rows; A1 reads recorded entries and any named drops")
+    # mover.py:2336,2343 write both lists, and :4004 keeps a refusal row out of `dropped`, so the
+    # named drops are counted beside the rows, never instead of them.
     # mover.py:1964-1965,3341: named refusals, mixed with notes. No commit boundary.
     dropped = (*RUN, "dropped")
     if t.optional(dropped) is not ABSENT:
@@ -461,7 +477,7 @@ def _plans_cover_buys(t: Term) -> None:
     for index in range(len(t.array(ENTRIES))):
         with t.scope():
             planned.add(t.text((*ENTRIES, index, "client_order_id")))
-    for cid, (_, path) in _buys(t).items():
+    for cid, (_, path) in _bought(t).items():
         if cid not in planned:
             with t.scope():
                 t.unknown((*path, 0), "filled BUY has no entry plan with its client order ID")
@@ -483,6 +499,16 @@ def _a1(t: Term) -> None:
 def _tick(price: Decimal) -> Decimal:
     # price_step.py:31-33, the recorded Alpaca two/four decimal price contract.
     return Decimal("0.01") if price >= 1 else Decimal("0.0001")
+
+
+def _stepped_stop(price: Decimal, fraction: Decimal) -> Decimal:
+    """sizing.py:70-79: the fractional loss rounded up, then the stop floored onto its step."""
+    with localcontext() as context:
+        context.prec, context.rounding = 28, ROUND_CEILING
+        unstepped_loss = price * fraction
+        context.rounding = ROUND_FLOOR
+        unstepped_stop = price - unstepped_loss
+        return unstepped_stop.quantize(_tick(unstepped_stop), rounding=ROUND_FLOOR)
 
 
 def _a2_entry(t: Term, entry: KeyPath) -> None:
@@ -520,18 +546,42 @@ def _a2_entry(t: Term, entry: KeyPath) -> None:
             return
     if numbers["trail"] != t.number((*entry, "trail")):
         t.fail((*sizing, "trail"), "sizing distance differs from the opening plan")
+    fraction = numbers["trail"]
+    # mover.py:4340-4364,4409: an L rounded down under the spread floor is taken up onto the entry
+    # step and the size taken again on that fraction, `sized_trail`, beside the plan's `trail`.
+    if t.optional((*sizing, "sized_trail")) is not ABSENT:
+        sized = t.number((*sizing, "sized_trail"))
+        if sized != fraction:
+            # :4351-4355: only an L rounded down on the entry step under price * floor is widened.
+            if t.read((*entry, "spread_floor")) is None:
+                t.fail((*sizing, "sized_trail"), "a plan with no spread floor is never widened")
+                return
+            least = price * t.number((*entry, "spread_floor"))
+            planned = (price - _stepped_stop(price, fraction)).quantize(
+                _tick(price), rounding=ROUND_FLOOR
+            )
+            if planned >= least:
+                t.fail(
+                    (*sizing, "sized_trail"),
+                    f"the plan's distance {planned} holds the floor {least}: not widened",
+                )
+                return
+            wider = (price - _stepped_stop(price, fraction)).quantize(
+                _tick(price), rounding=ROUND_CEILING
+            )
+            with localcontext() as context:
+                context.prec, context.rounding = 28, ROUND_FLOOR
+                widened = wider / price
+            if sized != widened:
+                t.fail((*sizing, "sized_trail"), f"the plan widened onto the step is {widened}")
+                return
+            fraction = sized
     # sizing.py:45,144-147,173-174: even the stepped stop must stay within the ceiling.
     if numbers["trail"] > Decimal("0.10"):
         t.fail((*sizing, "trail"), "plan refuses distance_over_ceiling (0.10, UNCALIBRATED)")
     if price - stop > price * Decimal("0.10"):
         t.fail((*sizing, "stop"), "stepped stop exceeds the sizing plan's 0.10 ceiling")
-    # sizing.py:70-79 rounds the fractional loss up before flooring the stop.
-    with localcontext() as context:
-        context.prec, context.rounding = 28, ROUND_CEILING
-        unstepped_loss = price * numbers["trail"]
-        context.rounding = ROUND_FLOOR
-        unstepped_stop = price - unstepped_loss
-        expected_stop = unstepped_stop.quantize(_tick(unstepped_stop), rounding=ROUND_FLOOR)
+    expected_stop = _stepped_stop(price, fraction)
     if stop != expected_stop:
         t.fail((*sizing, "stop"), f"plan's stepped stop is {expected_stop}")
     # mover.py:3600-3602: L floors on the ENTRY step, even if the stop crosses $1.
@@ -545,17 +595,21 @@ def _a2_entry(t: Term, entry: KeyPath) -> None:
     start = t.read((*sizing, "start_cap"))
     if start is not None:
         caps.append(t.number((*sizing, "start_cap")))
+    # sizing.py:169-202 and pinned risk sizing.rs:74-116: size against the stop,
+    # BEFORE Mover floors L; using planned_loss/L would over-size a cross-dollar stop.
+    expected = min(numbers["planned_loss"] / (price - stop), *caps).to_integral_value(
+        rounding=ROUND_FLOOR
+    )
+    # mover.py:4263-4266: max_shares only lowers the cap, so more than `expected` is proven.
+    if quantity > expected:
+        t.fail((*sizing, "quantity"), f"planned loss and recorded caps allow at most {expected}")
+        return
     if held_by == "max_shares":
         t.unknown(
             (*sizing, "held_by"),
             "max_shares cap not recorded: mover.py:1924 omits it with size_from_budget; "
             "mover.py:3625-3650 records no replacement cap",
         )
-    # sizing.py:169-202 and pinned risk sizing.rs:74-116: size against the stop,
-    # BEFORE Mover floors L; using planned_loss/L would over-size a cross-dollar stop.
-    expected = min(numbers["planned_loss"] / (price - stop), *caps).to_integral_value(
-        rounding=ROUND_FLOOR
-    )
     if quantity != expected:
         t.fail(
             (*sizing, "quantity"), f"planned loss and recorded caps give {expected} whole shares"
@@ -590,11 +644,11 @@ def _a3(t: Term) -> None:
                     limit = t.read((*row, "limit_offset"))
                     if trailing is None and limit is None:
                         continue  # explicitly a plain limit, with no trailing offset to compare
-                    distance = t.number((*row, "distance"))
+                    distance = t.number((*row, "distance_in_force"))  # mover.py:2225
                     offset = t.number((*row, "trailing_offset"))
-                    t.number((*row, "limit_offset"))
                     if distance <= 0 or offset != distance:
                         t.fail((*row, "trailing_offset"), f"distance in force is {distance}")
+                    t.number((*row, "limit_offset"))
 
 
 def _buys(t: Term) -> dict[str, tuple[int, KeyPath]]:
@@ -709,25 +763,65 @@ def _fill_rows(t: Term) -> None:
             t.stamp((*row, 4))
 
 
+def _bought(t: Term) -> dict[str, tuple[Decimal | None, KeyPath]]:
+    """Each BUY fill's client order ID with the shares bought under it, read without its clock: a
+    bought holding needs its exit whenever it filled. An unread quantity leaves the total None; an
+    unread row can only add shares, so it never makes a shortfall."""
+    found: dict[str, tuple[Decimal | None, KeyPath]] = {}
+    for index in range(len(t.array(FILLS))):
+        with t.scope():
+            path = (*FILLS, index)
+            if t.text((*path, 1)) != "BUY":
+                continue
+            cid = t.text((*path, 0))
+            total, first = found.get(cid, (Decimal(0), path))
+            found[cid] = (None, first)
+            if total is not None:
+                found[cid] = (total + t.number((*path, 2)), first)
+    return found
+
+
 def _a5(t: Term) -> None:
     with t.scope():
         _fill_rows(t)
-    buys = _buys(t)
-    represented: set[str] = set()
-    identities_readable = True
+    bought = _bought(t)
+    # mover.py:4473-4475,4515: every entry sent is recorded with its name, so a BUY is placed by its
+    # own entry even when its exit row is labelled by a later one.
+    sent: dict[str, str] = {}
+    entries = t.optional(ENTRIES)
+    for index in range(len(entries) if isinstance(entries, list) else 0):
+        cid = t.optional((*ENTRIES, index, "client_order_id"))
+        name = t.optional((*ENTRIES, index, "instrument_id"))
+        if isinstance(cid, str) and isinstance(name, str):
+            sent[cid] = name
+    represented: dict[str, dict[str, KeyPath]] = {}
+    first_row: dict[str, KeyPath] = {}
+    identities_readable, names_unread = True, False
+    unread: set[str] = set()
     remainders: dict[str, Decimal] = {}
+    held: dict[str, Decimal] = {}
     # mover.py:1195-1205: holding identity, quantity and exit evidence.
     for index in range(len(t.array(EXITS))):
         path = (*EXITS, index)
-        cid = None
+        cid = instrument = None
         with t.scope():
             cid = t.text((*path, "entry_client_order_id"))
+        with t.scope():
+            instrument = t.text((*path, "instrument_id"))
+        if instrument is None and cid in sent:
+            instrument = sent[cid]  # :3201-3209, a row's name is its own entry's
         if cid is None:
             identities_readable = False
         else:
-            represented.add(cid)
+            rows = represented.setdefault(cid, {})
+            if instrument is not None:
+                rows.setdefault(instrument, path)
+        if instrument is None:
+            names_unread = True
+        else:
+            first_row.setdefault(instrument, (*path, "quantity"))
+        read = False
         with t.scope():
-            instrument = t.text((*path, "instrument_id"))
             reason = t.read((*path, "trigger_reason"))
             if not isinstance(reason, str) or not reason.strip():
                 t.fail((*path, "trigger_reason"), "holding has no named exit reason")
@@ -738,7 +832,10 @@ def _a5(t: Term) -> None:
                     (*path, "filled_quantity"),
                     "filled quantity must be between zero and holding quantity",
                 )
-            remainders[instrument] = remainders.get(instrument, Decimal(0)) + quantity - filled
+            if instrument is not None:
+                remainders[instrument] = remainders.get(instrument, Decimal(0)) + quantity - filled
+                held[instrument] = held.get(instrument, Decimal(0)) + quantity
+            read = True
             trigger_price = t.read((*path, "trigger_price"))
             # mover.py:3045-3050,3274-3276: these named exits may have no quoted trigger price.
             if (
@@ -756,9 +853,43 @@ def _a5(t: Term) -> None:
                 t.fail((*path, "final_fill_ns"), "unsold remainder cannot have a final-fill clock")
             elif final is not None and t.stamp((*path, "final_fill_ns")) < triggered:
                 t.fail((*path, "final_fill_ns"), "final fill precedes exit decision")
-    for cid, (_, fill_path) in buys.items():
-        if cid not in represented and identities_readable:
-            t.fail((*fill_path, 0), "BUY fill has no named exit/holding record")
+        if not read and instrument is not None:
+            unread.add(instrument)
+    # :3201-3209: one entry's exit rows are all on its own slot's name, the name it was sent on.
+    for cid, rows in represented.items():
+        own = sent.get(cid) or next(iter(rows), None)
+        for name, row in rows.items():
+            if name != own:
+                with t.scope():
+                    t.fail((*row, "instrument_id"), f"an exit row of an entry on {own}")
+    # mover.py:2062-2068,2076-2080: a BUY fill adds its shares to its name's current exit row,
+    # which a late fill of an earlier entry finds labelled by a later entry, or by none after a
+    # flat (:3201-3209,3268-3334); so the shares are compared by name, not by client order ID.
+    shares_by_name: dict[str, Decimal | None] = {}
+    first: dict[str, KeyPath] = dict(first_row)
+    for cid, (shares, fill_path) in bought.items():
+        rows = represented.get(cid, {})
+        name = sent.get(cid) or (next(iter(rows)) if len(rows) == 1 else None)
+        if name is None:
+            if cid not in represented and identities_readable:
+                t.fail((*fill_path, 0), "BUY fill has no named exit/holding record")
+            continue
+        first[name] = (*fill_path, 2)
+        total = shares_by_name.get(name, Decimal(0))
+        shares_by_name[name] = None if total is None or shares is None else total + shares
+    for name in shares_by_name.keys() | held.keys():
+        shares = shares_by_name.get(name, Decimal(0))
+        recorded = held.get(name, Decimal(0))
+        if shares is None or recorded == shares:
+            continue
+        with t.scope():
+            # more held than bought means BUY fills missing from the record, which never fails a
+            # term (an exit with no BUY reads incomplete); fewer is proven unless a row is unread
+            if recorded > shares:
+                t.unknown(first[name], "the record's BUY fills do not account for the shares held")
+            if names_unread or name in unread:
+                t.unknown(first[name], "the exit records' quantities are not all read")
+            t.fail(first[name], f"exit records hold {recorded} of {shares} shares bought")
     # session_window.py:3345-3353: once the account check after the stop ends without raising, the
     # result is read again over the strategy's fills and the check's own closes (`check_fills`,
     # :1752-1755, rows (client order ID, instrument, side, quantity, price)) and says so in
@@ -793,6 +924,8 @@ def _a5(t: Term) -> None:
             expected = remainders.get(instrument, Decimal(0)) + closed
             if opened != expected and fills_unread:
                 t.unknown(path, "the account check's closes are not all read")
+            elif opened != expected and (names_unread or instrument in unread):
+                t.unknown(path, "the exit records' quantities are not all read")
             elif opened != expected and instrument not in remainders:
                 t.fail(path, "open holding has no exit evidence/reason")
             elif opened != expected:
@@ -848,12 +981,17 @@ def _a6(t: Term) -> None:
 
 def _refusal(t: Term, path: KeyPath, by: str | None = None) -> None:
     reason = t.text(path)  # sources are listed beside REFUSAL_PATTERNS above
-    pattern = next(
-        (name for name, regex in REFUSAL_PATTERNS if re.search(regex, reason, re.IGNORECASE)), None
+    pattern, local = next(
+        (
+            (name, local)
+            for name, regex, local in REFUSAL_PATTERNS
+            if re.search(regex, reason, re.IGNORECASE)
+        ),
+        (None, False),
     )
     if pattern is None:
         t.notes.append(f"{json_path(path)}: refusal outside A7's three causes: {reason}")
-    elif by == "before_venue" or (by is None and pattern == "off_step"):
+    elif by == "before_venue" or (by is None and local):
         t.notes.append(f"{json_path(path)}: {pattern}, before venue")
     else:
         t.fail(path, f"venue refusal: {pattern}")
