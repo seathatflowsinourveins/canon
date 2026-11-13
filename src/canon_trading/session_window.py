@@ -2042,6 +2042,9 @@ def _shown_record(report: WindowReport) -> dict:
     fields = asdict(report)
     if fields["result"] == "running" and _SIGNALS.first is not None:
         fields["result"] = f"stopping: {_SIGNALS.first} received; the window has not finished"
+    # the copy's request measurement follows the copy's own result and end, so a result chosen and not yet
+    # ended is not shown `running` or `complete` (`asdict` copies the budget; the report is unchanged)
+    _finish_request_measurement(fields)
     return fields
 
 
@@ -4623,9 +4626,11 @@ class _WindowSignals:
         if self.first is not None:
             return  # a forwarded copy, or a second stop: the first one's stop is under way
         self.first = signal.Signals(signum).name
-        if self.record is not None and self.record[1].result == "running":
+        if self.record is not None:
             # never `running` again: a kill before the window's end leaves this mark. The report is not
-            # changed here, only a copy written (`_shown_record`); a result already set is left as it is.
+            # changed here, only a copy written (`_shown_record`); a result already set is written as it
+            # is, since the main thread may have chosen it and not yet written it (a second reader of
+            # #323): a kill then leaves that result, with its request measurement perhaps not final.
             try:
                 _write_window_record(*self.record)
             except Exception as e:  # noqa: BLE001 - the stop goes on; said on stderr
@@ -4920,11 +4925,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"paper:session: {e}", file=sys.stderr)
         named = re.search(r"stopped by (SIG[A-Z]+)", str(e))
         code = 128 + signal.Signals[named.group(1)].value if named else 1
-        if _ABANDONED:
-            try:
-                write_heartbeat(args.log_dir, f"failed: {type(e).__name__}: {e}")
-            except OSError:
-                pass
+        try:  # abandoned or not: the schedule's status reads a failed firing from it
+            write_heartbeat(args.log_dir, f"failed: {type(e).__name__}: {e}")
+        except OSError:
+            pass
     except BaseException as e:
         if not _ABANDONED:
             raise
@@ -5309,38 +5313,26 @@ def _main(args: argparse.Namespace) -> int:
     except WindowRefused as e:
         print(f"paper:session: {e}", file=sys.stderr)
         _heard(args.log_dir, f"refused: {e}")  # the refusal stands, said above
-        try:
-            unrecorded = write_record(
-                args.log_dir,
-                {
-                    "session": session,
-                    "strategy": args.strategy,
-                    "result": f"refused: {e}",
-                    **(
-                        {}
-                        if config is None
-                        else {
-                            "trigger": config.trigger,
-                            "validate_trade_sequence": config.validate_trade_sequence,
-                        }
-                    ),
-                    "started_epoch": time.time(),
-                    "started": datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ"),
-                    "stale_after": STALE_RUNNING_SECS,
-                    "commit": running_commit(),
-                    "account": paper_account(),
-                    "request_budget": request_record(()),
-                    **_refused_arm(args),
-                },
-            )
-            if unrecorded is not None:
-                print(
-                    f"paper:session: the refused record's request snapshot failed: {unrecorded}",
-                    file=sys.stderr,
-                )
-        except OSError as written:
-            print(f"paper:session: the record could not be written: {written}", file=sys.stderr)
+        _record_unrun(args, session, f"refused: {e}", config)
         return 1
+    except WindowSignalled as e:
+        # a window stopped before its node ends failed (ADR 0050). Before run_window registered its record
+        # (a signal in the mover's sample or the reference read), a record says so, so an earlier window's
+        # result is not left as the latest. A registered record still `running` (a signal in its first
+        # write, before run_window's `try`) shows only the handler's stopping mark: it is ended here. One
+        # run_window ended holds. `main` says the stop and writes the heartbeat.
+        failed = f"failed: {type(e).__name__}: {e}"
+        if _SIGNALS.record is None:
+            _record_unrun(args, session, failed, config)
+        elif _SIGNALS.record[1].result == "running":
+            log_dir, report = _SIGNALS.record
+            report.result = failed
+            report.ended = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+            try:
+                write_record(log_dir, report, refresh_requests=False)
+            except OSError as written:
+                print(f"paper:session: the record could not be written: {written}", file=sys.stderr)
+        raise
     # KeyError: no key pair in the env; OSError: the HTTP layer's errors, the adapter's timeouts among them
     except (RuntimeError, ValueError, KeyError, APIError, OSError) as e:
         print(f"paper:session: {e}", file=sys.stderr)
@@ -5350,7 +5342,51 @@ def _main(args: argparse.Namespace) -> int:
         _heard_failed(args.log_dir, e)
         raise
     print(json.dumps(asdict(report), indent=2))
+    if report.result.startswith("failed:"):  # a signal after the node: the heartbeat says it too
+        _heard(args.log_dir, report.result)
+    elif _SIGNALS.first is not None:
+        # one after the result was chosen: `main` exits for it, so the heartbeat says so
+        _heard(args.log_dir, f"{report.result}; {_SIGNALS.first} received; the wind-down finished")
     return 0
+
+
+def _record_unrun(
+    args: argparse.Namespace, session: str, result: str, config: WindowConfig | None
+) -> None:
+    """The record of a window that ended before `run_window` registered one (refused, or stopped by a
+    signal), with `result`; one that cannot be written is said on stderr, so the run's own outcome and
+    exit code stand."""
+    try:
+        unrecorded = write_record(
+            args.log_dir,
+            {
+                "session": session,
+                "strategy": args.strategy,
+                "result": result,
+                **(
+                    {}
+                    if config is None
+                    else {
+                        "trigger": config.trigger,
+                        "validate_trade_sequence": config.validate_trade_sequence,
+                    }
+                ),
+                "started_epoch": time.time(),
+                "started": datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ"),
+                "stale_after": STALE_RUNNING_SECS,
+                "commit": running_commit(),
+                "account": paper_account(),
+                "request_budget": request_record(()),
+                **_refused_arm(args),
+            },
+        )
+        if unrecorded is not None:
+            print(
+                f"paper:session: the record's request snapshot failed: {unrecorded}",
+                file=sys.stderr,
+            )
+    except OSError as written:
+        print(f"paper:session: the record could not be written: {written}", file=sys.stderr)
 
 
 if __name__ == "__main__":
