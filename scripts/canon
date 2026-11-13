@@ -5,6 +5,8 @@
 #   - Git smart-HTTP ref advertisement: GET <repo>.git/info/refs?service=git-upload-pack
 #     https://git-scm.com/docs/gitprotocol-http  (same data `git ls-remote` prints)
 #   - Registry: canon/upstreams.json   Lock: canon/upstreams.lock.json
+#   - Agent skill metadata: agentskills-spec@83021e2be457 docs/specification.mdx:19-28,58-65.
+#   - AGENTS.md byte limit: codex-cli@0a94398fa60c codex-rs/config/defaults.toml:9.
 #
 # Needs curl and jq, plus awk, grep, sed, tr, cut, sort, ls, mktemp and date, all of which ship with macOS
 # and Ubuntu, so it runs before any toolchain install. Bash 3.2 or later.
@@ -405,6 +407,154 @@ cmd_lint() {
       done <<<"$mv"
     fi
   done
+
+  # 5. Repository skills: required front matter from agentskills-spec@83021e2be457
+  # docs/specification.mdx:19-28; the name rule is at :58-65 (including Unicode alphanumerics).
+  # Read the required scalar fields in plain (on the key's line or the indented lines after it), single-line
+  # quoted or block form using bootstrap tools. That is a subset of YAML that Canon's skills keep to: a
+  # multi-line quoted scalar, a block header with an indentation indicator, a plain scalar opening with an
+  # indicator (- @ % ` | >) and a key with a space before its colon are refused, not guessed at. Top-level
+  # fields are held to the spec's table (:25-32) and description to its 1024 characters. The reference
+  # validator (skills-ref in the same pin) is not adopted; this checks the fields, not the Markdown body.
+  local skill folder skill_name skill_fields skill_compat skill_description bytes doc
+  # Codex finds a SKILL.md at any depth below a repository skill root (codex-cli@0a94398fa60c
+  # codex-rs/utils/plugins/src/lib.rs:21-24, Recursive the default), so every one is read, symlinks included.
+  while IFS= read -r skill; do
+    b=${skill#"$ROOT"/}; folder=${skill%/*}; folder=${folder##*/}
+    if [ ! -f "$skill" ] || [ ! -r "$skill" ]; then
+      err=1; echo "lint: $b is not a readable file"; continue
+    fi
+    if skill_fields=$(awk -v file="$b" '
+        function problem(message) { print "lint: " file " " message > "/dev/stderr"; bad = 1 }
+        function trim(s) { sub(/^[[:space:]]+/, "", s); sub(/[[:space:]]+$/, "", s); return s }
+        function scalar(s, q, end, tail, c, value) {
+          s = trim(s); q = substr(s, 1, 1)
+          if (q == "\047" || q == "\"") {
+            value = ""
+            for (end = 2; end <= length(s); end++) {
+              c = substr(s, end, 1)
+              if (c == q) {
+                if (q == "\047" && substr(s, end + 1, 1) == q) end++
+                else break
+              }
+              if (q == "\"" && c == "\\") {
+                problem("requires an unescaped quoted " key " field; use a block scalar for escapes"); return ""
+              }
+              value = value c
+            }
+            tail = trim(substr(s, end + 1))
+            if (end > length(s) || (tail != "" && tail !~ /^#/)) {
+              problem("has an invalid quoted " key " field"); return ""
+            }
+            return value
+          }
+          if (s ~ /^#/) return ""
+          sub(/[[:space:]]+#.*$/, "", s)
+          if (s ~ /^[][{}&*!@%`|>,]/ || s ~ /^-([[:space:]]|$)/ || s ~ /:([[:space:]]|$)/) {
+            problem("requires a scalar " key " field"); return ""
+          }
+          return trim(s)
+        }
+        { sub(/\r$/, "") }
+        NR == 1 { opened = ($0 ~ /^---[[:space:]]*$/); if (!opened) exit; next }
+        /^---[[:space:]]*$/ { closed = 1; exit }
+        block != "" && /^[[:blank:]]/ {
+          line = trim($0)
+          if (line == "") next
+          if (kind == "map") { if (line ~ /^-([[:space:]]|$)/) problem("requires metadata to be a mapping"); next }
+          if (kind == "quoted") { if (line ~ /^#/) next; problem("requires a single-line quoted " block " field"); next }
+          if (kind == "plain") {
+            if (line ~ /^#/) next
+            sub(/[[:space:]]+#.*$/, "", line)
+            # Only the first line of a value can open with an indicator, not a continuation line.
+            if ((values[block] == "" && (line ~ /^[][{}"\047&*!@%`|>,]/ || line ~ /^-([[:space:]]|$)/)) || line ~ /:([[:space:]]|$)/) {
+              problem("requires a scalar " block " field"); next
+            }
+          }
+          values[block] = values[block] (values[block] == "" ? "" : " ") line; next
+        }
+        /^[^[:space:]#]/ {
+          block = ""; kind = ""
+          field = $0; sub(/:.*/, "", field)
+          if ($0 !~ /^[A-Za-z0-9_-]+:([[:space:]]|$)/ || field !~ /^(name|description|license|compatibility|metadata|allowed-tools)$/) {
+            problem("has a field outside the spec table: " field); next
+          }
+          if (++seen[field] > 1) problem("has duplicate " field " fields")
+          key = field
+          value = trim(substr($0, length(field) + 2))
+          if (field == "metadata") {
+            if (value != "" && value !~ /^#/ && value !~ /^\{.*\}([[:space:]]+#.*)?$/) problem("requires metadata to be a mapping")
+            block = field; kind = "map"; next
+          }
+          if (value ~ /^[>|][+-]?([[:space:]]+#.*)?$/) { block = field; kind = "literal"; values[field] = ""; next }
+          if (value == "" || value ~ /^#/) { block = field; kind = "plain"; values[field] = ""; next }
+          q = substr(value, 1, 1)
+          values[field] = scalar(value); quoted[field] = (q == "\"" || q == "\047")
+          block = field; kind = (q == "\"" || q == "\047") ? "quoted" : "plain"
+        }
+        END {
+          if (!opened) problem("must open with YAML front matter (---)")
+          else if (!closed) problem("has unclosed YAML front matter (---)")
+          else {
+            if (!seen["name"] || trim(values["name"]) == "") problem("missing or empty name")
+            if (!seen["description"] || trim(values["description"]) == "") problem("missing or empty description")
+            if (seen["compatibility"] && trim(values["compatibility"]) == "") problem("has an empty compatibility; the spec allows 1-500 characters")
+            # An unquoted null or number is not a YAML string, and Codex and skills-ref refuse it.
+            for (f in seen) if (f != "metadata" && !quoted[f] && trim(values[f]) ~ /^(null|Null|NULL|~|[-+]?[0-9][0-9_]*(\.[0-9]*)?([eE][-+]?[0-9]+)?)$/)
+              problem("requires " f " to be a string; quote it")
+          }
+          if (bad) exit 1
+          print trim(values["name"]); print trim(values["compatibility"]); print trim(values["description"])
+        }' "$skill"); then
+      { IFS= read -r skill_name; IFS= read -r skill_compat; IFS= read -r skill_description; } <<< "$skill_fields"
+      if ! jq -en --arg c "$skill_compat" '$c | length <= 500' >/dev/null; then
+        err=1; echo "lint: $b has compatibility over the spec limit of 500 characters"
+      fi
+      if ! jq -en --arg d "$skill_description" '$d | length <= 1024' >/dev/null; then
+        err=1; echo "lint: $b description exceeds the spec's 1024 characters"
+      fi
+      # jq counts Unicode characters and tests their classes independently of the shell locale.
+      if ! jq -en --arg name "$skill_name" '$name | length >= 1 and length <= 64
+          and test("^[\\p{Ll}\\p{Lm}\\p{Lo}\\p{N}]+(-[\\p{Ll}\\p{Lm}\\p{Lo}\\p{N}]+)*$")' >/dev/null; then
+        err=1; echo "lint: $b name must be 1-64 lowercase alphanumeric characters with single internal hyphens"
+      fi
+      if [ "$skill_name" != "$folder" ]; then
+        err=1; echo "lint: $b name '$skill_name' does not match folder '$folder'"
+      fi
+    else
+      err=1; echo "lint: $b could not read valid required skill fields"
+    fi
+  done < <([ -d "$ROOT/.agents/skills" ] && find "$ROOT/.agents/skills" -name SKILL.md \( -type f -o -type l \) | LC_ALL=C sort)
+  # Codex truncates project instructions at this default: codex-cli@0a94398fa60c
+  # codex-rs/config/defaults.toml:9, one budget for the docs on the path from the project root (the nearest
+  # folder with .git) down to the working folder, one per folder, AGENTS.override.md before AGENTS.md
+  # (core/src/agents_md.rs:68-92,192-270). Each folder holding a doc is checked as a working folder; a
+  # folder below another .git is another project's. Count bytes, not characters; equality is allowed.
+  local seen_dirs="" c chain names
+  while IFS= read -r doc; do
+    c=${doc%/*}
+    case "$seen_dirs" in *"|$c|"*) continue ;; esac
+    seen_dirs="$seen_dirs|$c|"; chain=0; names=""
+    while :; do
+      if [ "$c" != "$ROOT" ] && [ -e "$c/.git" ]; then chain=-1; break; fi
+      doc=""
+      if [ -f "$c/AGENTS.override.md" ]; then doc="$c/AGENTS.override.md"; elif [ -f "$c/AGENTS.md" ]; then doc="$c/AGENTS.md"; fi
+      # Codex charges nothing for a doc with only whitespace (core/src/agents_md.rs:168-178).
+      if [ -n "$doc" ] && grep -q '[^[:space:]]' "$doc" 2>/dev/null; then
+        if bytes=$(wc -c < "$doc"); then
+          chain=$((chain + bytes)); names="${doc#"$ROOT"/} $names"
+        else
+          err=1; echo "lint: ${doc#"$ROOT"/} could not be read for its 32768-byte limit"
+        fi
+      fi
+      [ "$c" = "$ROOT" ] && break
+      c=${c%/*}
+    done
+    if [ "$chain" -gt 32768 ]; then
+      err=1; echo "lint: AGENTS.md files on one path exceed Codex project_doc_max_bytes (32768 bytes): $names"
+    fi
+  done < <(find "$ROOT" \( -name .git -o -name .venv -o -name node_modules -o -path "$ROOT/catalog" -o -path "$ROOT/ledger" \) -prune \
+             -o \( -name AGENTS.md -o -name AGENTS.override.md \) \( -type f -o -type l \) -print)
 
   if [ "$err" -eq 0 ]; then echo "canon: lint clean"; else exit 1; fi
 }

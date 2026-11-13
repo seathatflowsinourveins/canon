@@ -6,7 +6,7 @@
   `lane-report` (state of every session).
 - **Subagents:** `upstream-scout` (Sonnet; sourced web research) and `evidence-verifier` (Opus; re-checks an
   ADR's claims against its sources). Give a scout the question, not your expected answer.
-- **Hooks:** an edit under `canon/` or `docs/adr/` runs `scripts/canon lint`, and an edit to a Python file
+- **Hooks:** an edit under `canon/`, `docs/adr/` or `.agents/`, or to an `AGENTS.md`, runs `scripts/canon lint`, and an edit to a Python file
   runs ruff on it. Fix what they report before moving on. No hook runs before a tool call (ADR 0020); a
   permission prompt is the owner's to answer, so do not route around one. ADR 0028 lists what still asks.
   Session start prints the pin count, any ADR past review and the last upstream check.

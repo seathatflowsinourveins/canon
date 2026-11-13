@@ -5,11 +5,13 @@
 # the shape refs_for reads. Its answers are prepared files, built once from a snapshot of the lock and
 # rebuilt when a section adds extra refs. Hooks get the documented stdin JSON
 # (https://code.claude.com/docs/en/hooks.md) with CLAUDE_PROJECT_DIR set. Sections run concurrently.
+# Agent skill contract: agentskills-spec@83021e2be457 docs/specification.mdx:19-28,58-65;
+# document byte limit: codex-cli@0a94398fa60c codex-rs/config/defaults.toml:9.
 #
 # Usage: scripts/test-canon [pattern]   run only the sections whose name contains pattern
 #        (names: baseline, registry validation, resolve keeps pins, stale pin, check exits, refs, evidence,
 #        workflows, broken pipe, outdated, network down, mise requests, claude pin, resolve lock, lint hook,
-#        watch and brief, brief toolchain, src)
+#        watch and brief, brief toolchain, src, agent skills)
 # Prints one line per case. Exit 0 if every case passes, 1 otherwise. TEST_CANON_VERBOSE=1 shows the
 # output of the command under test for a failing case.
 set -uo pipefail
@@ -85,7 +87,10 @@ fresh() {
   cp -R "$SRC/.claude/hooks" "$T/.claude/"
   cp -R "$SRC/.github/workflows" "$T/.github/"
   cp -R "$SRC/home" "$T/"
-  cp "$SRC/mise.toml" "$SRC/mise.lock" "$SRC/uv.lock" "$T/"
+  cp "$SRC/mise.toml" "$SRC/mise.lock" "$SRC/uv.lock" "$SRC/AGENTS.md" "$T/"
+  if [ -d "$SRC/.agents/skills" ]; then
+    mkdir -p "$T/.agents"; cp -R "$SRC/.agents/skills" "$T/.agents/"
+  fi
   : > "$EXTRA"; fake_build
   cp "$SNAP" "$BEFORE"
   unset FAKE_PAD FAKE_FAIL
@@ -120,6 +125,191 @@ sec_baseline() {
   check "lint is clean on an unchanged copy"                 test "$rc" -eq 0
   out=$(canon check); rc=$?
   check "check is current on an unchanged copy"              test "$rc" -eq 0
+}
+
+# fill N: N bytes of visible text; Codex charges nothing for a doc of only whitespace (agents_md.rs:168-178)
+fill() { head -c "$1" /dev/zero | tr '\0' x; }
+
+sec_agent_skills() {
+  fresh
+  out=$(canon lint); rc=$?
+  check "agent skills: the built tree passes lint"          test "$rc" -eq 0
+  local rel=".agents/skills/test-skill/SKILL.md" file invalid value long
+  file="$T/$rel"; mkdir -p "${file%/*}"
+  # shellcheck disable=SC2329  # invoked by check
+  skill_diagnostic() { has "$out" "$rel" && has "$out" "$1"; }
+  skill_rejected() {
+    out=$(canon lint); rc=$?
+    check "agent skills: $1"                                test "$rc" -ne 0
+    check "... names the file and $2"                       skill_diagnostic "$2"
+  }
+  printf 'name: test-skill\ndescription: Test worker.\n' > "$file"
+  skill_rejected "missing front matter fails" "front matter"
+  printf -- '---\nname: test-skill\ndescription: Test worker.\n' > "$file"
+  skill_rejected "unclosed front matter fails" "front matter"
+  printf -- '---\ndescription: Test worker.\n---\n' > "$file"
+  skill_rejected "missing name fails" "name"
+  printf -- '---\nname:\ndescription: Test worker.\n---\n' > "$file"
+  skill_rejected "empty name fails" "name"
+  printf -- '---\nname: other-skill\ndescription: Test worker.\n---\n' > "$file"
+  skill_rejected "name differs from the folder" "folder"
+
+  # Match the folder to each invalid name so the name rule is tested on its own.
+  long=$(printf '%065d' 0)
+  for invalid in Test-skill -test-skill test-skill- test--skill test_skill "test skill" CAFÉ "$long"; do
+    rm -rf "${file%/*}"
+    rel=".agents/skills/$invalid/SKILL.md"; file="$T/$rel"; mkdir -p "${file%/*}"
+    printf -- '---\nname: %s\ndescription: Test worker.\n---\n' "$invalid" > "$file"
+    skill_rejected "invalid name '$invalid' fails" "name"
+  done
+  rm -rf "${file%/*}"
+  long=$(printf '%064d' 0)
+  rel=".agents/skills/$long/SKILL.md"; file="$T/$rel"; mkdir -p "${file%/*}"
+  printf -- '---\nname: "%s"\ndescription: Test worker.\n---\n' "$long" > "$file"
+  out=$(canon lint); rc=$?
+  check "agent skills: a 64-character numeric name passes" test "$rc" -eq 0
+  rm -rf "${file%/*}"
+  rel=".agents/skills/café-日本語/SKILL.md"; file="$T/$rel"; mkdir -p "${file%/*}"
+  printf -- '---\nname: café-日本語\ndescription: Test worker.\n---\n' > "$file"
+  out=$(canon lint); rc=$?
+  check "agent skills: lowercase and uncased Unicode names pass" test "$rc" -eq 0
+  rm -rf "${file%/*}"
+  rel=".agents/skills/test-skill/SKILL.md"; file="$T/$rel"; mkdir -p "${file%/*}"
+
+  printf -- '---\nname: test-skill\n---\n' > "$file"
+  skill_rejected "missing description fails" "description"
+  for value in '' '""' "''" '"  "' ' # only a comment' '"" # "comment"' '>-' '|'; do
+    printf -- '---\nname: test-skill\ndescription: %s\n---\n' "$value" > "$file"
+    skill_rejected "empty description '$value' fails" "description"
+  done
+  printf -- '---\nname: test-skill\nmetadata:\n  description: Nested metadata.\n---\ndescription: Body text.\n' > "$file"
+  skill_rejected "body and nested metadata cannot supply description" "description"
+  printf -- '---\nname: test-skill\ndescription: >-\n  Review a worker task\n  and report findings.\n---\n' > "$file"
+  out=$(canon lint); rc=$?
+  check "agent skills: a folded description passes"        test "$rc" -eq 0
+  printf -- '---\r\nname: "test-skill" # folder name\r\ndescription: '\''Review # findings.'\''\r\n---\r\n' > "$file"
+  out=$(canon lint); rc=$?
+  check "agent skills: quoted fields and CRLF pass"         test "$rc" -eq 0
+  printf -- '---\nname: test-skill\ndescription: ">"\n---\n' > "$file"
+  out=$(canon lint); rc=$?
+  check "agent skills: a quoted block marker is a scalar"  test "$rc" -eq 0
+  # The spec's limits and field table (agentskills-spec@83021e2be457 docs/specification.mdx:25-32).
+  long=$(fill 1025)
+  printf -- '---\nname: test-skill\ndescription: %s\n---\n' "$long" > "$file"
+  skill_rejected "a description over 1024 characters fails" "description"
+  long=$(fill 1024)
+  printf -- '---\nname: test-skill\ndescription: %s\n---\n' "$long" > "$file"
+  out=$(canon lint); rc=$?
+  check "agent skills: a 1024-character description passes" test "$rc" -eq 0
+  printf -- '---\nname: test-skill\ndescription: Test worker.\nfoo: bar\n---\n' > "$file"
+  skill_rejected "a field outside the spec's table fails" "foo"
+  printf -- '---\nname: test-skill\ndescription: Test worker.\nlicense: MIT\nmetadata:\n  owner: canon\n---\n' > "$file"
+  out=$(canon lint); rc=$?
+  check "agent skills: the spec's optional fields pass"    test "$rc" -eq 0
+  for value in '- x' '@x' '%x' '`x' '|2' '>1-'; do
+    printf -- '---\nname: test-skill\ndescription: %s\n---\n' "$value" > "$file"
+    skill_rejected "description '$value', not a plain scalar Canon reads, fails" "description"
+  done
+  for value in '\n  - item' '\n  key: value' '\n  "quoted"' 'Use when:' ']x' '}x' ',x' 'one\n  two: three' '"open\n  close"'; do
+    printf -- '---\nname: test-skill\ndescription: %b\n---\n' "$value" > "$file"
+    skill_rejected "description '$value', not a plain scalar Canon reads, fails" "description"
+  done
+  printf -- '---\nname: test-skill\ndescription: Review a worker task\n  and report findings.\n---\n' > "$file"
+  out=$(canon lint); rc=$?
+  check "agent skills: a plain description continued on the next lines passes" test "$rc" -eq 0
+  printf -- '---\nname: test\n  skill\ndescription: Test worker.\n---\n' > "$file"
+  skill_rejected "a name continued on the next line is read whole" "name"
+  printf -- '---\nname: test-skill\ndescription: Test worker.\nmetadata: x\n---\n' > "$file"
+  skill_rejected "metadata that is not a mapping fails" "metadata"
+  printf -- '---\nname: test-skill\ndescription: Test worker.\nlicense: MIT\nlicense: MIT\n---\n' > "$file"
+  skill_rejected "a duplicate optional field fails" "license"
+  long=$(fill 501)
+  printf -- '---\nname: test-skill\ndescription: Test worker.\ncompatibility: %s\n---\n' "$long" > "$file"
+  skill_rejected "compatibility over 500 characters fails" "compatibility"
+  printf -- '---\nname: test-skill\ndescription: Test worker.\nallowed-tools: [a, b]\n---\n' > "$file"
+  skill_rejected "allowed-tools that is not a string fails" "allowed-tools"
+  printf -- '---\nname: test-skill\ndescription:\n  Review a worker task\n  and report findings.\n---\n' > "$file"
+  out=$(canon lint); rc=$?
+  check "agent skills: a plain description on the next lines passes" test "$rc" -eq 0
+  printf -- '---\nname: test-skill\ndescription: Test worker.\n---\n' > "$file"
+
+  # Review round 3: YAML forms Codex reads, and limits the spec sets.
+  printf -- '---\nname: test-skill\ndescription: a b\n  *c* d # note: x\n---\n' > "$file"
+  out=$(canon lint); rc=$?
+  check "agent skills: a continuation line may open with an indicator and end in a comment" test "$rc" -eq 0
+  for value in '~' 'null' 'NULL' '12'; do
+    printf -- '---\nname: test-skill\ndescription: %s\n---\n' "$value" > "$file"
+    skill_rejected "an unquoted '$value' description, not a string, fails" "description"
+  done
+  printf -- '---\nname: test-skill\ndescription: Test worker.\ncompatibility: ""\n---\n' > "$file"
+  skill_rejected "an empty compatibility fails" "compatibility"
+  long=$(awk 'BEGIN { for (i = 0; i < 200; i++) printf "日" }')
+  printf -- '---\nname: test-skill\ndescription: Test worker.\ncompatibility: %s\n---\n' "$long" > "$file"
+  out=$(LC_ALL=C canon lint); rc=$?
+  check "agent skills: compatibility counts characters, not bytes, in any locale" test "$rc" -eq 0
+  printf -- '---\nname: test-skill\ndescription: Test worker.\nmetadata:\n  - x\n---\n' > "$file"
+  skill_rejected "metadata given as a list fails" "metadata"
+  printf -- '---\nname: test-skill\ndescription: Test worker.\nmetadata: {owner: canon}\n---\n' > "$file"
+  out=$(canon lint); rc=$?
+  check "agent skills: an inline metadata mapping passes"   test "$rc" -eq 0
+  printf -- '---\nname: test-skill\ndescription: Test worker.\n---\n' > "$file"
+  mkdir -p "$T/.agents/skills/group/deep"
+  printf -- '---\nname: WRONG\n---\n' > "$T/.agents/skills/group/deep/SKILL.md"
+  out=$(canon lint); rc=$?
+  check "agent skills: a SKILL.md deeper than one folder is linted" test "$rc" -ne 0
+  rm -rf "$T/.agents/skills/group"
+
+  # Codex spends one 32768-byte budget on every project doc from the root down (agents_md.rs:68-92).
+  mkdir -p "$T/packages/nested"
+  fill 20000 > "$T/packages/nested/AGENTS.md"
+  fill 20000 > "$T/AGENTS.md"
+  out=$(canon lint); rc=$?
+  check "agent skills: AGENTS.md files over 32768 bytes together fail" test "$rc" -ne 0
+  check "... names the nested AGENTS.md"                    has "$out" "packages/nested/AGENTS.md"
+  rm -rf "$T/packages/nested"
+  fill 20000 > "$T/AGENTS.override.md"
+  out=$(canon lint); rc=$?
+  check "agent skills: AGENTS.override.md is read instead of AGENTS.md beside it" test "$rc" -eq 0
+  fill 32769 > "$T/AGENTS.override.md"
+  out=$(canon lint); rc=$?
+  check "agent skills: an AGENTS.override.md over the budget fails" test "$rc" -ne 0
+  rm -f "$T/AGENTS.override.md"
+  mkdir -p "$T/packages/a" "$T/packages/b"
+  fill 8000 > "$T/packages/a/AGENTS.md"; fill 8000 > "$T/packages/b/AGENTS.md"
+  out=$(canon lint); rc=$?
+  check "agent skills: sibling AGENTS.md files are on different paths" test "$rc" -eq 0
+  rm -rf "$T/packages/a" "$T/packages/b"
+  mkdir -p "$T/.claude/worktrees/x"; : > "$T/.claude/worktrees/x/.git"
+  fill 20000 > "$T/.claude/worktrees/x/AGENTS.md"
+  out=$(canon lint); rc=$?
+  check "agent skills: a nested checkout is its own project root" test "$rc" -eq 0
+  rm -rf "$T/.claude/worktrees"
+  mkdir -p "$T/pk"; fill 20000 > "$T/AGENTS.md"; fill 20000 > "$T/pk/real.md"; ln -s real.md "$T/pk/AGENTS.md"
+  out=$(canon lint); rc=$?
+  check "agent skills: a symlinked AGENTS.md is counted, as Codex follows it" test "$rc" -ne 0
+  rm -rf "$T/pk"; mkdir -p "$T/src/catalog"; fill 20000 > "$T/src/catalog/AGENTS.md"
+  out=$(canon lint); rc=$?
+  check "agent skills: a nested folder named catalog is still counted" test "$rc" -ne 0
+  rm -rf "$T/src/catalog"; printf '%20000s' '' > "$T/AGENTS.md"; mkdir -p "$T/pk"; fill 20000 > "$T/pk/AGENTS.md"
+  out=$(canon lint); rc=$?
+  check "agent skills: a doc of only whitespace is not charged, as in Codex" test "$rc" -eq 0
+  rm -rf "$T/pk"
+
+  fill 32769 > "$T/AGENTS.md"
+  out=$(canon lint); rc=$?
+  check "agent skills: AGENTS.md at 32769 bytes fails"      test "$rc" -ne 0
+  check "... names AGENTS.md and its 32768-byte limit"      has "$out" "AGENTS.md"
+  check "... gives the byte limit"                         has "$out" "32768"
+  fill 32768 > "$T/AGENTS.md"
+  out=$(canon lint); rc=$?
+  check "agent skills: AGENTS.md at 32768 bytes passes"     test "$rc" -eq 0
+  awk 'BEGIN { for (i = 0; i < 16385; i++) printf "é" }' > "$T/AGENTS.md"
+  out=$(canon lint); rc=$?
+  check "agent skills: AGENTS.md counts bytes, not characters" test "$rc" -ne 0
+  cp "$SRC/AGENTS.md" "$T/AGENTS.md"
+  rm -rf "$T/.agents/skills"
+  out=$(canon lint); rc=$?
+  check "agent skills: absent skills folder passes"         test "$rc" -eq 0
 }
 
 sec_registry_validation() {
@@ -634,6 +824,10 @@ sec_lint_hook() {
   check "an edit under canon/ is linted"                     test "$rc" -eq 2
   lint_hook "$T/docs/adr/0001-canon-first.md" "$T"; rc=$?
   check "an edit under docs/adr/ is linted"                  test "$rc" -eq 2
+  lint_hook "$T/.agents/skills/canon-builder/SKILL.md" "$T"; rc=$?
+  check "an edit to a repository skill is linted"            test "$rc" -eq 2
+  lint_hook "$T/AGENTS.md" "$T"; rc=$?
+  check "an edit to AGENTS.md is linted"                     test "$rc" -eq 2
   mkdir -p "$W/other/docs/adr"; echo x > "$W/other/docs/adr/0001-x.md"; git_tree "$W/other"
   lint_hook "$W/other/docs/adr/0001-x.md" "$T"; rc=$?
   check "an edit in another repository's docs/adr/ is left alone" test "$rc" -eq 0
@@ -748,7 +942,7 @@ sec_brief_toolchain() {
 
 # Each section runs in the background in its own work directory (W, T, EXTRA, FAKE_DIR, BEFORE), so the
 # sections can run at once. Their lines are printed in order once all have finished.
-SECTIONS="baseline registry_validation resolve_keeps_pins stale_pin check_exits refs evidence workflows broken_pipe
+SECTIONS="baseline agent_skills registry_validation resolve_keeps_pins stale_pin check_exits refs evidence workflows broken_pipe
           outdated network_down mise_requests claude_pin resolve_lock lint_hook watch_and_brief brief_toolchain pipe_readers src"
 pids=""; ran=""
 for s in $SECTIONS; do
