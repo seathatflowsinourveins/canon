@@ -43,6 +43,7 @@ currently supported only with single orders".
 | The session | Alpaca's clock must say the regular session is open, for a submit and for a change of the trail. One answer is reused until the boundary it names, its age the longer of the monotonic clock's and the wall clock's, since the first stops while a machine sleeps. A closed, unreadable or absent clock refuses by name. A quantity-only replace and a cancel need no open session. |
 | The election | Alpaca's alone: "elected on the consolidated print", by a trade at or under the stop "provided the electing trade is not outside of the NBBO", and "will not trigger outside of the regular market hours". Then "the order turns into a market order". |
 | The trail | Changed through `ModifyOrder` with `params={"trailing_offset": …}`, the convention of upstream's Interactive Brokers adapter, sent as the replace's `trail`. The kind of offset cannot change. |
+| A replacement's ID | Every replace the adapter sends, a stop's or not, names a new client order ID: the order's own with a nineteen-digit clock stamp after its count. It is of the form the node writes, so an account read by client order ID shows the replaced stop as the node's (the lead, 2026-11-12), and it is at most 128 characters or not sent. An order whose own ID does not end in a number gets Alpaca's ID as before. A replacement adopted under any ID the adapter did not name (Alpaca's, or a hand's) is named in a warning. Custody counts an order that replaces another by what it filled beyond that one, so a chain is counted once and a foreign order's fills stay foreign (ADR 0042's paper reading); a filled replacement of ours whose replaced order is older than custody's lookback freezes its symbol. NautilusTrader's client order ID does not change, and a report still maps back through `replaces`, never through the ID. |
 | The intent | A trailing stop is in `sell_to_close_order_types` only when a node names it there. A reduce-only one is refused otherwise. |
 | A start with no cache | An open trailing stop the cache does not hold maps only with `report_external_trailing_stops`; else the start fails by name. Nothing in a client order ID tells one node's order from another's. |
 
@@ -76,7 +77,9 @@ account unless a gap says otherwise, then one opt-in paper test runs through the
   shares a resting stop holds. If Alpaca refuses both, a venue stop cannot oversell there.
 * The venue ID and order type a fill arrives under after the election: a stop with a tight trail left
   to trigger.
-* Submit, read back, a change of quantity with the offset, and cancel, through the adapter.
+* Submit, read back, a change of quantity with the offset, and cancel, through the adapter. The same
+  run shows whether Alpaca takes the client order ID a replace names; a refusal would reach the strategy
+  as a rejected modify with the stop left as it was.
 * A `GTC` stop electing at the next open, where Alpaca warns of a worse fill: one held overnight.
 
 ### Consequences
@@ -95,7 +98,11 @@ They cover: the setting off; each refused form; the two offsets on the wire; the
 unreadable, absent, reused to its boundary and not trusted past it after a sleep; the trail change and
 the quantity-only replace; a cancel sent during the clock read; fills under the order's own ID and
 under one linked by `replaces`; a fill under an unlinked ID, counted and not adopted; and a start with
-and without the cache. Run in `scripts/ci`. The paper proof's reads are added here when they exist.
+and without the cache. `packages/canon-alpaca/tests/test_replacement_client_order_id.py` covers the
+replacement's ID on the same stand-in, which refuses a named ID an order already carries: its form and
+length, two replaces in one reading of the clock, and a restart's reports under the node's own ID;
+`tests/test_custody.py` reads such an ID as the node's and a hand's replacement as foreign. Run in
+`scripts/ci`. The paper proof's reads are added here when they exist.
 
 ## Evidence
 
@@ -112,7 +119,7 @@ Read 2026-11-12.
   supported during the overnight session" — fetched (raw).
 * `alpaca-py@c42add7c0a70` `alpaca/trading/requests.py:624-670` — `TrailingStopOrderRequest`, one of
   `trail_price` and `trail_percent`; `:388`, `position_intent` on every order request; `:307-335`,
-  `ReplaceOrderRequest.trail`; `alpaca/trading/client.py:422-436`, `get_clock`;
+  `ReplaceOrderRequest.trail` and its `client_order_id`; `alpaca/trading/client.py:422-436`, `get_clock`;
   `alpaca/trading/models.py:410-424`, `Clock` — resolved.
 * `nautilus-trader@d53849b216e2` `crates/trading/src/strategy/mod.rs:359-404` — `modify_order` fails
   when "quantity, price, and trigger were either None" or unchanged — resolved.
@@ -121,6 +128,10 @@ Read 2026-11-12.
   update sets the trigger price and quantity only; `python/nautilus_trader/model/__init__.pyi:4862-4898`,
   `OrderStatusReport` with no high-water mark; `crates/risk/src/engine/mod.rs:2367-2397`, the cached
   trade — resolved.
+* https://docs.alpaca.markets/us/reference/patchorderbyorderid-1.md — the replace's body has
+  `client_order_id`, "A unique identifier for the new order. Automatically generated if not sent. (<= 128
+  characters)", `maxLength` 128 — fetched (raw). ADR 0042, paper, 2026-11-10 — a replace that keeps the
+  order's own ID is refused, 422 "client_order_id must be unique" — read.
 * The same pin, `docs/integrations/interactive_brokers.md:446-447` — "A modify that sets a trailing
   stop's trigger must pass `params={"trailing_offset": <offset>}` in the order's offset units" —
   resolved. Our adapter takes the parameter with no trigger price; the convention is borrowed.
@@ -134,6 +145,9 @@ Read 2026-11-12.
 * That Alpaca enforces `sell_to_close` on the market order a trigger creates, or that a long-only
   account refuses that order beyond the holding — UNVERIFIED.
 * A `GTC` trailing stop electing at the next session's open — UNVERIFIED.
+* That Alpaca takes a new client order ID named on a replace — UNVERIFIED on paper; the reference
+  documents the field, `packages/canon-alpaca/tests/test_replacement_client_order_id.py` runs against a
+  stand-in, and `packages/canon-alpaca/tests/test_paper_replace.py` asserts it on its next paper run.
 * The venue ID and type of that order, and its fills on paper — UNVERIFIED.
 * A submit that crosses the close in flight — UNVERIFIED.
 * Any election of a venue trailing stop on paper — UNVERIFIED; no paper run is part of this record.

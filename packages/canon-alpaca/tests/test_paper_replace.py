@@ -7,12 +7,15 @@ original `client_order_id` with 422 "client_order_id must be unique"; its answer
 new ID, an Alpaca-made client order ID and `replaces`; the stream's `replaced`
 (https://docs.alpaca.markets/us/docs/websocket-streaming.md) carries the old order, with `replaced_by`; and
 a second replace of the old order is refused with 422 "order already replaced". This test asserts each, so
-a change on Alpaca's side fails it. It uses alpaca-py's `TradingClient` and `TradingStream` (`paper=True`,
+a change on Alpaca's side fails it. It also asserts what the page states and the client's replace has
+relied on since 2026-11-12 (ADR 0129): a replace that names a new `client_order_id`, "A unique identifier
+for the new order", is taken, and the replacement carries that ID. It uses alpaca-py's `TradingClient` and `TradingStream` (`paper=True`,
 `raw_data=True`, so every field Alpaca sends is seen) as alpaca-py's own `replace_order_by_id` is called.
 
 It places a DAY limit buy of 1 AAPL at $1.00, far below the market, waits for Alpaca's `new`, replaces it
 with $1.01 asking to keep its client order ID, then without one, waits for `replaced`, replaces the old
-order again with $1.02, and cancels what is open. It needs the regular session: an order not yet routed
+order again with $1.02, replaces the replacement with $1.03 naming a new client order ID, waits for
+that to take effect and reads the new order back, and cancels what is open. It needs the regular session: an order not yet routed
 (`accepted`) cannot be replaced. It places nothing if the account holds an open AAPL order or an AAPL
 position, and in a `finally` cancels every open AAPL order and sells any share that filled, read from
 the position.
@@ -145,6 +148,37 @@ def observe(trading: TradingClient, created: list[str], run: int) -> dict:
     except APIError as e:
         seen["second_replace_of_old"] = {"error": error(e)}
 
+    # A replace of the replacement that names a new client order ID. Whatever goes wrong here is
+    # recorded and not raised, so what the earlier steps observed is still asserted below.
+    named = f"{client_order_id}-named"
+    step: dict = {"sent": named}
+    seen["replace_naming_a_new_client_order_id"] = step
+    try:
+        # the first order was replaced once it read `new`; what a replacement reads before it can
+        # be replaced was not observed before, so the status is recorded and the replace tried
+        wait_for(lambda: status(trading, new_id) == "new", f"order {new_id} to be new")
+    except AssertionError as e:
+        step["wait_before"] = str(e)
+    try:
+        step["status_before"] = status(trading, new_id)
+        third = raw(
+            trading.replace_order_by_id(
+                new_id, ReplaceOrderRequest(limit_price=1.03, client_order_id=named)
+            )
+        )
+        created.append(third["id"])
+        step["answer"] = third
+        try:
+            # a success "does NOT guarantee the existing open order has been replaced"
+            wait_for(
+                lambda: status(trading, new_id) == "replaced", f"order {new_id} to be replaced"
+            )
+        except AssertionError as e:
+            step["wait_after"] = str(e)
+        step["read_back"] = raw(trading.get_order_by_id(third["id"]))
+    except APIError as e:
+        step["error"] = error(e)
+
     cancel_open(trading, created)
     seen["old_at_end"] = raw(trading.get_order_by_id(old_id))
     seen["new_at_end"] = raw(trading.get_order_by_id(new_id))
@@ -275,3 +309,11 @@ def test_paper_replace_answers_as_observed() -> None:
         again = seen["second_replace_of_old"]
         assert again["error"]["status"] == 422, again
         assert "order already replaced" in again["error"]["body"], again
+        # 7. A replace that names a new client order ID is taken, and the replacement carries it.
+        named = seen["replace_naming_a_new_client_order_id"]
+        assert "answer" in named, f"Alpaca refused a replace naming a new client order ID: {named}"
+        assert named["answer"]["client_order_id"] == named["sent"], named
+        assert str(named["answer"]["replaces"]) == str(new["id"]), named
+        # and it took effect under that ID: the replaced order reads `replaced`, the new one carries it
+        assert "wait_after" not in named, named
+        assert named["read_back"]["client_order_id"] == named["sent"], named

@@ -32,6 +32,7 @@ from alpaca.trading.models import Position
 from alpaca.trading.models import TradeAccount
 from alpaca.trading.requests import LimitOrderRequest
 from alpaca.trading.requests import MarketOrderRequest
+from canon_alpaca.execution import replacement_client_order_id
 
 from canon_trading import custody
 from canon_trading import paper_node
@@ -94,6 +95,499 @@ def test_an_order_with_no_client_order_id_is_never_ours(client_order_id) -> None
     assert custody.lineage(client_order_id) == custody.MISSING
 
 
+STAMP = 1_762_999_999_123_456_789
+"""A clock reading, as the adapter puts one after the count of a replacement's client order ID."""
+
+
+@pytest.mark.parametrize("client_order_id", [o for o in OURS if o.startswith("O-")])
+def test_a_replacement_our_adapter_sent_reads_as_ours(client_order_id) -> None:
+    """R1 (the lead, 2026-11-12): the adapter gives its own replacement the node's ID with a clock
+    stamp after the count, which is still an ID of our nodes' form."""
+    sent = replacement_client_order_id(client_order_id, STAMP)
+    assert sent is not None and sent != client_order_id
+    assert custody.lineage(sent) == custody.OURS
+
+
+def test_a_replacement_a_hand_made_is_foreign_although_it_replaces_ours() -> None:
+    """R2: an order replaced by hand carries an ID Alpaca made. It freezes its symbol and is never
+    canceled, whatever it replaces: nothing a hand touched is ours to end."""
+    venue = Venue(REGULAR)
+    venue.hold("SPY", 1)
+    # the stop of ours it replaced is no longer open, and is not listed
+    by_hand = venue.open(
+        client_order_id=str(uuid4()), symbol="SPY", side="sell", replaces=str(uuid4())
+    )
+    report = close(venue)
+    assert venue.sent == [] and venue.canceled == []
+    assert report.frozen["SPY"] == ["open a foreign order: sell 1 SPY limit, new"]
+    assert any(
+        o.client_order_id == by_hand.client_order_id and _value(o.status) == "new"
+        for o in venue.history
+    )
+
+
+def test_our_own_replacement_of_our_stop_is_canceled_like_any_order_of_ours() -> None:
+    """R1 where it is acted on: the replaced stop no longer freezes its symbol. The stop it replaced
+    is not listed, as one placed before the lookback is not, and with no fill it carries none."""
+    venue = Venue(REGULAR)
+    venue.hold("SPY", 1)
+    replacement = venue.open(
+        client_order_id=replacement_client_order_id("O-20261111-145500-001-001-2", STAMP),
+        symbol="SPY",
+        side="sell",
+        replaces=str(uuid4()),
+    )
+    report = close(venue)
+    assert venue.canceled == [replacement.client_order_id]
+    assert report.frozen == {}
+
+
+@pytest.mark.parametrize("client_order_id", FOREIGN)
+def test_no_foreign_order_reads_as_ours_through_its_replacement(client_order_id) -> None:
+    """R3: the replacement's ID is derived from the order's own, so what was foreign stays foreign."""
+    sent = replacement_client_order_id(client_order_id, STAMP)
+    assert sent is None or custody.lineage(sent) == custody.FOREIGN
+
+
+@pytest.mark.parametrize(
+    "client_order_id",
+    [
+        *(o for o in OURS if o.startswith(custody.CHECK_CLOSE_PREFIX)),
+        "canon-close-20261111T150424Z-1-12345678",  # a random tail that happens to be all digits
+    ],
+)
+def test_a_replacement_of_a_checks_close_is_never_read_as_ours(client_order_id) -> None:
+    """The limit of R1: only an ID of the form a node writes keeps its form through a replace. A
+    close the account check or the close-only form placed ends in eight hex digits, so its replacement
+    gets Alpaca's ID or, when those digits are all decimal, one that is no longer a close's: foreign
+    either way. No node replaces such an order."""
+    assert custody.lineage(client_order_id) == custody.OURS
+    sent = replacement_client_order_id(client_order_id, STAMP)
+    assert sent is None or custody.lineage(sent) == custody.FOREIGN
+
+
+def chain(
+    venue: Venue,
+    *filled: str,
+    qty: str = "20",
+    last: str = "filled",
+    side: str = "buy",
+    by_hand: tuple[int, ...] = (),
+    first: str | None = None,
+    first_age: timedelta = timedelta(minutes=10),
+) -> None:
+    """An order of ours for `qty` replaced once for each further entry of `filled`, as Alpaca lists a
+    chain: each replaced order with its own fills and `replaced_by`, each replacement with `replaces`
+    and a filled quantity that counts the fills before it (ADR 0042, paper, 2026-11-10). A replacement
+    is the adapter's, under the first order's ID with a clock stamp, unless its place is in `by_hand`,
+    which gives it an ID Alpaca made. The first order was submitted `first_age` ago, each replacement
+    within the last ten minutes."""
+    ids = [str(uuid4()) for _ in filled]
+    first = first or NODE_BUY
+    for n, quantity in enumerate(filled):
+        is_last = n == len(filled) - 1
+        age = first_age if n == 0 else timedelta(minutes=10 - n)
+        venue.open(
+            id=ids[n],
+            client_order_id=first
+            if n == 0
+            else str(uuid4())
+            if n in by_hand
+            else replacement_client_order_id(first, STAMP + n),
+            symbol="SPY",
+            side=side,
+            qty=qty,
+            filled_qty=quantity,
+            status=last if is_last else "replaced",
+            replaces=ids[n - 1] if n else None,
+            replaced_by=None if is_last else ids[n + 1],
+            submitted_at=(venue.now - age).isoformat(),
+        )
+
+
+def opened(venue: Venue) -> tuple[Decimal | None, str]:
+    return custody._opened(cast(Any, venue), "SPY", venue.now)
+
+
+def test_a_hands_replacement_in_the_middle_of_a_chain_takes_its_own_fills_out_of_ours() -> None:
+    """Ours filled 16, a hand replaced it and 2 more filled, and the node replaced that one: the last
+    order is ours again and shows 20, the whole chain's. Ours filled 16 and then 2 after the hand's
+    18: 18, neither the 36 of the two orders of ours nor the chain's 20."""
+    venue = Venue(REGULAR)
+    chain(venue, "16", "18", "20", by_hand=(1,))
+    assert opened(venue) == (Decimal(18), "")
+
+
+def test_a_chain_of_our_sells_takes_its_fills_away_once() -> None:
+    venue = Venue(REGULAR)
+    venue.hold("SPY", 12)  # 20 bought by ours in the lookback, 8 of them sold by the chain
+    venue.history[-1] = venue.history[-1].model_copy(update={"qty": "20", "filled_qty": "20"})
+    chain(venue, "5", "8", side="sell", first="O-20261111-145500-001-001-2")
+    assert opened(venue) == (Decimal(12), "")
+
+
+def test_an_order_of_our_form_that_replaces_a_foreign_one_counts_only_its_own_fills() -> None:
+    """Nothing foreign reads as ours through a chain either: the 5 a foreign order filled stay
+    foreign when an order of our form replaces it and shows 8."""
+    venue = Venue(REGULAR)
+    foreign = str(uuid4())
+    venue.open(
+        id=foreign, client_order_id=str(uuid4()), filled_qty="5", qty="20", status="replaced"
+    )
+    venue.open(client_order_id=OURS[1], filled_qty="8", qty="20", status="filled", replaces=foreign)
+    assert opened(venue) == (Decimal(3), "")
+
+
+def test_a_replacement_whose_replaced_order_is_not_listed_freezes_the_symbol() -> None:
+    """A buy of ours working for more than the lookback filled 18 before it and was replaced inside
+    it: the replacement shows 20, of which only 2 are the lookback's, and the listing does not hold
+    the order that says so. With 18 foreign shares held the 20 would match and all be sold. What
+    cannot be established freezes."""
+    venue = Venue(REGULAR)
+    venue.hold("SPY", 20, client_order_id=None)
+    chain(venue, "18", "20", first_age=custody.LINEAGE_LOOKBACK + timedelta(hours=1))
+    quantity, why = opened(venue)
+    assert quantity is None
+    assert why == (
+        "an order of ours in SPY replaces one the listing of the last 1 day, 0:00:00 does not hold, "
+        "whose fills it carries, so the quantity ours opened is not established"
+    )
+    report = close(venue)
+    assert venue.sent == []
+    assert report.frozen["SPY"] == [why]
+
+
+@pytest.mark.parametrize("shown", [None, "", "many"], ids=["absent", "empty", "no number"])
+def test_a_replaced_order_that_shows_no_fill_count_freezes_the_symbol(shown) -> None:
+    """Ours filled nothing, a hand replaced it and 18 filled, and the node replaced that one, which
+    shows the chain's 20. The listing holds the hand's order but not its fill count, which alpaca-py's
+    `Order.filled_qty` allows. Read as zero, all 20 would be ours and the 18 foreign shares held would
+    be sold with them. What the replaced order filled is not known, so nothing is established."""
+    venue = ReplacedNotListedOpen(REGULAR)
+    venue.hold("SPY", 20, client_order_id=None)
+    chain(venue, "0", "18", "20", by_hand=(1,))
+    (at,) = [n for n, order in enumerate(venue.history) if order.filled_qty == "18"]
+    venue.history[at] = venue.history[at].model_copy(update={"filled_qty": shown})
+    quantity, why = opened(venue)
+    assert quantity is None
+    assert why == (
+        "an order in SPY shows no fill count that can be counted, so the quantity ours opened is not "
+        "established"
+    )
+    report = close(venue)
+    assert venue.sent == []
+    assert report.frozen["SPY"] == [why]
+
+
+def test_a_replaced_order_that_shows_a_negative_fill_count_freezes_the_symbol() -> None:
+    """A count below zero is no count either. Taken as shown, the replacement's 20 less the hand's
+    "-18" would be 38 of ours, and with 38 held, 18 of them foreign, all would be sold."""
+    venue = ReplacedNotListedOpen(REGULAR)
+    venue.hold("SPY", 38, client_order_id=None)
+    chain(venue, "0", "-18", "20", by_hand=(1,))
+    quantity, why = opened(venue)
+    assert quantity is None
+    assert why == (
+        "an order in SPY shows no fill count that can be counted, so the quantity ours opened is not "
+        "established"
+    )
+    report = close(venue)
+    assert venue.sent == []
+    assert report.frozen["SPY"] == [why]
+
+
+NO_COUNT = [None, "", "many", "-18", "NaN", "Infinity"]
+"""What a listing may show for a fill count that is no count: alpaca-py's `Order.filled_qty` is an
+optional string or number with no bound."""
+
+
+@pytest.mark.parametrize("shown", NO_COUNT, ids=[repr(v) for v in NO_COUNT])
+def test_an_order_of_ours_that_shows_no_fill_count_freezes_the_symbol(shown) -> None:
+    """Ours bought 20. Our sell filled nothing, our replacement of it sold 18, and a hand replaced
+    that one, showing the chain's 20. Our replacement is listed without its count. Read as zero, our
+    sale of 18 vanishes, ours still reads 20, and the 20 held, of which at most 2 are ours, are sold."""
+    venue = ReplacedNotListedOpen(REGULAR)
+    venue.hold("SPY", 20)
+    chain(venue, "0", "18", "20", side="sell", by_hand=(2,), first="O-20261111-145500-001-001-2")
+    (at,) = [n for n, order in enumerate(venue.history) if order.filled_qty == "18"]
+    venue.history[at] = venue.history[at].model_copy(update={"filled_qty": shown})
+    quantity, why = opened(venue)
+    assert quantity is None
+    assert why == (
+        "an order in SPY shows no fill count that can be counted, so the quantity ours opened is not "
+        "established"
+    )
+    report = close(venue)
+    assert venue.sent == []
+    assert report.frozen["SPY"] == [why]
+
+
+def test_an_order_of_ours_with_no_fill_count_still_has_our_open_orders_canceled() -> None:
+    """The symbol freezes by name; it does not end the run. An open order of ours in it is still
+    canceled, as in any frozen symbol, where a count that is no number used to raise before that."""
+    venue = ReplacedNotListedOpen(REGULAR)
+    venue.hold("SPY", 20)
+    venue.open(client_order_id=OURS[1], side="sell", qty="1", filled_qty="many", status="canceled")
+    resting = venue.open(
+        client_order_id=OURS[2], side="sell", qty="1", type="limit", limit_price="999"
+    )
+    report = close(venue)
+    assert venue.sent == []
+    assert venue.canceled == [resting.client_order_id]
+    assert report.frozen["SPY"] == [
+        (
+            "an order in SPY shows no fill count that can be counted, so the quantity ours opened is not "
+            "established"
+        )
+    ]
+
+
+NO_NUMBER = [None, "", "many", "NaN", "Infinity"]
+
+
+@pytest.mark.parametrize("shown", NO_NUMBER, ids=[repr(v) for v in NO_NUMBER])
+def test_a_position_that_shows_no_count_freezes_its_symbol_and_the_rest_goes_on(shown) -> None:
+    """A position's quantity that is no finite number is not known, and its symbol freezes by name.
+    It does not end the run: our open order in it is still canceled, and the long ours opened in
+    another symbol is still closed."""
+    venue = PositionShows(REGULAR)
+    venue.shown = {"SPY": {"qty": shown}}
+    venue.hold("SPY", 1)
+    venue.hold("AAPL", 1)
+    venue.history[-1] = venue.history[-1].model_copy(
+        update={"client_order_id": OURS[1], "symbol": "AAPL"}
+    )
+    resting = venue.open(
+        client_order_id=OURS[2], symbol="SPY", side="sell", qty="1", type="limit", limit_price="999"
+    )
+    report = close(venue)
+    assert venue.canceled == [resting.client_order_id]
+    why = (
+        "the position in SPY shows no quantity that can be counted, so what is held there is not "
+        "known"
+    )
+    assert report.frozen == {"SPY": [why]}
+    (sent,) = venue.sent
+    assert (sent.symbol, sent.qty) == ("AAPL", 1)
+
+
+@pytest.mark.parametrize("shown", NO_NUMBER, ids=[repr(v) for v in NO_NUMBER])
+def test_a_position_of_unknown_quantity_is_not_carried_as_holding_nothing(shown) -> None:
+    """Unknown is not zero: the holding's quantity is None, apart from the zero of a symbol that has
+    only an open order."""
+    venue = PositionShows(REGULAR)
+    venue.shown = {"SPY": {"qty": shown}}
+    venue.hold("SPY", 1)
+    venue.open(client_order_id=OURS[2], symbol="AAPL", side="buy", qty="1")
+    unknown, only_an_order = sorted(
+        custody.read_holdings(cast(Any, venue), venue.now), key=lambda h: h.symbol != "SPY"
+    )
+    assert (unknown.symbol, unknown.held) == ("SPY", None)
+    assert unknown.ours_left() == []
+    assert (only_an_order.symbol, only_an_order.held) == ("AAPL", Decimal(0))
+
+
+def test_a_long_listed_below_zero_is_a_short_and_never_read_as_a_long() -> None:
+    venue = PositionShows(REGULAR)
+    venue.shown = {"SPY": {"qty": "-18"}}
+    venue.hold("SPY", 18)
+    report = close(venue)
+    assert venue.sent == []
+    assert report.frozen["SPY"] == ["a short of 18 SPY: never bought back here"]
+
+
+@pytest.mark.parametrize(
+    ("order", "quantity"),
+    [
+        ({"qty": "-1", "filled_qty": "NaN"}, "a quantity that is no count"),
+        ({"qty": "many"}, "a quantity that is no count"),
+        ({"qty": ""}, "a quantity that is no count"),
+        ({"qty": None, "notional": "100"}, "notional 100"),
+        ({"qty": "2"}, "2"),
+    ],
+    ids=["below zero", "no number", "empty", "by notional", "a count"],
+)
+def test_a_line_about_an_order_names_a_quantity_that_is_no_count(order, quantity) -> None:
+    assert custody.order_line(_order(**order)).startswith(f"SPY buy {quantity} limit ")
+    assert f"(buy {quantity} SPY limit, " in custody.describe(_order(**order))
+
+
+@pytest.mark.parametrize(
+    ("position", "said"),
+    [
+        ({"qty": "many"}, "SPY long a quantity that is no number avg_entry"),
+        ({"qty": "NaN"}, "SPY long a quantity that is no number avg_entry"),
+        ({"qty": "2"}, "SPY long 2 avg_entry"),
+        ({"qty": "-3", "side": "short"}, "SPY short -3 avg_entry"),
+    ],
+    ids=["no number", "not finite", "a count", "a short"],
+)
+def test_a_line_about_a_position_names_a_quantity_that_is_no_number(position, said) -> None:
+    assert custody.position_line(_position(**position)).startswith(said)
+
+
+@pytest.mark.parametrize(
+    ("position", "note"),
+    [
+        ({"qty": "2"}, ""),
+        ({"qty": "-3", "side": "short"}, ""),
+        ({"qty": "-18"}, " (below zero: read as a short)"),
+        (
+            {"qty": "2", "qty_available": "many"},
+            " (the position in SPY lists a quantity no order holds that cannot be counted)",
+        ),
+        (
+            {"qty": "many"},
+            (
+                " (the position in SPY shows no quantity that can be counted, so what is held there "
+                "is not known)"
+            ),
+        ),
+    ],
+    ids=["a long", "a short", "a long below zero", "available unreadable", "no number"],
+)
+def test_the_accounts_line_reads_a_position_as_the_close_form_does(position, note) -> None:
+    line = custody.position_line(_position(**position))
+    assert line.endswith(f"unrealized_pl 0.88{note}")
+
+
+@pytest.mark.parametrize("available", [None, "0", "1"], ids=["not listed", "none free", "one free"])
+def test_the_quantity_no_order_holds_decides_nothing_and_may_be_left_out(available) -> None:
+    """Custody reads a position's `qty_available` for no decision: the long of ours is closed whole
+    whatever it shows, and a listing that leaves it out is read like any other. The day custody decides
+    on it, this case changes and the field becomes required in that same change."""
+    venue = PositionShows(REGULAR)
+    venue.shown = {"SPY": {"qty_available": available}}
+    venue.hold("SPY", 2)
+    (holding,) = custody.read_holdings(cast(Any, venue), venue.now)
+    assert (holding.held, holding.frozen) == (Decimal(2), [])
+    report = close(venue)
+    assert report.frozen == {}
+    (sent,) = venue.sent
+    assert (sent.symbol, sent.qty) == ("SPY", 2)
+
+
+@pytest.mark.parametrize("available", ["", "many", "-1", "NaN", "Infinity"])
+def test_a_listed_quantity_no_order_holds_that_is_no_count_freezes_the_symbol(available) -> None:
+    venue = PositionShows(REGULAR)
+    venue.shown = {"SPY": {"qty_available": available}}
+    venue.hold("SPY", 2)
+    report = close(venue)
+    assert venue.sent == []
+    assert report.frozen["SPY"] == [
+        "the position in SPY lists a quantity no order holds that cannot be counted"
+    ]
+
+
+def test_a_short_listed_with_its_quantity_below_zero_is_still_a_short_never_bought_back() -> None:
+    """Alpaca lists a short with its quantity below zero: there, and only there, that is a count."""
+    venue = PositionShows(REGULAR)
+    venue.shown = {"SPY": {"qty": "-3", "qty_available": "-3", "side": "short"}}
+    venue.hold("SPY", -3, client_order_id=None)
+    report = close(venue)
+    assert venue.sent == []
+    assert report.frozen["SPY"] == ["a short of 3 SPY: never bought back here"]
+
+
+def test_an_order_placed_by_notional_names_no_quantity_and_freezes_nothing() -> None:
+    """Alpaca takes an order for a dollar amount in place of a share quantity, and lists it with no
+    quantity. That is not a quantity that cannot be counted: its fill count is still a count."""
+    venue = ReplacedNotListedOpen(REGULAR)
+    venue.hold("SPY", 2)
+    by_notional = venue.open(
+        client_order_id=str(uuid4()), symbol="SPY", filled_qty="0.5", status="canceled"
+    )
+    venue.history[-1] = by_notional.model_copy(update={"qty": None, "notional": "100"})
+    assert opened(venue) == (Decimal(2), "")
+    report = close(venue)
+    assert report.frozen == {}
+    (sent,) = venue.sent
+    assert (sent.symbol, sent.qty) == ("SPY", 2)
+
+
+def test_an_order_with_neither_a_quantity_nor_a_notional_freezes_the_symbol() -> None:
+    venue = ReplacedNotListedOpen(REGULAR)
+    venue.hold("SPY", 2)
+    neither = venue.open(client_order_id=str(uuid4()), symbol="SPY", status="canceled")
+    venue.history[-1] = neither.model_copy(update={"qty": None, "notional": None})
+    quantity, why = opened(venue)
+    assert quantity is None
+    assert why == (
+        "an order in SPY shows no quantity that can be counted, so the quantity ours opened is not "
+        "established"
+    )
+
+
+@pytest.mark.parametrize("filled", [("18", "20"), ("16", "18", "20"), ("0", "20")])
+def test_a_chain_of_our_own_replacements_counts_its_fills_once(filled) -> None:
+    """Now that the adapter's replacement reads as ours, a partly filled buy and its replacement are
+    both in the count, and the replacement's filled quantity already holds the first one's fills. The
+    long of 20 is what the chain opened, not the sum: it is closed, and nothing is frozen."""
+    venue = Venue(REGULAR)
+    venue.hold("SPY", 20, client_order_id=None)
+    chain(venue, *filled)
+    report = close(venue)
+    assert report.frozen == {}
+    (sent,) = venue.sent
+    assert (sent.symbol, sent.qty) == ("SPY", 20)
+
+
+def test_a_chain_never_counts_more_than_it_filled_so_a_foreign_share_is_not_sold() -> None:
+    """The case the sum would get wrong the dangerous way: 18 foreign shares beside the 20 a chain of
+    ours filled. Summed, ours would read 38, the long would match and the close would sell all of it."""
+    venue = Venue(REGULAR)
+    venue.hold("SPY", 38, client_order_id=None)
+    chain(venue, "18", "20")
+    report = close(venue)
+    assert venue.sent == []
+    assert report.frozen["SPY"] == [
+        "38 SPY held, but our orders opened 20 in the last 1 day, 0:00:00"
+    ]
+
+
+def test_a_replacement_that_carries_no_fills_leaves_the_replaced_orders_own() -> None:
+    """A replacement Alpaca rejected after `replaced` may show no fills: the chain still counts what
+    the replaced order filled."""
+    venue = Venue(REGULAR)
+    venue.hold("SPY", 18, client_order_id=None)
+    chain(venue, "18", "0", last="rejected")
+    report = close(venue)
+    assert report.frozen == {}
+    (sent,) = venue.sent
+    assert (sent.symbol, sent.qty) == ("SPY", 18)
+
+
+def test_a_replacement_a_hand_made_takes_none_of_our_replaced_orders_fills() -> None:
+    """Ours filled 18 and was then replaced by hand: the replacement is foreign and its fills are
+    not ours, so the 18 still count and the 20 held do not match."""
+    venue = Venue(REGULAR)
+    venue.hold("SPY", 20, client_order_id=None)
+    by_hand = str(uuid4())
+    venue.open(
+        client_order_id=NODE_BUY,
+        side="buy",
+        qty="20",
+        filled_qty="18",
+        status="replaced",
+        replaced_by=by_hand,
+        submitted_at=(venue.now - timedelta(minutes=10)).isoformat(),
+    )
+    venue.open(
+        id=by_hand,
+        client_order_id=str(uuid4()),
+        side="buy",
+        qty="20",
+        filled_qty="20",
+        status="filled",
+        submitted_at=(venue.now - timedelta(minutes=9)).isoformat(),
+    )
+    report = close(venue)
+    assert venue.sent == []
+    assert report.frozen["SPY"] == [
+        "20 SPY held, but our orders opened 18 in the last 1 day, 0:00:00"
+    ]
+
+
 def test_the_lineage_is_the_one_our_nodes_and_checks_are_built_with() -> None:
     """The pattern's parts are the ones the code that writes the IDs uses: `paper_node.TRADER_ID`'s tag,
     the order ID tag each order-sending strategy is given, and the account check's close prefix."""
@@ -150,7 +644,10 @@ def _position(**fields: Any) -> Position:
         "lastday_price": "679.00",
         "change_today": "0.003",
     }
-    return Position.model_validate({**payload, **fields})
+    payload = {**payload, **fields}
+    # Alpaca lists what no order holds beside what is held; a test that wants it absent says so
+    payload.setdefault("qty_available", payload["qty"])
+    return Position.model_validate(payload)
 
 
 class Paper:
@@ -600,6 +1097,31 @@ class Clocks:
 
     def monotonic(self) -> float:
         return self.t
+
+
+class ReplacedNotListedOpen(Venue):
+    """A venue whose listing of open orders does not hold a replaced order, so nothing but the
+    quantity rule stands between a chain and the close."""
+
+    def get_orders(self, filter: Any = None):
+        found = super().get_orders(filter)
+        if filter is not None and filter.status and filter.status.value == "all":
+            return found
+        return [order for order in found if _value(order.status) != "replaced"]
+
+
+class PositionShows(Venue):
+    """A venue whose position in one symbol is listed with a quantity of the test's choosing."""
+
+    shown: dict[str, Any]
+
+    def get_all_positions(self):
+        return [
+            position.model_copy(update=self.shown[position.symbol])
+            if position.symbol in self.shown
+            else position
+            for position in super().get_all_positions()
+        ]
 
 
 def close(venue: Venue, data: Any = None):

@@ -37,7 +37,8 @@ unique identifier for the new order. Automatically generated if not sent." It le
 answer has a new ID, an Alpaca-made client order ID and `replaces`; `replaced` carries the old order with
 `replaced_by`; a second replace of the old order is refused, 422 "order already replaced"; no replacement
 sent `new`. On that, the master orchestrator chose (b) under the owner's delegation of 2026-11-10.
-`_modify_order` sends no client order ID; `OrderUpdated` comes only with `replaced`, its values from the
+`_modify_order` sent no client order ID (since 2026-11-12 it sends a new one of the order's own form, ADR
+0129; nothing else here changes); `OrderUpdated` comes only with `replaced`, its values from the
 replacement as the answer or a read of `replaced_by` gives it, nothing if neither does. Each node order's
 replace chain is one record, as Binance spot's `OrderBinding`: built from the node's cache, it holds the
 Alpaca orders the order has been, the one it is on and the replaces pending, and every update and report
