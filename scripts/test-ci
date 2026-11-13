@@ -49,6 +49,11 @@ echo "$*" >>"$UV_LOG"
 dir=""; if [ "$1" = "--directory" ]; then dir=$2; shift 2; fi
 if [ "$1 $2" = "lock --check" ] && [ -z "$dir" ] && [ -n "${FAKE_LOCK_FAIL:-}" ]; then echo "uv.lock needs to be updated"; exit 1; fi
 if [ "$1 $2" = "lock --check" ] && [ -n "$dir" ] && [ -n "${FAKE_APART_LOCK_FAIL:-}" ]; then echo "$dir/uv.lock needs to be updated"; exit 1; fi
+# FAKE_TY_FAIL fails the root's ty; FAKE_TY_DONE names a file ty writes once it has finished, half a second in
+if [ "$1 $2 $3" = "run --locked ty" ] && [ -z "$dir" ]; then
+  [ -z "${FAKE_TY_DONE:-}" ] || { sleep 0.5; : >"$FAKE_TY_DONE"; echo "ty finished" >>"$UV_LOG"; }
+  [ -z "${FAKE_TY_FAIL:-}" ] || { echo "error[invalid-assignment]: a typing line"; exit 1; }
+fi
 if [ "$1 $2 $3" = "run --locked pytest" ]; then
   for a in "$@"; do
     case "$a" in -r*s*) echo "SKIPPED tests/test_x.py::test_net - Skipped: no credentials" ;; esac
@@ -277,6 +282,53 @@ unset FAKE_LOCK_FAIL
 check "the lock check fails"                       has '^  FAIL  uv.lock matches the manifests$'
 check "the environment step is skipped with why"   has '^  skip  Python environment \(uv.lock does not match the manifests\)$'
 check "so are the Python checks"                   has '^  skip  pytest \(uv.lock does not match the manifests\)$'
+check "and the self-tests, which never start"      has '^  skip  lane report self-test \(a fast check failed\)$'
+}
+
+# --- the fast checks (lock, ruff, format, ty) finish before anything slower starts, and stop the run ---
+case_fastfirst() {
+fresh fastfirst
+printf '#!/bin/bash\n: >"%s"\n' "$C.lanes.ran" >"$C/scripts/lanes"
+printf '#!/bin/bash\n: >"%s"\n' "$C.selftest.ran" >"$C/scripts/test-zz"; chmod +x "$C/scripts/test-zz"
+gitq -C "$C" add -A; gitq -C "$C" commit -q -m selftest
+FAKE_TY_FAIL=1; export FAKE_TY_FAIL
+runci
+unset FAKE_TY_FAIL
+check "a failed ty fails the run"                  test "$RC" = 1
+check "it is named, with its output"               line_after '^  FAIL  ty type check$' '^        error.invalid-assignment.: a typing line$'
+check "the lane self-test never starts"            test ! -e "$C.lanes.ran"
+check "nor does a test script"                     test ! -e "$C.selftest.ran"
+check "nor pytest"                                 test "$(grep -c '^run --locked pytest' "$C.uv.log")" = 0
+check "each is a skip line saying why"             has '^  skip  test-zz \(a fast check failed\)$'
+check "pytest too"                                 has '^  skip  pytest \(a fast check failed\)$'
+check "ruff and its format still ran"              test "$(grep -cE '^run --locked ruff (check|format)' "$C.uv.log")" = 2
+check "ending with FAILED"                         has '^ci: FAILED$'
+}
+case_fastorder() {
+fresh fastorder
+printf '#!/bin/bash\n[ -e "%s" ] || { echo "started before ty finished"; exit 1; }\n' "$C.ty.done" >"$C/scripts/lanes"
+FAKE_TY_DONE="$C.ty.done"; export FAKE_TY_DONE
+runci
+unset FAKE_TY_DONE
+check "a self-test starts only after ty finished"  has '^  ok    lane report self-test$'
+check "and the run passes"                         test "$RC" = 0
+first_after=$(awk '/^ty finished$/ { t = NR } /^run --locked pytest/ && !p { p = NR } END { print (t && p > t) + 0 }' "$C.uv.log")
+check "pytest starts only after ty finished"       test "$first_after" = 1
+}
+
+# --- a fast failure still names what fails at once: a test script not executable, a tool not found ---
+case_fastnamed() {
+fresh fastnamed
+printf '#!/bin/bash\nexit 0\n' >"$C/scripts/test-yy"; gitq -C "$C" add scripts/test-yy
+gitq -C "$C" update-index --chmod=-x scripts/test-yy; gitq -C "$C" commit -q -m yy
+mkdir -p "$C.tools"; cp "$TMP/tools/uv" "$TMP/tools/shellcheck" "$TMP/tools/actionlint" "$C.tools/"
+FAKE_TY_FAIL=1; export FAKE_TY_FAIL
+TOOLS="$C.tools" runci
+unset FAKE_TY_FAIL
+check "a non-executable test script still fails"   has '^  FAIL  test-yy \(not executable\)$'
+check "a missing tool still fails by name"         has '^  FAIL  gitleaks \(not found\)$'
+check "with why"                                   line_after '^  FAIL  gitleaks .not found.$' '^        gitleaks: not found in the mise toolchain'
+check "the tools present are not named"            test "$(printf '%s\n' "$OUT" | grep -c '(not found)')" = 1
 }
 
 # --- a project kept apart (a tracked uv.lock below the root): its own lock, environment, ty and pytest ---
@@ -607,7 +659,7 @@ check "a landing leaves shared capacity for a staged run" test -e "$S/staged.sta
 }
 
 # Every case above works in its own copy, so they run concurrently; their output prints in this order.
-CASES="yaml noflows shell staged untracked tests testdir testgone notes skipsum died symlink deleted deleted2 lockfail apart apartlock hookenv parallel order missing pathorder strayconfig longfail slots nice priority prioritycapacity"
+CASES="yaml noflows shell staged untracked tests testdir testgone notes skipsum died symlink deleted deleted2 lockfail fastfirst fastorder fastnamed apart apartlock hookenv parallel order missing pathorder strayconfig longfail slots nice priority prioritycapacity"
 for c in $CASES; do ( "case_$c" ) >"$TMP/out.$c" 2>&1 & done
 wait
 for c in $CASES; do cat "$TMP/out.$c"; done
