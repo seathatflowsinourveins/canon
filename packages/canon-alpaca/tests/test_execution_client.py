@@ -9118,6 +9118,195 @@ def test_a_stale_terminal_report_does_not_end_an_order_whose_end_waits_for_more_
     assert (status, filled, trades) == (OrderStatus.CANCELED, 2.0, both), strategy.names()
 
 
+# -- Stream acknowledgement time (Nautilus OrderAccepted / Alpaca Order.submitted_at) ---------------
+
+
+@pytest.fixture
+def submit_answer_held(venue, monkeypatch):
+    """Let the stand-in place the order, but hold its HTTP answer until the test releases it."""
+    venue.trading.script = "silent"
+    ready = threading.Event()
+    release = threading.Event()
+    submit = venue.trading.submit_order
+
+    def held(order_data):
+        answer = submit(order_data)
+        ready.set()
+        assert release.wait(10), "the test did not release the submit answer"
+        return answer
+
+    monkeypatch.setattr(venue.trading, "submit_order", held)
+    try:
+        yield ready, release
+    finally:
+        release.set()
+
+
+@pytest.mark.parametrize(
+    ("event", "status", "quantity", "last_event"),
+    [
+        ("new", "new", None, "OrderAccepted"),
+        ("accepted", "accepted", None, "OrderAccepted"),
+        ("pending_new", "pending_new", None, "OrderAccepted"),
+        ("partial_fill", "partially_filled", 1, "OrderFilled"),
+        ("fill", "filled", 2, "OrderFilled"),
+        ("canceled", "canceled", None, "OrderCanceled"),
+        ("expired", "expired", None, "OrderExpired"),
+    ],
+)
+def test_stream_acceptance_time_before_the_http_answer(
+    venue,
+    submit_answer_held,
+    generated,
+    event,
+    status,
+    quantity,
+    last_event,
+) -> None:
+    # OrderAccepted.ts_event becomes the cached ts_accepted (Nautilus d53849b216e2,
+    # crates/model/src/orders/mod.rs:1042-1046). The fill's own time must stay later.
+    ready, release = submit_answer_held
+    strategy = trader(order_type="limit")
+    strategy.stopped_for = "held open"
+
+    async def body(client) -> None:
+        try:
+            async with asyncio.timeout(5):
+                while not ready.is_set():
+                    await asyncio.sleep(0.005)
+            await until_named(strategy, "OrderSubmitted")
+            assert strategy.client_order_id is not None
+            placed = placed_order(venue)
+            submitted_at = datetime.fromisoformat(placed["submitted_at"])
+            update_at = submitted_at + timedelta(seconds=5, microseconds=123456)
+            raw = venue.trading.update(
+                placed["id"],
+                event,
+                quantity,
+                deliver=False,
+                status=status,
+                filled_qty=str(quantity or 0),
+            )
+            update = TradeUpdate.model_validate({**raw, "timestamp": update_at})
+            expected = dt_to_unix_nanos(submitted_at)
+            names = ["OrderSubmitted", "OrderAccepted"]
+            if last_event != "OrderAccepted":
+                names.append(last_event)
+
+            await client._apply(update)
+            await until_named(strategy, last_event)
+            assert strategy.names() == names
+            assert strategy.events[1].ts_event == expected
+            assert client.cache.order(strategy.client_order_id).ts_accepted == expected
+            if last_event != "OrderAccepted":
+                assert strategy.events[-1].ts_event == dt_to_unix_nanos(update_at)
+            if quantity is not None:
+                fill = strategy.events[-1]
+                assert fill.trade_id.value == str(update.execution_id)
+                assert fill.last_qty == Quantity.from_int(quantity)
+                assert fill.last_px == Price.from_str(str(raw["price"]))
+                assert trade_ids(client.cache.order(strategy.client_order_id)) == [
+                    str(update.execution_id)
+                ]
+
+            await client._apply(update)  # a duplicate update must not accept or fill twice
+            release.set()
+            await until_idle(client, venue)
+            await client._apply(update)  # nor does the same update after the HTTP answer
+            await until_idle(client, venue)
+            assert strategy.names() == names
+            assert client.cache.order(strategy.client_order_id).ts_accepted == expected
+            assert generated.count("accepted") == 1
+        finally:
+            release.set()
+
+    run_with_client(body, strategy)
+
+
+def test_stream_acceptance_time_survives_a_pending_cancel(
+    venue, submit_answer_held, generated
+) -> None:
+    ready, release = submit_answer_held
+    strategy = trader(order_type="limit", cancel_on="OrderSubmitted")
+    strategy.stopped_for = "held open"
+    # Once released, the queued HTTP cancel adds no further stream update.
+    venue.trading.cancel_order_by_id = lambda order_id: None
+
+    async def body(client) -> None:
+        try:
+            async with asyncio.timeout(5):
+                while not ready.is_set():
+                    await asyncio.sleep(0.005)
+            await until_named(strategy, "OrderPendingCancel")
+            assert strategy.client_order_id is not None
+            placed = placed_order(venue)
+            submitted_at = datetime.fromisoformat(placed["submitted_at"])
+            update_at = submitted_at + timedelta(seconds=5, microseconds=123456)
+            raw = venue.trading.update(placed["id"], "new", deliver=False, status="new")
+            update = TradeUpdate.model_validate({**raw, "timestamp": update_at})
+            expected = dt_to_unix_nanos(submitted_at)
+            await client._apply(update)
+            assert "OrderAccepted" not in strategy.names()
+            assert client._acknowledged[strategy.client_order_id][1] == expected
+
+            refused_at = update_at + timedelta(seconds=1)
+            refused = TradeUpdate.model_validate(
+                {**raw, "event": "order_cancel_rejected", "timestamp": refused_at}
+            )
+            await client._apply(refused)
+            await until_named(strategy, "OrderAccepted")
+            release.set()
+            await until_idle(client, venue)
+            assert strategy.names() == [
+                "OrderSubmitted",
+                "OrderPendingCancel",
+                "OrderCancelRejected",
+                "OrderAccepted",
+            ]
+            assert strategy.events[-2].ts_event == dt_to_unix_nanos(refused_at)
+            assert strategy.events[-1].ts_event == expected
+            assert client.cache.order(strategy.client_order_id).ts_accepted == expected
+            assert generated.count("accepted") == 1
+        finally:
+            release.set()
+
+    run_with_client(body, strategy)
+
+
+def test_stream_acceptance_time_keeps_an_http_first_acceptance(venue, generated) -> None:
+    venue.trading.script = "silent"
+    strategy = trader(order_type="limit")
+    strategy.stopped_for = "held open"
+
+    async def body(client) -> None:
+        await until_named(strategy, "OrderAccepted")
+        await until_idle(client, venue)
+        placed = placed_order(venue)
+        submitted_at = datetime.fromisoformat(placed["submitted_at"])
+        expected = dt_to_unix_nanos(submitted_at)
+        assert strategy.events[1].ts_event == expected
+        assert client.cache.order(strategy.client_order_id).ts_accepted == expected
+        raw = venue.trading.update(
+            placed["id"],
+            "partial_fill",
+            1,
+            deliver=False,
+            status="partially_filled",
+            filled_qty="1",
+        )
+        update_at = submitted_at + timedelta(seconds=5, microseconds=123456)
+        update = TradeUpdate.model_validate({**raw, "timestamp": update_at})
+        await client._apply(update)
+        await until_idle(client, venue)
+        assert strategy.names() == ["OrderSubmitted", "OrderAccepted", "OrderFilled"]
+        assert client.cache.order(strategy.client_order_id).ts_accepted == expected
+        assert strategy.events[-1].ts_event == dt_to_unix_nanos(update_at)
+        assert strategy.events[-1].trade_id.value == str(update.execution_id)
+        assert generated.count("accepted") == 1
+
+    run_with_client(body, strategy)
+
+
 @pytest.mark.parametrize("cancel", [False, True], ids=["fill", "then-cancel"])
 def test_a_fill_on_an_order_whose_chain_cannot_be_read_waits_rather_than_moving_the_order(
     venue, alpaca, monkeypatch, cancel
