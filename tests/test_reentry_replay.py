@@ -975,3 +975,60 @@ def test_a_merge_refuses_shards_that_recorded_no_symbol_list(tmp_path) -> None:
     old = [shard_file(tmp_path / f"{k}.jsonl", f"{k}/2", universe_sha256=None) for k in (0, 1)]
     with pytest.raises(ValueError, match="universe"):
         r3.merge(old, tmp_path, "old")
+
+
+# The Codex reader on the second read's fixes (2026-11-12): each test names the bias it removes.
+
+
+def test_a_stop_computed_on_the_step_is_sold_on_it_not_a_cent_under() -> None:
+    # 2.01 less 2% of 2.00 is 1.97; in floats 1.9699999999999998, which the step floored to 1.96.
+    from decimal import Decimal
+
+    tape = (
+        study.Minute(570, 2.00, 2.00, 2.00, 2.00, 10_000_000),
+        study.Minute(571, 2.00, 2.01, 1.95, 2.00, 10_000_000),
+    )
+    context = r3.ReplayContext(replace(day([]), bars=tape), {}, True, slot_budget=Decimal(2))
+    assert context.sale("fixed", 0, 0)["sold"] == 1.97
+
+
+def test_a_low_at_exactly_the_computed_stop_sells() -> None:
+    # The same float error held a low of exactly 1.97 above a trigger of 1.9699999999999998.
+    bar = (study.Minute(571, 2.00, 2.01, 1.97, 2.00, 100),)
+    out = study.protect(bar, 2.00, 2.00, study.GROSS)
+    assert out is not None and (out.why, out.price) == ("trail", 1.97)
+
+
+def test_an_atr_trail_of_exactly_three_ticks_is_not_counted_under_three() -> None:
+    # OWN1 at 1.01 with an ATR of 0.03 walks 0.03, three cents, but the tick count divided a
+    # float fraction and came out 2.9999999999999996.
+    # At 1.10 the float product itself is 0.029999999999999995, so the walk's distance needs the
+    # rounding too, not only the tick count.
+    for close in (1.01, 1.10):
+        tape = (study.Minute(570, close, close, close, close, 100),)
+        context = r3.ReplayContext(replace(day([]), bars=tape), {}, True)
+        context.atr = (0.03,)
+        walked = context.path("own-1", 0)
+        assert walked["distance"] == 0.03
+        assert walked["trail_ticks"] == 3
+        assert r3.tick_bucket(walked["trail_ticks"]) == "3 to 5"
+
+
+def test_a_fall_of_exactly_one_trail_is_one_trail_deep() -> None:
+    # (2.03 - 1.99) / 0.04 is 0.9999999999999953 in floats, so turn-1-1 did not re-enter on a fall
+    # of exactly one trail, nor the opening arm on an opening fall of exactly its depth.
+    tape = bars([2.03, 1.99, 2.00])
+    signal = r3.reentry_signal(tape, 0, 2.03, 0.04, "turn-1-1", None)
+    assert signal is not None and signal.index == 2
+    opening = (study.Minute(570, 2.03, 2.03, 2.03, 2.03, 100), *bars([1.99, 2.00], 571))
+    assert r3.opening_signal(opening, 15, 1, 1, [0.04] * 3) is not None
+    context = r3.ReplayContext(replace(day([]), bars=bars([1.10])), {}, True)
+    context.atr = (0.03,)
+    assert context.distances("own-1") == (0.03,)
+
+
+def test_a_bar_as_far_from_its_high_as_its_low_takes_the_low_first() -> None:
+    # The pin compares fixed-point distances, so 10.4-10.3 and 10.3-10.2 tie and the low comes
+    # first; in floats 0.0999...64 < 0.1000...14 took the high first and stopped on the low.
+    bar = study.Minute(600, 10.3, 10.4, 10.2, 10.3, 100)
+    assert study.protect((bar,), 10.0, 10.0, study.GROSS, adaptive=True) is None

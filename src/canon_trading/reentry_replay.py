@@ -295,7 +295,7 @@ def reentry_signal(
         if b.close < low:
             low, low_index = b.close, i
         rises = rises + 1 if b.close > bars[i - 1].close else 0
-        depth = max(0.0, sale - low) / distance
+        depth = study.snap(max(0.0, sale - low) / distance)  # a fall of exactly d trails is d
         enter = arm == "reclaim" and b.close > sale
         if arm.startswith("turn-"):
             enter = rises >= k and depth >= d
@@ -330,15 +330,9 @@ def opening_signal(
             low, low_i = bars[i].close, i
         rises = rises + 1 if bars[i].close > bars[i - 1].close else 0
         distance = distances[i]
-        if (
-            distance
-            and rises >= k
-            and (opened - low) / distance >= fall
-            and (eligible is None or eligible(i))
-        ):
-            return Signal(
-                i, (opened - low) / distance, bars[low_i].start + 1 - 570, bars[i].start + 1 - 570
-            )
+        depth = study.snap((opened - low) / distance) if distance else 0.0
+        if distance and rises >= k and depth >= fall and (eligible is None or eligible(i)):
+            return Signal(i, depth, bars[low_i].start + 1 - 570, bars[i].start + 1 - 570)
     return None
 
 
@@ -519,7 +513,7 @@ class ReplayContext:
         out = []
         for b, atr in zip(self.bars, self.atr, strict=True):
             fraction = trail_fraction(exit_arm, b.close, atr, self.top)
-            out.append(None if fraction is None else fraction * b.close)
+            out.append(None if fraction is None else study.snap(fraction * b.close))
         self._distances[exit_arm] = tuple(out)
         return self._distances[exit_arm]
 
@@ -602,11 +596,11 @@ class ReplayContext:
         result = {
             "index": sold_index,
             "price": sold,
-            "distance": close * fraction,
-            # The walked distance in Alpaca's ticks at the entry's price (price_step.tick).
-            # In decimal, so a distance of exactly three ticks is not a float hair under three.
+            "distance": study.snap(close * fraction),
+            # The walked distance in Alpaca's ticks at the entry's price (price_step.tick): the
+            # walk's own distance, snapped as it is, so exactly three ticks is not a hair under.
             "trail_ticks": float(
-                Decimal(repr(close)) * Decimal(repr(fraction)) / tick(Decimal(repr(close)))
+                Decimal(repr(study.snap(close * fraction))) / tick(Decimal(repr(close)))
             ),
             "stop": out is not None,
             "why": "close" if out is None else out.why,
