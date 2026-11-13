@@ -8,7 +8,7 @@
 # window is its last 10 minutes of OTLP events. That report takes about 4 s, too long for a render, so this
 # prints the summary a previous run cached in <config>/canon/fleet-rate.json at once and, when that is older
 # than FLEET_RATE_TTL seconds (60), starts one refresh in the background under a lock (mkdir), which writes
-# the summary through a temporary file. The TTL counts from the last attempt (fleet-rate.tried), not the last
+# the summary through a temporary file. The TTL counts from the last attempt (its time in fleet-rate.tried), not the last
 # success, and the report runs under timeout(1) for FLEET_RATE_SECS (50), so a report that fails or hangs
 # still runs at most once a TTL, and only while a status line renders. A summary older than
 # FLEET_RATE_MAX_AGE (600), or dated ahead of the clock, no summary, or no installed report shows no label
@@ -28,7 +28,7 @@ command -v jq >/dev/null 2>&1 || exit 0
 now=$(date +%s)
 t=$(jq -r '.t | numbers | floor' "$cache" 2>/dev/null) || t=""
 [ -n "$t" ] || t=0
-a=$(stat -f %m "$tried" 2>/dev/null) || a=0
+a=$(head -c 20 "$tried" 2>/dev/null | tr -cd 0-9); [ -n "$a" ] || a=0
 [ "$a" -gt "$t" ] || a=$t
 # the last attempt; one dated ahead of the clock counts as none
 [ "$a" -le "$now" ] || a=0
@@ -37,7 +37,7 @@ if [ $((now - a)) -ge "$ttl" ] && [ -x "$lanes" ]; then
   # a lock left by a run that was stopped
   [ -z "$(find "$lock" -maxdepth 0 -mmin +2 2>/dev/null)" ] || { rm -f "$lock/owner"; rmdir "$lock" 2>/dev/null; }
   if mkdir "$lock" 2>/dev/null; then
-    touch "$tried" 2>/dev/null
+    date +%s > "$tried" 2>/dev/null
     (
       me="$$-$RANDOM-$now"; tmp=""
       printf '%s\n' "$me" > "$lock/owner"
