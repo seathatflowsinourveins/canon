@@ -638,3 +638,115 @@ def test_the_clock_arm_holds_reentry_above_the_sale_on_the_sales_trade_date_only
         )
         if not refused:
             assert why is None, (filled, now, why)
+
+
+def test_late_buy_after_completed_exit_before_flat_step_does_not_inherit_closed_exit_or_floor() -> (
+    None
+):
+    """P1-1: Under main's defaults (OWN1: trail_mode='atr', trail_cap='own', size_from_budget=True,
+    reentry_arm='clock', chase='resend', TriggerType.BID_ASK), E-1 (5 @ 10.00, L=0.20) times out
+    and is canceled; E-2 later buys 5 @ 10.20 (L=0.20), trails up to trigger 10.80 / limit 10.74,
+    releases, and fills all 5 @ 10.79 between steps. Before the next 1s timer step runs _flat,
+    canceled E-1 fills late (+5 @ 10.00). Neither an immediate liquidation above E-1's 9.80 stop
+    nor E-2's stale 10.53 chase floor clamping a gapped-down stop exit above the market may carry
+    into the new holding."""
+    from tests.test_mover_late_fill_blind import LateFillSeam
+    from tests.test_mover_late_fill_blind import entry
+    from tests.test_mover_late_fill_blind import event
+
+    def scenario(next_bid: str) -> tuple[LateFillSeam, Any, list[Any]]:
+        host = LateFillSeam(
+            trail_mode="atr",
+            trail_cap="own",
+            size_from_budget=True,
+            loss_share=D("0.02"),
+        )
+        host.cache.bars = lambda _: None
+        vars(host)["_request_history"] = lambda _: None  # the seam has no history request
+        _, old = entry(host)
+        host.entries_sent[-1].update(
+            trail="0.02",
+            exit_through="0.005",
+            chase_cap="0.02",
+            trail_bound="fixed",
+            trail_source="cold_atr_fallback",
+            sizing={"loss_per_share": "0.20"},
+        )
+        host.cancel_order(old.client_order_id)
+        host.rank_ns = T0
+        host.step(T0 + SECOND)
+        assert AAA not in host.slots
+
+        host._open_slot(AAA)
+        slot = host.slots[AAA]
+        newer = SimpleNamespace(**vars(old))
+        newer.client_order_id = ClientOrderId("E-2")
+        newer.price = Price.from_str("10.2000")
+        newer.filled_qty, newer.avg_px = Quantity.from_int(0), None
+        newer.is_closed, newer.is_open = False, True
+        newer.ts_init = T0 + 2 * SECOND
+        host.orders[newer.client_order_id.value] = newer
+        slot.entry_id = newer.client_order_id
+        slot.sized_loss = D("0.20")
+        newer_plan = mover.TrailPlan(
+            trail=D("0.02"),
+            exit_through=D("0.005"),
+            chase_cap=D("0.02"),
+            atr=None,
+            spread=D("0.01"),
+            bound="fixed",
+            source="cold_atr_fallback",
+        )
+        slot.trail_plan = slot.initial_trail = newer_plan
+        slot.entry_record = {
+            "client_order_id": "E-2",
+            "instrument_id": str(AAA),
+            "entry_price": None,
+            "stopped_out": False,
+            "trail": "0.02",
+            "exit_through": "0.005",
+            "chase_cap": "0.02",
+            "trail_bound": "fixed",
+            "trail_source": "cold_atr_fallback",
+            "sizing": {"loss_per_share": "0.20"},
+        }
+        host.entries_sent.append(slot.entry_record)
+
+        host.bid = "10.25"
+        host.fill(newer, 5, "10.2000", T0 + 3 * SECOND)
+        host.positions = [SimpleNamespace(signed_qty=D(5), avg_px_open=D("10.20"))]
+        host.step(T0 + 4 * SECOND)
+        sale = host._order(slot.protect_id)
+        assert sale is not None and sale.kind == "TRAILING"
+
+        sale.trigger_price = Price.from_str("10.8000")
+        sale.price = Price.from_str("10.7400")
+        sale.is_emulated, sale.is_open, sale.has_trigger_price = False, True, False
+        sale.events = lambda: [SimpleNamespace(trigger_price=Price.from_str("10.8000"))]
+        host.on_order_released(
+            event(sale.client_order_id, T0 + 4 * SECOND + 100_000_000, released_price=sale.price)
+        )
+        host.fill(sale, 5, "10.7900", T0 + 4 * SECOND + 200_000_000)
+        assert host.positions == []
+
+        before = len(host.submitted)
+        host.fill(old, 5, "10.0000", T0 + 4 * SECOND + 500_000_000)
+        host.positions = [SimpleNamespace(signed_qty=D(5), avg_px_open=D("10.00"))]
+        host.bid = next_bid
+        host.step(T0 + 5 * SECOND)
+        sent = [o for o in host.submitted[before:] if o.side == OrderSide.SELL]
+        return host, slot, sent
+
+    # Wrong order: unsolicited immediate liquidation while $0.99 above E-1's 9.80 stop.
+    host_up, slot_up, sent_up = scenario("10.79")
+    assert not slot_up.exiting, "new 10.00 holding at bid 10.79 must arm trailing stop, not exit"
+    assert [o.kind for o in sent_up] == ["TRAILING"]
+    assert AAA in host_up.sold and host_up.sold[AAA][1] == D("10.79")
+
+    # Wrong order + missed sale: bid gaps down to 9.70 (below E-1's 9.80 stop), and E-2's stale
+    # 10.53 chase floor clamps the stop exit $0.83 above the market.
+    _, _, sent_gap = scenario("9.70")
+    assert len(sent_gap) == 1 and sent_gap[0].kind == "LIMIT"
+    assert sent_gap[0].price.as_decimal() <= D("9.70"), (
+        f"stop exit at bid 9.70 was clamped above the market to {sent_gap[0].price}"
+    )

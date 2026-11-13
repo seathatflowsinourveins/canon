@@ -1605,6 +1605,21 @@ def name_oversale(dropped: list[str], event: Any, excess: Decimal, held: Decimal
         dropped.append(text)
 
 
+def _sold_out(row: ExitRecord | None) -> bool:
+    """Whether a holding's sale is complete: every share it bought sold, its final fill known."""
+    return row is not None and row.final_fill_ns is not None and row.filled >= row.quantity
+
+
+def entry_basis(entry: Any) -> Decimal | None:
+    """The entry order's own average fill, finite and positive, else None: the price its plan's fraction
+    was selected over, never a stale anchor or a bid (`offsets_in_force`, code-review-l5-latebuy2/F3).
+    As `_trail_anchor`: no other average anchors."""
+    if entry is None or entry.avg_px is None:
+        return None
+    filled = Decimal(str(entry.avg_px))
+    return filled if filled.is_finite() and filled > 0 else None
+
+
 def late_receipt(row: ExitRecord, event: Any) -> None:
     """Keep the first host receipt (`ts_init`) of a late entry fill no slot owns yet, so its
     recovery restores the hold's receipt clock, not the venue's (r-pair-codex/P1). Plain values
@@ -2019,6 +2034,7 @@ def offsets_in_force(
     trail: Decimal,
     exit_through: Decimal,
     floor_m: Decimal | None,
+    basis: Decimal | None = None,
 ) -> tuple[Decimal, Decimal]:
     """The offsets the working sale trails by (`offsets`): L's while L is in force, else the plan's.
     `_trail` sends these, and each tightening is taken only when it is closer than these. A tightening
@@ -2026,21 +2042,37 @@ def offsets_in_force(
     later, higher average is held at L, never over it (the high read of the ruling's fix, item 1).
     The plan's offset is never under the floor the plan in force took at its step, `floor_m` times the
     spread it was taken on, in price terms, so a later fill at a lower average does not cut it (the
-    lead's O3 of 2026-11-12); `floor_m` is None in the fixed arm, which takes no floor."""
+    lead's O3 of 2026-11-12); `floor_m` is None in the fixed arm, which takes no floor.
+
+    `basis` is the entry's own average fill (`entry_basis`), the price the plan's fraction was selected
+    over, when the sale is placed from another price, the whole holding's average: the plan's trailing
+    distance is then that fraction of its own basis, up to the step at the average, so a remake for a
+    changed quantity trails by the distance in force, whatever tightened it (limit 20 of the last
+    trailing landing). The limit offset's `exit_through` share is still of the average."""
     plan = slot.trail_plan or slot.initial_trail
     least = (
         None if floor_m is None or plan is None or plan.spread is None else floor_m * plan.spread
     )
     distance = l_in_force(slot, bought)
-    loss = slot.sized_loss
-    if (
-        distance is None
-        and slot.tightened
-        and loss is not None
-        and fill_trigger(bought, loss) is not None
-        and offsets(bought, trail, exit_through, least=least)[0] > loss
-    ):
-        distance = loss
+    if distance is None:
+        own = basis if basis is not None and basis > 0 and basis != bought else None
+        planned = (
+            offsets(bought, trail, exit_through, least=least)[0]
+            if own is None
+            else offsets(own, trail, exit_through, least=least)[0].quantize(
+                tick(bought), rounding=ROUND_CEILING
+            )
+        )
+        loss = slot.sized_loss
+        if (
+            slot.tightened
+            and loss is not None
+            and fill_trigger(bought, loss) is not None
+            and planned > loss
+        ):
+            distance = loss
+        elif own is not None:
+            distance = planned
     return offsets(bought, trail, exit_through, distance=distance, least=least)
 
 
@@ -2334,15 +2366,25 @@ class Mover(Strategy):
                     )
 
         slot = self.slots.get(event.instrument_id)
-        current = (
-            getattr(self, "late_buys", {}).get(event.instrument_id)
-            if slot is None
-            else slot.exit_record
+        late = getattr(self, "late_buys", {}).get(event.instrument_id)
+        # A sale fill sells the slot's holding, so a canceled leg's late fill of a sold holding is
+        # charged to that holding (code-review-l5-latebuy/4).
+        current = late if slot is None else slot.exit_record
+        # The slot's own entry is excluded while no late buy waits: its remainder after a first part
+        # sold joins the slot's holding, and `_time_out` cancels it at once once the sale is released
+        # (code-review-l5-latebuy/2). Once a late buy waits, every buy joins it, so the sold holding
+        # stays sold and one order's shares are in one record (code-review-l5-latebuy2/F1).
+        completed = (
+            slot is not None
+            and _sold_out(slot.exit_record)
+            and (event.client_order_id != slot.entry_id or late is not None)
         )
-        if slot is None and event.order_side == OrderSide.BUY:
+        if event.order_side == OrderSide.BUY and (slot is None or completed):
             # Plain accounting only: subscriptions wait for the timer. A sale callback can arrive
             # before that timer too, so an order ID alone would lose the intervening holding (F5).
-            row = current
+            # A complete sale followed by a buy is a new holding even before `_flat` runs
+            # (r-l5comp-ag/P1-1). Keep the old row intact until the timer records and clears it.
+            row = late
             if row is None:
                 row = ExitRecord(event.instrument_id, event.client_order_id.value, Decimal(0))
                 self.late_buys[event.instrument_id] = row
@@ -2434,6 +2476,7 @@ class Mover(Strategy):
             # leg's late fill after another leg sold it all is not counted again (w3-t-latefill, P3)
             take = row.take_sale(quantity, event.last_px.as_decimal(), event.ts_event)
             name_oversale(self.dropped, event, quantity - take, row.quantity)
+            # inline rather than `_sold_out`, so the checker keeps `final_fill_ns` narrowed
             if (
                 take > 0
                 and row.filled >= row.quantity
@@ -3226,6 +3269,17 @@ class Mover(Strategy):
             if slot is None:
                 self._open_slot(instrument_id)
                 slot = self.slots[instrument_id]
+            elif slot.exit_record is not row and _sold_out(slot.exit_record):
+                # The old holding sold in full before this late buy arrived. Finish it through
+                # the same path as an ordinary flat step before restoring the new holding.
+                self._flat(slot, now)
+                if slot.exit_record is not None and slot.was_held:
+                    # Its protect leg or entry still works, so `_flat` only withdrew it: the late
+                    # buy waits for the next step, and the old holding's sale is recorded first
+                    # (code-review-l5-latebuy/1). A sold row no step held has no sale for `_flat`
+                    # to record, and the late buy takes the slot now (code-review-l5-latebuy2/F5).
+                    self.late_buys[instrument_id] = row
+                    continue
             entry = self._order(slot.entry_id)
             # An order's average is unset until it fills (the pinned
             # `crates/model/src/orders/limit.rs:414`): a newer entry with shares of its own keeps its
@@ -3755,6 +3809,13 @@ class Mover(Strategy):
         entry = self._order(slot.entry_id)
         if entry is not None and not entry.is_closed:
             self._time_out(slot, entry, now)
+        if _sold_out(slot.exit_record) and slot.instrument_id in getattr(self, "late_buys", {}):
+            # The holding sold in full and a late buy of the name waits for its own record
+            # (`_reopen_late_buys`). Only withdraw the old holding's leg here: nothing is sold or
+            # protected through its exit state. The late shares are unprotected until that leg
+            # closes, usually one step (code-review-l5-latebuy/1).
+            self._flat(slot, now)
+            return
         held = self._held(slot)
         if held < 0:
             self._note(
@@ -3857,6 +3918,7 @@ class Mover(Strategy):
                 slot.run_ns = slot.run_close = slot.run_seen_ns = slot.run_closed_ns = None
             slot.trail_plan = slot.initial_trail = None
             slot.ratcheted, slot.tightened, slot.entry_record = False, False, None
+            slot.warm_checked = False
             slot.profile_evaluated_ns = None
             slot.exit_record = None
             slot.protection_anchor = slot.held_stop = slot.held_since = None
@@ -4184,6 +4246,7 @@ class Mover(Strategy):
             self.settings.trail if plan is None else plan.trail,
             self.settings.exit_through if plan is None else plan.exit_through,
             self._floor_m(),
+            basis=entry_basis(self._order(slot.entry_id)),
         )
         if kept is not None and at <= kept:
             # the market is at the trigger the canceled sell had reached, or the stop held: the sale
@@ -4317,6 +4380,7 @@ class Mover(Strategy):
                     self.settings.trail if plan is None else plan.trail,
                     self.settings.exit_through if plan is None else plan.exit_through,
                     self._floor_m(),
+                    basis=entry_basis(self._order(slot.entry_id)),
                 )[0]
                 # A3+O's floor in price terms can exceed the anchor: no stop at or under zero is held,
                 # and with none the hold ends in its bounded unpriced exit (xr7-r-a3o-1afe, P2); else on
@@ -4412,6 +4476,7 @@ class Mover(Strategy):
                 self.settings.trail if plan is None else plan.trail,
                 self.settings.exit_through if plan is None else plan.exit_through,
                 self._floor_m(),
+                basis=entry_basis(self._order(slot.entry_id)),
             )[0]
         at_l = fill_trigger(anchor, distance)
         if at_l is None:
@@ -5847,12 +5912,8 @@ class Mover(Strategy):
     def _bought(self, slot: Slot) -> Decimal | None:
         """The holding's purchase price for re-selecting its trail: the entry's average fill, else the
         protection anchor."""
-        entry = self._order(slot.entry_id)
-        if entry is not None and entry.avg_px is not None:
-            filled = Decimal(str(entry.avg_px))
-            if filled.is_finite() and filled > 0:  # as `_trail_anchor`: no other average anchors
-                return filled
-        return slot.protection_anchor
+        filled = entry_basis(self._order(slot.entry_id))
+        return slot.protection_anchor if filled is None else filled
 
     def _ratchet(self, slot: Slot, now: int) -> bool:
         """Tighten once only while the original emulated sale works; caller cancels and remakes it."""
