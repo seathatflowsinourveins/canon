@@ -1,0 +1,1 @@
+* Use about 80 per cent of the account's action budget over a session, protection first, and investigate a session with no action for fifteen minutes, never answering it by forcing a trade; not yet built (roadmap step 7).

@@ -7,6 +7,8 @@ review-by: 2026-12-10
 
 # Muse Code, Antigravity and DeepSeek Harness as review-only workers, and one review lifecycle for every change
 
+*Muse Code deferred 2026-11-13 by the owner: no Muse reviewer is started until the owner lifts it. Its row, pin and launch notes are kept as they are, so it can be resumed as written; Codex and Antigravity read in its place, and DeepSeek Harness stays on Flash.*
+
 ## Context and Problem Statement
 
 ADR 0043 adopted Codex as an Orca worker that reads a change and reports. On the owner's instruction of

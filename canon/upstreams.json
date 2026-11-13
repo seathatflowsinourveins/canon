@@ -97,6 +97,47 @@
       "adr": "0004"
     },
     {
+      "id": "towncrier",
+      "field": "decision-records",
+      "repo": "twisted/towncrier",
+      "track": "tag:26.9.0",
+      "role": "reference",
+      "license": "MIT",
+      "why": "News fragments, one file per change in a directory of its own: the pattern the handbook's practice and row files follow. Read only; not installed or run, and its collecting build step is not taken.",
+      "evidence": [
+        "https://towncrier.readthedocs.io/en/stable/tutorial.html",
+        "https://github.com/twisted/towncrier"
+      ],
+      "adr": "0145"
+    },
+    {
+      "id": "changesets",
+      "field": "decision-records",
+      "repo": "changesets/changesets",
+      "track": "tag:@changesets/cli@3.0.3",
+      "line": "@changesets/cli@3.",
+      "role": "reference",
+      "license": "MIT",
+      "why": "One Markdown file per change, named so that two never collide: the pattern the handbook's practice and row files follow. Read only; not installed or run.",
+      "evidence": [
+        "https://github.com/changesets/changesets/blob/main/docs/guide/getting-started.md",
+        "https://github.com/changesets/changesets/blob/main/docs/faq.md"
+      ],
+      "adr": "0145"
+    },
+    {
+      "id": "google-sre-workbook-postmortem",
+      "field": "decision-records",
+      "url": "https://sre.google/workbook/postmortem-culture/",
+      "role": "reference",
+      "license": "CC BY-NC-ND 4.0",
+      "why": "Postmortem action items with an owner and a verifiable end state: the pattern behind the journal entry's owner and closes fields. Read only; nothing copied beyond short quotations.",
+      "evidence": [
+        "https://sre.google/workbook/postmortem-culture/"
+      ],
+      "adr": "0145"
+    },
+    {
       "id": "spec-kit",
       "field": "agent-extensions",
       "repo": "github/spec-kit",
@@ -260,6 +301,22 @@
         "https://github.com/nautechsystems/nautilus_trader"
       ],
       "adr": "0009"
+    },
+    {
+      "id": "redis",
+      "field": "trading-runtime",
+      "repo": "redis/redis",
+      "track": "tag:8.10.3",
+      "role": "tool",
+      "license": "RSALv2 OR SSPLv1 OR AGPL-3.0",
+      "why": "NautilusTrader's built-in external message bus backing at the pin (docs/concepts/message_bus.md: 'Redis is the built-in external backing'; minimum 6.2). One process publishes the live mover list onto a Redis stream on 127.0.0.1 and the nodes that trade read it, so the list crosses processes without a file handoff. Installed only on request from mise's bus config environment (mise.bus.toml), which a plain install and hosted CI never read.",
+      "evidence": [
+        "https://github.com/redis/redis/releases/tag/8.10.3",
+        "https://raw.githubusercontent.com/nautechsystems/nautilus_trader/v2.0.0rc8/docs/concepts/message_bus.md",
+        "https://raw.githubusercontent.com/nautechsystems/nautilus_trader/v2.0.0rc8/docs/getting_started/installation.md",
+        "https://mise.jdx.dev/configuration/environments.html"
+      ],
+      "adr": "0149"
     },
     {
       "id": "alpaca-py",

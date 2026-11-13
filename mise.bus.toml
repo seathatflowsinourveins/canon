@@ -1,0 +1,10 @@
+# The `bus` config environment (https://mise.jdx.dev/configuration/environments.html): this file loads on top of
+# mise.toml only when it is selected, `mise -E bus <command>` or MISE_ENV=bus. A plain `mise install`,
+# `scripts/bootstrap --install` and hosted CI (which sets no MISE_ENV) read only mise.toml, so none of them
+# installs Redis (docs/adr/0149-redis-carries-the-live-mover-list-across-processes-on-nautilustraders-external-message-bus.md).
+# Install it on request, through the permission prompt the owner answers: mise -E bus install redis
+
+[tools]
+# Redis, NautilusTrader's built-in external message bus backing at the pin (docs/concepts/message_bus.md;
+# minimum 6.2, for the MINID stream trimming autotrim uses). canon/upstreams.json: redis.
+redis = "8.10.3"

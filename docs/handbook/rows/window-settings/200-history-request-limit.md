@@ -1,0 +1,1 @@
+| `HISTORY_REQUEST_LIMIT` | 20 warm-up requests in any rolling minute; an opening over it is held by name and asked again | UNCALIBRATED | `mover.HISTORY_REQUEST_LIMIT` (`mover.py:493`), one ranking's worth | 2026-11-13 |

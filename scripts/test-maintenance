@@ -533,6 +533,9 @@ rm -rf "$STUB/loaded"; logs_clear
 ainst AUTOMATION_SKIP_LAUNCHD=1; rc=$?
 check "rehearsal install: exit 0, the maintenance agent's script installed" \
       eval '[ "$rc" = 0 ] && cmp -s "$ROOT/home/.claude/canon/maintenance.sh" "$AH/canon/maintenance.sh"'
+PP="$LA/local.canon.paper-session.plist"
+check "paper schedule: interval retained beside both feed boundaries, with no Friday 20:00" \
+      eval 'plutil -convert json -o - "$PP" | jq -e '\''.StartInterval == 70 and .StartCalendarInterval == ([range(1;6) | {Weekday: ., Hour: 4, Minute: 0}] + [range(0;5) | {Weekday: ., Hour: 20, Minute: 0}])'\'' >/dev/null'
 margs=""; for i in 0 1 2 3; do margs="$margs|$(plutil -extract "ProgramArguments.$i" raw -o - "$MP" 2>/dev/null)"; done
 check "... its plist: the script on this clone with the mise install found" test "$margs" = "|/bin/bash|$AH/canon/maintenance.sh|$A|$B/mise"
 check "... every 30 minutes, not at load, its process group abandoned, CLAUDE_CONFIG_DIR the install's" \

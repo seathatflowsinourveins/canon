@@ -1,0 +1,1 @@
+* One full-market ranking generation each minute, published as the signal `movers-rank`; a missing, stale or invalid input publishes nothing, and no generation, an old one or one that does not parse means no entry (ADR 0087, ADR 0107, ADR 0088).

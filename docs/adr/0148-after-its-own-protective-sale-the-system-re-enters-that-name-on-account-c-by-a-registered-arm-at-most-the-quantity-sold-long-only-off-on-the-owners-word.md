@@ -5,7 +5,7 @@ decision-makers: repo owner (requirement, 2026-11-13, as the lead reads it: afte
 review-by: 2026-12-13
 ---
 
-# After its own protective sale, the system re-enters that name on account C by a registered re-entry arm, at most the quantity it sold, long only, never after the owner's own sale and off on the owner's word; open: the sale row, the protective sale's lineage and a live feed for two arms
+# After its own protective sale, the system re-enters that name on account C by a registered re-entry arm, at most the quantity it sold, long only, never after the owner's own sale and off on the owner's word; open: the sale row and a live feed for two arms
 
 ## Context and Problem Statement
 
@@ -49,7 +49,8 @@ entry arm qualified, so a name sold outside a ranked window never re-enters (`sr
 * **Only a name it sold itself.** The row is written only for a sell of the protective lineage, and the
   re-entry is keyed on the exact sell order recorded, not on a lineage alone. A protective sale is named
   in the protect lineage (`canon-protect-`, `src/canon_trading/custody.py`), the standing protector's
-  included (this record's choice): an order the engine names in the node's form reads as any node trade,
+  included (the lead's ruling, 2026-11-13: the protect lineage, decided by the one `lineage` rule in
+  custody.py; a protective sale of the owner's shares is never one of our nodes' orders): an order the engine names in the node's form reads as any node trade,
   so it cannot tell a protective sale from another. The engine's trailing stop takes a client order ID at
   the pin; whether the emulator keeps it on the order it releases is `UNVERIFIED`. A stop so named also
   counts as cover for the protect task, as its own stops do.

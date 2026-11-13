@@ -332,6 +332,12 @@ EOF
 # Mover firing outside overnight is refused by name.
 # CANON_PAPER_SCHEDULED=1 (launchd.plist(5), EnvironmentVariables) tells the runner and the window that the
 # schedule started them: only they stamp the firing and write the records status reads.
+# launchd.plist(5), read 2026-11-13: StartCalendarInterval accepts an array, and is
+# evaluated independently of StartInterval. Name both feed boundaries: 04:00 Mon-Fri,
+# 20:00 Sun-Thu (0 is Sunday); never Friday 20:00. The rows are in the host's zone,
+# which must be America/New_York (this Mac's /etc/localtime, read 2026-11-13). The man
+# page is silent on a calendar row that falls while the job still runs (UNVERIFIED);
+# the interval and Alpaca's clock and calendar still decide, after sleep and on holidays.
 # write_paper_plist <mise> <origin url> [file, else PAPER_PLIST]
 write_paper_plist() {
   local c; c=$(xml "$CANON_HOME")
@@ -368,6 +374,19 @@ write_paper_plist() {
   <string>$c</string>
   <key>StartInterval</key>
   <integer>$PAPER_INTERVAL</integer>
+  <key>StartCalendarInterval</key>
+  <array>
+    <dict><key>Weekday</key><integer>1</integer><key>Hour</key><integer>4</integer><key>Minute</key><integer>0</integer></dict>
+    <dict><key>Weekday</key><integer>2</integer><key>Hour</key><integer>4</integer><key>Minute</key><integer>0</integer></dict>
+    <dict><key>Weekday</key><integer>3</integer><key>Hour</key><integer>4</integer><key>Minute</key><integer>0</integer></dict>
+    <dict><key>Weekday</key><integer>4</integer><key>Hour</key><integer>4</integer><key>Minute</key><integer>0</integer></dict>
+    <dict><key>Weekday</key><integer>5</integer><key>Hour</key><integer>4</integer><key>Minute</key><integer>0</integer></dict>
+    <dict><key>Weekday</key><integer>0</integer><key>Hour</key><integer>20</integer><key>Minute</key><integer>0</integer></dict>
+    <dict><key>Weekday</key><integer>1</integer><key>Hour</key><integer>20</integer><key>Minute</key><integer>0</integer></dict>
+    <dict><key>Weekday</key><integer>2</integer><key>Hour</key><integer>20</integer><key>Minute</key><integer>0</integer></dict>
+    <dict><key>Weekday</key><integer>3</integer><key>Hour</key><integer>20</integer><key>Minute</key><integer>0</integer></dict>
+    <dict><key>Weekday</key><integer>4</integer><key>Hour</key><integer>20</integer><key>Minute</key><integer>0</integer></dict>
+  </array>
   <key>RunAtLoad</key>
   <false/>
   <key>ProcessType</key>

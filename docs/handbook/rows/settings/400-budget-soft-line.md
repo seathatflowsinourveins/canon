@@ -1,0 +1,1 @@
+| `BUDGET_SOFT_LINE` | 140 calls in any 60 seconds on one account, for a mover node; entries yield above it | UNCALIBRATED | The owner's requirement; `MoverConfig.soft_line` (ADR 0088, ADR 0106); the lead's decision of 2026-11-11 that it governs a mover node, and that ADR 0083's run failing at 100 in any 60 seconds belongs to the SPY session window's stack check | 2026-11-11 |
