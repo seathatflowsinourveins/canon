@@ -31,7 +31,7 @@ paths:
   `mise run paper:account windows` and `mise run paper:close windows`;
   account C's, stored with `paper:store protect`, reaches only `mise run paper:account protect` and
   `mise run paper:protect protect`, the one task that sends on C: a trailing stop for a long it finds,
-  never anything else (ADR 0114, ADR 0142).
+  or with `--cancel` the cancel of such a stop, never anything else (ADR 0114, ADR 0142).
   `mise run paper:history <tests|windows>` reads either one, GET only in data-only mode, a historical
   load that neither trades nor streams (ADR 0093).
   No task reads both pairs. `paper:long-only <account> <check|on|off>` reads, or sets, Alpaca's long-only

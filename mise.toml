@@ -35,14 +35,15 @@ actionlint = "1.7.12"   # canon/upstreams.json: actionlint
 # Two paper accounts (docs/adr/0069-two-paper-accounts.md): `tests`, account A, the service above, and
 # `windows`, account B, service "canon-alpaca-paper-windows", the same two item names. A third on ADR 0069's
 # pattern (the owner's requirement, 2026-11-12): `protect`, account C, service "canon-alpaca-paper-protect",
-# which paper:store, paper:check, paper:remove and paper:account take; no task trades on it yet.
+# which paper:store, paper:check, paper:remove and paper:account take, and paper:protect protect, the one task
+# that sends an order on it: a trailing stop for a long it finds, or that stop's cancel (ADR 0142).
 # paper:store, paper:check
 # and paper:remove take the account as an argument, `tests` when none is given; mise refuses any other name
 # before the script starts (the `usage` spec's `choices`, https://mise.jdx.dev/tasks/task-arguments.html,
 # tried with mise 2026.11.5), and each script's `case` refuses it again. paper:test reads account A's pair and
 # paper:session, by hand or from the schedule, account B's; neither reads the other's. Each account has its own
-# lock, canon-paper-test.lock for A and canon-paper-windows.lock for B, so a test and a window do not wait for
-# each other. Each account's pair has its own market-data stream lock as well, taken last by whatever opens a
+# lock, canon-paper-test.lock for A, canon-paper-windows.lock for B and canon-paper-protect.lock for C, so a
+# test and a window do not wait for each other. Each account's pair has its own market-data stream lock as well, taken last by whatever opens a
 # stream on that pair (ADR 0069, 2026-11-11: two pairs of one login each held a subscribed connection at
 # once): canon-alpaca-stream-tests.lock for A's pair, taken by each paper test that streams, from its fixture,
 # and by paper:data's streaming modules; canon-alpaca-stream-windows.lock for B's, taken by a window after its
@@ -866,11 +867,14 @@ exec /usr/bin/timeout -s TERM -k 30 600 uv run --locked python -c 'from canon_tr
 # session on one paper account, then exit (src/canon_trading/protect.py, ADR 0142, ADR 0129). Accounts A (tests) and C
 # (protect); windows is refused by name for now. --plan-only makes every read and names what each stop would be
 # under every registered row, and sends nothing: an account's first run. A run that sends names its row with
-# --row (the Mover's registered trail arms; there is no default). It reads one account's pair and takes that account's lock without
-# waiting: a lock held refuses the run, so the go it was started on is not spent later. Exit 0 each long covered
-# (or planned), 1 a read or send failed, 2 a long left uncovered by name, 3 refused by name.
+# --row (the Mover's registered trail arms; there is no default). --cancel cancels the open stops of the protect
+# lineage and nothing else, asks for no session, and sends no order. It reads one account's pair and takes that
+# account's lock without waiting: a lock held refuses the run, so the go it was started on is not spent later. Exit
+# 0 each long covered (or planned), 1 a read or send failed, 2 a long left uncovered by name, 3 refused by name. With
+# --cancel: 0 each protect stop named ended canceled with nothing filled, or none was open; 1 a cancel or a read
+# failed, or a stop ended another way; 2 --symbol named a symbol the open listing showed no protect stop in; 3 refused.
 [tasks."paper:protect"]
-description = "Send one GTC trailing stop Alpaca holds, marked sell_to_close, for each long no working sell covers, on paper account A or C, in the regular session, then exit; --plan-only sends nothing"
+description = "Send one GTC trailing stop Alpaca holds, marked sell_to_close, for each long no working sell covers, on paper account A or C, in the regular session, then exit; --plan-only sends nothing; --cancel cancels the open stops this task sent and sends nothing"
 shell = "bash -c"
 timeout = "10m"
 usage = '''
@@ -881,6 +885,8 @@ flag "--plan-only" help="make every read, print what each stop would be under ev
 flag "--row <row>" help="the registered trail row a sending run plans on: F2 the fixed trail, OWN1 and OWN3 one and three one-minute ATRs; no default, and a send without one is refused" {
   choices "F2" "OWN1" "OWN3"
 }
+flag "--cancel" help="cancel the open stops of the protect lineage, and nothing else, then exit; sends no order; with --plan-only it names them and cancels nothing"
+flag "--symbol <symbol>" help="with --cancel: only this symbol's protect stops; exit 2 when it has none open"
 '''
 run = '''
 case "${usage_account:-}" in
@@ -903,7 +909,7 @@ case "$held" in
   *) echo "paper:protect: account ${usage_account}'s lock could not be taken (lockf exit $held); nothing was sent" >&2; exit 1 ;;
 esac
 echo "account: $usage_account"
-exec /usr/bin/timeout -s TERM -k 30 300 uv run --locked python -c 'import sys; from canon_trading.protect import task_from_flags; raise SystemExit(task_from_flags(sys.argv[1], sys.argv[2]))' "${usage_plan_only:-false}" "${usage_row:-}"
+exec /usr/bin/timeout -s TERM -k 30 300 uv run --locked python -c 'import sys; from canon_trading.protect import task_from_flags; raise SystemExit(task_from_flags(*sys.argv[1:5]))' "${usage_plan_only:-false}" "${usage_row:-}" "${usage_cancel:-false}" "${usage_symbol:-}"
 '''
 
 # The nightly study (docs/adr/0089-the-nightly-study-loop.md): one firing of canon_trading.nightly_study in
