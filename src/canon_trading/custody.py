@@ -74,6 +74,35 @@ number, account ID, order ID or client order ID is printed; an order is named by
 quantity, type, limit, time in force, position intent, status and lineage. Time in force and position
 intent are Alpaca's returned values, or `not shown` when absent, never inferred from the order's lineage.
 
+The same read also prints ended orders for the current New York trade date, from the preceding 20:00
+inclusive to 20:00 exclusive (Alpaca's 24/5 trade-date rule, below), dated by Alpaca's clock. Each row
+shows the returned status, filled quantity, average fill price, submitted/filled/canceled times and
+lineage; an expired, rejected or replaced order also shows its corresponding ending time. Trailing
+stops show `trail_price`, `trail_percent` and `hwm`, or `not shown`. No value is inferred. Sources,
+read 2026-11-13:
+
+* alpaca-py at `c42add7c0a70`, `alpaca/trading/models.py:217-303`: the Order fields;
+  `alpaca/trading/client.py:107-131,422-437`: orders and clock are GETs;
+  `alpaca/trading/requests.py:205-226`: `closed`, the submission bounds, sort and limit.
+* https://docs.alpaca.markets/us/reference/getallorders-1 (from llms.txt): `after` and `until`
+  bound submission, not ending. A GTC stop submitted before today can sell today, so the walk's
+  `after` is not the date's start but `GTC_AGE_LIMIT` before it: Alpaca's aged order policy cancels
+  a GTC order 90 days after creation (orders-at-alpaca, below), so nothing submitted earlier can end
+  inside the date. `until` starts at the trade date's end and moves backwards, with the
+  overlap/checks/pacing described above. Only ending times inside the trade date are printed.
+  Incomplete pagination or a missing ending time is a named read failure, never a claim that the
+  date is empty. The account, positions, open orders and configuration are printed before the walk
+  starts, so a failed walk, or the task's 300-second timeout killing a long one, leaves them shown.
+* https://docs.alpaca.markets/us/docs/orders-at-alpaca, Order Lifecycle and Trailing Stop Orders:
+  filled/canceled/expired/rejected orders have ended; replaced orders have a replacement timestamp.
+  `done_for_day` can resume next day and is excluded. Time in Force: "Alpaca implements an aged
+  order policy that will automatically cancel GTC orders 90 days after creation", by a cancel request
+  at 4:15 pm ET on `expires_at` that may stay `pending_cancel` until the venue cancels it. The GET's optional `hwm` is documented, but
+  whether paper returns it on an ended trailing stop is UNVERIFIED until the owning lane's read.
+* https://docs.alpaca.markets/us/docs/245-trading-for-trading-api, session hours and settlement:
+  an execution from 20:00 New York belongs to the next date. These are wall-clock date bounds,
+  not a claim that every date has an exchange session; no session or calendar is needed for this read.
+
 Quantity (`read_holdings`). Alpaca's position carries no client order ID, so the quantity ours opened is read
 from the venue's orders: the net fill (buys add, sells take away) of every order of our lineage in the
 symbol submitted since the current trading week's start (`status=all`, so a partly filled open order counts).
@@ -169,6 +198,7 @@ from alpaca.trading.enums import OrderSide as AlpacaOrderSide
 from alpaca.trading.enums import QueryOrderStatus
 from alpaca.trading.enums import TimeInForce as AlpacaTimeInForce
 from alpaca.trading.models import AccountConfiguration
+from alpaca.trading.models import Clock
 from alpaca.trading.models import Order
 from alpaca.trading.models import Position
 from alpaca.trading.models import TradeAccount
@@ -309,8 +339,135 @@ def open_orders(trading: TradingClient) -> list[Order]:
     return _read("the open orders", lambda: trading.get_orders(request), list, Order)
 
 
+ENDED_AT = {
+    "filled": "filled_at",
+    "canceled": "canceled_at",
+    "expired": "expired_at",
+    "rejected": "failed_at",
+    "replaced": "replaced_at",
+}
+"""Final statuses and their returned ending times (module header, Order Lifecycle)."""
+
+
+def _dated(value: object, name: str) -> datetime:
+    """A returned timestamp with its offset, or a named failure without the returned body."""
+    if not isinstance(value, datetime) or value.utcoffset() is None:
+        raise ReadFailed(f"{name} is not shown with a timezone; the trade date is not established")
+    return value
+
+
+def _ended_at(order: Order) -> datetime | None:
+    """The returned final event's time, never submitted_at or updated_at in its place."""
+    field = ENDED_AT.get(_value(order.status))
+    if field is None:
+        return None
+    return _dated(getattr(order, field), "an ended order's ending time")
+
+
+def _returned(value: object) -> str:
+    """A returned value, with offsets on timestamps and an explicit label for absent fields."""
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return "not shown" if value in (None, "") else _value(value)
+
+
+def ended_order_line(order: Order) -> str:
+    """An ended order's result and returned times, with no identifiers or inferred trail values."""
+    kind = _value(order.type if order.type is not None else order.order_type)
+    fields = ["submitted_at", "filled_at", "canceled_at"]
+    ending = ENDED_AT.get(_value(order.status))
+    if ending is not None and ending not in fields:
+        fields.append(ending)
+    if kind == "trailing_stop":
+        fields.extend(("trail_price", "trail_percent", "hwm"))
+    times_and_trail = " ".join(f"{field} {_returned(getattr(order, field))}" for field in fields)
+    owner = lineage(order.client_order_id)
+    return (
+        f"{order.symbol or NO_SYMBOL} {_value(order.side)} {_quantity_named(order)} {kind} "
+        f"status {_value(order.status)} filled_qty {_returned(order.filled_qty)} "
+        f"filled_avg_price {_returned(order.filled_avg_price)} {times_and_trail} "
+        f"{LINEAGE_NAMES.get(owner, owner)}"
+    )
+
+
+GTC_AGE_LIMIT = timedelta(days=92)
+"""How far before a trade date's start the ended-order walk reads submissions: Alpaca's 90-day GTC
+cancel (module header), plus two days for the cancel to stay pending at the venue (Canon's margin,
+not a documented figure)."""
+
+
+def ended_orders(trading: TradingClient, start: datetime, end: datetime) -> list[Order]:
+    """Closed history, paged by submission, selected by ending in [start, end).
+
+    The submission lower bound is `GTC_AGE_LIMIT` before the date, not the date's start: a stop
+    submitted before the date but sold inside it must not vanish. IDs remain only in memory to
+    deduplicate the overlapping pagination boundary.
+    """
+    after = start - GTC_AGE_LIMIT
+    until = end
+    listed: dict[str, Order] = {}
+    selected: list[Order] = []
+    edge: set[str] = set()
+    while True:
+        request = GetOrdersRequest(
+            status=QueryOrderStatus.CLOSED,
+            after=after,
+            until=until,
+            direction=Sort.DESC,
+            limit=ORDERS_PAGE_LIMIT,
+            nested=False,
+        )
+        page = _read(
+            "the ended orders", lambda request=request: trading.get_orders(request), list, Order
+        )
+        stamps = [_dated(order.submitted_at, "an ended order's submission time") for order in page]
+        if any(stamp > until or stamp < after for stamp in stamps):
+            raise ReadFailed("the ended orders page is outside its submission bound")
+        if any(later > earlier for earlier, later in pairwise(stamps)):
+            raise ReadFailed("the ended orders pages are not newest first")
+        if not edge <= {str(order.id) for order in page}:
+            raise ReadFailed("the ended orders pagination lost its overlapping boundary")
+        for order in page:
+            key = str(order.id)
+            previous = listed.get(key)
+            if previous is not None:
+                if previous != order:
+                    raise ReadFailed("an ended order changed across pages; the date is incomplete")
+                continue
+            listed[key] = order
+            ended = _ended_at(order)
+            if ended is not None and start <= ended < end:
+                selected.append(order)
+        if len(page) < ORDERS_PAGE_LIMIT:
+            return selected
+        earliest = min(stamps)
+        boundary = earliest + timedelta(microseconds=1)
+        if boundary >= until:
+            raise ReadFailed("the ended orders pagination cannot advance; the date is incomplete")
+        edge = {str(order.id) for order in page if order.submitted_at == earliest}
+        until = boundary
+        time.sleep(session_window.POLL_SECS)
+
+
+def ended_order_lines(trading: TradingClient) -> list[str]:
+    """One trade date's endings, including prior-date submissions, or one explicit empty line."""
+    clock = _read("the account clock", trading.get_clock, Clock)
+    local = _dated(clock.timestamp, "the account clock").astimezone(session_window.NEW_YORK)
+    trade_date = local.date()
+    if local.time() >= session_window.OVERNIGHT_STARTS:
+        trade_date += timedelta(days=1)
+    end = datetime.combine(trade_date, session_window.OVERNIGHT_STARTS, session_window.NEW_YORK)
+    start = end - timedelta(days=1)
+    orders = ended_orders(trading, start.astimezone(UTC), end.astimezone(UTC))
+    return [
+        f"ended orders for {trade_date} (New York trade date): {len(orders) if orders else 'none'}",
+        *(f"  {ended_order_line(order)}" for order in orders),
+    ]
+
+
 def account_lines(trading: TradingClient) -> list[str]:
-    """The account as `paper:account` prints it (module header): four reads, all GET."""
+    """The account, positions, open orders and configuration as `paper:account` prints them first:
+    all GET. `account_task` prints the trade date's ended orders after them."""
     account = _read("the account", trading.get_account, TradeAccount)
     positions = _read("the positions", trading.get_all_positions, list, Position)
     orders = open_orders(trading)
@@ -354,7 +511,17 @@ def account_task(trading: TradingClient | None = None) -> int:
     except (ReadFailed, MethodRefused) as e:
         print(f"paper:account: {e}; nothing else was read", file=sys.stderr)
         return 1
-    print("\n".join(lines))
+    print("\n".join(lines), flush=True)  # before the history walk, which a failure or timeout ends
+    try:
+        ended = ended_order_lines(trading)
+    except ReadFailed as e:
+        print(
+            f"paper:account: {e}; the account, positions, open orders and configuration above "
+            "were read",
+            file=sys.stderr,
+        )
+        return 1
+    print("\n".join(ended))
     return 0
 
 

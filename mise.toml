@@ -799,13 +799,16 @@ exec /usr/bin/timeout -s KILL 600 uv run --locked python -c 'import sys; from ca
 
 # A read of one paper account (src/canon_trading/custody.py): equity, cash and buying power, each position,
 # each open order with its time in force and position intent as Alpaca returns them and whether its client
-# order ID is of our nodes' lineage or foreign, and `no_shorting`. GET only: the task and the module set
+# order ID is of our nodes' lineage or foreign, and `no_shorting`; then the New York trade date's ended orders,
+# from a closed-order history walk paged at the poll interval over submissions back to 92 days before the
+# date (Alpaca cancels a GTC order at 90 days), which can take minutes on a busy account and is printed after
+# the rest, so a failed or killed walk leaves the account read shown. GET only: the task and the module set
 # data-only mode (CANON_ALPACA_DATA_ONLY=1, ADR 0070), so the client refuses every other method before
 # sending. `tests` reads account A's pair and `windows` account B's (ADR 0069), as
 # paper:long-only does, into this task's environment only; neither value is printed, and no account number or
 # order ID is. It reads only, so it takes no lock and runs beside a window or a paper test.
 [tasks."paper:account"]
-description = "Print one paper account: balances, positions, open orders with their lineage, and no_shorting (GET only)"
+description = "Print one paper account: balances, positions, open orders with their lineage, no_shorting, and the trade date's ended orders (GET only)"
 shell = "bash -c"
 timeout = "10m"
 usage = '''
