@@ -360,10 +360,13 @@ def test_with_the_host_clock_far_behind_and_no_print_kept_the_trail_follows_the_
     assert seam.prints_ahead == {str(AAA): 1}
 
 
-def test_a_print_set_aside_as_late_does_not_go_through_a_held_stop() -> None:
-    """Held at 9.80 under a print trigger. The holding prints 9.90, and then a print of 9.70 arrives,
-    stamped by the venue a second before the 9.90 but after the fill. It is set aside as late and goes
-    through no held stop: it is not the hold's lowest price, and the step arms the trail and sells nothing."""
+def test_a_print_set_aside_as_late_still_counts_toward_the_hold_s_low() -> None:
+    """The lead's ruling of 2026-11-13 (09:27, F1 (b)): a holding's low is the lowest print traded at or
+    after the holding began, whatever order the prints arrive in. Held at 9.80 under a print trigger,
+    the holding prints 9.90, and then a print of 9.70 arrives, stamped by the venue a second before the
+    9.90 but after the fill. It is set aside as late, so it is not the newest price, but it is the
+    hold's low: the step sells, priced from the bid with the 9.90 as its followed price
+    (deepseek-w1-d-lpm/1)."""
     seam, slot, filled, last = holding(TriggerType.LAST_PRICE, bid="9.89", ask="9.91")
     seam.slots, seam.trades = {slot.instrument_id: slot}, 0
     last.append(stamped("10.0000", filled - SECOND, filled - SECOND))
@@ -382,12 +385,38 @@ def test_a_print_set_aside_as_late_does_not_go_through_a_held_stop() -> None:
         last.append(trade)
         seam.on_trade(trade)
     assert seam.late_prints[str(slot.instrument_id)]["count"] == 1
+    assert slot.newest_print is not None and slot.newest_print.price == D("9.90")
+    assert slot.held_low == D("9.7000")
+    seam._protect(slot, D(3), filled + 4 * SECOND)
+    assert [o.kind for o in seam.sent] == ["LIMIT"] and slot.exiting
+    assert slot.exit_record.trigger_reason == "held stop (followed price)"
+
+
+def test_a_late_print_from_before_the_holding_began_counts_toward_no_low() -> None:
+    """The same ruling: a print from before the holding began never counts, set aside as late or not.
+    A 9.70 stamped before the entry's acceptance, arriving after the 9.90, moves neither the newest
+    price nor the hold's low, and the hold's end arms the trail."""
+    seam, slot, filled, last = holding(TriggerType.LAST_PRICE, bid="9.89", ask="9.91")
+    seam.slots, seam.trades = {slot.instrument_id: slot}, 0
+    last.append(stamped("10.0000", filled - 3 * SECOND, filled - 3 * SECOND))
+    seam._protect(slot, D(3), filled + SECOND)
+    since = seam._holding_since(slot)
+    assert since is not None
+    for price, at, received in (
+        ("9.9000", filled + 3 * SECOND, filled + 3 * SECOND),
+        ("9.7000", since - 1, filled + 3 * SECOND + 1),
+    ):
+        trade = SimpleNamespace(
+            instrument_id=slot.instrument_id,
+            price=Price.from_str(price),
+            ts_event=at,
+            ts_init=received,
+        )
+        last.append(trade)
+        seam.on_trade(trade)
     assert slot.held_low == D("9.9000")
     seam._protect(slot, D(3), filled + 4 * SECOND)
-    # the 9.90 print ends the hold by arming the trail at the held stop, as the trigger unit's own
-    # case does; the late 9.70 sells nothing
     assert [o.kind for o in seam.sent] == ["TRAILING"] and not slot.exiting
-    assert D(str(seam.sent[0].trigger_price)) == D("9.80")
 
 
 @pytest.mark.parametrize(

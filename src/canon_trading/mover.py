@@ -1732,7 +1732,8 @@ class Slot:
     """This host's receipt of the entry's first fill (its `ts_init`), the clock the hold's bound reads;
     None for a holding this node did not see fill (a restart, or fills reconciled before the handler)."""
     held_low: Decimal | None = None
-    """The lowest followed price received while the stop is held, between steps (`on_quote`, `on_trade`):
+    """The lowest price of the holding received while the stop is held, between steps (`on_quote`'s
+    bids under `BID_ASK`; under a print trigger `on_trade`'s prints of the holding, a late one too):
     the hold's end reads it beside the price the cache has at that step, so a price through the held
     stop and back before the step is not forgotten (the xr4 reader's F2)."""
     held_at_l: Decimal | None = None
@@ -2352,7 +2353,8 @@ class Mover(Strategy):
         name = str(trade.instrument_id)
         if print_time(trade) is None:
             self.prints_ahead[name] = self.prints_ahead.get(name, 0) + 1
-        elif kept is not None and event < kept.event_ns:
+            return
+        if kept is not None and event < kept.event_ns:
             late = self.late_prints.setdefault(name, {"count": 0, "most_late_ms": 0})
             late["count"] += 1
             late["most_late_ms"] = max(
@@ -2360,12 +2362,14 @@ class Mover(Strategy):
             )
         else:
             slot.newest_print = Print(stamp, price, event)
-            if slot.held_since is not None and self.settings.trigger == TriggerType.LAST_PRICE:
-                # a print of this holding (`_holding_since`, as `_holding_trade`) while its stop is
-                # held; a print set aside as late, or with no usable time, goes through no held stop
-                since = self._holding_since(slot)
-                if since is None or event >= since:
-                    slot.held_low = price if slot.held_low is None else min(slot.held_low, price)
+        if slot.held_since is not None and self.settings.trigger == TriggerType.LAST_PRICE:
+            # the hold's low is the lowest print of this holding (`_holding_since`, as
+            # `_holding_trade`) while its stop is held, whatever order the prints arrive in: one set
+            # aside as late counts, though it is never the newest price nor prices a sale (the lead's
+            # ruling of 2026-11-13, F1 (b)); one with no usable time has no place in that order
+            since = self._holding_since(slot)
+            if since is None or event >= since:
+                slot.held_low = price if slot.held_low is None else min(slot.held_low, price)
 
     def record(self) -> dict[str, Any]:
         """What a run's report keeps of the strategy, in plain values: its rows, the ranking it last
@@ -3649,9 +3653,10 @@ class Mover(Strategy):
         if slot.held_since is not None and slot.held_stop is not None:
             # the first followed price meets the held stop before the hold ends, under either trigger
             # (the lead's H1-H3, 2026-11-12; the xr3 fast reader's SF1 and its BID_ASK twin): at or
-            # under it, the hold's sale at once, as `_hold` compares, with the lowest followed price
-            # received since the hold began (the xr4 reader's F2; the lead's H3); checked before the anchor is read,
-            # so an anchor that cannot be read does not leave the hold unchecked (code-review-high-succ/5)
+            # under it, the hold's sale at once, as `_hold` compares, with the hold's low received since
+            # the hold began (`Slot.held_low`; the xr4 reader's F2; the lead's H3); checked before the
+            # anchor is read, so an anchor that cannot be read does not leave the hold unchecked
+            # (code-review-high-succ/5)
             level = slot.held_stop
             low = at if slot.held_low is None else min(at, slot.held_low)
             if low <= level:

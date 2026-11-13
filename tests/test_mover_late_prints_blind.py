@@ -167,6 +167,9 @@ def test_p1_venue_order_does_not_use_the_earlier_of_event_and_receipt(
 
 @pytest.mark.parametrize("arms", ARMS, ids=ARM_NAMES)
 def test_p2_late_print_does_not_cross_a_held_stop(arms: tuple[int, int]) -> None:
+    # The lead's ruling of 2026-11-13 (09:27, F1 (b)) replaced P2: a late print of the holding counts
+    # toward the hold's low, which the hold's end reads (`_protect`; tests/test_mover_newest_print.py).
+    # `_hold` reads the last price, which a late print never becomes, so this case holds as it reads.
     seam = PrintSeam(arms=arms, bid="0")
     slot = seam.open_slot()
     slot.held_since, slot.held_stop = T0, Decimal("9.80")
