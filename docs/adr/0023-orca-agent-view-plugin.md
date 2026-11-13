@@ -179,8 +179,7 @@ Read 2026-11-10. `fetched`: downloaded whole with `curl` and read, not summarise
   https://code.claude.com/docs/en/discover-plugins.md — `claude plugin install`, `enable` and `marketplace
   add` "as ordinary terminal commands", and `owner/repo#ref` "to pin a branch or tag" (`fetched`, raw).
 * You should know exception, 2026-11-12: https://code.claude.com/docs/en/interactive-mode.md and
-  https://code.claude.com/docs/en/plugins/mods/overview.md (`fetched`). On 2026-11-13 a `/code-review` found
-  a second decision inside it, the user settings that let Claude Code fetch its feature flags and keep the
-  claude.ai account's skills, plugins and connectors out. That text moved to ADR 0139, with its sources,
-  and the check now says the owner turned the mod on. ADR 0139's second reader found the "direct" condition
-  dropped from the trimmed text; it is back.
+  https://code.claude.com/docs/en/plugins/mods/overview.md (`fetched`). Corrected 2026-11-13 after a review:
+  the user settings that let Claude Code fetch its feature flags, and keep the claude.ai account's skills,
+  plugins and connectors out, are a decision of their own, now ADR 0139 with its sources; the check names
+  the owner as the one who turned the mod on, and the "direct" condition stays.

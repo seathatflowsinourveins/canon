@@ -80,8 +80,11 @@ Where the evidence corrects the request:
   `NOTE` line saying what it changes, and keeps and names a value the owner set otherwise. A new settings
   file gets the same notes (`scripts/test-lanes`).
 * `scripts/bootstrap --check` has rows `claude.ai skill sync`, `claude.ai plugin sync` and
-  `claude.ai connectors`, and its telemetry row names `DO_NOT_TRACK "0"`. A key the file lacks is `NOT SET`
-  and fails the check; a value the owner set otherwise is `OWNER`, named without failing (`scripts/test-lanes`).
+  `claude.ai connectors`, and its telemetry row names `DO_NOT_TRACK "0"` while the template sets it. A key
+  the file lacks is `NOT SET` and fails the check. A skill or plugin sync set to anything but `false` is a
+  `MISMATCH` and fails, since it loads what the canon has not adopted. Connectors set otherwise are `OWNER`,
+  named without failing, since canon's project settings keep them off in its checkouts. A template that
+  cannot be read is `UNKNOWN` and fails (`scripts/test-lanes`).
 * `scripts/test-hooks` checks that canon's project settings turn connectors off as well.
 
 ## Evidence

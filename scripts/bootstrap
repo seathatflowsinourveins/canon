@@ -82,6 +82,10 @@ TELEMETRY_RE='^(CLAUDE_CODE_ENABLE_TELEMETRY$|OTEL_|DO_NOT_TRACK$)'
 # a key of CANON_KEYS removed so is then added from the template. The earlier template's "model": "fable" is
 # not among them: it is also the orchestrator lane's alias, which an owner may choose, so --check names it
 CANON_KEYS='["model", "availableModels", "modelPicker", "autoUpdatesChannel", "autoCompactWindow", "syncClaudeAiSkills", "syncClaudeAiPlugins", "disableClaudeAiConnectors"]'
+# the jq lookup of one top-level key, named by --arg k, as JSON text, or nothing when the key is absent
+# (`.[$k] // empty` would read a false as absent)
+# shellcheck disable=SC2016  # a jq program, not shell
+JQ_TOP='if type == "object" and has($k) then .[$k] | tojson else empty end'
 RETIRED='[{"path": ["autoUpdatesChannel"], "value": "stable"}, {"path": ["env", "ANTHROPIC_DEFAULT_FABLE_MODEL"], "value": "claude-fable-5-2"}]'
 # the variables that turn Claude Code's background updates off (https://code.claude.com/docs/en/env-vars.md)
 UPDATE_OFF_VARS="DISABLE_AUTOUPDATER DISABLE_UPDATES CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"
@@ -333,67 +337,73 @@ compact_row() {
   else row "auto-compact window" OWNER "$s sets $have; home/.claude/settings.json sets $want (ADR 0059); left as the owner set it$over"; fi
 }
 
-# claudeai_rows: ADR 0139's three top-level settings in the installed settings.json, against the template's
-# (https://code.claude.com/docs/en/settings-reference.md). syncClaudeAiSkills and syncClaudeAiPlugins false
-# stop the download of the skills and plugins enabled for the claude.ai account, and true is the same as
-# unset; disableClaudeAiConnectors true keeps out the connectors Claude Code fetches itself, and false is the
-# same as unset. A key the installed file lacks is NOT SET and fails, as --user-config adds it; another value
-# is the owner's (OWNER), named without failing. A key the template does not set has no row. Only that one
-# file is read: managed settings, or ENABLE_CLAUDEAI_MCP_SERVERS=false for one session, can turn these off as
-# well, and neither is named.
+# claudeai_rows: ADR 0139's three top-level settings in the installed settings.json
+# (https://code.claude.com/docs/en/settings-reference.md). syncClaudeAiSkills and syncClaudeAiPlugins: Claude
+# Code honors only false, and any other value syncs the claude.ai account's skills or plugins, which the canon
+# has not adopted (rule 2), so it is a MISMATCH and fails. disableClaudeAiConnectors: false is the same as
+# unset, and canon's project settings keep the connectors off in its checkouts whatever the user settings say,
+# so another value is the owner's (OWNER), named without failing. A key the installed file lacks is NOT SET
+# and fails, as --user-config adds it. A key the template does not set has no row; a template that cannot be
+# read is UNKNOWN and fails, so the rows never drop out silently. Only that one file is read: managed
+# settings, or ENABLE_CLAUDEAI_MCP_SERVERS=false for one session, can turn these off as well, and neither is
+# named.
 claudeai_rows() {
-  local s="$CLAUDE_HOME/settings.json" t="$ROOT/home/.claude/settings.json" rc=0 key label off okis unset want have
-  # shellcheck disable=SC2016  # a jq program, not shell
-  local get='if type == "object" and has($k) then .[$k] | tojson else empty end'
+  local s="$CLAUDE_HOME/settings.json" t="$ROOT/home/.claude/settings.json" rc=0 key label what have
+  if ! jq -e 'type == "object"' "$t" >/dev/null 2>&1; then
+    row "claude.ai settings" UNKNOWN "home/.claude/settings.json is not a readable JSON object, so ADR 0139's settings are not checked"; return 1
+  fi
   for key in syncClaudeAiSkills syncClaudeAiPlugins disableClaudeAiConnectors; do
+    [ -n "$(jq -r --arg k "$key" "$JQ_TOP" "$t")" ] || continue
     case "$key" in
-      syncClaudeAiSkills)  label="claude.ai skill sync";  off=false; okis="no skill of the claude.ai account is downloaded or loaded"
-                           unset="a session signed in with the claude.ai account downloads and loads its skills" ;;
-      syncClaudeAiPlugins) label="claude.ai plugin sync"; off=false; okis="no plugin of the claude.ai account is downloaded or loaded"
-                           unset="a session signed in with the claude.ai account downloads and loads its plugins" ;;
-      *)                   label="claude.ai connectors";  off=true;  okis="no claude.ai connector is fetched in a terminal, IDE or Agent SDK session"
-                           unset="Claude Code fetches and connects the claude.ai account's connectors" ;;
+      syncClaudeAiSkills)  label="claude.ai skill sync";  what=skills ;;
+      syncClaudeAiPlugins) label="claude.ai plugin sync"; what=plugins ;;
+      *)                   label="claude.ai connectors";  what="" ;;
     esac
-    want=$(jq -r --arg k "$key" "$get" "$t" 2>/dev/null)
-    [ -n "$want" ] || continue
     if [ ! -f "$s" ] || ! jq -e 'type == "object"' "$s" >/dev/null 2>&1; then
       row "$label" MISSING "no readable $s; run: scripts/bootstrap --user-config"; rc=1; continue
     fi
-    have=$(jq -r --arg k "$key" "$get" "$s")
-    if [ "$have" = "$want" ]; then
-      if [ "$have" = "$off" ]; then row "$label" ok "$key $have: $okis (ADR 0139)"
-      else row "$label" ok "$key $have, as home/.claude/settings.json sets it (ADR 0139)"; fi
-    elif [ -z "$have" ]; then
-      row "$label" "NOT SET" "$s sets no $key, so $unset; run: scripts/bootstrap --user-config"; rc=1
-    else
-      case "$have" in true|false) [ "$have" = "$off" ] || have="$have, the same as unset, so $unset" ;; esac
-      row "$label" OWNER "$s sets $key to $have; home/.claude/settings.json sets $want (ADR 0139); left as the owner set it"
-    fi
+    have=$(jq -r --arg k "$key" "$JQ_TOP" "$s")
+    case "$key=$have" in
+      syncClaudeAi*=false)
+        row "$label" ok "$key false: no $what of the claude.ai account are downloaded or loaded (ADR 0139)" ;;
+      syncClaudeAi*=)
+        row "$label" "NOT SET" "$s sets no $key, so a session signed in with the claude.ai account downloads and loads its $what, which the canon has not adopted (rule 2); run: scripts/bootstrap --user-config"; rc=1 ;;
+      syncClaudeAi*)
+        row "$label" MISMATCH "$s sets $key to $have, and Claude Code honors only false, so a session signed in with the claude.ai account downloads and loads its $what, which the canon has not adopted (rule 2, ADR 0139)"; rc=1 ;;
+      *=true)
+        row "$label" ok "$key true: no claude.ai connector is fetched in a terminal, IDE or Agent SDK session (ADR 0139)" ;;
+      *=)
+        row "$label" "NOT SET" "$s sets no $key, so Claude Code fetches the claude.ai account's connectors outside canon's checkouts, whose project settings keep them off; run: scripts/bootstrap --user-config"; rc=1 ;;
+      *)
+        row "$label" OWNER "$s sets $key to $have, the same as unset, so Claude Code fetches the claude.ai account's connectors outside canon's checkouts, whose project settings keep them off (ADR 0139); left as the owner set it" ;;
+    esac
   done
   return "$rc"
 }
 
 # claudeai_notes <settings.json> <keys>: a NOTE line for each of ADR 0139's four settings among the keys
 # (space-separated) that the file sets to that record's value, saying what it changes, so the change is not
-# made silently (https://code.claude.com/docs/en/env-vars.md, data-usage.md, settings-reference.md). Other
-# keys and values pass without a line.
+# made silently (https://code.claude.com/docs/en/env-vars.md, data-usage.md, settings-reference.md). The trash
+# folders are in the configuration folder, which CLAUDE_CONFIG_DIR replaces (env-vars.md). Other keys and
+# values pass without a line.
 claudeai_notes() {
-  local f="$1" k v
+  local f="$1" k v vals
+  # every value of the four as key=JSON, read once
+  # shellcheck disable=SC2016  # a jq program, not shell
+  vals=$(jq -r '. as $d | select(type == "object")
+           | ((.env // {}) | if type == "object" and has("DO_NOT_TRACK") then "DO_NOT_TRACK=\(.DO_NOT_TRACK | tojson)" else empty end),
+             ("syncClaudeAiSkills", "syncClaudeAiPlugins", "disableClaudeAiConnectors"
+              | . as $k | select($d | has($k)) | "\($k)=\($d[$k] | tojson)")' "$f" 2>/dev/null)
   for k in $2; do
-    case "$k" in
-      DO_NOT_TRACK) v=$(jq -r '(.env // {}) | if type == "object" then .DO_NOT_TRACK // empty | tostring else empty end' "$f" 2>/dev/null) ;;
-      syncClaudeAiSkills|syncClaudeAiPlugins|disableClaudeAiConnectors)
-        # shellcheck disable=SC2016  # a jq program, not shell
-        v=$(jq -r --arg k "$k" 'if type == "object" and has($k) then .[$k] | tojson else empty end' "$f" 2>/dev/null) ;;
-      *) continue ;;
-    esac
+    case "$k" in DO_NOT_TRACK|syncClaudeAiSkills|syncClaudeAiPlugins|disableClaudeAiConnectors) ;; *) continue ;; esac
+    v=$(printf '%s\n' "$vals" | sed -n "s/^$k=//p")
     case "$k=$v" in
-      DO_NOT_TRACK=0)
+      'DO_NOT_TRACK="0"')
         note "  NOTE       DO_NOT_TRACK \"0\": Claude Code fetches its feature flags and sends its usage metrics to Anthropic and third-party logging, under Orca too, and each command a session runs inherits the \"0\" (ADR 0139)" ;;
       syncClaudeAiSkills=false)
-        note "  NOTE       syncClaudeAiSkills false: Claude Code stops downloading the claude.ai account's skills and moves those already synced to ~/.claude/skills/.trash/ (ADR 0139)" ;;
+        note "  NOTE       syncClaudeAiSkills false: Claude Code stops downloading the claude.ai account's skills and moves those already synced to $CLAUDE_HOME/skills/.trash/ (ADR 0139)" ;;
       syncClaudeAiPlugins=false)
-        note "  NOTE       syncClaudeAiPlugins false: Claude Code stops downloading the claude.ai account's plugins and moves those already synced to ~/.claude/plugins/.trash/ (ADR 0139)" ;;
+        note "  NOTE       syncClaudeAiPlugins false: Claude Code stops downloading the claude.ai account's plugins and moves those already synced to $CLAUDE_HOME/plugins/.trash/ (ADR 0139)" ;;
       disableClaudeAiConnectors=true)
         note "  NOTE       disableClaudeAiConnectors true: no terminal, IDE or Agent SDK session fetches the claude.ai account's connectors; the desktop app and cloud sessions get theirs another way (ADR 0139)" ;;
     esac
@@ -482,8 +492,8 @@ telemetry_rows() {
   elif [ -n "$differ" ]; then
     row "telemetry settings" OWNER "$s sets $differ to another value than canon's (left as the owner set it)"
   else
-    # DO_NOT_TRACK "0" is among the values just matched when the template sets it (ADR 0139)
-    local dnt=""; [ "$(jq -r '.env.DO_NOT_TRACK // empty | tostring' "$s")" != 0 ] \
+    # named only when the template sets DO_NOT_TRACK "0", which the installed value matches here (ADR 0139)
+    local dnt=""; [ "$(jq -r '.env.DO_NOT_TRACK // empty | tojson' "$ROOT/home/.claude/settings.json" 2>/dev/null)" != '"0"' ] \
       || dnt='; DO_NOT_TRACK "0": feature flags fetched and usage metrics sent, under Orca too (ADR 0139)'
     row "telemetry settings" ok "OTLP logs to the local collector (ADR 0007)$dnt"
   fi
