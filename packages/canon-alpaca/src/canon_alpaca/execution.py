@@ -1,4 +1,43 @@
-"""Execution client: market, limit, stop and stop-limit orders for US equities on Alpaca's paper Trading API.
+"""Execution client for US equities on Alpaca's paper Trading API, with opt-in venue trailing stops.
+
+`submit_trailing_stops`, off by default, enables SELL TRAILING_STOP_MARKET with a PRICE or BASIS_POINTS
+offset, DEFAULT trigger, no activation or initial trigger price, DAY or GTC. The contract is Alpaca's
+"Trailing Stop Orders" (https://docs.alpaca.markets/us/docs/orders-at-alpaca.md, read 2026-11-12):
+`TrailingStopOrderRequest` at alpaca-py c42add7c0a70 requests.py:624-670 takes exactly
+one trail_price or trail_percent; BASIS_POINTS / 100 gives percent (Nautilus d53849b216e2
+docs/concepts/orders/index.md:235-236). BUY, other offset/trigger kinds and extra price fields are denied
+before transport. It is also an eligible explicit sell_to_close_order_types member, retaining the
+default scope of three proven types: TrailingStopOrderRequest inherits OrderRequest.position_intent
+(requests.py:388, :624, :644). Enforcement on the market order the trigger creates is UNVERIFIED.
+Before submission TradingClient.get_clock (client.py:422-436, Clock models.py:410-424) must say the
+regular session is open, with time remaining to next_close. One answer is reused until the boundary it
+names, its age the longer of the monotonic and the wall clock's, so a machine's sleep cannot carry an
+open answer past its close; a read that fails denies by name, with no submit, and is not kept. ADR 0129.
+At/after the sampled close it denies, without extended_hours. A close during the subsequent request
+can still queue an order until the next session (the same page, "Orders Submitted Outside of Eligible
+Trading Hours": "queued up for release the next trading day"); there is no atomic clock-and-submit
+endpoint. That boundary and paper election/fill behavior remain UNVERIFIED until paper proof.
+
+Trail modifications use ModifyOrder.params['trailing_offset'] in the existing order's units, the
+pinned Interactive Brokers adapter's convention (docs/integrations/interactive_brokers.md:446-450,
+execution/commands.rs:340-363). Alpaca PATCH takes ReplaceOrderRequest.trail (requests.py:307-335),
+keeping PRICE versus BASIS_POINTS; it cannot change kind (Orders page:329-333). Quantity replacement
+keeps the existing path and its reduce-only increase refusal; a limit/trigger price or extra parameter
+is refused. A trail replacement checks the regular-session clock too; a quantity-only replacement and a
+cancel do not, and only the trail change needs `submit_trailing_stops`. The native
+Strategy.modify_order requires a quantity/price/trigger change even with params (trading/src/strategy/
+mod.rs:359-404): offset-only works at the adapter hook, while the public strategy path can combine a
+quantity change with the offset. No meaningless trigger/quantity change is injected to bypass it.
+
+Native report/event limits at the pin: OrderStatusReport carries stop_price as trigger_price and the
+trail as trailing_offset/type; it has no hwm field (model/__init__.pyi:4862-4898). OrderUpdated updates
+only quantity and trigger, not the cached trailing_offset (model/src/orders/trailing_stop_market.rs:
+532-539), so the status report is the venue's current offset. There is no invented hwm or offset event.
+TRAILING_STOP_MARKET rejects OrderTriggered (model/src/orders/mod.rs:116-124, :874-878), so election
+arrives as OrderFilled. Alpaca does not document which ID the order a trigger creates carries. Two
+forms are covered, both by the existing paths: the order's own venue ID, and a new one that names the
+old in `replaces`. A new venue ID with no link is not adopted (its fills are counted by the existing
+rule for an unknown leg); that form is UNVERIFIED and is built only if a paper read shows it.
 
 Contract: `nautilus_trader.live.clients.ExecutionClient`, NautilusTrader v2.0.0rc8 (Python adapter guide,
 "Execution client hooks", https://nautilustrader.io/docs/md/latest/developer_guide/python_adapters.md). The
@@ -153,7 +192,7 @@ them under `FILLED_READING`, the reading observed on paper (ADR 0042); when they
 own, which paper did not show, its own fills are kept and the earlier ones left to the engine.
 
 With `report_external_trailing_stops`, off by default, an outside Alpaca `trailing_stop` maps to a
-NautilusTrader `TRAILING_STOP_MARKET` report only; submitting one is still denied. With the setting off
+NautilusTrader `TRAILING_STOP_MARKET` report; submission needs the independent setting above. With it off
 an open one fails start-up by name, as any open order this slice does not map does: an outside order is
 never taken on unasked. Alpaca's trailing-stop fields (`trail_price`, `trail_percent`,
 `stop_price`, https://docs.alpaca.markets/us/docs/orders-at-alpaca.md, "Trailing Stop Orders") give its
@@ -164,14 +203,20 @@ documented in `python/nautilus_trader/model/__init__.pyi` at the pin. A missing 
 advisory stop_price stays None (one warning per order for an unrepresentable value): the trailing model
 permits a trigger not materialized yet; no activation price or high-water mark is
 required (`docs/concepts/orders/trailing_stop_market.md`). Exactly one positive finite trailing offset
-is required, else the report fails by name, as any unmapped open order does. This mapping adds no
-trailing order command or local trailing logic, and no stream reports of a changing high-water mark.
+is required, else the report fails by name, as any unmapped open order does. This mapping has no local
+trailing logic and no stream reports of a changing high-water mark.
+Own cached trailing stops use it regardless of the outside-report setting. At a start with no cache
+nothing tells this node's open trailing stop from another's (a generated client ID carries the
+trader's tag, the same on every node here), so it is mapped only with the outside-report setting, and
+assigned to a strategy by Nautilus's external instrument claim, configured by the node, not inferred
+from a lost strategy name (execution/src/engine/mod.rs:1219, :1418-1423). Without that setting an
+uncached open trailing stop still fails start-up by name.
 
 Venue side, alpaca-py 0.45.0:
 
 * `TradingClient(api_key, secret_key, paper=True)` for `submit_order`, `cancel_order_by_id`,
   `replace_order_by_id`, `get_order_by_id`, `get_order_by_client_id`, `get_orders`, `get_all_positions`,
-  `get_account` and `get` (fill activities only). The
+  `get_account`, `get_clock` and `get` (fill activities only). The
   client is always built with `paper=True` and never with `url_override`, whatever the config holds; the
   config refuses both (`AlpacaExecutionClientConfig`). alpaca-py's REST client is synchronous, so each call
   runs in a worker thread, one at a time on its one `requests.Session`, as in `data.py`.
@@ -183,7 +228,7 @@ Venue side, alpaca-py 0.45.0:
 
 Known limits:
 
-* Market, limit, stop and stop-limit orders only, `DAY` or `GTC` only, whole shares only, simple orders
+* Market, limit, stop and stop-limit, plus the opt-in trailing-stop-market SELL above; `DAY` or `GTC`, whole shares, simple orders
   only. Alpaca marks IOC, FOK, OPG and CLS for whole-share market and limit orders "Yes*", and "Please
   contact the sales team for any TIF marked with a *", and for stop and stop-limit orders "No" ("Orders at
   Alpaca", https://docs.alpaca.markets/us/docs/orders-at-alpaca.md, "Order Types vs Supported Time in
@@ -196,8 +241,8 @@ Known limits:
   gives stop and stop-limit orders "No" in every time in force; a stop marked eligible is denied (below,
   "Extended hours"). The stop price and a stop-limit's limit price follow the sub-penny rule ("Sub-penny
   increments for stop orders"). Alpaca documents no status or trade update for a stop's election, so no
-  `OrderTriggered` is generated: an elected stop-limit stays `ACCEPTED` until it fills or ends. Trailing
-  stop submissions stay denied: their stop price moves with Alpaca's high-water mark and no update reports it.
+  `OrderTriggered` is generated: an elected stop-limit stays `ACCEPTED` until it fills or ends. A venue
+  trailing stop's moving stop price is read in reports; Alpaca's stream documents no hwm update.
 * Reduce-only orders are denied by default. Opting into `reduce_only_sells` sends a reduce-only SELL
   with `position_intent=sell_to_close`; BUY is always denied. No account configuration is read. The
   independent optional long-exit intent setting adds the same field to ordinary closing SELLs without
@@ -318,6 +363,7 @@ import collections
 import dataclasses
 import re
 import threading
+import time
 from datetime import datetime
 from decimal import ROUND_CEILING
 from decimal import ROUND_FLOOR
@@ -344,6 +390,7 @@ from alpaca.trading.enums import PositionIntent
 from alpaca.trading.enums import PositionSide as AlpacaPositionSide
 from alpaca.trading.enums import QueryOrderStatus
 from alpaca.trading.enums import TimeInForce as AlpacaTimeInForce
+from alpaca.trading.models import Clock as AlpacaClock
 from alpaca.trading.models import Order as AlpacaOrder
 from alpaca.trading.models import Position as AlpacaPosition
 from alpaca.trading.models import TradeAccount
@@ -354,6 +401,7 @@ from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.requests import ReplaceOrderRequest
 from alpaca.trading.requests import StopLimitOrderRequest
 from alpaca.trading.requests import StopOrderRequest
+from alpaca.trading.requests import TrailingStopOrderRequest
 from alpaca.trading.stream import TradingStream
 from nautilus_trader.common import Logger
 from nautilus_trader.config import ExecutionClientConfig
@@ -506,9 +554,15 @@ ORDER_TYPES_FROM_ALPACA = {
 }
 
 ORDER_TYPES = frozenset(
-    {OrderType.MARKET, OrderType.LIMIT, OrderType.STOP_MARKET, OrderType.STOP_LIMIT}
+    {
+        OrderType.MARKET,
+        OrderType.LIMIT,
+        OrderType.STOP_MARKET,
+        OrderType.STOP_LIMIT,
+        OrderType.TRAILING_STOP_MARKET,
+    }
 )
-"""Submission types: reporting an outside trailing stop does not allow submitting one."""
+"""Submission types; trailing stops require the separate submit_trailing_stops opt-in."""
 STOP_TYPES = frozenset({OrderType.STOP_MARKET, OrderType.STOP_LIMIT})
 SELL_TO_CLOSE_PROVEN = frozenset({OrderType.LIMIT, OrderType.STOP_MARKET, OrderType.STOP_LIMIT})
 """The order types on which `position_intent=sell_to_close` is shown, on paper, to be refused by Alpaca
@@ -558,7 +612,8 @@ class AlpacaExecutionClientConfig(ExecutionClientConfig):
     `sell_to_close_on_long_exits` also defaults to false; true adds SELL_TO_CLOSE to an ordinary SELL
     when this account's cached net position in the instrument is long. `reduce_only_sells`, also false
     by default, enables SELL_TO_CLOSE for reduce-only SELLs; otherwise all reduce-only orders are denied.
-    None of these settings sets reduce_only. `report_external_trailing_stops`, false by default,
+    None of these settings sets reduce_only. `submit_trailing_stops`, false by default, enables the
+    venue trailing-stop SELL contract in the module header. `report_external_trailing_stops`, false by default,
     reports an open trailing stop placed outside the node as an external order; with it false such an
     order fails start-up by name, since an outside order is never taken on unasked.
     `sell_to_close_order_types` scopes `sell_to_close_on_long_exits` and `reduce_only_sells`: the order
@@ -586,6 +641,7 @@ class AlpacaExecutionClientConfig(ExecutionClientConfig):
         reduce_only_sells: bool = False,
         sell_to_close_order_types: object = None,
         report_external_trailing_stops: bool = False,
+        submit_trailing_stops: bool = False,
         **kwargs: object,
     ) -> None:
         if paper is not True:
@@ -621,7 +677,7 @@ class AlpacaExecutionClientConfig(ExecutionClientConfig):
             if unsupported:
                 raise ValueError(
                     f"sell_to_close_order_types names {', '.join(unsupported)}, which this adapter "
-                    "does not submit; market, limit, stop and stop-limit only"
+                    "does not submit; market, limit, stop, stop-limit and trailing-stop-market only"
                 )
         # A tuple in the order of the types' names: instance fields are serialised with the config, and
         # the pinned serialiser takes a tuple of order types and no frozenset.
@@ -631,6 +687,9 @@ class AlpacaExecutionClientConfig(ExecutionClientConfig):
         if not isinstance(report_external_trailing_stops, bool):
             raise TypeError("report_external_trailing_stops must be a bool")
         self.report_external_trailing_stops = report_external_trailing_stops
+        if not isinstance(submit_trailing_stops, bool):
+            raise TypeError("submit_trailing_stops must be a bool")
+        self.submit_trailing_stops = submit_trailing_stops
         for key, value in kwargs.items():
             if key in self.COMMON_FIELDS:
                 continue
@@ -642,7 +701,7 @@ class AlpacaExecutionClientConfig(ExecutionClientConfig):
             raise TypeError(
                 f"AlpacaExecutionClientConfig has no setting {key!r}: it takes only "
                 "report_external_orders, sell_to_close_on_long_exits, reduce_only_sells, "
-                "sell_to_close_order_types, report_external_trailing_stops "
+                "sell_to_close_order_types, report_external_trailing_stops, submit_trailing_stops "
                 f"and {sorted(self.COMMON_FIELDS)}, "
                 "and NautilusTrader would "
                 "drop an unknown one silently",
@@ -676,6 +735,8 @@ class OrdersClient(Protocol):
     def get_all_positions(self) -> list[AlpacaPosition] | RawData: ...
 
     def get_account(self) -> TradeAccount | RawData: ...
+
+    def get_clock(self) -> AlpacaClock | RawData: ...
 
     def replace_order_by_id(
         self, order_id: UUID | str, order_data: ReplaceOrderRequest | None = None
@@ -870,6 +931,30 @@ def decimal_value(value: object, field: str) -> Decimal:
     return amount
 
 
+def venue_trail(offset: object, kind: TrailingOffsetType) -> float:
+    """Alpaca's one trail value: PRICE dollars or BASIS_POINTS / 100 percent.
+
+    alpaca-py requests.py:642-648 takes floats; Nautilus orders/index.md:235-236 defines units.
+    Reject an unrepresentable amount rather than silently underflowing it to zero or overflowing it.
+    """
+    if kind not in (TrailingOffsetType.PRICE, TrailingOffsetType.BASIS_POINTS):
+        raise ValueError(f"trailing offset type {getattr(kind, 'name', kind)} is not supported")
+    amount = decimal_value(offset, "trailing offset")
+    if amount <= 0:
+        raise ValueError(f"trailing offset {offset} must be positive")
+    try:
+        if kind == TrailingOffsetType.BASIS_POINTS:
+            amount /= 100
+        value = float(amount)
+    except ArithmeticError as e:
+        raise ValueError(
+            f"trailing offset {offset} cannot be represented by alpaca-py's float"
+        ) from e
+    if not 0 < value < float("inf") or Decimal(str(value)) != amount:
+        raise ValueError(f"trailing offset {offset} cannot be represented by alpaca-py's float")
+    return value
+
+
 def whole_quantity(value: object, field: str) -> Quantity:
     """A whole-share quantity from an Alpaca decimal string or number, refusing a fractional one."""
     amount = decimal_value(value, field)
@@ -993,6 +1078,17 @@ def replaces_as_asked(replacement: AlpacaOrder, request: ReplaceOrderRequest, or
         (request.limit_price, replacement.limit_price),
         (request.stop_price, replacement.stop_price),
     )
+    if request.trail is not None:
+        price_offset = order.trailing_offset_type == TrailingOffsetType.PRICE
+        held_trail = replacement.trail_price if price_offset else replacement.trail_percent
+        other_trail = replacement.trail_percent if price_offset else replacement.trail_price
+        if (
+            replacement.type != AlpacaOrderType.TRAILING_STOP
+            or held_trail is None
+            or other_trail is not None
+            or decimal_value(held_trail, "trail") != Decimal(str(request.trail))
+        ):
+            return False
     return all(
         asked is None or (held is not None and Decimal(str(held)) == Decimal(str(asked)))
         for asked, held in pairs
@@ -1141,15 +1237,15 @@ def order_status_report(
     trailing: bool = False,
 ) -> OrderStatusReport | None:
     """An `OrderStatusReport` for one Alpaca order, None for a closed one this slice does not map, whose
-    reason `skipped` is given. A trailing stop is mapped only when `trailing` is true
-    (`report_external_trailing_stops`); otherwise it is an order type this slice does not map.
+    reason `skipped` is given. A trailing stop is mapped only when `trailing` is true: the caller has
+    established own ownership/lineage or enabled `report_external_trailing_stops`.
 
     An open order this slice does not map raises, so reconciliation fails rather than leaving a working
     order unknown to the node. `replaced` is skipped: the order replacing it is reported in its own right,
     under `client_order_id` when the client has traced it back to the node's order. A stop's trigger type
     is `trigger_type` when the node holds the order, else `DEFAULT`: Alpaca's order has no trigger type
-    field. A trailing stop also carries its PRICE or BASIS_POINTS offset; it remains unsupported for
-    submission. `status`, `filled` and `quantity` stand in for what Alpaca's order shows when the client judges
+    field. A trailing stop also carries its PRICE or BASIS_POINTS offset. `status`, `filled` and
+    `quantity` stand in for what Alpaca's order shows when the client judges
     a replace chain as a whole (`AlpacaExecutionClient._order_report`, `chain_filled`).
     """
     try:
@@ -1400,8 +1496,7 @@ def position_status_report(position: AlpacaPosition, ts_init: int) -> PositionSt
 
 
 class AlpacaExecutionClient(ExecutionClient):
-    """Send market, limit, stop and stop-limit orders for US equities to Alpaca's paper Trading API and
-    report their events."""
+    """Send paper equity orders, including opt-in venue trailing-stop SELLs, and report their events."""
 
     def __init__(
         self,
@@ -1443,6 +1538,9 @@ class AlpacaExecutionClient(ExecutionClient):
         self._reduce_only_sells = config.reduce_only_sells
         self._sell_to_close_order_types = frozenset(config.sell_to_close_order_types)
         self._report_external_trailing_stops = config.report_external_trailing_stops
+        self._submit_trailing_stops = config.submit_trailing_stops
+        self._session_clock: tuple[AlpacaClock, tuple[float, float]] | None = None
+        """Alpaca's last clock answer and this loop's time just before it was asked for."""
         # Companion fills while the core has not yet materialized an outside order. They are not
         # marked applied: only the engine's cache can confirm a report's fills (ADR 0075).
         self._external_fills: dict[str, dict[str, FillReport]] = {}
@@ -1683,6 +1781,11 @@ class AlpacaExecutionClient(ExecutionClient):
         denial = denial or self._denial(order)
         if denial is None and extended_hours:
             denial = extended_hours_denial(order)
+        if denial is None and order.order_type == OrderType.TRAILING_STOP_MARKET:
+            # The one await before `OrderSubmitted`. The node hands this client its commands one at
+            # a time, so a cancel sent meanwhile runs after this submit and cancels the order at
+            # Alpaca (`test_a_cancel_sent_during_the_clock_read_...`).
+            denial = await self._trailing_session_denial()
         if denial is not None:
             self.generate_order_denied(order, denial)
             return
@@ -1735,6 +1838,43 @@ class AlpacaExecutionClient(ExecutionClient):
             )
             return
         self._accept(order, VenueOrderId(str(placed.id)), dt_to_unix_nanos(placed.submitted_at))
+
+    async def _trailing_session_denial(self) -> str | None:
+        """Why a trailing stop is not sent now, or None: Alpaca's clock must say the regular session is
+        open, never an extended-hours flag or a local weekday estimate.
+
+        One answer is reused until the boundary it names (`next_close` while open, `next_open` while
+        closed): one request a session, not one a stop. Its age is measured from before the read and
+        is the longer of two: this process's monotonic clock, which stops while the machine sleeps
+        (`time.get_clock_info("monotonic")` on macOS), and the wall clock, which does not but can be
+        set back. So an answer kept across a sleep is not trusted past the close it names. A read
+        that fails denies by name and is not kept, so the next order asks again; nothing is assumed
+        open.
+        """
+        loop = asyncio.get_running_loop()
+
+        def age(asked: tuple[float, float]) -> float:
+            return max(loop.time() - asked[0], time.time() - asked[1])
+
+        kept = self._session_clock
+        if kept is not None:
+            clock, asked = kept
+            boundary = clock.next_close if clock.is_open else clock.next_open
+            if age(asked) >= (boundary - clock.timestamp).total_seconds():
+                kept = self._session_clock = None
+        if kept is None:
+            asked = (loop.time(), time.time())
+            try:
+                clock = await self._call(self._venue().get_clock)
+                if not isinstance(clock, AlpacaClock):
+                    raise TypeError("alpaca-py clock must use raw_data=False")
+            except (APIError, OSError, ValueError, TypeError, AttributeError) as e:
+                return f"trailing stop regular session could not be verified ({failure_cause(e)})"
+            self._session_clock = (clock, asked)
+        remaining = (clock.next_close - clock.timestamp).total_seconds()
+        if not clock.is_open or age(asked) >= remaining:
+            return "trailing stop refused: regular session is not open (Alpaca clock)"
+        return None
 
     async def _refused(self, order: Any, error: APIError) -> None:
         """Reject an order Alpaca refused, unless Alpaca holds it.
@@ -2019,6 +2159,13 @@ class AlpacaExecutionClient(ExecutionClient):
             order.client_order_id, command.venue_order_id, order.venue_order_id
         )
         denial = self._modify_denial(order, command, venue_order_id)
+        if (
+            denial is None
+            and order.order_type == OrderType.TRAILING_STOP_MARKET
+            and "trailing_offset" in (command.params or {})
+        ):
+            # A trail change only: a quantity replace of a resting stop needs no open session.
+            denial = await self._trailing_session_denial()
         if denial is not None or venue_order_id is None:
             self.generate_order_modify_rejected(
                 order, venue_order_id, denial or "no venue order ID", self.clock.timestamp_ns()
@@ -2036,6 +2183,11 @@ class AlpacaExecutionClient(ExecutionClient):
             else None,
             stop_price=wire_price(command.trigger_price or order.trigger_price)
             if order.order_type in STOP_TYPES
+            else None,
+            trail=venue_trail(command.params["trailing_offset"], order.trailing_offset_type)
+            if order.order_type == OrderType.TRAILING_STOP_MARKET
+            and command.params
+            and "trailing_offset" in command.params
             else None,
         )
         record = self._record(order)
@@ -2207,6 +2359,28 @@ class AlpacaExecutionClient(ExecutionClient):
             if order.order_type not in STOP_TYPES:
                 return f"a {order.order_type.name} order has no stop price to change"
             return sub_penny_denial(command.trigger_price, "stop price")
+        if order.order_type == OrderType.TRAILING_STOP_MARKET:
+            params = getattr(command, "params", None) or {}
+            if not isinstance(params, dict):
+                return "trailing modify params must be a mapping"
+            unknown = sorted(str(key) for key in params if key != "trailing_offset")
+            if unknown:
+                return f"trailing modify params {unknown} are not taken; only 'trailing_offset'"
+            if "trailing_offset" in params:
+                # The setting and the side gate the trail change only: a quantity replace of a
+                # trailing stop the node holds, an outside one included, is the existing path.
+                if not self._submit_trailing_stops:
+                    return (
+                        "trailing stop trail change is not supported: submit_trailing_stops is off"
+                    )
+                if order.side != OrderSide.SELL:
+                    return "trailing stop BUY trail change is not supported; SELL only"
+                try:
+                    venue_trail(params["trailing_offset"], order.trailing_offset_type)
+                except ValueError as e:
+                    return str(e)
+            elif command.quantity is None:
+                return "trailing modify needs params['trailing_offset'] or a quantity change"
         return None
 
     def _denial(self, order: Any) -> str | None:
@@ -2228,9 +2402,26 @@ class AlpacaExecutionClient(ExecutionClient):
             return f"{order.instrument_id} is not tradable on Alpaca (asset tradable=false)"
         if order.order_type not in ORDER_TYPES:
             return (
-                f"order type {order.order_type.name} is not supported; market, limit, stop and "
-                "stop-limit only"
+                f"order type {order.order_type.name} is not supported; market, limit, stop, "
+                "stop-limit and opt-in trailing-stop-market only"
             )
+        if order.order_type == OrderType.TRAILING_STOP_MARKET:
+            if not self._submit_trailing_stops:
+                return (
+                    "order type TRAILING_STOP_MARKET is not supported: submit_trailing_stops is off"
+                )
+            if order.side != OrderSide.SELL:
+                return "trailing stop BUY is not supported; SELL only"
+            if order.activation_price is not None:
+                return "trailing stop activation price is not supported"
+            if order.trigger_price is not None:
+                return "trailing stop initial trigger price is not supported; Alpaca derives it"
+            if order.trigger_type != TriggerType.DEFAULT:
+                return f"trailing stop trigger type {order.trigger_type.name} is not supported; DEFAULT only"
+            try:
+                venue_trail(order.trailing_offset, order.trailing_offset_type)
+            except ValueError as e:
+                return str(e)
         if order.time_in_force not in TIMES_IN_FORCE:
             return f"time in force {order.time_in_force.name} is not supported; DAY or GTC only"
         if order.is_quote_quantity:
@@ -2300,6 +2491,15 @@ class AlpacaExecutionClient(ExecutionClient):
                 **fields,
                 stop_price=wire_price(order.trigger_price),
                 limit_price=wire_price(venue_limit_price(order.price, order.side)),
+            )
+        if order.order_type == OrderType.TRAILING_STOP_MARKET:
+            field = (
+                "trail_price"
+                if order.trailing_offset_type == TrailingOffsetType.PRICE
+                else "trail_percent"
+            )
+            return TrailingStopOrderRequest(
+                **fields, **{field: venue_trail(order.trailing_offset, order.trailing_offset_type)}
             )
         return MarketOrderRequest(**fields)
 
@@ -3029,7 +3229,8 @@ class AlpacaExecutionClient(ExecutionClient):
             order.trigger_type if order.order_type in STOP_TYPES else None,
             order.client_order_id,
             quantity=chain_quantity(qty, earlier) if qty is not None else None,
-            trailing=self._report_external_trailing_stops,
+            trailing=self._report_external_trailing_stops
+            or order.order_type == OrderType.TRAILING_STOP_MARKET,
         )
         if report is None:
             raise ValueError(f"replacement {replacement_id} is not an order this slice maps")
@@ -4486,7 +4687,8 @@ class AlpacaExecutionClient(ExecutionClient):
             filled,
             quantity,
             lambda reason: self._warn_advisory_trigger(order, reason),
-            trailing=self._report_external_trailing_stops,
+            trailing=self._report_external_trailing_stops
+            or (held is not None and held.order_type == OrderType.TRAILING_STOP_MARKET),
         )
 
     def _warn_advisory_trigger(self, order: AlpacaOrder, reason: str) -> None:

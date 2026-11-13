@@ -4,8 +4,9 @@ An out-of-tree NautilusTrader adapter for Alpaca, built on `alpaca-py`.
 
 **Status: data slice and first execution slice, paper only.** It loads US equities as instruments, serves
 historical bars, quotes and trades on request and streams quotes and trades, all against Alpaca's paper data. Its execution
-client sends market, limit, stop and stop-limit orders for US equities to Alpaca's **paper** Trading API, cancels them one
-at a time or all of an instrument's at once, turns Alpaca's trade updates into order events and fills, and
+client sends market, limit, stop and stop-limit orders, and opt-in venue trailing-stop SELLs, for US
+equities to Alpaca's **paper** Trading API, cancels them one at a time or all of an instrument's at once,
+turns Alpaca's trade updates into order events and fills, and
 reports orders and positions for reconciliation at start-up. Its config refuses anything but paper
 trading. The offline tests pass, and the paper integration tests run with `mise run paper:test` (see
 [Tests](#tests));what each has shown against Alpaca is in ADR 0030, ADR 0036, ADR 0038 and ADR 0042.
@@ -25,7 +26,7 @@ Follows upstream's adapter template, `examples/live/_template/` at the pinned Na
 | `providers.py` | `AlpacaInstrumentProvider`: US equities from Alpaca's `/v2/assets` as `Equity` instruments | Built |
 | `data.py` | `AlpacaDataClient` (`MarketDataClient`): `_request_bars`, `_request_quotes`, `_request_trades`, `_subscribe_quotes`, `_subscribe_trades` and their unsubscribes; `AlpacaDataClientConfig`, the stream's silence bounds | Built |
 | `factories.py` | `AlpacaDataClientFactory`, `AlpacaExecutionClientFactory` | Built |
-| `execution.py` | `AlpacaExecutionClient` (`ExecutionClient`): account state on connect, `_submit_order`, `_modify_order`, `_cancel_order` and `_cancel_all_orders` for market, limit, stop and stop-limit orders, trade updates as order events and fills, order and position status reports; `AlpacaExecutionClientConfig`, which refuses anything but paper trading | Built (first slice) |
+| `execution.py` | `AlpacaExecutionClient` (`ExecutionClient`): account state on connect, `_submit_order`, `_modify_order`, `_cancel_order` and `_cancel_all_orders` for market, limit, stop, stop-limit and opt-in trailing-stop-market SELLs, trade updates as order events and fills, order and position status reports; `AlpacaExecutionClientConfig`, which refuses anything but paper trading | Built (venue trailing-stop paper proof pending) |
 
 The template is LGPL-3.0; copying from it is a licensing decision for the owner, so it was read for shape
 only and this package's code is written against the documented interface.
@@ -125,7 +126,7 @@ From upstream's Python adapter guide (`developer_guide/python_adapters`):
   the same for execution. No `Live` prefix. `AlpacaDataClientConfig` has two adapter fields, the stream's
   silence bounds (Known limits, "Mute stream"); a plain `DataClientConfig` gets their defaults.
   `AlpacaExecutionClientConfig` has `report_external_orders`, `report_external_trailing_stops`,
-  `sell_to_close_on_long_exits` and `reduce_only_sells`, all off by default, with
+  `submit_trailing_stops`, `sell_to_close_on_long_exits` and `reduce_only_sells`, all off by default, with
   `sell_to_close_order_types` scoping the last two, and refuses what is not paper trading. With
   `report_external_orders` true, trade updates report outside orders and their real trade-ID
   fills through `_handle_report(report, fills)` (the same guide's typed output contract).
@@ -155,7 +156,7 @@ has a `position_intent` field. By default every reduce-only order is denied befo
 `reduce-only is not supported`. With `AlpacaExecutionClientConfig(reduce_only_sells=True)`, a reduce-only
 SELL carries `position_intent=sell_to_close` and a reduce-only BUY is denied before transport. The field is
 present at the pin in [OrderRequest, requests.py:388](https://github.com/alpacahq/alpaca-py/blob/c42add7c0a70/alpaca/trading/requests.py#L388),
-inherited by all four supported request classes, with [PositionIntent.SELL_TO_CLOSE](https://github.com/alpacahq/alpaca-py/blob/c42add7c0a70/alpaca/trading/enums.py#L598).
+inherited by all supported request classes, with [PositionIntent.SELL_TO_CLOSE](https://github.com/alpacahq/alpaca-py/blob/c42add7c0a70/alpaca/trading/enums.py#L598).
 No account configuration is read or cached, at connect, on a query or on any order.
 
 `AlpacaExecutionClientConfig(sell_to_close_on_long_exits=True)` also adds the field to an ordinary SELL
@@ -172,6 +173,62 @@ A BUY or a SELL from cached flat/short is
 unchanged by this setting; the venue resolves any position change after that cached view. The adapter
 never sets the order's Nautilus `reduce_only` flag or changes a strategy's exit settings. No adapter
 setting is enabled in a node by this change.
+
+`AlpacaExecutionClientConfig(submit_trailing_stops=True)` opts into Alpaca's own trailing stop for a
+whole-share `TRAILING_STOP_MARKET` SELL, `DAY` or `GTC`, `DEFAULT` trigger, with no activation price or
+initial trigger price. A PRICE offset sends `trail_price`; BASIS_POINTS sends `trail_percent` after
+division by 100 (125 basis points sends 1.25 percent). Only one is sent. The default denies submission
+by name, independently of `report_external_trailing_stops`. With the setting off two things still
+differ from before: `sell_to_close_order_types` accepts the trailing stop where it raised, and a modify
+carrying `trailing_offset` is refused where the parameter was ignored. BUY, other trigger and offset types, and
+extended-hours eligibility are refused before transport. The regular-session risk check needs a
+cached trade for a DEFAULT trailing stop at the Nautilus pin (`crates/risk/src/engine/mod.rs:2367-2397`).
+
+A trailing stop can be named explicitly in `sell_to_close_order_types`; the default scope stays limit,
+stop and stop-limit. A reduce-only trailing SELL needs both `reduce_only_sells=True` and that explicit
+scope, and sends `position_intent=sell_to_close` through the existing path. The request inherits
+`OrderRequest.position_intent` ([alpaca-py requests.py:624-644](https://github.com/alpacahq/alpaca-py/blob/c42add7c0a70/alpaca/trading/requests.py#L624)).
+Whether Alpaca enforces it on the market order created on election is **UNVERIFIED** until paper proof.
+
+Submission and a change of the trail each need alpaca-py's `TradingClient.get_clock`, the same
+regular session source the node uses, to say the regular session is open. One answer is reused until
+the boundary it names (`next_close` while open, `next_open` while closed): one request a session, not
+one a stop. The answer's age is the longer of the monotonic clock's and the wall clock's, because the
+first stops while a machine sleeps: an open answer kept across a sleep is not trusted past its close. A closed clock, an elapsed `next_close`, an unreadable clock, raw data or a client with no
+clock refuses the command by name before transport, and a failed read is not kept; no extended-hours
+flag is set. The check uses the broker's time and close, including early closes. A close during the
+subsequent network request can still queue an order for the next session; that boundary remains
+**UNVERIFIED** on paper. A quantity-only replacement and a cancel work outside the regular session.
+
+At the adapter hook, a `ModifyOrder` with `params={"trailing_offset": "250"}` changes a BASIS_POINTS
+trail to 2.5 percent through `ReplaceOrderRequest(trail=2.5)`. This parameter follows the pinned
+[Interactive Brokers convention](https://github.com/nautechsystems/nautilus_trader/blob/d53849b216e20f2c122ca01b4dd0da377638b186/docs/integrations/interactive_brokers.md#commands-and-order-attributes).
+The offset kind stays fixed. Only the trail change needs `submit_trailing_stops`; the quantity
+replacement is the existing path, for a reported outside trailing stop too, including its refusal to
+increase a reduce-only SELL; limit/stop prices, changing offset kind and unknown params are rejected.
+Updates and cancellation follow the existing replacement ID chain. A native `Strategy.modify_order`
+at this pin requires a quantity, price or trigger change too, so a params-only strategy call fails
+before reaching the adapter. Combining a genuine quantity change with the trail is tested; no dummy
+price or quantity change is inserted.
+
+Accepted, updated, filled, canceled, expired and rejected orders use the existing event/report paths.
+The pin rejects `OrderTriggered` for market-style stops, so election appears as a fill. Alpaca does
+not document which ID the order a trigger creates carries. Two forms are covered offline, both by the
+existing paths: the order's own venue ID, and a new one naming the old in `replaces`, with partial and
+duplicate fills. A new venue ID with no link is not adopted: its fills are counted by the existing
+rule for an unknown leg and the node's order keeps its own ID. The venue's actual behaviour is
+**UNVERIFIED**; that form is built only if a paper read shows it (ADR 0129).
+The report carries Alpaca's `stop_price` as the advisory trigger and its current trail offset/type.
+The pinned `OrderStatusReport` has no `hwm` field, and `OrderUpdated` cannot change a cached order's
+trailing offset: the venue report is the current offset after replacement. These are verified pin
+limits, rather than fields this adapter fabricates.
+
+At startup, cached own trailing orders map without opting into outside orders. With no cache nothing
+tells this node's open trailing stop from another's (a generated client ID carries the trader's tag,
+the same on every node here), so an uncached one maps only with `report_external_trailing_stops`, and
+otherwise fails startup by name. A node that submits venue stops and may start without its cache turns
+both settings on. The native engine assigns an uncached order to its strategy through the node's
+explicit instrument claim; without one it uses `EXTERNAL`.
 
 ## Known limits of this slice
 
@@ -514,11 +571,12 @@ Each is stated in `execution.py`'s header, with its source.
   start, and the execution client none of those the cache holds; and a whole-market start on paper has
   not been run on this change, so that the node's log file carries the line as the tests read it off
   the console is UNVERIFIED until a window's record shows the count.
-* **Order types:** market, limit, stop and stop-limit, `DAY` or `GTC`, whole shares, simple orders.
+* **Order types:** market, limit, stop and stop-limit, plus the opt-in trailing-stop-market SELL above;
+  `DAY` or `GTC`, whole shares, simple orders.
   Alpaca marks IOC, FOK, OPG and CLS for whole-share market and limit orders "Yes*", "contact the sales
   team", and for stop and stop-limit orders "No"
   (https://docs.alpaca.markets/us/docs/orders-at-alpaca.md, "Order Types vs Supported Time in Force"), so
-  they are denied. So are trailing, post-only, quote-quantity and display quantity orders (a stop-market's
+  they are denied. So are post-only, quote-quantity and display quantity orders (a stop-market's
   display quantity included), a
   stop trigger type other than `DEFAULT` or `LAST_PRICE` (Alpaca elects a stop "on the consolidated
   print"), a stop price at or above $1.00 with more than 2 decimals or below $1.00 with more than
@@ -541,8 +599,9 @@ Each is stated in `execution.py`'s header, with its source.
   and the pinned [trailing model](https://github.com/nautechsystems/nautilus_trader/blob/d53849b216e20f2c122ca01b4dd0da377638b186/docs/concepts/orders/trailing_stop_market.md)
   and [offset units](https://github.com/nautechsystems/nautilus_trader/blob/d53849b216e20f2c122ca01b4dd0da377638b186/docs/concepts/orders/index.md#trailing-offset-type).
   No high-water mark or activation price is required. Exactly one positive finite offset must be
-  present, otherwise an open order still fails by name. No trailing submission or local trailing logic
-  is added; updates of Alpaca's moving trigger between reports remain unavailable on its stream.
+  present, otherwise an open order still fails by name. Trailing submission uses its separate opt-in
+  above. There is no local trailing logic; updates of Alpaca's moving trigger between reports remain
+  unavailable on its stream.
 * **Reduce-only:** all reduce-only orders are denied with `reduce-only is not supported` by default.
   With `reduce_only_sells=True`, a SELL of an order type in `sell_to_close_order_types` carries
   `position_intent=sell_to_close`; a reduce-only market SELL (outside the default scope) and every

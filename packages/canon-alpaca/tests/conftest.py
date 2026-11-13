@@ -508,6 +508,12 @@ class FakeOrdersClient(FakeTradingClient):
             time_in_force=order_data.time_in_force.value,
             limit_price=str(getattr(order_data, "limit_price", None) or "") or None,
             stop_price=str(getattr(order_data, "stop_price", None) or "") or None,
+            trail_price=str(getattr(order_data, "trail_price", None))
+            if getattr(order_data, "trail_price", None) is not None
+            else None,
+            trail_percent=str(getattr(order_data, "trail_percent", None))
+            if getattr(order_data, "trail_percent", None) is not None
+            else None,
             created_at=now,
             submitted_at=now,
             updated_at=now,
@@ -627,6 +633,10 @@ class FakeOrdersClient(FakeTradingClient):
             value = getattr(order_data, field, None)
             if value is not None:
                 new[field] = str(value)
+        if (trail := getattr(order_data, "trail", None)) is not None:
+            # Orders at Alpaca, Trailing Stop Orders: PATCH uses `trail`, preserving its kind.
+            field = "trail_price" if old.get("trail_price") is not None else "trail_percent"
+            new[field] = str(trail)
         if self.replace_script == "reject":
             self._send("order_replace_rejected", old)
             raise api_error(422, 42210000, "replace rejected (stand-in)")
