@@ -272,9 +272,11 @@ cp "$ROOT/home/.claude/canon/fleet-rate.sh" "$FR/canon/fleet-rate.sh"
 cat > "$TMP/lanes-stub" <<'STUB'
 #!/bin/bash
 echo run >> "$FLEET_STUB_COUNT"; sleep "${FLEET_STUB_SLEEP:-0}"
+if [ -n "${FLEET_STUB_JSON:-}" ]; then cat "$FLEET_STUB_JSON"; exit 0; fi
 printf '%s\n' '{"workers":[{"runtime":"claude-code","state":"working","measured":true,"tok_s":100.4},
 {"runtime":"claude-code","state":"idle","measured":true,"tok_s":20.2},{"runtime":"claude-code","state":"working","measured":false,"tok_s":null},
-{"runtime":"codex","state":"events in window","measured":true,"tok_s":5}]}'
+{"runtime":"codex","state":"events in window","measured":true,"tok_s":5}],
+"fleet":{"working":2,"tok_s":125.6,"gen_tok_s":108.26,"gen_requests":40}}'
 STUB
 chmod +x "$TMP/lanes-stub"
 fr() { CLAUDE_CONFIG_DIR="$FR" FLEET_RATE_LANES="$TMP/lanes-stub" FLEET_STUB_COUNT="$TMP/fleet.count" "$FR/canon/fleet-rate.sh"; }
@@ -287,12 +289,12 @@ FNOW=$(date -u +%s)
 rm -f "$TMP/fleet.count"; out=$(fr); rc=$?
 check "fleet label, no summary yet: no label, exit 0" '[ "$rc" = 0 ] && [ -z "$out" ]'
 waitfor "$FR/canon/fleet-rate.json"
-check "... and one refresh writes the summary: measured tok/s of every runtime summed, working Claude Code sessions counted" \
-  '[ "$(jq -r .label "$FR/canon/fleet-rate.json")" = "Fleet 126 tok/s · 2 working" ] && [ "$(runs)" = 1 ]'
+check "... and one refresh writes the summary: the report's fleet speed, as the HUD's own out: is written, and its working sessions" \
+  '[ "$(jq -r .label "$FR/canon/fleet-rate.json")" = "Fleet out 108 tok/s · 2 working" ] && [ "$(runs)" = 1 ]'
 unlocked
 rm -f "$TMP/fleet.count"; out=$(fr)
 check "a fresh summary: its label as the HUD's JSON, and no refresh" \
-  '[ "$out" = "{\"label\":\"Fleet 126 tok/s · 2 working\"}" ] && sleep 1 && [ "$(runs)" = 0 ]'
+  '[ "$out" = "{\"label\":\"Fleet out 108 tok/s · 2 working\"}" ] && sleep 1 && [ "$(runs)" = 0 ]'
 printf '{"t":%s,"label":"Fleet 7 tok/s · 1 working"}' "$((FNOW - 120))" > "$FR/canon/fleet-rate.json"
 rm -f "$TMP/fleet.count" "$FR/canon/fleet-rate.tried"
 s0=$(date +%s); out=$(FLEET_STUB_SLEEP=3 fr); out2=$(FLEET_STUB_SLEEP=3 fr); s1=$(date +%s)
@@ -321,6 +323,26 @@ printf '{"t":%s,"label":"Fleet 7 tok/s · 1 working"}' "$((FNOW + 3600))" > "$FR
 rm -f "$TMP/fleet.count" "$FR/canon/fleet-rate.tried"; out=$(fr); waitfor "$TMP/fleet.count"
 check "a summary dated ahead of the clock: no label, and a refresh starts" '[ -z "$out" ] && [ "$(runs)" = 1 ]'
 unlocked
+# with no speed to show, the working sessions alone: a report with no timed request in its window, one from a
+# lanes that has no fleet summary yet (the installed copy is older than fleet-rate.sh), which shows no figure of its own,
+# and a speed under 0.5 tok/s, which would round to 0
+for case_ in nogen nofleet lowgen; do
+  case "$case_" in
+    nogen)   printf '%s\n' '{"workers":[{"runtime":"claude-code","state":"working","measured":true,"tok_s":3}],"fleet":{"working":1,"tok_s":3,"gen_tok_s":null,"gen_requests":0}}' > "$TMP/stub.json" ;;
+    nofleet) printf '%s\n' '{"workers":[{"runtime":"claude-code","state":"working","measured":true,"tok_s":3},{"runtime":"claude-code","state":"working","measured":false}]}' > "$TMP/stub.json" ;;
+    lowgen)  printf '%s\n' '{"workers":[],"fleet":{"working":3,"tok_s":0.2,"gen_tok_s":0.3,"gen_requests":1}}' > "$TMP/stub.json" ;;
+  esac
+  rm -f "$TMP/fleet.count" "$FR/canon/fleet-rate.tried" "$FR/canon/fleet-rate.json"
+  FLEET_STUB_JSON="$TMP/stub.json" fr >/dev/null; waitfor "$FR/canon/fleet-rate.json"; unlocked
+  case "$case_" in
+    nogen)   check "a report with no timed request: the working sessions alone, no speed and no zero" \
+               '[ "$(jq -r .label "$FR/canon/fleet-rate.json")" = "Fleet 1 working" ]' ;;
+    nofleet) check "a report without the fleet summary: the working sessions counted from its rows, no speed" \
+               '[ "$(jq -r .label "$FR/canon/fleet-rate.json")" = "Fleet 2 working" ]' ;;
+    lowgen)  check "a fleet speed that rounds to 0 (0.3 tok/s): the working sessions alone, never out 0" \
+               '[ "$(jq -r .label "$FR/canon/fleet-rate.json")" = "Fleet 3 working" ]' ;;
+  esac
+done
 # the status line hands the HUD the label's command and the opt-in, only when fleet-rate.sh is installed
 HC="$TMP/hc"; mkdir -p "$HC/canon" "$HC/plugins/cache/mp/claude-hud/1.0.0" "$TMP/nodebin"
 printf '{"enabledPlugins":{"claude-hud@mp":true}}' > "$HC/settings.json"
@@ -348,18 +370,20 @@ for bad_ in '"total_lines_added":12.7,"total_lines_removed":3' '"total_lines_add
   check "lines that are not two whole numbers are not passed: $bad_" \
     '[ "$out" = "args=--extra-cmd $(printf %q "$HC/canon/fleet-rate.sh") allow=1" ] || { echo "    got: $out"; false; }'
 done
-printf '{"t":%s,"label":"Fleet 126 tok/s · 2 working"}' "$(date -u +%s)" > "$FR/canon/fleet-rate.json"
+printf '{"t":%s,"label":"Fleet out 108 tok/s · 2 working"}' "$(date -u +%s)" > "$FR/canon/fleet-rate.json"
 frl() { CLAUDE_CONFIG_DIR="$FR" FLEET_RATE_LANES=/nonexistent "$FR/canon/fleet-rate.sh" "$@"; }
 check "the label: the lines changed, the HUD's separator, then the fleet figure" \
-  '[ "$(frl 156 23)" = "{\"label\":\"+156 -23 │ Fleet 126 tok/s · 2 working\"}" ]'
-FL='{"label":"Fleet 126 tok/s · 2 working"}'
+  '[ "$(frl 156 23)" = "{\"label\":\"+156 -23 │ Fleet out 108 tok/s · 2 working\"}" ]'
+FL='{"label":"Fleet out 108 tok/s · 2 working"}'
 check "no lines changed, or lines that are not two whole numbers of at most nine digits: the fleet figure alone" \
   '[ "$(frl 0 0)" = "$FL" ] && [ "$(frl 5)" = "$FL" ] && [ "$(frl "1;x" 2)" = "$FL" ] && [ "$(frl 1234567890 1)" = "$FL" ] && [ "$(frl -1 2)" = "$FL" ]'
 # the HUD cuts a label at 50 characters (src/extra-cmd.ts), so a count of a million or more is written as the HUD
 # writes token counts (src/utils/format.ts)
-printf '{"t":%s,"label":"Fleet 1234 tok/s · 12 working"}' "$(date -u +%s)" > "$FR/canon/fleet-rate.json"
+printf '{"t":%s,"label":"Fleet out 999 tok/s · 12 working"}' "$(date -u +%s)" > "$FR/canon/fleet-rate.json"
 check "a million lines or more are written as the HUD writes token counts, so the label keeps within its 50 characters" \
-  '[ "$(frl 999999 1234567)" = "{\"label\":\"+999999 -1.2M │ Fleet 1234 tok/s · 12 working\"}" ] && [ "$(frl 999999999 999999999 | jq -r ".label | length")" -le 50 ] || { echo "    got: $(frl 999999 1234567)"; false; }'
+  '[ "$(frl 999999 1234567)" = "{\"label\":\"+999999 -1.2M │ Fleet out 999 tok/s · 12 working\"}" ] && [ "$(frl 999999999 999999999 | jq -r ".label | length")" -le 50 ] || { echo "    got: $(frl 999999 1234567)"; false; }'
+check "lines and fleet that together pass the 50 characters: the fleet figure alone, not a label the HUD would cut" \
+  '[ "$(frl 999999999 999999999)" = "{\"label\":\"Fleet out 999 tok/s · 12 working\"}" ] || { echo "    got: $(frl 999999999 999999999)"; false; }'
 printf '{"t":%s,"label":"Fleet 7 tok/s · 1 working"}' "$(( $(date -u +%s) - 700 ))" > "$FR/canon/fleet-rate.json"
 check "a fleet summary too old to show: the lines changed alone" '[ "$(frl 0 4)" = "{\"label\":\"+0 -4\"}" ]'
 rm -f "$FR/canon/fleet-rate.json"
