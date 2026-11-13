@@ -1,0 +1,1 @@
+| `COOLDOWN_SECS` | 300 seconds after a sale before the same name is bought again, under the clock re-entry arm only; a state arm (`REENTRY_ARM`) imposes no time delay | UNCALIBRATED | `MoverConfig` (ADR 0088) | 2026-11-11 |

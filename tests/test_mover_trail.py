@@ -1361,9 +1361,11 @@ def test_a_paper_window_refuses_the_vwap_arm_by_name():
 
 
 def test_the_cooldown_row_names_the_clock_arm():
-    rows = (Path(__file__).parents[1] / "docs/handbook/rows.md").read_text()
-    line = next(row for row in rows.splitlines() if row.startswith("| `COOLDOWN_SECS`"))
-    assert "clock" in line
+    rows = Path(__file__).parents[1] / "docs/handbook/rows"
+    lines = [row for path in rows.rglob("*.md") for row in path.read_text().splitlines()]
+    found = [row for row in lines if row.startswith("| `COOLDOWN_SECS` |")]
+    assert len(found) == 1, f"{len(found)} COOLDOWN_SECS rows under docs/handbook/rows/"
+    assert "clock" in found[0]
 
 
 def test_seven_slots_chasing_over_the_soft_line_each_re_price_their_due_sale_without_waiting():

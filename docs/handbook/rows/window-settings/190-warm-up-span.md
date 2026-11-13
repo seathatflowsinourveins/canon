@@ -1,0 +1,1 @@
+| `WARM_UP_SPAN` | 1 hour of one-minute bars, or `atr_n` plus 5 minutes if longer, ending now, or 15 minutes ago on the overnight feed | UNCALIBRATED | `session_ma_cross.WARM_UP_SPAN` (`session_ma_cross.py:131`), `mover.py:1417-1420`; the overnight delay from Alpaca's overnight-trading page, read 2026-11-12 (`mover.py:505-508`) | 2026-11-13 |

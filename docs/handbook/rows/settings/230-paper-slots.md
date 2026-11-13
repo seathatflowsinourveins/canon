@@ -1,0 +1,1 @@
+| `PAPER_SLOTS` | At most 7 held names in every part of a paper session; a run that asks for more is refused | UNCALIBRATED | ADR 0106: the lead's decision, on a request count measured on one fixture; a raise comes only from measured peaks | 2026-11-12 |

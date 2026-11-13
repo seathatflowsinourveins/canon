@@ -121,3 +121,42 @@ ten fields as list lines, in this order, each with a value:
 * status: open
 * supersedes: none
 * source: lead
+
+### L0007: A copy bound left a long window's log behind with no word
+
+* area: execution
+* session: 2026-11-13
+* result: The scheduled runner kept each window's records outside the temp folder with a copy bounded at 1 MB, and a window log over that bound was left behind silently; a long window's log is often around 10 MB, so the log of the windows most worth reading was the one lost on a restart
+* evidence: scripts/test-lanes, the cases a log over 1 MB is never dropped silently and the log over 1 MB that cannot be kept is named on stderr with its size
+* lesson: A bound on what is kept says what it left out and where it still is; a silent bound reads later as a record that never existed
+* change: a log over the bound is kept as its first and last 512000 bytes with a line naming what was left out, and one that cannot be kept is named on stderr (mise.toml, kept)
+* next: none
+* status: adopted
+* supersedes: none
+* source: lead
+
+### L0008: The account read could not show what a protective stop did once it ended, and its first fix was proven against no bound
+
+* area: exits
+* session: 2026-11-13
+* result: The paper account read showed only open orders, so a protective stop that had sold or been canceled left no trace in it; the first fix walked 92 days of order history and its proof read took about four of its five allowed minutes, which was judged a pass because it ended; on a busier paper account the same walk met the timeout; bounded to the trade date's submissions, the read listed the date's ended orders in about a second
+* evidence: `src/canon_trading/custody.py` and `tests/test_custody.py`; the paper reads' output, kept outside the repository
+* lesson: A read's proof is judged against its stated bound, its duration included, on an account with a full day's history; a walk the venue cannot bound by the event's time is bounded by the date, with what it leaves out named on its output, and a read that is killed must say it did not finish
+* change: the account read prints the ended orders submitted in the trade date after the flat read, says when its walk did not finish, and names that an order submitted earlier is not listed
+* next: Read an earlier-date protective stop's sale from the venue's fill activities, a next unit
+* status: adopted
+* supersedes: none
+* source: review
+
+### L0009: The default window sells on one quote because persistence is refused on its arm
+
+* area: exits
+* session: 2026-11-13
+* result: The default paper window's trailing stop, triggered on the bid, elects on the first quote at its level, because the strategy refuses a breach count above one unless the trigger is the trade print, the trail is fixed, the size is not from the budget and protection is on; on paper account B, 31 of 34 windows exited by the trailing stop, 8 of them within 60 seconds of the first fill
+* evidence: ADR 0119's amendment of 2026-11-13; the by-hand window records, kept outside the repository
+* lesson: A rule the handbook states (a breach is a count over a span, never one quote) has to be checked against the default arm as it runs, not only against the arm its tests built
+* change: ADR 0119 amended to count spaced two-sided quotes under the default arm, its rows uncalibrated, nothing lifted in code yet
+* next: A failing test on shaped quote tapes, then the paper count per arm of exits by the stop, exits within 60 seconds and re-entries
+* status: open
+* supersedes: none
+* source: review

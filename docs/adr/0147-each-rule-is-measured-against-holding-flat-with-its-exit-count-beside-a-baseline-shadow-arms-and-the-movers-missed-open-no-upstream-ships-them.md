@@ -86,6 +86,11 @@ trial (ADR 0089, step 4).
 * **Pricing a counterfactual.** A counterfactual sale is at the last two-sided bid at or before its time;
   if there is none in the 60 seconds before it, the sale is unpriced, counted as unpriced and given no
   return, never filled at a guess. The costs are those above, plus the half spread the bid already implies.
+* **A modelled limit's fill (the lead, 2026-11-13).** Where a counterfactual, a shadow arm or a study
+  prices an order by a limit, its fill counts only where the tape shows prints at or through the limit,
+  for the size: the prints at or through the limit after the order's time add up to its quantity, else
+  the order is unfilled for the rest and counted so. A quote at the limit is not a fill. Whether a
+  window's tape holds the prints this needs is `UNVERIFIED` until the reflection's first count.
 * **Missed.** The day's gainers are the gainers list (gainers only, not losers) of Alpaca's movers endpoint
   in the recorder's last poll before 20:00 New York (ADR 0070). Alpaca computes a mover's change "from the
   previous closing price and the latest closing price", and for stocks the list "resets at market open";
