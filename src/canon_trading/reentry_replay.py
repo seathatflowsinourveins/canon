@@ -64,6 +64,7 @@ from canon_trading import early_entry_study as study
 from canon_trading.price_step import down_on_step
 from canon_trading.price_step import entry_price
 from canon_trading.price_step import stop_trigger_price
+from canon_trading.price_step import tick
 from canon_trading.sizing import size_for_loss
 
 if TYPE_CHECKING:
@@ -99,6 +100,19 @@ FLOW_SHARE, FLOW_BARS = Decimal("0.05"), 5
 GATE_LOSS_TRAIL = Decimal("0.02")
 """The lead's A/B rule: the planned loss is the slot budget's shares times entry less the stepped 2% stop."""
 CENT = Decimal("0.01")
+TICK_BUCKETS = ("under 3", "3 to 5", "5 to 10", "over 10")
+"""The lead's overnight breakdown (2026-11-12) of the trail's distance at entry in Alpaca's ticks: under
+3, 3 to under 5, 5 to 10, over 10. An observation, not a registered row."""
+
+
+def tick_bucket(ticks: float) -> str:
+    if ticks < 3:
+        return TICK_BUCKETS[0]
+    if ticks < 5:
+        return TICK_BUCKETS[1]
+    return TICK_BUCKETS[2] if ticks <= 10 else TICK_BUCKETS[3]
+
+
 SIZED = Equity(
     instrument_id=InstrumentId.from_str("R3.ALPACA"),
     raw_symbol=Symbol("R3"),
@@ -575,6 +589,11 @@ class ReplayContext:
             "index": sold_index,
             "price": sold,
             "distance": close * fraction,
+            # The walked distance in Alpaca's ticks at the entry's price (price_step.tick).
+            # In decimal, so a distance of exactly three ticks is not a float hair under three.
+            "trail_ticks": float(
+                Decimal(repr(close)) * Decimal(repr(fraction)) / tick(Decimal(repr(close)))
+            ),
             "stop": out is not None,
             "why": "close" if out is None else out.why,
             "peak": peak,
@@ -624,6 +643,7 @@ class ReplayContext:
             "entries": 0,
             "entry_minutes": [],
             "entry_returns_bps": [],
+            "trail_ticks": [],
             "shares": [],
             "per_share_dollars": [],
             "cold_atr_fallbacks": 0,
@@ -676,6 +696,7 @@ class ReplayContext:
                 10_000 * (sold["sold"] - sold["entry"]) / sold["entry"]
             )
             result["shares"].append(n)
+            result["trail_ticks"].append(sold["trail_ticks"])
             result["size_bounds"][sold["bound"]] = result["size_bounds"].get(sold["bound"], 0) + 1
             result["per_share_dollars"].append(sold["sold"] - sold["entry"])
             result["cold_atr_fallbacks"] += cold(exit_arm, self.atr[signal.index], self.top)
@@ -887,9 +908,55 @@ def new_aggregate(*, histogram: bool = False) -> dict[str, Any]:
     aggregate["returns_bps_sum"] = aggregate["returns_bps_sumsq"] = 0.0
     aggregate["size_refusals"] = {}
     aggregate["size_bounds"] = {}
+    aggregate["by_ticks"] = {b: new_returns(histogram=histogram) for b in TICK_BUCKETS}
     if histogram:
         aggregate["returns_bps_bins"] = {}
     return aggregate
+
+
+RETURNS = ("returns_count", "returns_bps_sum", "returns_bps_sumsq")
+
+
+def new_returns(*, histogram: bool) -> dict[str, Any]:
+    out: dict[str, Any] = {"returns_count": 0, "returns_bps_sum": 0.0, "returns_bps_sumsq": 0.0}
+    if histogram:
+        out["returns_bps_bins"] = {}
+    return out
+
+
+def add_return(target: dict[str, Any], value: float) -> None:
+    target["returns_count"] += 1
+    target["returns_bps_sum"] += value
+    target["returns_bps_sumsq"] += value * value
+    bins = target.get("returns_bps_bins")
+    if bins is not None:
+        edge = return_bin(value)
+        bins[edge] = bins.get(edge, 0) + 1
+
+
+def merge_returns(target: dict[str, Any], part: dict[str, Any]) -> None:
+    for field in RETURNS:
+        target[field] += part.get(field, 0)
+    if "returns_bps_bins" in target:
+        for edge, count in part.get("returns_bps_bins", {}).items():
+            target["returns_bps_bins"][int(edge)] = (
+                target["returns_bps_bins"].get(int(edge), 0) + count
+            )
+
+
+def returns_figures(a: dict[str, Any]) -> dict[str, Any]:
+    """The equal-entry mean, its spread and the median bin from a returns sum."""
+    count = a["returns_count"]
+    mean = a["returns_bps_sum"] / count if count else None
+    return {
+        "mean_return_bps": mean,
+        "sd_return_bps": (
+            math.sqrt(max(0.0, a["returns_bps_sumsq"] / count - mean * mean))
+            if count and mean is not None
+            else None
+        ),
+        "median_return_bin_bps": median_bin(a.get("returns_bps_bins", {})),
+    }
 
 
 def return_bin(value: float) -> int:
@@ -925,22 +992,23 @@ def add_to_aggregate(aggregate: dict[str, Any], result: dict[str, Any]) -> None:
         aggregate["depth_sum"] += fall["depth_trails"]
         aggregate["fall_minutes_sum"] += fall["fall_minutes"]
         aggregate["turn_minutes_sum"] += fall["turn_minutes"]
-    bins = aggregate.get("returns_bps_bins")
-    for value in result["entry_returns_bps"]:
-        aggregate["returns_count"] += 1
-        aggregate["returns_bps_sum"] += value
-        aggregate["returns_bps_sumsq"] += value * value
-        if bins is not None:
-            edge = return_bin(value)
-            bins[edge] = bins.get(edge, 0) + 1
+    for value, ticks in zip(result["entry_returns_bps"], result["trail_ticks"], strict=True):
+        add_return(aggregate, value)
+        add_return(aggregate["by_ticks"][tick_bucket(ticks)], value)
 
 
 def merge_aggregates(parts: Sequence[dict[str, Any]]) -> dict[str, Any]:
     """Sum shards' aggregates for one key: every summed field and every bin."""
     merged = new_aggregate(histogram=any("returns_bps_bins" in p for p in parts))
     for part in parts:
+        if part.get("returns_count", 0) and "by_ticks" not in part:
+            raise ValueError(
+                "a shard has per-entry returns but no by_ticks: rerun it at this commit"
+            )
         for field in SUMMED:
             merged[field] += part.get(field, 0)
+        for bucket, figures in part.get("by_ticks", {}).items():
+            merge_returns(merged["by_ticks"][bucket], figures)
         for field in ("size_refusals", "size_bounds"):
             for name, count in part.get(field, {}).items():
                 merged[field][name] = merged[field].get(name, 0) + count
@@ -1027,6 +1095,10 @@ def report_header(
         "rises on the same bar's high; a real released limit fills at or under its trigger, so stop "
         "prices lean in the strategy's favour under either path. A released limit never filled is "
         "a stop sold at the last close.\n\n"
+        "Per-entry returns are also split by the trail's distance at entry in Alpaca's ticks "
+        "(price_step.tick at the entry bar's close): under 3, 3 to under 5, 5 to 10 inclusive, over "
+        "10, the lead's breakdown of 2026-11-12, an observation and not a registered row. Every "
+        "arm's aggregate in the JSONL carries `by_ticks`; the table below shows F2's.\n\n"
         f"{sizing} Per-entry returns in bps (sale less "
         "entry over entry, after h) are kept as a count, a sum, a sum of squares and 10 bps bins, so "
         "the equal-entry mean and median per arm and tier can be read. No paper fills, impact, quoted "
@@ -1051,8 +1123,6 @@ Key = tuple[str, str, str, str, int, int, str]
 def aggregate_record(key: Key, a: dict[str, Any]) -> dict[str, Any]:
     group, initial, exit_arm, reentry, run, h, order = key
     n, turnover = a["falls"], a["turnover_dollars"]
-    count = a["returns_count"]
-    mean = a["returns_bps_sum"] / count if count else None
     return {
         "kind": "aggregate",
         "group": group,
@@ -1063,13 +1133,8 @@ def aggregate_record(key: Key, a: dict[str, Any]) -> dict[str, Any]:
         "half_spread_bps": h,
         "order": order,
         **a,
-        "mean_return_bps": mean,
-        "sd_return_bps": (
-            math.sqrt(max(0.0, a["returns_bps_sumsq"] / count - mean * mean))
-            if count and mean is not None
-            else None
-        ),
-        "median_return_bin_bps": median_bin(a.get("returns_bps_bins", {})),
+        **returns_figures(a),
+        "by_ticks": {b: {**f, **returns_figures(f)} for b, f in a["by_ticks"].items()},
         "mean_depth_trails": a["depth_sum"] / n if n else None,
         "mean_fall_minutes": a["fall_minutes_sum"] / n if n else None,
         "mean_turn_minutes": a["turn_minutes_sum"] / n if n else None,
@@ -1138,6 +1203,36 @@ def write_tier_table(out: Any, sums: dict[Key, dict[str, Any]]) -> None:
         )
 
 
+TICK_HEADER = (
+    "F2 (`fixed`, 2%) per-entry return by the trail's distance at entry in Alpaca's ticks, run-2: "
+    "under 3, 3 to under 5, 5 to 10 inclusive, over 10. "
+    "Each cell reads `entries mean-bps median-bin` under OHLC, then adaptive; an observation, not "
+    "a registered row.\n\n"
+    "| Group | Re-entry | h bps | " + " | ".join(TICK_BUCKETS) + " |\n"
+    "|---|---|---:|" + "---:|" * len(TICK_BUCKETS) + "\n"
+)
+
+
+def _tick_cell(figures: dict[str, Any] | None) -> str:
+    if not figures or not figures["returns_count"]:
+        return "-"
+    f = returns_figures(figures)
+    return f"{figures['returns_count']} {f['mean_return_bps']:.1f} {_figure(f['median_return_bin_bps'], 0)}"
+
+
+def write_tick_table(out: Any, sums: dict[Key, dict[str, Any]]) -> None:
+    out.write("\n" + TICK_HEADER)
+    for key in sorted(k for k in sums if k[0].startswith("tier:") and k[1:3] == ("run-2", "fixed")):
+        if key[6] != "ohlc":
+            continue
+        adaptive = sums.get((*key[:6], "adaptive"), {}).get("by_ticks", {})
+        cells = [
+            f"{_tick_cell(sums[key]['by_ticks'][b])}; {_tick_cell(adaptive.get(b))}"
+            for b in TICK_BUCKETS
+        ]
+        out.write(f"| {key[0]} | {key[3]} | {key[5]} | " + " | ".join(cells) + " |\n")
+
+
 def merge(paths: Sequence[Path], output: Path, name: str) -> Path:
     """One summary from shard runs: their tier aggregates and counts summed. Every shard is complete,
     the shards are exactly 0/n to n-1/n of one n, and they ran the same code on the same inputs."""
@@ -1191,6 +1286,7 @@ def merge(paths: Sequence[Path], output: Path, name: str) -> Path:
             f"`{json.dumps(used, sort_keys=True)}`.\n\n"
         )
         write_tier_table(out, merged)
+        write_tick_table(out, merged)
     return summary
 
 
@@ -1396,6 +1492,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "diagnostics, not portfolio returns.\n\n"
         )
         write_tier_table(out, sums)
+        write_tick_table(out, sums)
     print(summary, flush=True)
     return 0
 
