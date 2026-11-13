@@ -562,6 +562,8 @@ elif err_auto=$(gh pr merge "$num" --auto "${merge[@]}" 2>&1 >/dev/null); then
 else
   die "signed off, but GitHub would neither merge nor enable auto-merge on $url. It said: ${err:-nothing} / ${err_auto:-nothing}"
 fi
+asked="the merge of $url"; [ "$auto" -eq 0 ] || asked="the auto-merge request for $url"
+seen=""; readerr=""   # the last state read that succeeded, and what gh said when one failed
 waited=0; limit="${LAND_WAIT_SECONDS:-540}"; poll="${LAND_POLL_SECONDS:-10}"
 # unread: a read in the wait failed. On a spent budget the merge's outcome cannot be read until the reset,
 # so the land stops and says so, rather than polling on or calling it not merged.
@@ -569,14 +571,13 @@ unread() {
   local spent
   spent=$(spent_budget "$1" strict) || return 0
   GH_IN_USE=0
-  if [ "$auto" -eq 1 ]; then
-    die "GitHub accepted the auto-merge request for $url; whether it has merged cannot be read: $spent. After the reset: git fetch origin main:main"
-  fi
-  die "GitHub accepted the merge of $url, but whether it is merged cannot be read: $spent. After the reset: git fetch origin main:main"
+  die "GitHub accepted $asked, but whether it has merged cannot be read: $spent. After the reset: git fetch origin main:main"
 }
 while :; do
-  if ! view=$(gh pr view "$num" --json state,headRefOid --jq '"\(.state) \(.headRefOid)"' 2>"$tmpd/err"); then
-    unread "$(cat "$tmpd/err")"; view=""
+  if view=$(gh pr view "$num" --json state,headRefOid --jq '"\(.state) \(.headRefOid)"' 2>"$tmpd/err"); then
+    seen=$view
+  else
+    readerr=$(cat "$tmpd/err"); unread "$readerr"; view=""
   fi
   state=${view%% *}; headsha=${view#* }
   [ "$state" != "MERGED" ] || break
@@ -590,8 +591,15 @@ while :; do
     || unread "$(cat "$tmpd/err")"
   [ -z "$failed" ] || die "a required check failed on $url: $failed. Push a fix to $branch and land again."
   if [ "$waited" -ge "$limit" ]; then
-    [ "$auto" -eq 1 ] && die "$url is not merged after ${limit}s. GitHub accepted the auto-merge request, so it merges when the checks pass; then run: git fetch origin main:main"
-    die "GitHub accepted the merge of $url but has not marked it merged after ${limit}s; look at the pull request"
+    # say only what was read: the last state read, or that it could not be read. Whether auto-merge is
+    # still on is not read (only state and head are), so no later merge is promised.
+    then_do="look at the pull request, and once it is merged run: git fetch origin main:main"
+    if [ -z "$view" ] && [ -z "$seen" ]; then
+      die "GitHub accepted $asked, but its state could not be read before ${limit}s (gh said: ${readerr:-nothing}), so whether it merged is not confirmed; $then_do"
+    elif [ -z "$view" ]; then
+      die "GitHub accepted $asked; it was open at the last read that succeeded, and the last read before ${limit}s failed (gh said: ${readerr:-nothing}), so whether it merged is not confirmed; $then_do"
+    fi
+    die "GitHub accepted $asked, and it was still open at the last read after ${limit}s, so the merge is not confirmed; $then_do"
   fi
   sleep "$poll"; waited=$((waited + (poll > 0 ? poll : 1)))
 done

@@ -70,6 +70,9 @@ case "${1:-} ${2:-}" in
       esac
     done
     if [ -f "$FAKE/view_err" ]; then cat "$FAKE/view_err" >&2; exit 1; fi
+    # view_err_after_1: the first view answers from views, every later one fails with this text
+    if [ -f "$FAKE/view_err_after_1" ] && [ -f "$FAKE/viewed" ]; then cat "$FAKE/view_err_after_1" >&2; exit 1; fi
+    : > "$FAKE/viewed"
     line=$(sed -n 1p "$FAKE/views")
     if [ "$(wc -l < "$FAKE/views")" -gt 1 ]; then tail -n +2 "$FAKE/views" > "$FAKE/views.next" && mv "$FAKE/views.next" "$FAKE/views"; fi
     line=${line/HEAD/$(git rev-parse HEAD)}
@@ -226,7 +229,35 @@ t_auto_timeout() {         # R3: --auto succeeded and the wait runs out: the req
   new_repo; change README.md; echo 1 > "$FAKE/merge_rc"; echo "checks pending" > "$FAKE/merge_err"
   echo "OPEN HEAD" > "$FAKE/views"; land
   why="an accepted auto-merge request was reported as auto-merge on"
-  [ "$rc" -ne 0 ] && has "is not merged after" && has "accepted the auto-merge request" && ! has "uto-merge is on"
+  [ "$rc" -ne 0 ] && has "still open at the last read" && has "accepted the auto-merge request" && ! has "uto-merge is on" \
+    && ! has "merges when the checks pass"
+}
+t_unread_timeout_is_unknown() { # direct|auto, error text: no state read ever succeeds, so the timeout claims none
+  new_repo; change README.md; : > "$FAKE/rate"
+  if [ "$1" = auto ]; then
+    echo 1 > "$FAKE/merge_rc"
+    echo 'checks pending' > "$FAKE/merge_err"
+  fi
+  # This is the fixture's remote state, but the view call cannot deliver it.
+  echo 'MERGED HEAD' > "$FAKE/views"
+  printf '%s\n' "$2" > "$FAKE/view_err"
+  LAND_WAIT_SECONDS=0 land
+  why='an unread merge outcome was reported as an unmerged PR'
+  [ "$rc" -ne 0 ] \
+    && logged 'gh pr view 7 --json state,headRefOid' \
+    && has 'could not be read before' && has "gh said: $2" && ! has 'still open' && ! has 'was open at' \
+    && ! has 'is not merged after' \
+    && ! has 'has not marked it merged' \
+    && ! has 'so it merges when the checks pass' \
+    && ! has 'landed:'
+}
+t_timeout_last_open() {    # the wait read OPEN, then its last read failed: it says it was open, and that the read failed
+  new_repo; change README.md; : > "$FAKE/rate"; echo 1 > "$FAKE/merge_rc"; echo "checks pending" > "$FAKE/merge_err"
+  echo "OPEN HEAD" > "$FAKE/views"; echo 'gh: connection reset by peer' > "$FAKE/view_err_after_1"
+  LAND_WAIT_SECONDS=2 LAND_POLL_SECONDS=1 land
+  why="a failed last read hid an earlier OPEN read, or claimed a state"
+  [ "$rc" -ne 0 ] && has "open at the last read that succeeded" && has "gh said: gh: connection reset by peer" \
+    && ! has "merges when the checks pass"
 }
 t_auth_words_ignored() {   # R4: gh auth status fails with rate-limit words while /rate_limit shows calls left: signed out
   new_repo; change README.md; : > "$FAKE/rate"; echo 1 > "$FAKE/auth_rc"; echo "$RATE_WORDS" > "$FAKE/auth_err"; land
@@ -300,6 +331,10 @@ case_ "a rate-limited --pr read is not called not found"   t_pr_info_rate
 case_ "a budget spent at gh's own check is not called signed out"  t_auth_spent
 case_ "an accepted auto-merge request is not reported as armed when the wait cannot read"  t_auto_unread
 case_ "an accepted auto-merge request is not reported as armed when the wait runs out"  t_auto_timeout
+case_ "auto-merge, no state ever read: the timeout claims none and names gh's error"  t_unread_timeout_is_unknown auto "gh: connection reset by peer"
+case_ "a direct merge, no state ever read: the timeout claims none and names gh's error"  t_unread_timeout_is_unknown direct "gh: connection reset by peer"
+case_ "auto-merge, a secondary limit on every read: the timeout claims no state"  t_unread_timeout_is_unknown auto "gh: You have exceeded a secondary rate limit. (HTTP 403)"
+case_ "a read that failed after an OPEN one: the timeout says both"  t_timeout_last_open
 case_ "rate-limit words from gh auth status are not read as a spent budget"  t_auth_words_ignored
 case_ "a secondary rate limit in the wait is not a spent budget"  t_wait_secondary
 case_ "a merge refused for another reason while REST is spent still tries auto-merge"  t_merge_core_spent
