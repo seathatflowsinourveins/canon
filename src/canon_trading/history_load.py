@@ -1,4 +1,4 @@
-"""Alpaca's historical SIP bars/trades or IEX quotes into a catalog, GET only and paced (ADR 0093).
+"""Alpaca's historical SIP bars/trades, or IEX or bounded SIP quotes, into a catalog (ADR 0093).
 
 `mise run paper:history <account>` runs this module with one paper account's pair in data-only mode
 (ADR 0070): it sends market data GETs and nothing else, and takes neither the account's lock nor a
@@ -91,9 +91,21 @@ a load waits at least `PUBLICATION_DELAY`, and a root reloaded from empty takes 
 Quotes (2026-11-11): `--data quotes` follows the adapter's `get_stock_quotes(StockQuotesRequest)` /
 `QuoteSet` / `parse_quote` contract (alpaca-py `stock.py`, `models/quotes.py` at c42add7c0a70), then
 NautilusTrader `write_quote_ticks(ticks, start, end)` (the same catalog bindings as trades, at
-d53849b216e2). Coverage uses `NautilusDataType.QuoteTick` and instrument ID. ADR 0066's IEX-only,
-2025-or-later window is enforced, with a conservative quarter ceiling of 90 elapsed days; tiny probes
-are allowed. The size-unit limit below further restricts starts to 2025-11-04 00:00 New York or later.
+d53849b216e2). Coverage uses `NautilusDataType.QuoteTick` and instrument ID. ADR 0066's 2025-or-later
+window is enforced, with a conservative quarter ceiling of 90 elapsed days; tiny probes are allowed.
+The feed is `iex` by default (ADR 0066). `feed=sip` (CLI `--feed sip`) asks for the Securities
+Information Processor feed (alpaca-py's `DataFeed.SIP` docstring, `alpaca/data/enums.py` at
+c42add7c0a70), so a replay rests on the consolidated quote rather than one venue's; that it is the
+national best bid and offer is UNVERIFIED, since the pin does not say so. It is bounded: symbols named
+with `--symbols`, never `--symbols-file` (the CLI refuses that, as a sequence does not say where it
+came from), at most `SIP_QUOTES_MAX_SYMBOLS` (8) distinct symbols and an `end - start` of at most
+`SIP_QUOTES_MAX_SPAN` (60 minutes), each refused by name before any request or lock (ADR 0151).
+SIP quotes keep a root of their own, by default `SIP_QUOTES_CATALOG`
+(`catalog/sip-quotes`; IEX quotes keep `catalog/`): `_check_kinds` refuses them in a root that holds
+bars or trades, and refuses bars or trades in a root that holds quotes of either feed, through the
+pinned catalog's `list_instruments(data_type)`, since `sip` quotes, bars and trades share one feed
+marker (ADR 0151). Every other rule below holds for both feeds, and nothing falls back from
+one feed to the other. The size-unit limit below further restricts starts to 2025-11-04 00:00 New York or later.
 Each missing interval is split into pieces of at most one hour (the endpoint's microsecond joins the
 last, so no piece is that microsecond alone), fetching at most
 `MAX_ROWS_PER_CALL + 1` quotes; an overfull answer is loaded in parts, as prints are: each part keeps
@@ -102,7 +114,7 @@ next part starts at that microsecond, so no bucket is split; more than `MAX_ROWS
 one microsecond stops by name. There is no assumed quote rate. Pages and SDK retries use the trades transport pace,
 and the same lock and per-feed marker rules apply; SIP and IEX need separate roots. The end must be
 `PUBLICATION_DELAY` before now, as for prints: covered is covered for good, and how soon Alpaca's
-historical store holds an IEX quote is UNVERIFIED.
+historical store holds a quote is UNVERIFIED.
 
 As in the adapter, one-sided quotes and prices finer than the instrument precision are dropped and
 named, while other conversion errors stop by name. Empty or dropped-only pieces write no coverage.
@@ -241,6 +253,28 @@ trading day 2025-11-03 in New York, which ends at 05:00 UTC on 2025-11-04 (its e
 QUOTES_MAX_PAGES = TRADES_MAX_PAGES
 """The adapter's fetch_trades page ceiling; never treat capped pagination as complete."""
 
+QUOTE_FEEDS = (DataFeed.IEX, DataFeed.SIP)
+"""The quote feeds a load may name: `iex`, the default, and `sip` inside its bound below."""
+
+SIP_QUOTES_MAX_SYMBOLS = 8
+"""The most distinct symbols one `sip` quote load takes: UNCALIBRATED, the lead's bound for a case
+replay, not a measured size or rate. The symbols are named on the command line, never a file."""
+
+SIP_QUOTES_MAX_SPAN = timedelta(minutes=60)
+"""The longest `end - start` one `sip` quote load takes: UNCALIBRATED, the lead's bound for a case
+replay, as `SIP_QUOTES_MAX_SYMBOLS` is."""
+
+SIP_QUOTES_CATALOG = DEFAULT_CATALOG / "sip-quotes"
+"""The CLI's default root for `sip` quotes, apart from the `sip` bars and trades in `DEFAULT_CATALOG`;
+`iex` quotes keep `DEFAULT_CATALOG` as their default (ADR 0151)."""
+
+_KINDS = (
+    ("bars", NautilusDataType.Bar),
+    ("trades", NautilusDataType.TradeTick),
+    ("quotes", NautilusDataType.QuoteTick),
+)
+"""The data a history load writes, by the pinned catalog's `list_instruments(data_type)`."""
+
 LEDGER = SOURCE_ROOT / "ledger"
 
 
@@ -375,6 +409,25 @@ def _claim_feed(path: Path, feed: DataFeed = FEED) -> bool:
     return True
 
 
+def _check_kinds(path: Path, loading: str, feed: DataFeed = FEED) -> None:
+    """Keep quotes apart: `sip` quotes go in a root with no bars or trades, and bars or trades in a root
+    with no quotes, of either feed (ADR 0151). The feed marker alone cannot tell, since
+    `sip` quotes, bars and trades share it. Read with the pinned `list_instruments(data_type)`."""
+    catalog = ParquetDataCatalog(str(path))
+    held = [name for name, kind in _KINDS if catalog.list_instruments(kind)]
+    if loading == "quotes":
+        if feed == DataFeed.SIP and (others := [k for k in held if k != "quotes"]):
+            raise HistoryStopped(
+                f"the catalog at {path} holds {' and '.join(others)}, and sip quotes go in a root of "
+                f"their own (default {SIP_QUOTES_CATALOG}; ADR 0151); nothing was requested"
+            )
+    elif "quotes" in held:
+        raise HistoryStopped(
+            f"the catalog at {path} holds quotes, and a root of quotes takes no bars or trades "
+            "(ADR 0151); nothing was requested"
+        )
+
+
 @contextmanager
 def _paced_trade_gets(
     client: Any,
@@ -469,6 +522,7 @@ def load_history(
             )
         if not path.is_dir():
             raise HistoryStopped(f"the catalog at {path} must be an existing directory")
+        _check_kinds(path, "bars")
         _check_feed(path)
         catalog = ParquetDataCatalog(str(path))
         ids = [f"{s}.{VENUE}" for s in symbols]
@@ -480,6 +534,7 @@ def load_history(
                 "nothing was requested"
             )
         with _catalog_lock(path):
+            _check_kinds(path, "bars")
             _check_feed(path)
             return _load_history(
                 client,
@@ -713,6 +768,7 @@ def load_trades(
             )
         if not path.is_dir():
             raise HistoryStopped(f"the catalog at {path} must be an existing directory")
+        _check_kinds(path, "trades")
         _check_feed(path)
         catalog = ParquetDataCatalog(str(path))
         ids = [f"{s}.{VENUE}" for s in dict.fromkeys(s.strip() for s in symbols)]
@@ -724,6 +780,7 @@ def load_trades(
             )
         written = 0
         with _catalog_lock(path), _paced_trade_gets(client, pace, clock, sleep):
+            _check_kinds(path, "trades")
             _check_feed(path)
             for identifier in ids:
                 instrument = instruments[identifier]
@@ -871,6 +928,32 @@ def _quote_bounds(start: datetime, end: datetime, now: datetime) -> tuple[int, i
     return dt_to_unix_nanos(start) // 1_000 * 1_000, dt_to_unix_nanos(end) // 1_000 * 1_000 + 999
 
 
+def _quote_feed(feed: DataFeed, symbols: Sequence[str], start: datetime, end: datetime) -> None:
+    """Refuse a feed other than `iex` or `sip`, and a `sip` load outside its bound, by name.
+
+    Nothing falls back from one feed to the other. Symbols count once after strip and upper case.
+    Whether they came from a file is the CLI's to refuse, since a sequence does not say (`main`).
+    """
+    if feed not in QUOTE_FEEDS:
+        raise HistoryStopped(
+            f"quote feed {feed.value} is refused; iex, or sip within its bound (ADR 0151)"
+        )
+    if feed != DataFeed.SIP:
+        return
+    if end - start > SIP_QUOTES_MAX_SPAN:
+        raise HistoryStopped(
+            f"a sip quote load spans at most {SIP_QUOTES_MAX_SPAN} (SIP_QUOTES_MAX_SPAN, "
+            f"ADR 0151), got {end - start}; nothing was requested"
+        )
+    count = len({s.strip().upper() for s in symbols})
+    if count > SIP_QUOTES_MAX_SYMBOLS:
+        raise HistoryStopped(
+            f"a sip quote load takes at most {SIP_QUOTES_MAX_SYMBOLS} symbols "
+            f"(SIP_QUOTES_MAX_SYMBOLS, ADR 0151), got {count}; "
+            "nothing was requested"
+        )
+
+
 def _check_quote_coverage(catalog: ParquetDataCatalog) -> None:
     """Pinned catalog list_instruments/get_intervals: refuse legacy units or partial buckets."""
     for identifier in catalog.list_instruments(NautilusDataType.QuoteTick):
@@ -939,14 +1022,14 @@ def load_quotes(
     the last); the row sentinel detects an overfull piece, which loads in parts, and more quotes in
     one microsecond than the bound stop the piece before any of it is written. The SDK's microsecond
     timestamps and adapter's dropped-quote rules apply; start after the ambiguous 2025-11-03 unit
-    cutover (ADR 0066).
+    cutover (ADR 0066). `feed` is `iex` by default, or `sip` for at most `SIP_QUOTES_MAX_SYMBOLS`
+    symbols over at most `SIP_QUOTES_MAX_SPAN`; each feed keeps its own root.
     """
     try:
         start_ns, end_ns = _quote_bounds(start, end, now())
-        if feed != DataFeed.IEX:
-            raise HistoryStopped(f"quote feed {feed} is refused; iex only (ADR 0066)")
         if not symbols or any(not symbol.strip() for symbol in symbols):
             raise HistoryStopped("at least one nonempty symbol is required")
+        _quote_feed(feed, symbols, start, end)
         if max_rows < 1:
             raise HistoryStopped(f"the quote row bound must be positive, got {max_rows}")
         path = Path(catalog_path).resolve()
@@ -960,6 +1043,7 @@ def load_quotes(
             )
         if not path.is_dir():
             raise HistoryStopped(f"the catalog at {path} must be an existing directory")
+        _check_kinds(path, "quotes", feed)
         _check_feed(path, feed)
         catalog = ParquetDataCatalog(str(path))
         ids = [f"{s}.{VENUE}" for s in dict.fromkeys(s.strip() for s in symbols)]
@@ -971,6 +1055,7 @@ def load_quotes(
             )
         written = 0
         with _catalog_lock(path), _paced_trade_gets(client, pace, clock, sleep):
+            _check_kinds(path, "quotes", feed)
             _check_feed(path, feed)
             _check_quote_coverage(catalog)
             for identifier in ids:
@@ -1114,9 +1199,31 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--bars", default="1-MINUTE,1-DAY", help="1-MINUTE, 1-DAY or both, comma-separated"
     )
-    parser.add_argument("--catalog", type=Path, default=DEFAULT_CATALOG, help="the catalog root")
+    parser.add_argument(
+        "--catalog",
+        type=Path,
+        help=f"the catalog root; default {DEFAULT_CATALOG}, or {SIP_QUOTES_CATALOG} for sip quotes",
+    )
     parser.add_argument("--data", choices=("bars", "trades", "quotes"), default="bars")
+    parser.add_argument(
+        "--feed",
+        choices=[f.value for f in QUOTE_FEEDS],
+        help="quotes: iex (the default) or sip within its bound; bars and trades are sip only",
+    )
     args = parser.parse_args(argv)
+    quote_feed = None  # only quotes have a feed to choose; bars and trades load sip (FEED)
+    if args.data != "quotes":
+        if args.feed not in (None, FEED.value):
+            parser.error(f"--feed {args.feed} is for --data quotes only; {args.data} load sip")
+    else:
+        quote_feed = DataFeed(args.feed or DataFeed.IEX.value)
+        if quote_feed == DataFeed.SIP and args.symbols_file is not None:
+            parser.error(
+                "sip quotes take --symbols named on the command line, not --symbols-file "
+                f"(at most {SIP_QUOTES_MAX_SYMBOLS}; ADR 0151)"
+            )
+    if args.catalog is None:
+        args.catalog = SIP_QUOTES_CATALOG if quote_feed == DataFeed.SIP else DEFAULT_CATALOG
     for name in ("start", "end"):
         if getattr(args, name).tzinfo is None:
             parser.error(f"--{name} must carry a time zone")
@@ -1164,12 +1271,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not symbols:
         parser.error("no symbols given")
     symbols = list(dict.fromkeys(symbols))
+    if quote_feed is not None:
+        try:
+            _quote_feed(quote_feed, symbols, args.start, args.end)
+        except HistoryStopped as e:
+            parser.error(str(e))
     try:
         client = history_client()
         if args.data == "trades":
             written = load_trades(client, symbols, args.start, args.end, args.catalog, now=utc_now)
-        elif args.data == "quotes":
-            written = load_quotes(client, symbols, args.start, args.end, args.catalog, now=utc_now)
+        elif quote_feed is not None:
+            written = load_quotes(
+                client, symbols, args.start, args.end, args.catalog, feed=quote_feed, now=utc_now
+            )
         else:
             written = load_history(
                 client, symbols, specs, args.start, args.end, args.catalog, now=utc_now
