@@ -26,6 +26,7 @@ DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
 
 ROWS_HEADER = "| Row | Value | Status | Source or study | Date |"
 ROW_NAME = re.compile(r"`[A-Z][A-Z0-9_]*`")
+ROW_SEPARATOR = re.compile(r"\|(?:\s*:?-+:?\s*\|){5}")
 ROW_STATES = {"UNCALIBRATED", "calibrated"}
 
 JOURNAL_HEADING = re.compile(r"### L(\d{4}): \S.*")
@@ -165,6 +166,9 @@ def check_rows(text: str) -> list[str]:
         if line != ROWS_HEADER:
             continue
         table_lines.update((index, index + 1))  # the header and separator
+        separator = lines[index + 1] if index + 1 < len(lines) else ""
+        if not ROW_SEPARATOR.fullmatch(separator):
+            errors.append(f"line {index + 1}: the header has no separator row: {separator!r}")
         before = len(rows)
         for row_index in range(index + 2, len(lines)):
             row = lines[row_index]
@@ -472,3 +476,34 @@ def test_rows_check_refuses_an_empty_later_table() -> None:
     first = "| `MIN_MOVE` | 3 per cent | UNCALIBRATED | Requirement | 2026-11-11 |"
     errors = check_rows(table + first + "\n\n" + table)
     assert "the table has no row" in errors
+
+
+@pytest.mark.parametrize(
+    ("row", "complaint"),
+    [
+        ("| `TRAIL_CAP` | 0.02 | UNCALIBRATED | Requirement | 2026-11-12 |", "second row"),
+        ("| `LATE_ROW` | 1 | UNCALIBRATED | Requirement | bad-date |", "not a date"),
+    ],
+)
+def test_rows_md_second_table_row_is_checked_by_name(row: str, complaint: str) -> None:
+    # Code review of the rows check: the row is appended inside the last table, not after a blank
+    # line, so it is caught by its own fault rather than only as a stray row.
+    text = (HANDBOOK / "rows.md").read_text().rstrip("\n") + "\n" + row + "\n"
+    errors = check_rows(text)
+    assert any(complaint in error for error in errors), errors
+    assert not any("outside a headered table" in error for error in errors), errors
+
+
+@pytest.mark.parametrize(
+    "after_header",
+    [
+        "| `TRAIL_CAP` | | guessed | | bad-date |",
+        "| Row | Value | Status | Source or study | Date |",
+    ],
+)
+def test_rows_check_refuses_a_header_with_no_separator(after_header: str) -> None:
+    # Code review of the rows check: the line after a header was taken as its separator unread.
+    page = f"{ROWS_HEADER}\n{after_header}\n|---|---|---|---|---|\n"
+    page += "| `MIN_MOVE` | 3 per cent | UNCALIBRATED | Requirement | 2026-11-11 |\n"
+    errors = check_rows(page)
+    assert any("no separator" in error for error in errors), errors
