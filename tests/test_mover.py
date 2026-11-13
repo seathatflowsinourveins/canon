@@ -2850,8 +2850,17 @@ class Seam:
     _time_out = Mover._time_out
     _chase = Mover._chase
     _note = Mover._note
+    _trail_anchor = Mover._trail_anchor
+    _ensure_exit = Mover._ensure_exit
+    _mark_exit = Mover._mark_exit
+    _hold = Mover._hold
+    _end_hold = Mover._end_hold
+    _held_anchor = Mover._held_anchor
+    _last_known = Mover._last_known
+    _position_average = Mover._position_average
 
     def __init__(self, bid: str, **rows: Any) -> None:
+        rows.setdefault("trail_mode", "fixed")
         self.settings = MoverConfig(max_notional=Decimal(50_000), max_move=Decimal(5), **rows)
         self.persistence = self.settings.breach_count > 1 or self.settings.high_count > 1
         self.submit_params = None
@@ -2863,7 +2872,16 @@ class Seam:
         self.said: list[str] = []
         self.notes: dict = {}
         self.dropped: list[str] = []
-        self.cache = SimpleNamespace(quote=self._quote)
+        self.exits: list = []
+        self.protection_fallbacks = {"position average price": 0, "current bid": 0}
+        self.protect_paths = {"held_stop": 0, "unpriced_exit": 0, "trail": 0}
+        self.fills: list = []
+        self.recent = 0
+        self.positions: list = []
+        self.strategy_id = MOVER_ID
+        self.cache = SimpleNamespace(
+            quote=self._quote, trade=lambda _: None, positions_open=lambda **_: self.positions
+        )
         self.order_factory = SimpleNamespace(trailing_stop_limit=self._trailing, limit=self._limit)
 
     def _quote(self, _instrument_id: InstrumentId) -> SimpleNamespace:
@@ -2948,16 +2966,17 @@ def test_a_refused_remake_of_the_trailing_sell_keeps_the_trigger_it_had_reached(
     assert slot.exiting
 
 
-def test_a_position_with_no_entry_of_the_strategys_is_named_as_unprotected() -> None:
-    """Shares held in a watched name with no entry order of this strategy have no price to size a
-    trailing sell from. Nothing is sent, and the run's record says so, once."""
+def test_a_position_with_no_entry_of_the_strategys_has_a_sale_from_the_current_bid() -> None:
+    """The missing entry must not leave five held shares waiting for wind-down."""
     seam = Seam("10.50")
     slot = seam_slot(seam, bought=None)
     for step in range(3):
         cast(Any, seam)._protect(slot, Decimal(5), T0 + step * SECOND)
-    assert seam.sent == []
+    assert len(seam.sent) == 1
+    assert seam.sent[0].quantity == Quantity.from_int(5)
+    assert seam.sent[0].is_emulated
     assert len(seam.notes[AAA]) == 1
-    assert "no filled entry of this strategy" in seam.notes[AAA][0]
+    assert "current bid" in seam.notes[AAA][0]
 
 
 def test_a_holding_above_the_schemes_top_exits_chases_and_closes_on_the_cent() -> None:
