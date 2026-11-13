@@ -1821,3 +1821,22 @@ def test_an_open_sell_whose_fill_count_is_not_shown_is_not_counted_as_unfilled_c
     code, lines = _run(paper, Data({"AAA": AAA_BOOK}), capsys)
     assert code == 2 and paper.submitted == [], (code, paper.submitted, lines)
     assert [x for x in lines if x.startswith("unprotected AAA:")], lines
+
+
+def test_the_paper_tests_checks_of_what_is_working_leave_out_a_listed_order_that_has_ended(
+    monkeypatch, capsys
+) -> None:
+    """Alpaca's open-orders listing can still show an order a second after it filled (seen on paper,
+    2026-11-13, with the paper test's own buy): the test's checks of what is working go by each
+    order's own read, and the listed status of such an order is printed."""
+    paper_test = _paper_test()
+    buy = _order("SPY", "1", f"{paper_test.PREFIX}0123456789abcdef0123-buy", side="buy")
+    stop = _stop("SPY", "1", PROTECT_STOP)
+    paper = Cancelable(orders=[buy, stop])
+    filled = buy.model_copy(update={"status": "filled", "filled_qty": "1"})
+    monkeypatch.setattr(
+        paper, "get_order_by_id", lambda order_id: filled if str(order_id) == str(buy.id) else stop
+    )
+    working = paper_test._working(paper)
+    assert [str(o.id) for o in working] == [str(stop.id)]
+    assert "listed as open though ended: listed new, its own read filled" in capsys.readouterr().out

@@ -1003,15 +1003,67 @@ def test_the_account_read_names_balances_positions_orders_lineage_and_no_shortin
         "positions: 1",
         "  SPY long 1 avg_entry 680.12 market_value 681.00 unrealized_pl 0.88",
         "open orders: 3",
-        "  AAPL buy 1 market limit - status new foreign",
-        "  AAPL sell 1 limit limit 680.05 status new missing",
-        "  SPY sell 1 limit limit 679.95 status new ours",
+        "  AAPL buy 1 market limit - time_in_force day position_intent not shown status new foreign",
+        "  AAPL sell 1 limit limit 680.05 time_in_force day position_intent not shown status new missing",
+        "  SPY sell 1 limit limit 679.95 time_in_force day position_intent not shown status new ours",
         "no_shorting: true",
     ]
     for identifier in (ACCOUNT_NUMBER, ACCOUNT_ID, str(ours.id), *OURS[:1], FOREIGN[0]):
         assert identifier not in out
     (_, request), *_ = [c for c in paper.calls if c[0] == "get_orders"]
     assert request.status.value == "open" and request.limit == 500
+
+
+@pytest.mark.parametrize("intent", ["sell_to_close", "sell_to_open"])
+def test_the_account_read_shows_a_gtc_stops_returned_position_intent(
+    capsys, monkeypatch, intent: str
+) -> None:
+    """A protect lineage must not substitute its intended intent for Alpaca's returned value."""
+    data_only_unset(monkeypatch)
+    monkeypatch.setattr(custody, "require_get_only", lambda client: None)
+    stop = _order(
+        client_order_id=PROTECT_STOP,
+        side="sell",
+        type="trailing_stop",
+        order_type="trailing_stop",
+        time_in_force="gtc",
+        position_intent=intent,
+        limit_price=None,
+        trail_price="1.00",
+        extended_hours=False,
+    )
+    assert custody.account_task(cast(Any, Paper(orders=[stop]))) == 0
+    captured = capsys.readouterr()
+    assert (
+        "  SPY sell 1 trailing_stop limit - time_in_force gtc "
+        f"position_intent {intent} status new ours (a protect stop)"
+    ) in captured.out.splitlines()
+    assert captured.err == ""
+    for identifier in (ACCOUNT_NUMBER, ACCOUNT_ID, str(stop.id), stop.client_order_id):
+        assert identifier not in captured.out
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [{}, {"position_intent": None}, {"position_intent": ""}],
+    ids=["omitted", "null", "empty"],
+)
+def test_an_unreturned_position_intent_is_not_shown_not_inferred(fields: dict[str, Any]) -> None:
+    stop = _order(client_order_id=PROTECT_STOP, side="sell", time_in_force="gtc", **fields)
+    assert stop.position_intent is None
+    line = custody.order_line(stop)
+    assert "time_in_force gtc position_intent not shown status new ours (a protect stop)" in line
+    assert "sell_to_close" not in line and PROTECT_STOP not in line
+
+
+@pytest.mark.parametrize("field", ["time_in_force", "position_intent"])
+def test_an_absent_order_field_is_not_shown(field: str) -> None:
+    """Defensive model case: the pinned SDK requires time_in_force on validated payloads."""
+    order = _order(time_in_force="gtc", position_intent="sell_to_close")
+    delattr(order, field)
+    line = custody.order_line(order)
+    assert f"{field} not shown" in line
+    assert line.endswith("status new ours")
 
 
 def test_a_failed_read_is_named_without_its_body_and_exits_1(capsys, monkeypatch) -> None:
