@@ -64,12 +64,26 @@ a level supplied while flat is refused and dropped. A residual after our complet
 holding, with a new row distance, level and first-observation guard. A stopped node leaves no engine
 protection. P1 3 is a named limit: another strategy's sell may cause cancellation of ours; every such
 cancellation attempt names that limit and the other strategy.
+
+Observations (the lead's rulings, 2026-11-13): a quote counts only if it was received after the
+arming and is a newer venue observation than the one it follows (`_newer`; the table in
+tests/test_owner_protector_stamp_table.py is the specification). The first observation of a breached
+or fresh level is guarded; a second confirms (property (b): no election on one observation). Its
+other half (e5): once our sell has gone out, the breach is confirmed, so an exit in progress
+finishes and the rest of the holding goes out at once with no new guard, whether our cancel resized
+the holding (a growth, property (e)) or our sell filled in part and then ended. Named limits: (e4)
+after a DAY expiry the level is held and the sell is re-placed on the latest quote, which decides
+only the limit's sign; the two observations of the next arming (U-c) cover the election that
+follows. A late older quote after a reference stamped beyond `STAMP_AHEAD_MOST_NS` is ordered by its
+receipt and counts as newer. A protector that cannot act on its quotes says so at every step.
 """
 
 from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import UTC
+from datetime import datetime
 from datetime import timedelta
 from decimal import ROUND_FLOOR
 from decimal import Decimal
@@ -77,7 +91,9 @@ from time import monotonic
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import Self
+from uuid import uuid4
 
+from canon_alpaca.data import STAMP_AHEAD_MOST_NS
 from canon_alpaca.execution import AlpacaExecutionClientConfig
 from nautilus_trader.config import StrategyConfig
 from nautilus_trader.indicators import AverageTrueRange
@@ -100,6 +116,7 @@ from nautilus_trader.trading import Strategy
 from . import protect
 from .custody import OURS
 from .custody import PROTECT
+from .custody import PROTECT_PREFIX
 from .custody import lineage
 from .ma_cross import refuse_unknown_keywords
 from .mover import offsets
@@ -111,6 +128,8 @@ if TYPE_CHECKING:
 
 
 STEP_TIMER = "owner-protection"
+WAITING = "unprotected: waiting"
+
 EXTERNAL = StrategyId("EXTERNAL")
 SUMMABLE_TYPES = frozenset(
     {
@@ -226,12 +245,38 @@ def _remaining(order: Any) -> Decimal | None:
     return left if left == total - filled else None
 
 
+def _seen(tick: QuoteTick) -> tuple[int, int]:
+    """A quote as a reference: its venue stamp and its receipt."""
+    return tick.ts_event, tick.ts_init
+
+
+def _newer(tick: QuoteTick, reference: tuple[int, int] | None) -> bool:
+    """Whether `tick` is a venue observation newer than `reference` (a stamp and its receipt).
+
+    The same stamp is the same observation, re-delivered: never newer. Otherwise the venue stamp
+    orders the two, so a late older quote is never newer, whatever the node clock's offset from
+    Alpaca's (both stamps carry it). One exception: a reference stamped more than the adapter's
+    `STAMP_AHEAD_MOST_NS` further ahead of its receipt than `tick` is of its own was stamped ahead
+    of the stream, and has no usable time (as `canon_alpaca.data.trade_stamp` holds for prints,
+    data.py:1044-1062); ordered by its stamp it would stall every later quote, so the receipts order
+    them instead (the lead's rulings, 2026-11-13: the round-2 review's P2-1 and the (e) review's
+    P1-1; the table in tests/test_owner_protector_stamp_table.py is the specification)."""
+    if reference is None:
+        return True
+    stamp, receipt = reference
+    if tick.ts_event == stamp:
+        return False
+    if (stamp - receipt) - (tick.ts_event - tick.ts_init) > STAMP_AHEAD_MOST_NS:
+        return tick.ts_init > receipt
+    return tick.ts_event > stamp
+
+
 def _after_arming(slot: Holding, tick: QuoteTick) -> bool:
-    """Received after the level was fixed, and stamped after the quote it was fixed on."""
+    """Received after the level was fixed, and a newer observation than the quote it was fixed on."""
     return (
         slot.armed_at is not None
         and tick.ts_init > slot.armed_at
-        and (slot.armed_event is None or tick.ts_event > slot.armed_event)
+        and _newer(tick, slot.armed_event)
     )
 
 
@@ -241,7 +286,8 @@ class Holding:
     opened_at: int
     initialized_at: int
     protect_id: ClientOrderId | None = None
-    last_observation: int | None = None
+    # The last observation counted: its venue stamp and its receipt.
+    last_observation: tuple[int, int] | None = None
     distance: protect.Distance | None = None
     limit_offset: Decimal | None = None
     fresh: bool = False
@@ -249,9 +295,15 @@ class Holding:
     # The clock when the level was fixed. Only a quote received after it is an observation
     # (the lead's ruling, 2026-11-13, 15:55: ruling 6, no election on one observation).
     armed_at: int | None = None
-    # The venue time of the quote the level was fixed on, if any: a quote spends the guard only if
-    # it is also stamped after it, so a re-delivered or late older quote never does.
-    armed_event: int | None = None
+    # The quote the level was fixed on, if any (its stamp and receipt): a quote spends the guard only
+    # if it is also a newer observation (`_newer`), so a re-delivered or late older quote never does.
+    armed_event: tuple[int, int] | None = None
+    # Set at our first send for this holding: its breach was confirmed, or its level placed, on new
+    # observations. Re-placing coverage after that needs none: after our own cancel for a grown
+    # holding (property (e), 2026-11-13, 16:31: covered whole within one step), after our sell
+    # filled in part and ended (e5: the exit in progress finishes), or after a DAY expiry (e4, a
+    # named limit). A sell of ours that FILLED ends the holding; its residual is a new one.
+    placed: bool = False
 
 
 class OwnerProtector(Strategy):
@@ -266,6 +318,7 @@ class OwnerProtector(Strategy):
         self.frozen: dict[InstrumentId, str] = {}
         self.sent_ids: set[ClientOrderId] = set()
         self.cancel_requested: set[ClientOrderId] = set()
+        self.sells_named = 0
         self.subscribed: set[InstrumentId] = set()
         # The holding (ts_opened, ts_init) whose supplied level was refused: it is named
         # unprotected at every step, and a later holding on the symbol self-arms.
@@ -432,10 +485,20 @@ class OwnerProtector(Strategy):
             position.ts_opened,
             position.ts_init,
             armed_at=self.clock.timestamp_ns(),
-            armed_event=None if cached is None else cached.ts_event,
+            armed_event=None if cached is None else _seen(cached),
         )
         self._subscribe_holding(instrument_id)
         self._manage(instrument_id)
+
+    def _protect_id(self) -> ClientOrderId:
+        """A client order ID of the protect lineage, by custody's one rule
+        (`custody.PROTECT_CLIENT_ORDER_ID`): a protective sale of the owner's shares is never one
+        of our nodes' orders (the lead's ruling, 2026-11-13, 16:04:49; ADR 0148)."""
+        self.sells_named += 1
+        stamp = datetime.fromtimestamp(self.clock.timestamp_ns() // 1_000_000_000, UTC)
+        return ClientOrderId(
+            f"{PROTECT_PREFIX}{stamp:%Y%m%dT%H%M%SZ}-{self.sells_named}-{uuid4().hex[:8]}"
+        )
 
     def _subscribe_holding(self, instrument_id: InstrumentId) -> None:
         if instrument_id not in self.subscribed:
@@ -495,7 +558,16 @@ class OwnerProtector(Strategy):
             return
         for instrument_id in list(self.slots):
             self._manage(instrument_id)
+            waiting = self.frozen.get(instrument_id, "")
+            if waiting.startswith(WAITING):
+                # A protector that cannot act on its quotes says so at every step (the lead's
+                # ruling, 2026-11-13, 16:3x).
+                self._say(f"{instrument_id}: {waiting}; no sell yet")
         self._discover_holdings()
+
+    def _wait(self, instrument_id: InstrumentId, reason: str) -> None:
+        """A holding with no sell of ours that waits on its quotes: a named record, said each step."""
+        self.frozen[instrument_id] = f"{WAITING} for {reason}"
 
     def _record_unprotected(self, instrument_id: InstrumentId, reason: str) -> None:
         """A planning failure is a current named record and a log on every attempt."""
@@ -516,7 +588,9 @@ class OwnerProtector(Strategy):
         bars are stamped at their open (data.py:1237-1257); ts_init is receipt, not completeness.
         """
         now = self.clock.timestamp_ns()
-        age = timedelta(seconds=(now - tick.ts_event) / 1_000_000_000)
+        # Aged from the earlier of its stamp and its receipt: a stamp ahead of the clock never
+        # makes an old quote young (the (e) review's P2-2).
+        age = timedelta(seconds=(now - min(tick.ts_event, tick.ts_init)) / 1_000_000_000)
         try:
             if age > protect.QUOTE_MOST:
                 # The bound paper:protect plans on (protect.py:360, :693); never armed from it.
@@ -551,7 +625,7 @@ class OwnerProtector(Strategy):
                 level = instrument.make_price(planned_level)
                 if planned_level <= 0 or level.as_decimal() != planned_level:
                     raise ValueError("no positive level on Alpaca's step at instrument precision")
-                slot.level, slot.armed_at, slot.armed_event = level, now, tick.ts_event
+                slot.level, slot.armed_at, slot.armed_event = level, now, _seen(tick)
             slot.distance, slot.limit_offset = plan, limit
             self._say(f"{instrument_id}: armed distance {distance}; {plan.source()}")
         except ValueError as exc:
@@ -637,15 +711,23 @@ class OwnerProtector(Strategy):
             slot.level is not None and slot.distance is not None and slot.limit_offset is not None
         )
         previous = slot.last_observation
-        if previous is not None and tick.ts_event <= previous:
-            return
-        if previous is None and not _after_arming(slot, tick):
-            return  # No send and no guard before a new observation since the arming.
-        if previous is None and (slot.fresh or bid <= slot.level.as_decimal()):
-            slot.last_observation = tick.ts_event
-            self._say(f"{instrument_id}: holding level {slot.level}; one observation cannot elect")
-            return
-        slot.last_observation = tick.ts_event
+        if not slot.placed:
+            if previous is not None and not _newer(tick, previous):
+                self._wait(instrument_id, "a second observation newer than the one guarded")
+                return
+            if previous is None and not _after_arming(slot, tick):
+                # No send and no guard before a new observation since the arming.
+                self._wait(instrument_id, "a quote received and stamped after the arming")
+                return
+            if previous is None and (slot.fresh or bid <= slot.level.as_decimal()):
+                slot.last_observation = _seen(tick)
+                self._say(
+                    f"{instrument_id}: holding level {slot.level}; one observation cannot elect"
+                )
+                self._wait(instrument_id, "a second observation to confirm")
+                return
+        if _newer(tick, previous):
+            slot.last_observation = _seen(tick)
         trailing, limit = slot.distance.distance, slot.limit_offset
         if bid - limit <= 0:
             self._freeze(instrument_id, "no positive protective limit at this bid and trail")
@@ -671,11 +753,14 @@ class OwnerProtector(Strategy):
             time_in_force=TimeInForce.DAY,
             reduce_only=True,
             emulation_trigger=TriggerType.BID_ASK,
+            # The pin takes the ID (common/src/factories/order.rs:950-973), and the emulator's
+            # released LIMIT keeps it (order_emulator/emulator.rs:5094).
+            client_order_id=self._protect_id(),
         )
         if self.cache.order(order.client_order_id) is not None:
             self._freeze(instrument_id, "generated client order ID already exists; left untouched")
             return
-        slot.protect_id = order.client_order_id
+        slot.protect_id, slot.placed = order.client_order_id, True
         self.sent_ids.add(order.client_order_id)
         self.submit_order(order, params={"extended_hours": True})
 
@@ -715,6 +800,8 @@ class OwnerProtector(Strategy):
         self.stopped_instruments.add(instrument_id)
         slot = self.slots.pop(instrument_id, None)
         self.levels.pop(instrument_id, None)
+        if self.frozen.get(instrument_id, "").startswith(WAITING):
+            self.frozen.pop(instrument_id)  # A stopped instrument waits on nothing.
         if slot is not None:
             self._cancel_own(slot)
 

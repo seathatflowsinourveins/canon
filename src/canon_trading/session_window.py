@@ -173,6 +173,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import fcntl
 import functools
 import hashlib
 import json
@@ -1045,6 +1046,110 @@ def window_feed(part: str) -> str:
     if found.feed is None:
         raise WindowSkipped(f"no {part} window: {found.observed}")
     return found.feed
+
+
+def protection_span(
+    clock: AlpacaClock,
+    calendar: AlpacaCalendar | Sequence[AlpacaCalendar] | None,
+    *,
+    minutes: int,
+    feed: str | None = None,
+) -> tuple[datetime, str, str]:
+    """ADR 0146's carrying-node amendment: one SIP or BOATS span, at most sixteen hours.
+
+    Reuse the session/calendar check and MOVER_PARTS' explicit feed. SIP carries through the
+    regular/extended seam to today's session_close; BOATS ends at session_open. Other windows
+    still use window_seconds and its sixty-minute bound.
+    """
+    if not isinstance(minutes, int) or isinstance(minutes, bool) or not 1 <= minutes <= 16 * 60:
+        raise ValueError("minutes must be between 1 and 960 for a carrying node (ADR 0146)")
+    if feed is not None and feed not in ("sip", "boats"):
+        raise WindowRefused("IEX is refused by name: protection requires explicit sip or boats")
+    try:
+        ends, part = session_part("regular" if clock.is_open else "extended", clock, calendar)
+        chosen = MOVER_PARTS[part].feed
+        if chosen == "sip":
+            today = _trading_days(calendar).get(clock.timestamp.astimezone(NEW_YORK).date())
+            if today is None:
+                raise RuntimeError("the carrying node's trading day is absent from the calendar")
+            _opens, ends = _session_bounds(today)
+    except (RuntimeError, KeyError) as e:
+        raise WindowRefused(str(e)) from e
+    if chosen not in ("sip", "boats"):
+        raise WindowRefused(f"{chosen} (IEX included) is refused for protection")
+    if feed is not None and feed != chosen:
+        raise WindowRefused(f"{feed} is refused in {part}: this span requires {chosen}")
+    return min(ends, clock.timestamp + timedelta(minutes=minutes)), part, chosen
+
+
+def read_start_controls(holds_dir: Path, inbox: Path) -> None:
+    """Read both start controls in one step, refusing either, including an unread control.
+
+    Unit 10i supplies the locations explicitly: the base window has no persisted holds/inbox
+    schema. Any holds entry blocks; an inbox file must be empty (whitespace allowed), or an inbox
+    directory must have no entries. Nothing is consumed, acknowledged, cleared or copied.
+    """
+    reasons = []
+    try:
+        if not holds_dir.is_absolute():
+            raise ValueError("an absolute folder is required")
+        if list(holds_dir.iterdir()):
+            reasons.append("holds folder is not empty")
+    except (OSError, ValueError) as e:
+        reasons.append(f"holds folder unread: {type(e).__name__}")
+    try:
+        if not inbox.is_absolute():
+            raise ValueError("an absolute inbox is required")
+        pending = bool(list(inbox.iterdir())) if inbox.is_dir() else bool(inbox.read_text().strip())
+        if pending:
+            reasons.append("inbox is not empty")
+    except (OSError, ValueError) as e:
+        reasons.append(f"inbox unread: {type(e).__name__}")
+    if reasons:
+        raise WindowRefused("; ".join(reasons) + "; nothing started")
+
+
+PAPER_ACCOUNT_LOCKS = {
+    "tests": "canon-paper-test.lock",
+    "windows": "canon-paper-windows.lock",
+    "protect": "canon-paper-protect.lock",
+}
+"""The existing mise tasks' account lock names (ADRs 0069 and 0142)."""
+_RETAINED_PAPER_LOCKS: list[int] = []
+
+
+@contextlib.contextmanager
+def paper_start(account: str, *, holds_dir: Path, inbox: Path, lock_dir: Path) -> Generator[None]:
+    """Hold the account and its stream for one run, with no wait that could spend a stale go.
+
+    flock(2), the lockf(1) contract used by mise's paper tasks and tests/conftest.py. Account A's
+    stream lock is taken by a streaming paper test and paper:data; the movers recorder takes none,
+    so its hours are refused by the clock in the caller (`protector_node._recorder_hours`).
+    B uses its own stream lock; C gets its own. The default caller uses default_log_dir().parent,
+    the very per-user temporary folder the shell tasks use. Tests inject a private folder.
+    An abandoned node keeps the locks until process exit, like the shell window's descriptors.
+    """
+    if account not in PAPER_ACCOUNT_LOCKS:
+        raise WindowRefused("no such paper account; expected tests, windows or protect")
+    if not lock_dir.is_absolute() or not lock_dir.is_dir():
+        raise WindowRefused("the paper lock folder must be an existing absolute directory")
+    descriptors: list[int] = []
+    try:
+        for name in (PAPER_ACCOUNT_LOCKS[account], f"canon-alpaca-stream-{account}.lock"):
+            fd = os.open(lock_dir / name, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+            descriptors.append(fd)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as e:
+                raise WindowRefused(f"{name}: lock is held; nothing started") from e
+        read_start_controls(holds_dir, inbox)
+        yield
+    finally:
+        if _ABANDONED:
+            _RETAINED_PAPER_LOCKS.extend(descriptors)
+        else:
+            for fd in reversed(descriptors):
+                os.close(fd)
 
 
 def warm_up_start(

@@ -1261,7 +1261,7 @@ def test_the_task_reads_account_as_pair_under_its_lock_without_waiting() -> None
 @pytest.mark.parametrize(
     ("account", "said"),
     [
-        ("windows", "account windows (B) is refused by name for now"),
+        ("windows", "account windows (B) takes only --cancel"),
         ("live", "no paper account named 'live'"),
     ],
 )
@@ -1271,6 +1271,54 @@ def test_the_task_refuses_windows_and_any_other_name_before_the_keychain(
     done, asked = _run_task(tmp_path, account)
     assert done.returncode == 3 and asked == ""
     assert said in done.stderr and "nothing was read" in done.stderr
+
+
+# The lead's ruling (d)3 (2026-11-13): a protect-lineage sell left working on B is closed before proof 3
+# by a cancel of that lineage on B. B takes `--cancel` alone; a send on B stays refused.
+def _run_cancel_on_b(tmp_path: Path, cancel: str) -> tuple[subprocess.CompletedProcess, str, Path]:
+    """The task's body on B with the keychain, the temporary folder and the final `exec` stood in
+    for: nothing reaches Alpaca, and the lock is taken in `tmp_path`."""
+    log, ran = tmp_path / "security.log", tmp_path / "ran.log"
+    security, runner = tmp_path / "security", tmp_path / "runner"
+    security.write_text(f'#!/bin/bash\necho "$*" >> {log}\necho "made-up-value-$5"\n')
+    runner.write_text(f'#!/bin/bash\necho "$*" > {ran}\n')
+    for stub in (security, runner):
+        stub.chmod(0o755)
+    body = (
+        _task()["run"]
+        .replace("/usr/bin/security", str(security))
+        .replace("/usr/bin/getconf DARWIN_USER_TEMP_DIR", f"echo {tmp_path}/")
+        .replace("exec /usr/bin/timeout", f"exec {runner}")
+    )
+    done = subprocess.run(
+        ["bash", "-c", body],
+        env={
+            "PATH": f"{tmp_path}:/usr/bin:/bin",
+            "usage_account": "windows",
+            "usage_cancel": cancel,
+        },
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    return done, log.read_text() if log.exists() else "", ran
+
+
+def test_a_cancel_on_b_reads_bs_pair_under_bs_lock_and_runs_only_the_cancel(tmp_path) -> None:
+    done, asked, ran = _run_cancel_on_b(tmp_path, "true")
+    assert done.returncode == 0, done.stderr
+    assert "-s canon-alpaca-paper-windows " in asked and "canon-alpaca-paper-protect" not in asked
+    assert (tmp_path / "canon-paper-windows.lock").exists()
+    args = ran.read_text()
+    assert "task_from_flags" in args and args.rstrip().endswith("false  true")
+
+
+@pytest.mark.parametrize("cancel", ["false", ""])
+def test_a_send_on_b_stays_refused_before_the_keychain(tmp_path, cancel) -> None:
+    done, asked, ran = _run_cancel_on_b(tmp_path, cancel)
+    assert done.returncode == 3 and asked == "" and not ran.exists()
+    assert "account windows (B) takes only --cancel" in done.stderr
 
 
 # -- The cancel of protect stops, by name (`paper:protect <account> --cancel`) ------------------------

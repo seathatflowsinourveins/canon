@@ -60,6 +60,7 @@ from .position_cap import PositionCap
 from .position_cap import position_cap_config
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from collections.abc import Sequence
 
     from nautilus_trader.live import LiveNodeBuilder
@@ -148,7 +149,7 @@ def risk_limits(
     instrument_id: InstrumentId | Sequence[InstrumentId],
     *,
     max_order_submit_rate: str = MAX_ORDER_SUBMIT_RATE,
-    max_notional_per_order: Decimal = MAX_NOTIONAL_PER_ORDER_USD,
+    max_notional_per_order: Decimal | None = MAX_NOTIONAL_PER_ORDER_USD,
 ) -> RiskLimits:
     """The risk engine's settings for a run on `instrument_id`, as keywords of either risk config class.
 
@@ -158,16 +159,23 @@ def risk_limits(
     strategy sizes its own entries gives `max_notional_per_order` as an outer bound above them, since
     the engine holds a sale to the cap as it does a buy (`mover_window`, ADR 0088).
 
+    A close-only carrying node can pass None for no notional cap: the pin's
+    `crates/risk/src/engine/config.rs:55-59` defaults that map to empty. The submit/modify throttle
+    and other risk checks remain on; existing callers keep their cap.
+
     `LiveRiskEngineConfig` (the live node's) and `nautilus_trader.risk.RiskEngineConfig` (a backtest's)
     take the same keywords, so the offline proof of the throttle runs on exactly these values.
     """
+    instruments = _instrument_ids(instrument_id)
     return {
         "bypass": False,
         "max_order_submit_rate": max_order_submit_rate,
         "max_order_modify_rate": MAX_ORDER_MODIFY_RATE,
-        "max_notional_per_order": {
-            instrument: max_notional_per_order for instrument in _instrument_ids(instrument_id)
-        },
+        "max_notional_per_order": (
+            {}
+            if max_notional_per_order is None
+            else {instrument: max_notional_per_order for instrument in instruments}
+        ),
     }
 
 
@@ -187,11 +195,12 @@ def alpaca_paper_builder(
     *,
     trader_id: TraderId = TRADER_ID,
     max_order_submit_rate: str = MAX_ORDER_SUBMIT_RATE,
-    max_notional_per_order: Decimal = MAX_NOTIONAL_PER_ORDER_USD,
+    max_notional_per_order: Decimal | None = MAX_NOTIONAL_PER_ORDER_USD,
     delay_post_stop_secs: int = DELAY_POST_STOP_SECS,
     data_load_all: bool = False,
     trade_condition_filter: bool = False,
     validate_trade_sequence: bool = False,
+    execution_config: Callable[..., AlpacaExecutionClientConfig] = AlpacaExecutionClientConfig,
 ) -> LiveNodeBuilder:
     """A builder with the Alpaca data and execution clients for one or several `instrument_id`s, `risk_limits`,
     `exec_engine_config` and the timeouts every paper node here uses; the caller adds logging and builds.
@@ -242,7 +251,7 @@ def alpaca_paper_builder(
         .add_exec_client(
             "ALPACA",
             AlpacaExecutionClientFactory,
-            AlpacaExecutionClientConfig(instrument_provider=provider),
+            execution_config(instrument_provider=provider),
         )
     )
 

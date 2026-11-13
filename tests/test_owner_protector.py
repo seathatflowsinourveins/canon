@@ -519,13 +519,18 @@ def test_no_new_sell_after_instrument_or_strategy_stop() -> None:
     assert not strategy.sent
 
 
-def test_client_id_collision_never_makes_an_existing_order_ours_to_cancel() -> None:
+def test_client_id_collision_never_makes_an_existing_order_ours_to_cancel(monkeypatch) -> None:
     strategy = Harness()
     inherited = strategy.factory.limit(
-        AAA, OrderSide.SELL, Quantity.from_int(3), Price.from_str("11.00")
+        AAA,
+        OrderSide.SELL,
+        Quantity.from_int(3),
+        Price.from_str("11.00"),
+        client_order_id=ClientOrderId(CANON_SELL),
     )
-    strategy.factory.reset()  # same-second restart with the same trader/strategy tags
     strategy.cached.working = [inherited]
+    # A protect-lineage ID the protector would name again (pnode: canon-protect- client IDs).
+    monkeypatch.setattr(strategy, "_protect_id", lambda: ClientOrderId(CANON_SELL))
     strategy.adopt_holding(AAA, Price.from_str("9.90"))
     new_quote(strategy)
     strategy.on_stop()
@@ -1492,6 +1497,7 @@ class SyntheticExecution(ExecutionClient):
             self.released_params.append(command.params)
         else:
             assert order.strategy_id == EXTERNAL
+        # TradeId holds at most 36 characters; a canon-protect- client order ID is longer.
         venue_id = VenueOrderId(str(order.client_order_id))
         self.generate_order_submitted(order)
         self.generate_order_accepted(order, venue_id, self.clock.timestamp_ns())
@@ -1499,7 +1505,7 @@ class SyntheticExecution(ExecutionClient):
             order,
             venue_id,
             None,
-            TradeId(str(order.client_order_id)),
+            TradeId(str(order.client_order_id)[-36:]),
             order.quantity,
             tick.bid_price if order.side == OrderSide.SELL else tick.ask_price,
             USD,
