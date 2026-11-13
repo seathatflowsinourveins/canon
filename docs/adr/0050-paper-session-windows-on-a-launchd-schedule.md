@@ -272,6 +272,15 @@ Read 2026-11-10. "raw": fetched with `curl` and read whole.
   `crates/live/src/python/node.rs` (`run_async`) at the pin; uv's `crates/uv-command-support/src/child.rs:117-122`
   (`scripts/canon src`, read); `man timeout` on this machine (`bundled`); the stops, the ignored copies, the
   `stopping` mark under a kill and `bounded()`'s grace in `tests/test_session_window.py` (run).
+* 2026-11-12, the stop row on paper, three short windows by hand on account B in the overnight part, each
+  started as the schedule starts one (`timeout -s KILL` around `mise run paper:session --session auto --mover`,
+  in the background, so with SIGINT ignored), each signal sent only after a read of 0 positions and 0 open
+  orders (run): SIGTERM to the task after a ranking had run in the node; SIGINT to the task; SIGINT to the
+  window's own process. Each record read `stopping: <signal> received; the window has not finished` within 6 s,
+  never `running` again, and closed 9 to 10 s after the signal as `failed: WindowSignalled: stopped by <signal>`,
+  with no order, no error and the account flat. A SIGINT sent to the task reaches the window as SIGTERM:
+  `bounded()`'s shell traps it (`trap 'stop 130' INT`) and passes the stop on as SIGTERM to the group, as the
+  row says (read in `mise.toml`); the window's own SIGINT path ran in the third window.
 * https://nautilustrader.io/docs/md/latest/how_to/configure_live_trading.md: "run nodes as standalone
   Python scripts or services"; "One LiveNode per process" (fetched, raw).
 * `scripts/automation` and ADR 0011: the launchd agent, its install, status and uninstall (read).
