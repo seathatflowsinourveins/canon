@@ -109,7 +109,20 @@ ten fields as list lines, in this order, each with a value:
 * supersedes: none
 * source: review
 
-### L0006: A checker written to a contract before its writer drifted from the writer, and its clock gap was measured, not assumed
+### L0006: An entry's cap refused a stop for a long that was already held
+
+* area: exits
+* session: 2026-11-13
+* result: Under an own-cap row the protect task twice refused to plan a stop for a long it found in the account, once when the ATR distance and once when the spread floor came out over the 0.02 entry cap; two firings earlier the same holding's distance was under the cap and it got its stop, so a volatile name had a stop or none depending on the minute
+* evidence: ADR 0142's amendment of 2026-11-13; tests/test_protect.py, the cases a found long keeps its own distance over the entry cap and an own distance over the ceiling is named and sends no stop
+* lesson: A bound written for choosing an entry's size does not apply to a holding that has no size left to choose; a protection path takes the bound of what it protects, here the sizing ceiling, and refuses past it by name
+* change: a found holding under an own cap keeps its distance up to the 0.10 sizing ceiling and is refused over it, with the Mover's entry path unchanged (ADR 0142)
+* next: The paper run of this path on account A at the next regular session, and a standing set of protection cases every protection unit passes
+* status: open
+* supersedes: none
+* source: lead
+
+### L0007: A checker written to a contract before its writer drifted from the writer, and its clock gap was measured, not assumed
 
 * area: execution
 * session: 2026-11-13
@@ -122,7 +135,7 @@ ten fields as list lines, in this order, each with a value:
 * supersedes: none
 * source: review
 
-### L0007: A sizing quotient formed in floats can land just past a ceiling that the exact value meets
+### L0008: A sizing quotient formed in floats can land just past a ceiling that the exact value meets
 
 * area: sizing
 * session: 2026-11-13
@@ -135,7 +148,7 @@ ten fields as list lines, in this order, each with a value:
 * supersedes: none
 * source: review
 
-### L0008: A Decimal test passed alone and failed in the full suite, because `localcontext` copies the thread's sticky flags
+### L0009: A Decimal test passed alone and failed in the full suite, because `localcontext` copies the thread's sticky flags
 
 * area: exits
 * session: 2026-11-13

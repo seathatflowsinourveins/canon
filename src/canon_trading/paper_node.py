@@ -50,6 +50,7 @@ from nautilus_trader.config import InstrumentProviderConfig
 from nautilus_trader.config import LiveExecutionEngineConfig
 from nautilus_trader.live import LiveNode
 from nautilus_trader.live import LiveRiskEngineConfig
+from nautilus_trader.live import SubmissionRecoveryPolicy
 from nautilus_trader.model import InstrumentId
 from nautilus_trader.model import Quantity
 from nautilus_trader.model import StrategyId
@@ -125,13 +126,34 @@ def exec_engine_config(
 ) -> LiveExecutionEngineConfig:
     """The execution engine with its open-order and position checks against the venue turned on, and
     start-up reconciliation scoped to every window instrument, as upstream's Lighter tutorial scopes it to its
-    target, and to `RECONCILIATION_LOOKBACK_MINS` of history."""
+    target, and to `RECONCILIATION_LOOKBACK_MINS` of history.
+
+    A submit never answered is retained, not rejected by the node (`RETAIN_UNRESOLVED`; the session
+    window's claim 10, ADR 0044). With upstream's default, once the in-flight check's queries run out the
+    node rejects such an order itself (`INFLIGHT_TIMEOUT`, `check_inflight_orders` in
+    `crates/live/src/execution/manager.rs` at the pin), though Alpaca may hold it: Alpaca says of a submit
+    that timed out "You should not attempt to resend the order" (working-with-orders, FAQ). The order
+    then closes at the node, the adapter ignores Alpaca's later fill of it as an update for an order that
+    has ended, and a strategy that sends nothing while one of its orders works can send again. Retained,
+    "Exhausted unacknowledged submissions stay unresolved", while "later venue evidence" can still resolve
+    them (concepts/execution/reconciliation, "Submission recovery" and "In-flight checks"); if none does,
+    the node's run ends with an error naming the order ("Submission recovery at shutdown",
+    concepts/live), so a session window is recorded failed and its account check looks the order up.
+
+    What it costs: a read that finds no order is no outcome, so a submit Alpaca never placed is retained
+    too, and its strategy sends nothing more for the rest of the run; and any submit still unanswered at
+    the end of `delay_post_stop` fails the run, its recovery budget spent or not (concepts/live,
+    "Submission recovery at shutdown"). A market exit still cancels and closes by position, so a retained
+    close whose fill the node has not booked can be sent again; the account check after the stop finds
+    what that leaves. A Python adapter cannot require retention itself (`retain_unresolved_submissions` is not exposed to
+    Python at the pin), so it is set here, for every paper node."""
     return LiveExecutionEngineConfig(
         reconciliation=True,
         reconciliation_instrument_ids=_instrument_ids(instrument_id),
         reconciliation_lookback_mins=RECONCILIATION_LOOKBACK_MINS,
         open_check_interval_secs=OPEN_CHECK_INTERVAL_SECS,
         position_check_interval_secs=POSITION_CHECK_INTERVAL_SECS,
+        submission_recovery_policy=SubmissionRecoveryPolicy.RETAIN_UNRESOLVED,
     )
 
 

@@ -1,7 +1,7 @@
 ---
 status: accepted
 date: 2026-11-11
-decision-makers: master orchestrator (Claude), under the owner's delegation of 2026-11-11; read and accepted by the lead on 2026-11-11
+decision-makers: master orchestrator (Claude), under the owner's delegation of 2026-11-11; accepted on 2026-11-11
 review-by: 2026-12-11
 ---
 
@@ -10,8 +10,8 @@ review-by: 2026-12-11
 ## Context and Problem Statement
 
 ADR 0042's term of 2026-11-11 ("one identity for a fill") knew a fill by Alpaca's trade ID, and matched a
-fill the engine had inferred from a status report to a later stream fill by its shares. The first review
-round on that model found the match failing in six ways, all members of one family. NautilusTrader infers
+fill the engine had inferred from a status report to a later stream fill by its shares. Review
+found the match failing in six ways, all members of one family. NautilusTrader infers
 a fill under an ID of its own, so nothing that arrives later can be matched to it by trade ID, and a
 match by shares cannot tell fills of different sizes, prices or order apart. Under ADR 0073 a family
 found twice is redesigned as one model. This record replaces the matching: the engine is never left to
@@ -77,7 +77,7 @@ Alpaca's trade ID, so the engine's own deduplication works on every source.
   update or a read of it, is never adopted: a fill on a replacement the record has not adopted adopts it
   only when its `replaces` links reach the order the record is on, so a modify's replacement takes its
   quantity before its fills count, and an order the record has moved past keeps the record where it is.
-* **Added 2026-11-11, after outside round 2: the replace chain, one model.** Before a fill on an Alpaca
+* **Added 2026-11-11: the replace chain, one model.** Before a fill on an Alpaca
   order the record is not on counts, from the stream, a report or the client's read of the activities,
   that order is placed in the chain: behind the order the record is on (its fill counts under that order;
   nothing is adopted) or ahead of it (adopted first, so its quantity and price apply before its fills, as
@@ -101,8 +101,8 @@ stream", which Alpaca's do.
 
 ### Consequences
 
-* Good: Antigravity's findings 1 to 5 and 7, and Codex's history recount, are each fixed by one rule,
-  and finding 8's vacuous test goes with the matching it tested.
+* Good: six fill-matching defects and the history recount are fixed by one rule,
+  and a vacuous test goes with the matching it tested.
 * Good: a lost stream update no longer books the missing share to an `EXTERNAL` order: the next read
   showing it brings it by its trade ID.
 * Bad: a report is held back for one engine check after its fills are brought, and for as long as the
@@ -112,7 +112,8 @@ stream", which Alpaca's do.
   still `SUBMITTED`, `PENDING_UPDATE` or `PENDING_CANCEL` whose fills the activities do not list through
   all of the engine's in-flight queries is resolved locally: a submit rejected with `INFLIGHT_TIMEOUT`, the
   others canceled (`check_inflight_orders` at the pin). A fill Alpaca makes on it afterwards is booked to
-  an `EXTERNAL` order. With `open_check_open_only` off, an open order whose report is held back past
+  an `EXTERNAL` order. Closed for a submit on the paper nodes (2026-11-13, port of PR #234, ADR 0044): their engine retains
+  it, and the adapter's fill report names it by the client order ID Alpaca's read of it shows. With `open_check_open_only` off, an open order whose report is held back past
   `open_check_missing_retries` and a targeted query is resolved locally too: an accepted one rejected
   with `NOT_FOUND_AT_VENUE`, a partly filled one canceled, a pending one deferred. How long the
   activities lag is not on Alpaca's pages (UNVERIFIED).
@@ -138,7 +139,7 @@ stream", which Alpaca's do.
   trade ID, inferring only what they leave short (`manager.rs` at the pin, the external order's events);
   only the form "Generated inferred fill for <id>: qty=" is an inference the cache keeps. Seen on paper on
   2026-11-11, the order holding Alpaca's trade ID alone.
-* Neutral (added 2026-11-11, outside round 2): the client's own count overlaps upstream's
+* Neutral (added 2026-11-11): the client's own count overlaps upstream's
   `reconcile_fill_report` (a trade ID the order holds, a venue order ID it never held) and its catch-up
   overlaps `reconcile_order_with_fills` (fills sorted and applied by trade ID, amendments first). The
   overlap is kept on purpose: at the pin that path still infers a continuous report's residue, which this
@@ -155,55 +156,54 @@ stream", which Alpaca's do.
 
 ### Confirmation
 
-Offline, on a real `LiveNode`, each failing before this change (main at a2042a4) and passing with it,
-crediting the reader who found it:
+Offline, on a real `LiveNode`, each failing before this change (main at a2042a4) and passing with it:
 
-* Antigravity, round 1 on the fill-identity model:
-  * finding 3: a `QueryOrder` report and its fill's stream update in one loop turn, FILLED 2 on one share;
-  * finding 2: a 2-share fill after a 1-share one, both orders of size, FILLED 4 on 3 shares, or an
+* Fill matching:
+  * a `QueryOrder` report and its fill's stream update in one loop turn, FILLED 2 on one share;
+  * a 2-share fill after a 1-share one, both orders of size, FILLED 4 on 3 shares, or an
     overfill refused while the client ended the order;
-  * finding 7: two prices delivered out of order, an average of 150 for fills at 150 and 140;
-  * finding 1: a lost update under the paper node's open-order and position checks, open and closed,
+  * two prices delivered out of order, an average of 150 for fills at 150 and 140;
+  * a lost update under the paper node's open-order and position checks, open and closed,
     with an engine-made trade ID and, closed, an `EXTERNAL` order;
-  * finding 4: a fill on a chain order the node never held moving the order back, and its end ignored
+  * a fill on a chain order the node never held moving the order back, and its end ignored
     after a reconnect;
-  * finding 5: a replacement's fill after a reconnect under the own reading taken for an inferred share.
-* Codex, round 1 on the fill-identity model: a full-history open-order check after a `QueryOrder` report,
+  * a replacement's fill after a reconnect under the own reading taken for an inferred share.
+* A full-history open-order check after a `QueryOrder` report,
   FILLED 3 where Alpaca shows 2, never streamed and streamed.
 * This model: a report held back while the activities lag; an open order whose fills are not listed
   failing start-up by name, after three reads; and one listed on a second read reaching start-up under
   its trade ID.
 
-* The code review of this model, rounds 1 to 3, each failing before its round's fix: an open order's
+* Further cases, each failing before its fix: an open order's
   fill older than the start-up window counted again by its trade ID; an open replacement whose earlier
   orders were outside the window failing start-up; a second update not widening the reads waiting, or
   showing more during the last of them; a trade ID listed at two prices failing start-up under the
   wrong cause; a chain walk cut short by one failed read kept for every try; and open-order fills kept
   between requests reaching the wrong one or outliving a failed check.
-* Rounds 4 and 5 found the kept open-order fills, and then the two reads that replaced them, in new
+* Later review found the kept open-order fills, and then the two reads that replaced them, in new
   forms, so the design changed rather than another test being added: each fill reports request reads
   the open orders itself and chooses, checks and reports an outside order's fills in one read, by its
   status report. Their findings are covered by the tests above and have no failing test of their own.
-* Outside round 1 on this model (Codex and Muse, findings only), each failing before its fix:
-  * Codex 1 and Muse 3, one family, start-up leaving an outside open order's fills to inference: a
+* Further cases, each failing before its fix:
+  * start-up leaving an outside open order's fills to inference: a
     later failed read of the order dropping fills already shown whole; a newest activity without
     `cum_qty`, or counting its own fills only;
-  * Codex 2 and Muse 1, one defect: a cancel showing a fill the stream lost ending the order without
+  * a cancel showing a fill the stream lost ending the order without
     it, listed, listed later, and with the fill's update after the cancel;
-  * Codex 3, and Antigravity's upstream-conformance read (item 1): a canceled `QueryOrder` report held
+  * a canceled `QueryOrder` report held
     for its fill and never asked for again under the paper node's checks;
-  * Antigravity's upstream-conformance read (item 6), next to Codex 1: the window's end applied before
+  * the window's end applied before
     the check that an order's listed fills are all of them, dropping the fills inside it;
-  * Muse 2: a fill on the middle order of a three-order outside chain moving the node's order back to
+  * a fill on the middle order of a three-order outside chain moving the node's order back to
     it, the update showing the order as filled or as replaced;
-  * Muse 4: the test of a fill listed on a second read now lists it only from the order's second read,
+  * the test of a fill listed on a second read now lists it only from the order's second read,
     and fails with one read.
-* The code review of the round-1 fixes, each failing before its fix: a fill on a replacement of
+* Further cases, each failing before its fix: a fill on a replacement of
   raised quantity, before its `replaced`, ending the order early; a cancel waiting for its fill lost
   across a reconnect; an outside order pending replace and its replacement both reporting one fill.
   Declined: a late fill on an order the node's order held does not move it back
   (`nautilus-trader@d53849b216e2:crates/model/src/orders/mod.rs:1389-1395`).
-* The lead's question before landing: a fill report and its stream update in one engine step, in
+* A question before landing: a fill report and its stream update in one engine step, in
   either order and with another fill between them, counted once; a guard that passed before the question
   and fails when the record sums its own count and the order's.
 
@@ -225,35 +225,76 @@ On paper, 2026-11-11, regular session, account A for the tests and B for the win
   came on the stream, and paper gives no way to lose an update on demand, so the catch-up path itself
   did not run on paper and the lag stays unmeasured.
 
-Review rounds (ADR 0073, rule 5): round 1 on the fill-identity model found 9 behaviour-changing findings,
-most of them in the known family; outside round 1 on this model found 5 behaviour findings and 1 vacuous
-test (Codex 3, Muse 4, one shared), with Antigravity's upstream-conformance read folding 1 more into its
-families; `/code-review high` ran five rounds on the model and one on the round-1 fixes.
+Review counts (ADR 0073, rule 5): the initial review found 9 behaviour-changing findings,
+most of them in the known family; additional review found 5 behaviour findings and 1 vacuous
+test, with an upstream-conformance check folding 1 more into its
+families; `/code-review high` ran five times on the model and once on its fixes.
 
-Finding 6 (a replacement's end before a fill on the order it replaced) is the replace chain's own item,
+A replacement's end before a fill on the order it replaced is the replace chain's own item,
 fixed on its own branch after this one. Observed while building: a report returned to the engine was
 reconciled before the fills generated just before it, and the engine inferred a fill; so a report waits
 for the node's cached order.
 
-**Added 2026-11-11: outside round 2 on this record (at 1c3d671), one family, fixed as the replace chain's
-one model above, each failing on 1c3d671's code and passing after.** Codex 1: a query bringing a raised
-replacement's fill ended the order FILLED on the old quantity. Codex 2: a `replaced` read finding the
+2026-11-13, port of PR #234: the in-flight-timeout external booking named under Consequences (session
+window claim 10) is closed for a submit on the paper nodes, as recorded in ADR 0044's Confirmation. The
+engine retains a submit never answered, and the adapter names its fill report by the client order ID
+Alpaca's order read shows, so the engine matches it to that retained order
+(`test_retained_a_lost_fill_reaches_the_order_by_its_client_order_id`). The change removes the
+initially ported window instrument claim: the pin claims every unmatched order/fill on that symbol,
+including proven foreign activity (`crates/execution/src/engine/mod.rs:1334, 1418-1423` and
+`crates/live/src/execution/manager.rs:4632-4655`). Confirmed client-ID matching precedes that claim
+(`engine/mod.rs:1556-1565`) and still resolves the retained order. Without readable identity, the fill
+is withheld from the engine and the next check reads it again. Giving the engine an unnamed fill
+would create an external order, hiding the position discrepancy that asks for the next read. The
+claimed/unclaimed controls check repeated reads without an external booking; a permanently unread
+order still leaves the retained submit unresolved and fails shutdown
+(`test_a_lost_fill_whose_order_cannot_be_read_keeps_retrying_without_external_booking`).
+
+Fill naming catches an order's failed ancestor trace in `_unanswered_named`: that order's reports
+are withheld and retried, and identified fills are delivered independently. The request fails its
+coverage so the native position check cannot replace the missing identity with a synthetic fill;
+at the pin, a successful empty response permits that fallback, whereas a failed response does not
+(`crates/live/src/node/reconciliation.rs:458-480,860-918`). Each failed naming attempt is counted
+and logged; transport failures use `failure_cause`, never raw exception text containing an account or
+order identifier. A permanently failing trace is re-read on every request, without a total retry cap.
+This does not
+change the earlier completeness check or the rule for an outside open order whose full fills cannot
+be established. The ancestor cases, the batch reproduction and private/retryable read
+cases are in `test_execution_client.py`.
+
+For a refused cancel, `_cancel_refused` sends a FILLED read for an unacknowledged order
+through `_send_report`, as `_refused` already does, bringing actual activities through `_catch_up` by
+their trade IDs. The engine no longer queries a retained submit automatically
+(`crates/live/src/execution/submission.rs:23-27`, `manager.rs:264-274`), but FILLED can follow
+PENDING_CANCEL (`crates/model/src/orders/mod.rs:263-272`). The 422 reproduction checks that the original
+order ends FILLED with the one actual trade ID and one share held. If the activities lag, the existing
+`_catch_up_later` task keeps reading at `FILL_READ_RETRY_SECS` until those fills arrive or the node stops;
+the ordinary three-read budget cannot abandon this retained submit, which has no automatic queries
+left. Each unsuccessful read is counted and logged. No fill is inferred from the status alone;
+activities that never appear remain unresolved at shutdown. Offline cases cover a one-read order
+failure, a one-read replacement-ancestor failure, activities listed 0.5 s after a refused cancel with
+and without a claim, and activity lag beyond the normal retry budget. These recovery cases are
+UNVERIFIED on paper.
+
+**Added 2026-11-11: one family at 1c3d671, fixed as the replace chain's
+one model above, each failing on 1c3d671's code and passing after.** A query bringing a raised
+replacement's fill ended the order FILLED on the old quantity. A `replaced` read finding the
 replacement canceled with a lost fill left the order PARTIALLY_FILLED under the paper node's checks.
-Codex 3: an older canceled snapshot closed the order short of an end already waiting (whether Alpaca sends
-such copies is UNVERIFIED; a paper probe is asked). Muse: a fill on the middle order of a chain whose first
-order could not be read moved the node's order back to the middle order, and its cancel left it open. Round
-2 was not clean. The code review of the model, high: 9 findings, 7 fixed, two of them with failing tests (a catch-up
+An older canceled snapshot closed the order short of an end already waiting (whether Alpaca sends
+such copies is UNVERIFIED; a paper probe is asked). A fill on the middle order of a chain whose first
+order could not be read moved the node's order back to the middle order, and its cancel left it open.
+The code review of the model, high: 9 findings, 7 fixed, two of them with failing tests (a catch-up
 on the working order counting a raised replacement's fills before placing it; a held canceled report with
 no end waiting never ending the order), the others in code (a re-check after the reads, no adoption of a
 rejected or left-behind replacement, the behind order marked, no chain walk in update handling); 1 recorded
 as a limit (the unplaced order's stream fill); 1 in tests (strict patches).
 
-**Added 2026-11-11: finding 6 and the replace chain's item, closed by this record's rules.** A
+**Added 2026-11-11: a replacement's end before a fill on the order it replaced, and the replace chain's item, closed by this record's rules.** A
 replacement's `canceled` before a late fill on the order it replaced, the fill listed and lagging, ended
 the order with 0 filled before this record landed and keeps the fill under its trade ID after it (the end
-after its fills). The replace chain's own branch, for Codex's findings 2 and 3 on that record, is not
+after its fills). The replace chain's own branch, for two findings on that record, is not
 landed: its two reproductions pass on this record's code (an order the record has moved past is never
-adopted; the end after its fills) and are kept as guards beside finding 6's test.
+adopted; the end after its fills) and are kept as guards beside that end's test.
 
 ## Evidence
 
@@ -277,11 +318,11 @@ Read 2026-11-11.
   = 3`, `DEFAULT_RETRY_WAIT_SECONDS = 3` — bundled (read in the installed 0.45.0).
 * [ADR 0024](0024-alpaca-fill-history.md): the stream's `execution_id` is a fill activity's trade ID,
   observed on paper.
-* The two readers' reports of round 1 on the fill-identity model at beba468, Antigravity (8 findings) and
-  Codex (1): each reproduced here by a failing test before the change.
-* Corrected 2026-11-11, by the `evidence-verifier` (two passes): the inferred fill's source, alpaca-py's
+* Two reviews of the fill-identity model at beba468, with 8 findings and 1 respectively:
+  each reproduced here by a failing test before the change.
+* Corrected 2026-11-11, after two evidence checks: the inferred fill's source, alpaca-py's
   retry count, the missing-order resolution, the position check as the mid-session caller of fill
-  reports, the cost of the open-order read, and the round 5 Confirmation.
+  reports, the cost of the open-order read, and the Confirmation.
 * Alpaca's fill activities' lag behind the stream: not on Alpaca's pages — UNVERIFIED. The gap this record
   leaves open is how long the lag lasts in the regular session: no catch-up ran on paper on 2026-11-11, so
   the count lines (Decision) are how a later window measures it against the three reads.

@@ -382,7 +382,9 @@ class SessionMaCross(MaCross):
         )
 
     def held(self) -> Decimal:
-        """This strategy's signed open quantity in the instrument: positive long, negative short."""
+        """This strategy's signed open quantity in the instrument: positive long, negative short.
+        Recovered fills matched to its retained orders by confirmed client ID count here, by strategy
+        ID, as upstream's `market_exit` counts them; EXTERNAL activity does not."""
         return sum(
             (
                 p.signed_qty
