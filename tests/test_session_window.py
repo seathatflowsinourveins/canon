@@ -7242,6 +7242,32 @@ def test_an_auto_part_that_runs_another_strategy_names_the_trail_flags_it_does_n
     assert f"runs {session_window.DEFAULT_STRATEGY}" in out
 
 
+def test_an_auto_part_that_runs_another_strategy_names_the_trigger_it_does_not_run(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    """`--session auto --mover --trigger last_price` in a regular part that runs another strategy runs
+    the bid_ask default; it says so, as for the trail flags (code-review-high-succ/2, AGENTS.md rule 5)."""
+    seen = []
+
+    class At(Account):
+        def get_clock(self) -> Clock:
+            return clock(datetime(2026, 11, 10, 11, 0, tzinfo=NEW_YORK), is_open=True)
+
+    def window(config, **_kwargs):
+        seen.append((config.strategy, config.trigger))
+        raise session_window.WindowSkipped("the test stops here")
+
+    monkeypatch.setattr(session_window, "EXTENDED_READY", True)
+    monkeypatch.setattr(session_window, "paper_trading", lambda: At())
+    monkeypatch.setattr(session_window, "run_window", window)
+    argv = ["--session", "auto", "--mover", "--log-dir", str(tmp_path), "--trigger", "last_price"]
+    assert session_window.main(argv) == 0
+    assert seen == [(session_window.DEFAULT_STRATEGY, "bid_ask")]
+    out = capsys.readouterr().out
+    assert "--trigger last_price not run" in out
+    assert f"runs {session_window.DEFAULT_STRATEGY}" in out
+
+
 def test_an_auto_part_names_a_trail_flag_given_at_its_fixed_row_as_not_run(
     monkeypatch, tmp_path, capsys
 ) -> None:

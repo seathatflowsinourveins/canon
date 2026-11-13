@@ -2876,6 +2876,9 @@ class Seam:
     _persistent_trail = Mover._persistent_trail
     _followed = Mover._followed
     _holding_trade = Mover._holding_trade
+    _entry_filled_ns = Mover._entry_filled_ns
+    on_quote = Mover.on_quote
+    on_trade = Mover.on_trade
     _limit_sell = Mover._limit_sell
     _sell_out = Mover._sell_out
     _time_out = Mover._time_out

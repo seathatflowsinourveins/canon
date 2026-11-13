@@ -5061,9 +5061,14 @@ def _main(args: argparse.Namespace) -> int:
         if args.mover and session == "extended":
             args.strategy = MOVER
         config = window_config(args, session)
-        # an auto schedule's part that runs another strategy runs none of Mover's trail flags; it
-        # says so, rather than drop them unseen (AGENTS.md rule 5)
-        unrun = [] if args.strategy == MOVER else _trail_flags_given(args)
+        # an auto schedule's part that runs another strategy runs none of Mover's trail flags or its
+        # trigger; it says so, rather than drop them unseen (AGENTS.md rule 5)
+        unrun = (
+            []
+            if args.strategy == MOVER
+            else _trail_flags_given(args)
+            + ([] if args.trigger == WindowConfig.trigger else [f"--trigger {args.trigger}"])
+        )
         if unrun:
             print(
                 f"paper:session: {', '.join(unrun)} not run: this {session} window runs {args.strategy}"

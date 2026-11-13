@@ -7,10 +7,12 @@ trail, under the held stop. The hold's end is one rule for both triggers (`Mover
 from __future__ import annotations
 
 from decimal import Decimal
+from types import SimpleNamespace
 from typing import Any
 from typing import cast
 
 from nautilus_trader.model import OrderSide
+from nautilus_trader.model import Price
 
 from tests.test_mover import SECOND
 from tests.test_mover import T0
@@ -48,3 +50,66 @@ def test_under_the_bid_a_returning_bid_above_the_held_stop_arms_the_trail_from_i
     assert [o.kind for o in seam.sent] == ["TRAILING"] and not slot.exiting
     assert seam.sent[0].trigger_price is not None
     assert Decimal(str(seam.sent[0].trigger_price)) == Decimal("9.80")
+
+
+def test_a_sale_through_the_held_stop_at_the_holds_end_records_its_trigger_and_drops_the_trail() -> (
+    None
+):
+    """The hold's end sells through the held stop as `_hold` does: the stop it sold through is kept
+    beside the sale (`sell_triggers`), and a trigger an earlier trailed sale had reached no longer
+    stands beside a sale under way (code-review-high-succ/1 and /10)."""
+    seam = cast(Any, Seam("0"))
+    slot = cast(Any, seam_slot(seam))
+    filled = T0 + 10 * SECOND
+    seam.fills = [("E-1", OrderSide.BUY.name, "3", "10.00", filled)]
+    seam.orders["E-1"].client_order_id = slot.entry_id
+    seam._protect(slot, Decimal(3), filled + SECOND)
+    slot.trail_trigger, slot.trail_limit = Decimal("9.60"), Decimal("9.50")
+    seam.bid = "9.70"
+    seam._protect(slot, Decimal(3), filled + 3 * SECOND)
+    assert [o.kind for o in seam.sent] == ["LIMIT"] and slot.exiting
+    assert seam.sell_triggers == {seam.sent[0].client_order_id.value: "9.80"}
+    assert slot.trail_trigger is None and slot.trail_limit is None
+
+
+def test_a_held_stop_is_met_by_the_followed_price_when_the_anchor_cannot_be_read() -> None:
+    """The anchor read raises (no entry price, position average or bid it accepts): the followed price
+    through the held stop still sells, and the hold is not ended unprotected (code-review-high-succ/5)."""
+    seam = cast(Any, Seam("0"))
+    slot = cast(Any, seam_slot(seam))
+    filled = T0 + 10 * SECOND
+    seam.fills = [("E-1", OrderSide.BUY.name, "3", "10.00", filled)]
+    seam.orders["E-1"].client_order_id = slot.entry_id
+    seam._protect(slot, Decimal(3), filled + SECOND)
+
+    def unreadable(_slot: Any) -> Decimal:
+        raise RuntimeError("no anchor")
+
+    seam._trail_anchor = unreadable
+    seam.bid = "9.90"
+    seam._protect(slot, Decimal(3), filled + 2 * SECOND)
+    assert seam.sent == [] and slot.held_since is not None and slot.held_stop == Decimal("9.80")
+    seam.bid = "9.70"
+    seam._protect(slot, Decimal(3), filled + 3 * SECOND)
+    assert [o.kind for o in seam.sent] == ["LIMIT"] and slot.exiting
+    assert slot.exit_record.trigger_reason == "held stop (followed price)"
+
+
+def test_under_the_bid_a_bid_through_the_held_stop_and_back_before_the_step_sells() -> None:
+    """The same hold; between two steps the bid returns at 9.70, through the 9.80 stop, then 9.90. The
+    step sees 9.90, and the hold's end still sells through the stop the bid went through (the xr4
+    reader's F2), not arming a trail at 9.80 under a price that has already met it."""
+    seam = cast(Any, Seam("0"))
+    slot = cast(Any, seam_slot(seam))
+    filled = T0 + 10 * SECOND
+    seam.fills = [("E-1", OrderSide.BUY.name, "3", "10.00", filled)]
+    seam.orders["E-1"].client_order_id = slot.entry_id
+    seam.slots, seam.quotes = {slot.instrument_id: slot}, 0
+    seam._protect(slot, Decimal(3), filled + SECOND)
+    seam.on_quote(
+        SimpleNamespace(instrument_id=slot.instrument_id, bid_price=Price.from_str("9.70"))
+    )
+    seam.bid = "9.90"
+    seam._protect(slot, Decimal(3), filled + 3 * SECOND)
+    assert [o.kind for o in seam.sent] == ["LIMIT"] and slot.exiting
+    assert slot.exit_record.trigger_reason == "held stop (followed price)"

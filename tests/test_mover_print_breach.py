@@ -247,6 +247,67 @@ def test_under_a_print_trigger_the_first_print_through_the_held_stop_sells() -> 
     assert slot.entry_record is None or slot.entry_record.get("protect_path") == "held_stop"
 
 
+def test_under_a_print_trigger_a_held_stop_with_no_print_at_all_reads_no_minute_close() -> None:
+    """Under `last_price` with no print cached at all, the minute close is from before the entry, so it is
+    no price of this holding either and does not sell through the held stop (code-review-high-succ/3)."""
+    seam, slot, filled, _last = holding(TriggerType.LAST_PRICE)
+    slot.closes = deque([Decimal("9.70")], maxlen=4)
+    seam._protect(slot, Decimal(3), filled + SECOND)
+    assert seam.sent == [] and not slot.exiting and slot.held_stop is not None
+
+
+def test_under_a_print_trigger_a_print_between_the_step_and_an_off_step_held_stop_sells() -> None:
+    """A held stop off Alpaca's step (9.8049) and a first print of the holding's own at 9.802, under it
+    but over the stop rounded down: the hold's end sells as `_hold` would, not arming a trail at 9.80
+    under the holding's own held stop (code-review-high-succ/6)."""
+    seam, slot, filled, last = holding(TriggerType.LAST_PRICE, bid="9.79", ask="9.81")
+    last.append(stamped("10.0000", filled - SECOND, filled - SECOND))
+    seam._protect(slot, Decimal(3), filled + SECOND)
+    slot.held_stop = Decimal("9.8049")
+    last.append(stamped("9.8020", filled + 2 * SECOND, filled + 2 * SECOND))
+    seam._protect(slot, Decimal(3), filled + 3 * SECOND)
+    assert [o.kind for o in seam.sent] == ["LIMIT"] and slot.exiting
+    assert slot.exit_record.trigger_reason == "held stop (followed price)"
+
+
+def test_under_a_print_trigger_a_cheaper_fill_in_the_hold_does_not_lower_the_held_stop() -> None:
+    """Filled 3 at 10.00 for L 0.20: held at 9.80. A further 3 fill at 9.80 (average 9.90) would put L
+    under the average at 9.70; the held stop stays 9.80, and the first own print at 9.75 sells through
+    it rather than arming a trail at 9.70 (the xr4 reader's F1; the lead's H3)."""
+    seam, slot, filled, last = holding(TriggerType.LAST_PRICE, bid="9.74", ask="9.76")
+    slot.sized_loss = Decimal("0.20")
+    last.append(stamped("10.0000", filled - SECOND, filled - SECOND))
+    seam._protect(slot, Decimal(3), filled + SECOND)
+    assert slot.held_stop == Decimal("9.80")
+    seam.fills.append(("E-1", OrderSide.BUY.name, "3", "9.80", filled + 2 * SECOND))
+    seam.orders["E-1"].avg_px = 9.90
+    seam._protect(slot, Decimal(6), filled + 3 * SECOND)
+    assert slot.held_stop == Decimal("9.80") and seam.sent == []
+    last.append(stamped("9.7500", filled + 4 * SECOND, filled + 4 * SECOND))
+    seam._protect(slot, Decimal(6), filled + 5 * SECOND)
+    assert [o.kind for o in seam.sent] == ["LIMIT"] and slot.exiting
+
+
+def test_under_a_print_trigger_a_print_through_the_held_stop_and_back_before_the_step_sells() -> (
+    None
+):
+    """Held at 9.80; between two steps the holding prints 9.70, through the stop, then 9.90. The step's
+    cached print is 9.90, and the hold's end still sells through the stop (the xr4 reader's F2)."""
+    seam, slot, filled, last = holding(TriggerType.LAST_PRICE, bid="9.89", ask="9.91")
+    seam.slots, seam.trades = {slot.instrument_id: slot}, 0
+    last.append(stamped("10.0000", filled - SECOND, filled - SECOND))
+    seam._protect(slot, Decimal(3), filled + SECOND)
+    for price, at in (("9.7000", filled + 2 * SECOND), ("9.9000", filled + 2 * SECOND + 1)):
+        trade = SimpleNamespace(
+            instrument_id=slot.instrument_id, price=Price.from_str(price), ts_event=at, ts_init=at
+        )
+        last.append(trade)
+        seam.on_trade(trade)
+    seam._protect(slot, Decimal(3), filled + 3 * SECOND)
+    assert [o.kind for o in seam.sent] == ["LIMIT"] and slot.exiting
+    assert slot.exit_record.trigger_reason == "held stop (followed price)"
+
+
 def test_under_a_print_trigger_a_first_print_above_the_held_stop_arms_the_trail_from_it() -> None:
     """The same hold, its first own print at 9.90, above the 9.80 stop: the trail is armed with its
     trigger at the held stop on Alpaca's step, so the protection does not fall to 9.90 less the trail
