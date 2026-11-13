@@ -234,3 +234,49 @@ def test_smaller_offset_raises_planned_stop_and_legacy_risk_size():
         assert after.as_decimal() == D(534)
     finally:
         eng.dispose()
+
+
+def test_the_plans_own_chase_cap_bounds_the_spacing_so_results_over_a_dollar_keep_their_digits():
+    """The review of this unit, finding 1: a plan that widened its chase cap (the own-cap path, about
+    a 12% trail) keeps its old pair over $1, and legacy sizing with it; only the registered row's
+    cap, which no such plan uses, would narrow it."""
+    assert mover.offsets(D("5.00"), D("0.12"), D("0.03"), chase_cap=D("0.12")) == (
+        D("0.60"),
+        D("0.75"),
+    )
+    assert mover.planned_stop(D("5.00"), D("0.12"), D("0.03"), D("0.12")) == D("3.74")
+
+
+def test_an_off_step_distance_under_a_one_step_cap_is_spaced_exactly_one_step():
+    """The review of this unit, finding 3: one step means one step, not one rounded up past the
+    off-step distance."""
+    trailing, limit = mover.offsets(
+        D("2.00"), PLANNER.trail, PLANNER.exit_through, distance=D("1.9555")
+    )
+    assert (trailing, limit) == (D("1.9555"), D("1.9655"))
+
+
+def test_an_entry_with_no_positive_planned_stop_is_refused_by_name(monkeypatch):
+    """The review of this unit, finding 4: the entry refusal for a planned stop at or under zero is
+    still driven. Under one step 0.0003 plans none (the tuning study's agy_3); here the planned stop
+    is held at zero on a tape that otherwise enters, so the refusal, not the tape, keeps it out."""
+    assert (
+        mover.planned_stop(D("0.0003"), PLANNER.trail, PLANNER.exit_through, PLANNER.chase_cap) <= 0
+    )
+    monkeypatch.setattr(mover, "planned_stop", lambda *_args, **_kwargs: D(0))
+    eng = engine()
+    s = strategy(max_notional=D(100), flow_share=D(1))
+    try:
+        orders = run(
+            eng,
+            s,
+            ranker(rank((AAA, "0.25"))),
+            [
+                *tape(AAA, [0.38, 0.39, 0.40, 0.41, 0.4199], spread=0.0001),
+                quote(302.1, 0.4200, 0.4201),
+            ],
+        )
+        assert not [o for o in orders if o.side == OrderSide.BUY]
+        assert s.dropped == ["AAA.ALPACA: no room for the trail under 0.4200"]
+    finally:
+        eng.dispose()

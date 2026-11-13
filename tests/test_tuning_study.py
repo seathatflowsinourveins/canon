@@ -1430,7 +1430,9 @@ def test_a_native_stop_limit_seeded_under_its_limit_offset_is_priced_at_least_on
 
     real = tuning_study.offsets
 
-    def wide(entry: Decimal, trail: Decimal, exit_through: Decimal) -> tuple[Decimal, Decimal]:
+    def wide(
+        entry: Decimal, trail: Decimal, exit_through: Decimal, **_kwargs: Decimal | None
+    ) -> tuple[Decimal, Decimal]:
         trailing, _ = real(entry, trail, exit_through)
         return trailing, entry + Decimal("0.01")  # a limit offset over the seed close
 
