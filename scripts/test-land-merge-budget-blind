@@ -1,0 +1,282 @@
+#!/bin/bash
+# Contract: scripts/land's documented gh merge/view/checks interface, exercised with scripts/test-land's
+# throwaway repositories and canned gh replies. Oracle: the lead's 2026-11-12 23:58 ruling (reader F1),
+# not a fix. A spent REST budget must stop the merge wait, name its reset or its absence, and acknowledge
+# unread merge state; it must never turn a direct budget refusal into an --auto request.
+# Offline: only temporary local Git repositories; copied land, stub CI, fake mise and gh first on PATH.
+# Each named case includes a passing secondary/ordinary-failure control and a primary-budget regression.
+# The six cases should all fail at 63d7ad04. Every entire case has a 120-second process-group bound.
+set -uo pipefail
+SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+ROOT="$(dirname "$(dirname "$SELF")")"
+CASES='t_view_known_reset t_checks_known_reset t_view_unknown_reset t_checks_unknown_reset t_merge_known_reset t_merge_unknown_reset'
+
+setup_suite() {
+  local f
+  for f in scripts/land scripts/check-addresses; do
+    [ -x "$ROOT/$f" ] || { echo "test-land-merge-budget-blind: missing executable $f" >&2; return 1; }
+  done
+  # Keep hooks, identities and config from the caller out of the throwaway repositories, as test-land does.
+  unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_PREFIX \
+        GIT_COMMON_DIR GIT_AUTHOR_NAME GIT_AUTHOR_EMAIL GIT_AUTHOR_DATE GIT_COMMITTER_NAME GIT_COMMITTER_EMAIL \
+        GIT_COMMITTER_DATE GIT_CONFIG_COUNT GIT_CONFIG_PARAMETERS LAND_PR CHECK_ADDRESSES_STRICT
+  export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL="$BLIND_SUITE_TMP/gitconfig"
+  printf '[user]\n\tname = Test\n\temail = 1+test@users.noreply.github.com\n[commit]\n\tgpgsign = false\n[maintenance]\n\tauto = false\n[gc]\n\tauto = 0\n' > "$GIT_CONFIG_GLOBAL"
+  export LAND_POLL_SECONDS=1 LAND_WAIT_SECONDS=4 TZ=UTC
+  BLIND_REAL_DATE=$(command -v date) || return 1
+  export BLIND_REAL_DATE
+  mkdir -p "$BLIND_SUITE_TMP/bin" || return 1
+
+  cat > "$BLIND_SUITE_TMP/bin/mise" <<'MISE'
+#!/bin/bash
+[ "${1:-} ${2:-} ${3:-}" = 'exec -- gh' ] || { echo "fake mise: unexpected call: $*" >&2; exit 99; }
+shift 3
+exec "$BLIND_SUITE_TMP/bin/gh" "$@"
+MISE
+  cat > "$BLIND_SUITE_TMP/bin/gh" <<'GH'
+#!/bin/bash
+set -uo pipefail
+now=$(cat "$FAKE/now")
+reset=$(cat "$FAKE/reset")
+printf '%s gh %s\n' "$now" "$*" >> "$FAKE/log"
+case "${1:-} ${2:-}" in
+  'pr view'|'pr checks'|'pr merge')
+    if [ -f "$FAKE/fired" ] && [ "$now" -ge "$reset" ]; then
+      printf '%s gh %s\n' "$now" "$*" >> "$FAKE/after_reset"
+    fi ;;
+esac
+active_primary() {
+  [ -f "$FAKE/fired" ] || return 1
+  case "$FAULT_KIND" in
+    primary-known) [ "$now" -lt "$reset" ] ;;
+    primary-unknown) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+refuse() {
+  if [ ! -f "$FAKE/fired" ]; then printf '%s %s\n' "$now" "$FAULT_ENDPOINT" > "$FAKE/fired"; fi
+  case "$FAULT_KIND" in
+    primary-*) echo "gh: API rate limit exceeded for user ID 1. (HTTP $HTTP_STATUS)" >&2 ;;
+    secondary) echo 'gh: You have exceeded a secondary rate limit. Please wait a few minutes before you try again. (HTTP 403)' >&2 ;;
+    transport) echo 'gh: connection reset by peer' >&2 ;;
+    policy) echo 'Pull request cannot be merged: required checks are pending' >&2 ;;
+    failed-check) echo 'unit-tests' ;;
+    *) echo "fake gh: unexpected fault $FAULT_KIND" >&2; exit 98 ;;
+  esac
+  exit 1
+}
+case "${1:-} ${2:-}" in
+  'auth status') exit 0 ;;
+  'api rate_limit')
+    if active_primary; then
+      if [ "$FAULT_KIND" = primary-known ]; then printf 'core 5000 %s\n' "$reset"
+      else echo 'gh: HTTP 500 while reading rate_limit' >&2; exit 1; fi
+    fi ;;
+  'api -X') case "$*" in *'/statuses/'*) exit 0 ;; *) exit 98 ;; esac ;;
+  'pr list') if [ -f "$FAKE/pr_open" ]; then cat "$FAKE/pr_open"; fi ;;
+  'pr create') echo '7 https://github.example/o/r/pull/7' > "$FAKE/pr_open" ;;
+  'pr merge')
+    active_primary && refuse
+    case " $* " in
+      *' --auto '*)
+        [ "$FAULT_ENDPOINT:$FAULT_KIND" != merge:secondary ] || refuse
+        exit 0 ;;
+    esac
+    if [ "$FAULT_ENDPOINT" = merge ] && [ ! -f "$FAKE/fired" ]; then refuse; fi
+    if [ "$MERGE_PATH" = auto ]; then
+      echo 'Pull request cannot be merged: required checks are pending' >&2; exit 1
+    fi ;;
+  'pr view')
+    case "$*" in
+      *'--json title '*) echo 'Change readme'; exit 0 ;;
+      *'--json state,headRefOid '*) ;;
+      *) echo "fake gh: unexpected view: $*" >&2; exit 98 ;;
+    esac
+    active_primary && refuse
+    if [ "$FAULT_ENDPOINT" = view ] && [ ! -f "$FAKE/fired" ]; then refuse; fi
+    # At the synthetic reset the primary budget recovers, but the PR remains OPEN. A land which kept
+    # polling loses the evidence of exhaustion and eventually gives its ordinary timeout diagnosis.
+    state=OPEN
+    case "$FAULT_KIND" in primary-*) ;; *) [ ! -f "$FAKE/fired" ] || state=MERGED ;; esac
+    printf '%s %s\n' "$state" "$(git rev-parse HEAD)" ;;
+  'pr checks')
+    active_primary && refuse
+    if [ "$FAULT_ENDPOINT" = checks ] && [ ! -f "$FAKE/fired" ]; then refuse; fi ;;
+  *) echo "fake gh: unexpected call: $*" >&2; exit 98 ;;
+esac
+GH
+  # A deterministic clock proves whether polling crosses reset; it does not wait for a wall-clock reset.
+  # Calendar formatting stays date(1)'s, as in test-land. The 120 s outer timeout uses the real clock.
+  cat > "$BLIND_SUITE_TMP/bin/date" <<'DATE'
+#!/bin/bash
+if [ "$#" -eq 1 ] && [ "$1" = +%s ]; then cat "$FAKE/now"
+else exec "$BLIND_REAL_DATE" "$@"; fi
+DATE
+  cat > "$BLIND_SUITE_TMP/bin/sleep" <<'SLEEP'
+#!/bin/bash
+set -uo pipefail
+case "${1:-}" in ''|*[!0-9]*) echo 'fake sleep: expected integer seconds' >&2; exit 98 ;; esac
+[ "$#" -eq 1 ] || exit 98
+now=$(cat "$FAKE/now")
+printf '%s sleep %s\n' "$now" "$1" >> "$FAKE/log"
+if [ -f "$FAKE/fired" ]; then printf '%s\n' "$1" >> "$FAKE/sleeps_after_fault"; fi
+echo "$((now + $1))" > "$FAKE/now"
+SLEEP
+  chmod +x "$BLIND_SUITE_TMP/bin/"* || return 1
+  PATH="$BLIND_SUITE_TMP/bin:$PATH"; export PATH
+
+  local t="$BLIND_SUITE_TMP/template"
+  mkdir -p "$t/work/scripts" || return 1
+  git init -q -b main "$t/work" && git init -q --bare "$t/origin.git" || return 1
+  cp "$ROOT/scripts/land" "$ROOT/scripts/check-addresses" "$t/work/scripts/" || return 1
+  # shellcheck disable=SC2016 # expanded by the stub, not here
+  printf '%s\n' '#!/bin/bash' 'echo ran > "$FAKE/ci"' > "$t/work/scripts/ci"
+  chmod +x "$t/work/scripts/ci" || return 1
+  echo readme > "$t/work/README.md"
+  git -C "$t/work" add -A && git -C "$t/work" commit -q -m Start \
+    && git -C "$t/work" push -q "$t/origin.git" main
+}
+
+scenario() { # endpoint, fault kind, direct|auto; entirely inside a fresh temporary repository
+  FAULT_ENDPOINT=$1; FAULT_KIND=$2; MERGE_PATH=$3
+  HTTP_STATUS=403; [ "$1" != checks ] || HTTP_STATUS=429
+  [ "$2" != primary-unknown ] || HTTP_STATUS=429
+  export FAULT_ENDPOINT FAULT_KIND MERGE_PATH HTTP_STATUS
+  local c
+  c=$(mktemp -d "$BLIND_SUITE_TMP/case.XXXXXX") || return 1
+  W="$c/work"; FAKE="$c/fake"; export FAKE
+  mkdir -p "$FAKE" || return 1
+  : > "$FAKE/log"
+  echo 1800000000 > "$FAKE/now"
+  echo 1800000002 > "$FAKE/reset"
+  cp -R "$BLIND_SUITE_TMP/template/work" "$BLIND_SUITE_TMP/template/origin.git" "$c/" || return 1
+  git -C "$W" remote add origin "$c/origin.git" && git -C "$W" switch -q -c topic || return 1
+  echo change >> "$W/README.md"
+  git -C "$W" add -A && git -C "$W" commit -q -m 'Change readme' || return 1
+  out=$(cd "$W" && scripts/land 2>&1); rc=$?
+  if [ ! -f "$FAKE/ci" ] || [ ! -f "$FAKE/fired" ]; then
+    why="fixture did not reach the requested $1 failure after CI"; return 1
+  fi
+  if grep -q 'fake .*unexpected' <<<"$out"; then why='fixture saw an unsupported command'; return 1; fi
+}
+has() { case "$out" in *"$1"*) return 0 ;; *) return 1 ;; esac; }
+spent_named() { grep -Eiq '(REST|primary).*(budget|rate.?limit).*(spent|exhaust|exceed)' <<<"$out"; }
+problem() { why="${why:+$why; }$1"; }
+
+control() { # These are controls inside the named regression, not separately reported failing cases.
+  scenario "$1" "$2" "$3" || return 1
+  if spent_named; then why="control: $2 was mistaken for a spent primary budget"; return 1; fi
+  case "$2" in
+    failed-check)
+      if [ "$rc" -eq 0 ] || ! has 'a required check failed' || ! has unit-tests; then
+        why='control: an actual failed required check lost its existing diagnosis'; return 1
+      fi ;;
+    secondary)
+      if [ "$1" = merge ]; then
+        if [ "$rc" -eq 0 ] || ! has 'secondary rate limit'; then
+          why='control: a secondary merge refusal was not reported as before'; return 1
+        fi
+      elif { [ "$rc" -eq 0 ] && ! has 'landed:'; } || { [ "$rc" -ne 0 ] && ! has 'secondary rate limit'; }; then
+        why='control: secondary read failure neither recovered nor named the secondary limit'; return 1
+      fi ;;
+    *)
+      if [ "$rc" -ne 0 ] || ! has 'landed:'; then
+        why="control: ordinary $1 failure no longer recovers as before"; return 1
+      fi ;;
+  esac
+  if [ "$2" = policy ] && ! grep -q 'gh pr merge .* --auto ' "$FAKE/log"; then
+    why='control: non-primary direct refusal lost its existing auto-merge fallback'; return 1
+  fi
+  printf '        control ok: %s / %s\n' "$1" "$2"
+}
+
+primary() {
+  scenario "$1" "primary-$2" "$3" || return 1
+  why=''
+  [ "$rc" -ne 0 ] || problem 'spent budget was reported as success'
+  spent_named || problem 'spent REST budget was not named'
+  if [ "$2" = known ]; then
+    local reset_text
+    reset_text=$("$BLIND_REAL_DATE" -r 1800000002 '+%Y-%m-%d %H:%M:%S' 2>/dev/null \
+      || "$BLIND_REAL_DATE" -d @1800000002 '+%Y-%m-%d %H:%M:%S') || return 1
+    has "$reset_text" || has "${reset_text/ /T}" || has 1800000002 || problem 'readable reset was not reported'
+  elif ! grep -Eiq '(reset.*(unknown|unavailable|unread|could not|cannot|not known)|unknown.*reset|(could not|cannot|unable).*reset)' <<<"$out"; then
+    problem 'unreadable reset was not called unknown'
+  fi
+  # Check semantics, allowing a checks refusal to describe the last successful OPEN read instead of
+  # claiming that read failed. A view refusal or refused direct merge has no successful state read.
+  if ! grep -Eiq '((merge|merged|state).*(unknown|unread|could not|cannot|unavailable|not (read|known|confirmed))|(could not|cannot|unable).*(read|confirm|determin).*(merge|state))' <<<"$out"; then
+    if [ "$1" != checks ] || ! grep -Eiq '(last.*(OPEN|state)|state.*last)' <<<"$out"; then
+      problem 'whether merge state could be read was not explained'
+    fi
+  fi
+  if grep -Eiq '(is not merged|not merged after|has not marked it merged|a required check failed|checks failed)' <<<"$out"; then
+    problem 'budget refusal was called an unmerged PR or failed check'
+  fi
+  [ ! -s "$FAKE/sleeps_after_fault" ] || problem 'continued waiting after the budget refusal'
+  if [ "$2" = known ] && [ -s "$FAKE/after_reset" ]; then problem 'polled at or beyond the reset'; fi
+  if [ "$1" = merge ] && grep -q 'gh pr merge .* --auto ' "$FAKE/log"; then
+    problem 'retried the budget-refused direct merge with --auto'
+  fi
+  [ -z "$why" ]
+}
+
+t_view_known_reset() {
+  control view secondary auto && primary view known auto
+}
+t_checks_known_reset() {
+  control checks secondary auto && primary checks known auto
+}
+t_view_unknown_reset() {
+  control view transport direct && primary view unknown direct
+}
+t_checks_unknown_reset() {
+  control checks transport direct && control checks failed-check direct && primary checks unknown direct
+}
+t_merge_known_reset() {
+  control merge policy direct && primary merge known direct
+}
+t_merge_unknown_reset() {
+  control merge secondary direct && primary merge unknown direct
+}
+
+run_case() {
+  out=''; rc=''; why=''
+  if "$1"; then printf '  ok    %s\n' "$1"; return 0; fi
+  printf '  FAIL  %s [%s; land exit %s]\n' "$1" "${why:-fixture setup failed}" "${rc:-none}"
+  printf '%s\n' "$out" | sed 's/^/        /'
+  if [ -n "${FAKE:-}" ]; then
+    printf '        fault: '; cat "$FAKE/fired" 2>/dev/null
+    printf '        virtual end: '; cat "$FAKE/now" 2>/dev/null
+    sed -n '/gh pr merge /p; /gh pr view /p; /gh pr checks /p; / sleep /p' "$FAKE/log" | sed 's/^/        /'
+  fi
+  return 1
+}
+
+if [ "${1:-}" = --case ] && [ "$#" -eq 2 ]; then
+  case " $CASES " in *" $2 "*) ;; *) echo 'unknown case' >&2; exit 2 ;; esac
+  [ -d "${BLIND_SUITE_TMP:-}/template" ] || { echo 'missing suite fixture' >&2; exit 2; }
+  run_case "$2"; exit $?
+fi
+[ "$#" -eq 0 ] || { echo 'usage: bash scripts/test-land-merge-budget-blind' >&2; exit 2; }
+BOUND=$(command -v timeout) || { echo 'test-land-merge-budget-blind: timeout not installed' >&2; exit 1; }
+BLIND_SUITE_TMP=$(mktemp -d "${TMPDIR:-/tmp}/canon-test-land-merge-budget-blind.XXXXXX") || exit 1
+export BLIND_SUITE_TMP
+trap 'rm -rf "$BLIND_SUITE_TMP"' EXIT
+setup_suite || { echo 'test-land-merge-budget-blind: fixture setup failed' >&2; exit 1; }
+pass=0; fail=0
+for test_case in $CASES; do
+  "$BOUND" -s KILL 120 "$BASH" "$SELF" --case "$test_case"
+  result=$?
+  if [ "$result" -eq 0 ]; then pass=$((pass + 1))
+  else
+    fail=$((fail + 1))
+    case "$result" in
+      1) ;;
+      124|137) printf '  FAIL  %s [120 s bound reached]\n' "$test_case" ;;
+      *) printf '  FAIL  %s [case runner exited %s]\n' "$test_case" "$result" ;;
+    esac
+  fi
+done
+printf 'test-land-merge-budget-blind: %s passed, %s failed\n' "$pass" "$fail"
+[ "$fail" -eq 0 ]
