@@ -189,7 +189,7 @@ locally on the data client's live data; nothing in `src/` builds one yet (ADR 00
   gain (ADR 0051).
 * **Unasked.** The commit gate, the push address check, edit-time lint, a daily canon watch, a lane
   watchdog, a weekly model run and Dependabot (ADR 0011, ADR 0016, ADR 0026; `AGENTS.md`, "Automation").
-  Once installed, a paper session window about every 35 minutes, run from a clone each firing brings to
+  Once installed, a paper session window about two minutes after the last one ends (70 s after a firing ends), run from a clone each firing brings to
   GitHub's `main` first, never from a checkout a person uses (ADR 0050). Every 30 minutes, the
   maintenance agent brings the main checkout to origin/main by fast-forward and reinstalls what differs
   from it, so what lands under `home/` and in the installers reaches the machine at its next round,

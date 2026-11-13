@@ -5,7 +5,7 @@
 #   commit gate            on every `git commit`             .githooks/pre-commit via core.hooksPath (githooks(5))
 #   landscape watch        once a day, at session start      .claude/hooks/canon-watch.sh, async SessionStart hook
 #   lane watchdog          every 10 minutes, Mac awake       launchd user agent (launchd.plist(5), launchctl(1))
-#   paper session          10 min after each firing, awake   launchd user agent running one window, if Alpaca's
+#   paper session          70 s after each firing, awake     launchd user agent running one window, if Alpaca's
 #                                                            clock says a session is open and main's
 #                                                            canon/paper-schedule says to (ADR 0050)
 #   movers recorder        weekdays 04:00-20:00 New York     launchd user agent: back-to-back data-only

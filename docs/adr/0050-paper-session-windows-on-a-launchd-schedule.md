@@ -5,7 +5,7 @@ decision-makers: master orchestrator (Claude), under the owner's delegation of 2
 review-by: 2026-12-10
 ---
 
-# Paper session windows on a schedule: a launchd agent every 35 minutes, each firing on the origin's `main`
+# Paper session windows on a schedule: a launchd agent firing 70 s after each firing ends, each firing on the origin's `main`
 
 ## Context and Problem Statement
 
@@ -32,7 +32,7 @@ bounded windows; each part below follows the upstream named:
 
 | Part | How | Follows |
 |---|---|---|
-| What fires | A second launchd user agent, `local.canon.paper-session`, installed, reported and removed by `scripts/automation` beside the lane watchdog; every 2100 s (from 2026-11-11, 600 s after each firing ends: below), not at load; a firing while the job still runs or the Mac sleeps is missed (launchd.plist(5)) | ADR 0011's launchd agent |
+| What fires | A second launchd user agent, `local.canon.paper-session`, installed, reported and removed by `scripts/automation` beside the lane watchdog; 70 s after each firing ends (from 2026-11-13: below; every 2100 s until 2026-11-11, then 600 s after each firing ends until 2026-11-13, each superseded), not at load; a firing while the job still runs or the Mac sleeps is missed (launchd.plist(5)) | ADR 0011's launchd agent |
 | What runs | `~/.claude/canon/paper-session.sh` makes its own clone, `~/.claude/canon/paper-checkout`, anew at each firing from the `main` the origin has then, detached, keeping only `.venv`, or fails the firing, then runs `mise run paper:session --session auto --minutes 25` there: one window, one node, one process, disposed, its records naming the commit. 25 minutes, with about three of start-up and stop (a regular stop waits its 65 s post-stop delay; an estimate, UNVERIFIED until a window has run), leaves the gap (300 s then, 60 s since ADR 0044's line of 2026-11-11) inside 35 | configure_live_trading: "run nodes as standalone Python scripts or services"; "One LiveNode per process"; actions/checkout's path for a directory it does not reuse (the runner's header) |
 | Which session | `auto` takes the regular session when Alpaca's clock says it is open (`is_open`, which is false on weekends and holidays; UNVERIFIED, the clock page says only "Whether or not the market is open"), the extended one when `EXTENDED_READY` and it is open, and otherwise prints "nothing to run" and exits 0 | Alpaca's paper-trading skill: "always check the clock/calendar endpoint" |
 | A window that dies | It writes `latest.json` as `running` before the node is built and `ok` or `failed: <why>` after, the account check included; a refusal someone must look at (account not flat) is `refused: <why>`, while a skip that clears by itself (the gap, under 575 s of session left, or start-up reads that left too little of the window) exits 0 and keeps the last result. A `running` record past its `stale_after` (70 minutes) is a window that died | No upstream |
@@ -44,7 +44,8 @@ login keychain without a dialog is UNVERIFIED until its first firing. A firing w
 
 ### Consequences
 
-* Good: once installed, a window starts every 35 minutes while the Mac is awake and a session is open, with
+* Good: once installed, a window starts about two minutes after the last one ends (70 s after a firing ends, from
+  2026-11-13; every 35 minutes as first decided) while the Mac is awake and a session is open, with
   no one starting it, each on the newest `main`; extended sessions only once `EXTENDED_READY` is on.
 * Since 2026-11-11 the windows run on paper account B and the paper tests on account A, each under its
   own lock, and both take a stream lock last, since Alpaca allows a user one market-data stream connection
@@ -99,7 +100,7 @@ login keychain without a dialog is UNVERIFIED until its first firing. A firing w
   coordinator or the maintenance agent (ADR 0065, addition of 2026-11-11) runs the install. Launchd
   documents no other start for `StartInterval`, so this is UNVERIFIED on real launchd. Install reloads
   this agent only when its runner or plist changed, or it is not loaded. So only landings that change
-  those, less than the interval apart (35 minutes until 2026-11-11, now 10 after a firing ends), can
+  those, less than the interval apart (35 minutes until 2026-11-11, then 10 after a firing ends, 70 s from 2026-11-13), can
   hold windows off. The maintenance agent does not repeat an
   install within a day for the same differences at the same origin/main. Its install runs while it holds account B's lock, which a window
   holds (ADR 0069), so it never unloads a window that is running; a scheduled firing then waits for the
@@ -121,7 +122,7 @@ observed on macOS 27.2.
 
 So with 2,100 s, windows came about an hour apart: the firing's own length plus 35 minutes.
 
-The interval is now 600 s, the pause after a firing. That is above the gap (300 s then, 60 s since ADR 0044's line of 2026-11-11), and a 25-minute window
+The interval was then 600 s, the pause after a firing (superseded on 2026-11-13 by 70 s: below). That is above the gap (300 s then, 60 s since ADR 0044's line of 2026-11-11), and a 25-minute window
 with its start and stop then comes about every 35 minutes, as decided above. A closed session's firing
 ends in seconds and checks the clock again 10 minutes later: a fresh clone (0.5 s) and one clock call,
 about 144 a day when no session is open where there were about 40, each holding account B's lock for its
@@ -260,14 +261,18 @@ UNVERIFIED until the first one. Limits:
 
 * **Account B is idle between windows** for the interval and a firing's start-up, about two minutes. That
   is UNVERIFIED until the first firings at 70 s have run.
-* **How a proof takes its turn.** A run by hand waits for account B's lock as a firing does, at most
-  `lockwait` (900 s), and a scheduled window holds it for about 27 minutes. A proof started in a scheduled
-  window's last 14 minutes or so takes account B when that window ends, ahead of the next firing, which comes
-  an interval later and then waits behind it. Started earlier, it fails by name with nothing placed and is
-  started again. A run that takes the lock under the 60 s gap after the last window's end now waits out the
-  rest of the gap, from what is left of its lock wait (`paper:session`'s `gapwait`), where before it reached
-  the window's own check and was skipped. A firing that waits out 900 s behind a run by hand longer than
-  about 14 minutes fails by name the same way, and the next firing comes 70 s later.
+* **How a proof takes its turn.** A run by hand waits for account B's lock as a firing does, polling for at
+  most `lockwait` (900 s). It has no priority over another waiter: a firing, another run by hand, or the
+  maintenance agent's boundary waiter (ADR 0065). Whichever poll first finds the lock free takes it. A
+  scheduled window holds the lock for about 27 minutes, so a proof started in its last 14 minutes or so can
+  take account B when that window ends, ahead of the next firing unless another waiter's poll comes first.
+  Started earlier, it fails by name with nothing placed (exit 1) and is started again. Holding the lock
+  under the 60 s gap after the last window's end, it sleeps out the rest of the gap, never longer than is
+  left of its lock wait (`paper:session`'s `gapwait`). With too little left, the window's own check still
+  finds the gap and skips by name, exit 0, nothing run, as every such run did before. A firing that waits out
+  900 s behind a run by hand longer than about 14 minutes fails by name the same way, and the next firing
+  comes 70 s later. Two windows are at least the 60 s gap apart, not 70 s: a firing that waited behind a run
+  by hand starts its window about a minute after that run's end.
 * **The history load moves to account A.** ADR 0093's history load takes no account lock; with the schedule
   on, it runs on account A, not B. Nothing enforces this; it is a rule for the lane that runs a load.
 

@@ -93,8 +93,8 @@ Every edit to a Python file runs ruff on it, and every edit under `canon/` or
 next session start prints the result; a scheduled workflow does the same comparison on GitHub every day
 and keeps one locked `canon-drift` issue in step with what has drifted, which the brief names (ADR 0064).
 A background watchdog raises a macOS notification when a session
-stalls or fails repeatedly. A local OpenTelemetry Collector on 127.0.0.1 keeps the token events `scripts/lanes --rates` reads (ADR 0007). Once the owner installs it, a second agent runs a paper session window every
-35 minutes when Alpaca's clock says a session is open and `canon/paper-schedule` on main says to, and
+stalls or fails repeatedly. A local OpenTelemetry Collector on 127.0.0.1 keeps the token events `scripts/lanes --rates` reads (ADR 0007). Once the owner installs it, a second agent runs a paper session window
+70 s after the last firing ends when Alpaca's clock says a session is open and `canon/paper-schedule` on main says to, and
 `scripts/automation status` shows its last result (ADR 0050). The movers recorder (ADR 0070) runs the
 data-only screener on weekdays 04:00–20:00 New York from its own clone of `main`, in back-to-back batches of
 at most 80 polls; a failed batch ends that firing by name and the next firing starts fresh, and its status row reports the result.
