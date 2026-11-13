@@ -274,7 +274,8 @@ cap arm `own`, sized by `sizing.plan_for_loss`), and its record and heartbeat sa
 no arm. `--arm F2` and the explicit trail flags run as before, a flag left out beside one given keeping its
 fixed row, so `--arm OWN1` alone is still refused. A trail flag given at its fixed row (`--trail-mode
 fixed`, say) counts as given, since it opts out of OWN1: without Mover it is refused, and in an auto
-schedule's part that runs another strategy it is named as not run, where before it passed unseen.
+schedule's part that runs another strategy it is named as not run, where before it passed unseen. A profile flag or `--trail-profile-path`, given at its row or away from it,
+is a named trail in the same way.
 Other strategies' windows, and `MoverConfig`'s and `WindowConfig`'s own defaults, do not move: the bars replay ranks fixed rows only
 (`tuning_contract.BARS_REPLAY_FIXED_ROWS`), so the ledger's keys, the tuning trials, the replay, live and
 account C's construction are unchanged.
@@ -286,16 +287,19 @@ account C's construction are unchanged.
 * The window path already gives OWN1 what it needs beyond its three rows: budget sizing, which `own`
   requires; the paper loss share; and one-minute bars built from trades, which ATR mode accepts. A slot
   whose ATR has fewer than 14 complete bars enters on the larger of the fixed plan's distance and the floor.
-* The window terms: A1, every opening's distance is at least the spread floor, or the entry is refused by
-  name; A2, every entry's size is the plan for its planned loss at that distance, on Alpaca's step; A3,
-  after a remake the order's offset is the distance the record gives; A4, an exit inside 60 s of its entry;
+* The window terms: A1, where a usable spread is quoted, every opening's distance is at least the spread
+  floor, or the entry is refused by name. An entry with no usable spread (no bid or a zero bid, a crossed or
+  locked quote) takes the fixed plan, the same distance the fixed arm gives; its record says so, and it is
+  counted, not a violation. ADR 0133's record judges whether such entries are refused. A2, every entry's
+  size is the plan for its planned loss at that distance, on Alpaca's step; A3, after a remake the order's offset is the distance the record gives; A4, an exit inside 60 s of its entry;
   A5, every exit carries its evidence and reason, and no holding ends neither sold nor named; A6, the window
   ends flat by its own wind-down, its record closed, not failed; A7, Alpaca refuses no order for a cause of
   ours (a wash-trade refusal, a price off the step, a refused replace).
 * The undo rule: one A1-A3 or A5-A7 violation in a window after the switch is a revert commit within the
   same hour. A4, a sale inside 60 s on a distance at or above the floor, is the minimum distance working as
-  asked; it is counted per arm and reported, never reverted on. ADR 0133's record (proposed) judges OWN1
-  against F2 and can undo the default by its own rule.
+  asked; it is counted per arm from each window's record and reported with the window's end, never
+  reverted on; no code counts it yet. ADR 0133 (proposed, landing on its own) judges OWN1 against F2 and
+  can undo the default by its own rule; until it is on `main`, only the window terms above undo it.
 * UNCALIBRATED: the sources compared give an ATR lookback of 14 in two of three, but multiples that do not
   converge (1.0, 2 and 3.5), and none ties a stop's distance to the quoted spread. The multiple and the
   floor are ours.
@@ -361,7 +365,9 @@ archived documentation, `nautilus-trader` and `alpaca-py`) were read 2026-11-11.
 * The default arm's tests: in `tests/test_session_window.py`, from
   `test_an_auto_part_names_a_trail_flag_given_at_its_fixed_row_as_not_run` to
   `test_only_the_default_arm_is_marked_as_the_default`, and in `tests/test_mover_sizing.py` the trail flags'
-  namespace and refusal cases. Run 2026-11-12/13.
+  namespace and refusal cases, and the profile flags' cases in `tests/test_mover_profile.py`. Run
+  2026-11-12/13. The paper window this change rests on (ADR 0074) is one 15-minute extended Mover window
+  on account B from the landing commit with no trail flag; its result is in the landing's pull request.
 * The margin probe's run, 2026-11-12 14:26 New York on paper account A: one run, one name each, flat before
   and after (`paper:account`); its relations are above. Alpaca, https://docs.alpaca.markets/us/docs/orders-at-alpaca.md
   ("Buying Power", read 2026-11-12), https://docs.alpaca.markets/us/docs/margin-and-short-selling.md

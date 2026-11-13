@@ -7267,6 +7267,37 @@ def test_a_refused_mover_window_record_names_its_arm(
     assert (latest["arm"], latest["arm_default"]) == (arm, arm_default)
 
 
+@pytest.mark.parametrize(
+    ("flags", "named"),
+    [
+        (["--profile-k", "3"], "--profile-k 3"),
+        (["--profile-floor", "off"], "--profile-floor off"),
+        (
+            ["--trail-profile-path", "/profiles/today.json"],
+            "--trail-profile-path /profiles/today.json",
+        ),
+        (["--profile-k", "2"], "--profile-k 2"),
+        (["--profile-pctl", "p75"], "--profile-pctl p75"),
+        (["--profile-floor", "median"], "--profile-floor median"),
+        (["--profile-multipliers", "1", "1", "1"], "--profile-multipliers 1 1 1"),
+    ],
+)
+def test_a_profile_flag_is_a_named_trail_and_not_the_default_arm(flags, named, tmp_path) -> None:
+    """/code-review high on F-1 rebased onto the ported profile, finding 2, and the Codex range-diff
+    reader's P1: a Mover window that named only a profile flag ran OWN1 labelled the default, the
+    named row dropped unsaid, where before it ran the fixed rows. A profile flag given, at its row or
+    away from it, is a named trail: the default arm is not taken, and without Mover the flag is
+    refused like any other trail flag."""
+    args = session_window._args(
+        ["--session", "extended", "--mover", *flags, "--log-dir", str(tmp_path)]
+    )
+    assert named in session_window._trail_flags_given(args)
+    trail = session_window._mover_trail(args)
+    assert (trail["arm"], trail["arm_default"], trail["trail_mode"]) == (None, False, "fixed")
+    with pytest.raises(SystemExit):
+        session_window._args(["--session", "regular", *flags, "--log-dir", str(tmp_path)])
+
+
 TRAIL_FIELDS = ("trail_mode", "trail_cap", "atr_k", "arm", "arm_default")
 """The configuration fields that say which trail a window's Mover runs, and how its arm was taken."""
 FIXED_ROWS = {"trail_mode": "fixed", "trail_cap": "clamp", "atr_k": Decimal(1)}

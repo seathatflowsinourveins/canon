@@ -891,7 +891,9 @@ def test_a_profile_flag_that_is_not_a_registered_value_is_a_usage_error(flags, t
 def test_the_profile_k_flag_offers_exactly_the_registered_values(tmp_path):
     row = trail.PROFILE_SETTINGS["profile_k"]
     for value in (row["default"], *row["alternates"]):
-        args = session_window._args(["--profile-k", str(value), "--log-dir", str(tmp_path)])
+        # a profile flag is Mover's, refused on another strategy's window like any trail flag
+        argv = ["--strategy", "Mover", "--mover", "--profile-k", str(value)]
+        args = session_window._args([*argv, "--log-dir", str(tmp_path)])
         assert args.profile_k == value
 
 

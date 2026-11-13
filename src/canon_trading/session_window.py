@@ -4738,23 +4738,22 @@ def _parser() -> argparse.ArgumentParser:
         help="default: catalog/movers-baseline/trail-profile-v1.json",
     )
     profile_k = PROFILE_SETTINGS["profile_k"]
+    # the profile flags default to None, as the trail flags do, so a flag given at its row is told
+    # from one left out; `window_config` fills the rows (`_profile_rows`)
     parser.add_argument(
         "--profile-k",
         type=_decimal_argument,
         choices=sorted((profile_k["default"], *profile_k["alternates"])),
-        default=profile_k["default"],
     )
     for name in ("profile_pctl", "profile_floor"):
         parser.add_argument(
             "--" + name.replace("_", "-"),
             choices=PROFILE_SETTINGS[name]["arms"],
-            default=PROFILE_SETTINGS[name]["default"],
         )
     parser.add_argument(
         "--profile-multipliers",
         type=_decimal_argument,
         nargs=3,
-        default=PROFILE_SETTINGS["profile_multipliers"]["default"],
     )
     parser.add_argument("--log-dir", type=Path, help="default: `default_log_dir()`")
     for name in ARM_FLAGS:
@@ -4771,12 +4770,20 @@ ARM_FLAGS = ("reentry_arm", "opening_arm")
 validated as a `MoverConfig` row. The opening is a regular-session arm, so another part keeps it off."""
 
 
+def _profile_rows(args: argparse.Namespace) -> dict[str, Any]:
+    """The profile's rows from the command line: each as given, or its registered row when left out."""
+    return {
+        name: row["default"] if getattr(args, name) is None else getattr(args, name)
+        for name, row in PROFILE_SETTINGS.items()
+    }
+
+
 def window_config(args: argparse.Namespace, session: str) -> WindowConfig:
     """The window's configuration from the parsed arguments and the session resolved for this run. The
     arms reach only a Mover window, as `slots` does; an auto run's part that is not regular keeps the
     opening off and says so on stderr, so the arm asked for is never dropped unsaid."""
     rows: dict[str, Any] = {}
-    profile = {name: getattr(args, name) for name in PROFILE_SETTINGS}
+    profile = _profile_rows(args)
     if args.strategy == MOVER:
         # the trail rows and arm as named, or `DEFAULT_ARM`'s when none is (`_mover_trail`)
         rows.update(_mover_trail(args), **profile, trail_profile_path=args.trail_profile_path)
@@ -4831,9 +4838,10 @@ def _args(argv: Sequence[str] | None) -> argparse.Namespace:
     (an empty `getconf` in the caller's shell leaves only the folder's name)."""
     parser = _parser()
     args = parser.parse_args(argv)
-    args.profile_multipliers = tuple(args.profile_multipliers)
+    if args.profile_multipliers is not None:
+        args.profile_multipliers = tuple(args.profile_multipliers)
     multipliers = PROFILE_SETTINGS["profile_multipliers"]
-    if args.profile_multipliers not in (multipliers["default"], *multipliers["alternates"]):
+    if args.profile_multipliers not in (None, multipliers["default"], *multipliers["alternates"]):
         registered = " or ".join(
             " ".join(str(value) for value in row)
             for row in (multipliers["default"], *multipliers["alternates"])
@@ -4908,17 +4916,26 @@ def _mover_trail(args: argparse.Namespace) -> dict[str, Any]:
         n: default if getattr(args, n) is None else getattr(args, n)
         for n, default in TRAIL_FLAGS.items()
     }
-    return {**rows, "arm": args.arm}
+    return {**rows, "arm": args.arm, "arm_default": False}
 
 
 def _trail_flags_given(args: argparse.Namespace) -> list[str]:
     """Mover's trail flags and `--arm` given on the command line, each as `flag value`. A flag given at
-    its fixed row counts: it opts a Mover window out of `DEFAULT_ARM`."""
-    return [
+    its fixed row counts: it opts a Mover window out of `DEFAULT_ARM`. The profile's flags and
+    `--trail-profile-path` count the same way, by presence: each names a trail the default arm would
+    drop."""
+    given = [
         f"--{name.replace('_', '-')} {getattr(args, name)}"
         for name in (*TRAIL_FLAGS, "arm")
         if getattr(args, name) is not None
     ]
+    for name in PROFILE_SETTINGS:
+        if (value := getattr(args, name)) is not None:
+            shown = " ".join(map(str, value)) if isinstance(value, tuple) else value
+            given.append(f"--{name.replace('_', '-')} {shown}")
+    if args.trail_profile_path is not None:
+        given.append(f"--trail-profile-path {args.trail_profile_path}")
+    return given
 
 
 def _refused_arm(args: argparse.Namespace) -> dict[str, Any]:
@@ -4927,7 +4944,7 @@ def _refused_arm(args: argparse.Namespace) -> dict[str, Any]:
     if args.strategy != MOVER:
         return {"arm": None, "arm_default": False}
     trail = _mover_trail(args)
-    return {"arm": trail["arm"], "arm_default": trail.get("arm_default", False)}
+    return {"arm": trail["arm"], "arm_default": trail["arm_default"]}
 
 
 def _main(args: argparse.Namespace) -> int:
