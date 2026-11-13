@@ -20,6 +20,19 @@ NautilusTrader's client order ID generator at the pin (`d53849b216e2`). Sources,
 * https://docs.alpaca.markets/us/reference/getallorders-1.md: `status=open`, "Defaults to 50 and max is 500";
   alpaca-py's `GetOrdersRequest`: `status` "open, closed or all", `after` "only ones submitted after this
   timestamp", `symbols`; `Order.filled_qty` and `side`.
+* alpaca-py at `c42add7c0a70`, `trading/client.py:107-131`, `trading/requests.py:205-226`, read
+  2026-11-13: `get_orders` makes one GET, with no automatic pagination or page token. `direction`
+  sorts by submission time, and `until` bounds that time. History pages here descend with a fixed
+  `after` at the current trading week's start; each full page's earliest timestamp plus one microsecond
+  is the next `until`, overlapping the boundary so tied submissions are not skipped. Order IDs deduplicate
+  that overlap; a changed row or a full page that cannot advance freezes the symbol. The reference
+  above calls `after` and `until` "(exclusive.)" (read 2026-11-13); it states no precision. Once a
+  walk pages, every page must hold only rows inside `after` and `until`, newest first, and list again
+  the orders at the last page's earliest time, or the symbol freezes: a venue that answers oldest first
+  or cuts `until` to whole seconds would otherwise end the walk with orders of ours unread. A full page of
+  submissions in one microsecond cannot be proven complete through this API and remains frozen.
+  Each further page waits `session_window.POLL_SECS`, the existing trading-read poll pace (2.5 s;
+  `session_window.py`, ADR 0044), through the same client and its timeout/request counter.
 * https://docs.alpaca.markets/us/docs/orders-at-alpaca.md, "Extended Hours Trading", and the 24/5 page
   (https://docs.alpaca.markets/us/docs/245-trading-for-trading-api.md): outside the regular session only a
   limit order marked `extended_hours`, `day` or `gtc`, is taken (ADR 0044, ADR 0055).
@@ -63,7 +76,11 @@ intent are Alpaca's returned values, or `not shown` when absent, never inferred 
 
 Quantity (`read_holdings`). Alpaca's position carries no client order ID, so the quantity ours opened is read
 from the venue's orders: the net fill (buys add, sells take away) of every order of our lineage in the
-symbol submitted in the last `LINEAGE_LOOKBACK` (`status=all`, so a partly filled open order counts). An
+symbol submitted since the current trading week's start (`status=all`, so a partly filled open order counts).
+The week starts Sunday at 20:00 New York, the overnight open of the 24/5 week (alpaca-skills at
+`0e7c35163ae4`, `skills/trading-api/paper-trading/SKILL.md:590-598`, read 2026-11-13;
+`session_window.OVERNIGHT_STARTS`). It is not a rolling seven-day read: orders before that start are
+not read, and an older long whose entry is absent stays frozen by name. An
 order that replaces another counts only what it filled beyond the earlier fills in its chain: Alpaca's
 replacement "carries the order on", its filled quantity counting the fills before it (ADR 0042, paper,
 2026-11-10, overnight; the regular session is UNVERIFIED), so a chain of ours is counted once, and the fills
@@ -100,8 +117,9 @@ is ours to close only when it is exactly that net. On an account held long-only,
 is not negative, so the net over the lookback is never more than what ours holds now, and a match never takes
 a foreign share; a lookback too short to hold our entry gives a mismatch, which freezes the symbol rather than
 closing it. So the form reads Alpaca's `no_shorting` with the account, and on an account that is not held
-long-only it freezes every position. A listing that returns its maximum (`ORDERS_PAGE_LIMIT`) may not hold
-every order, so it freezes the symbol too. A short is frozen: the form never buys.
+long-only it freezes every position. A history listing is counted only after every page is read; an
+incomplete listing freezes the symbol. The open-order read still freezes at its maximum
+(`ORDERS_PAGE_LIMIT`), since it may not hold every open order. A short is frozen: the form never buys.
 
 An open order with no symbol is kept under `(no symbol)`, ours still canceled and any other left alone.
 Since its effect cannot be attributed, every listed symbol is frozen for that run, including a position
@@ -140,10 +158,12 @@ from datetime import UTC
 from datetime import datetime
 from datetime import timedelta
 from decimal import Decimal
+from itertools import pairwise
 from typing import TYPE_CHECKING
 from typing import Any
 from uuid import uuid4
 
+from alpaca.common.enums import Sort
 from alpaca.common.exceptions import APIError
 from alpaca.trading.enums import OrderSide as AlpacaOrderSide
 from alpaca.trading.enums import QueryOrderStatus
@@ -341,8 +361,9 @@ def account_task(trading: TradingClient | None = None) -> int:
 # ---------------------------------------------------------------------------------------------------------
 # The close-only form (module header, "The close-only form")
 
-LINEAGE_LOOKBACK = timedelta(hours=24)
-"""How far back the venue's orders are read for the quantity ours opened (module header, "Quantity")."""
+LINEAGE_LOOKBACK = timedelta(weeks=1)
+"""One trading week in New York wall time; `_lineage_start` chooses its Sunday evening boundary,
+not a rolling duration before the read (module header, "Quantity")."""
 CLOSE_WAIT_SECS = 60.0
 """How long the one close is left working before it is canceled."""
 CANCEL_WAIT_SECS = 30.0
@@ -496,7 +517,7 @@ class Holding:
     ours_open: list[Order] = field(default_factory=list)
     foreign_open: list[Order] = field(default_factory=list)
     opened: Decimal | None = None
-    """Our orders' net fill over `LINEAGE_LOOKBACK`, or None when it could not be established."""
+    """Our orders' net fill in the current trading week, or None when it could not be established."""
     frozen: list[str] = field(default_factory=list)
     """Why the symbol is frozen, by name: empty when it is ours to close."""
 
@@ -521,22 +542,73 @@ def _unattributed(symbol: str) -> str:
     return _Unread(f"an open order has no symbol, so its effect on {symbol} is not established")
 
 
+def _lineage_start(now: datetime) -> datetime:
+    """The most recent Sunday 20:00 New York, in UTC, including across a DST change."""
+    local = now.astimezone(session_window.NEW_YORK)
+    sunday = local.date() - timedelta(days=(local.weekday() + 1) % 7)
+    start = datetime.combine(sunday, session_window.OVERNIGHT_STARTS, session_window.NEW_YORK)
+    if start > local:
+        start -= LINEAGE_LOOKBACK
+    return start.astimezone(UTC)
+
+
 def _opened(trading: TradingClient, symbol: str, now: datetime) -> tuple[Decimal | None, str]:
-    """Our orders' net fill in `symbol` over `LINEAGE_LOOKBACK`, from the venue's orders (`status=all`),
-    or None and why when the listing is full, so it may not hold them all."""
-    request = GetOrdersRequest(
-        status=QueryOrderStatus.ALL,
-        symbols=[symbol],
-        after=now - LINEAGE_LOOKBACK,
-        limit=ORDERS_PAGE_LIMIT,
-        nested=False,
-    )
-    orders = _read(f"the orders in {symbol}", lambda: trading.get_orders(request), list, Order)
-    if len(orders) >= ORDERS_PAGE_LIMIT:
-        return None, (
-            f"{len(orders)} orders in {symbol} in the last {LINEAGE_LOOKBACK}, the most one listing "
-            "returns, so the quantity ours opened is not established"
+    """Our orders' net fill in `symbol` in the current trading week, over every page of the venue's
+    orders (`status=all`), or None and why when the listing cannot be established."""
+    after = _lineage_start(now)
+    until: datetime | None = None
+    listed: dict[str, Order] = {}
+    edge: set[str] = set()
+    while True:
+        request = GetOrdersRequest(
+            status=QueryOrderStatus.ALL,
+            symbols=[symbol],
+            after=after,
+            until=until,
+            direction=Sort.DESC,
+            limit=ORDERS_PAGE_LIMIT,
+            nested=False,
         )
+        page = _read(
+            f"the orders in {symbol}",
+            lambda request=request: trading.get_orders(request),
+            list,
+            Order,
+        )
+        for order in page:
+            previous = listed.get(str(order.id))
+            if previous is not None and previous != order:
+                return None, _Unread(
+                    f"an order in {symbol} changed across history pages, so the quantity ours "
+                    "opened is not established"
+                )
+            listed[str(order.id)] = order
+        if len(page) < ORDERS_PAGE_LIMIT and until is None:
+            break  # one short listing: nothing was paged, so nothing below applies
+        stamps = [order.submitted_at for order in page]
+        if any(not isinstance(stamp, datetime) or stamp.tzinfo is None for stamp in stamps):
+            return None, _Unread(
+                f"history pagination in {symbol} has no dated submission boundary, so the "
+                "quantity ours opened is not established"
+            )
+        if why := _page_out_of_order(symbol, page, stamps, after, until, edge):
+            return None, why
+        if len(page) < ORDERS_PAGE_LIMIT:
+            break
+        earliest = min(stamps)
+        edge = {str(order.id) for order in page if order.submitted_at == earliest}
+        # Alpaca's reference calls `until` exclusive; alpaca-py's docstring does not say. Overlap
+        # the whole last microsecond under either reading, at the precision of the model's datetime
+        # submission timestamps; `_page_out_of_order` checks the venue kept that precision.
+        boundary = min(stamps) + timedelta(microseconds=1)
+        if until is not None and boundary >= until:
+            return None, _Unread(
+                f"history pagination in {symbol} cannot advance past a full page, so the "
+                "quantity ours opened is not established"
+            )
+        until = boundary
+        time.sleep(session_window.POLL_SECS)
+    orders = list(listed.values())
     for order in orders:
         if what := _no_count(order):
             # ours or not: a row that shows no count says nothing sure about the symbol, and read as
@@ -550,6 +622,37 @@ def _opened(trading: TradingClient, symbol: str, now: datetime) -> tuple[Decimal
             f"the fill counts of the orders in {symbol} cannot be summed, so the quantity ours opened "
             "is not established"
         )
+
+
+def _page_out_of_order(
+    symbol: str,
+    page: list[Order],
+    stamps: list[datetime],
+    after: datetime,
+    until: datetime | None,
+    edge: set[str],
+) -> str:
+    """Why a page of a paged history cannot be trusted to continue the walk, or "". The walk holds
+    only if the venue does as asked: every row inside `after` and `until`, newest first, and the
+    orders at the last page's earliest time listed again (the boundary overlaps them under either
+    reading of `until`'s equality). A venue that answers oldest first or keeps fewer digits of
+    `until` would otherwise end the walk with orders of ours unread."""
+    if any(stamp < after or (until is not None and stamp > until) for stamp in stamps):
+        return _Unread(
+            f"a history page in {symbol} holds an order outside the time asked for, so the "
+            "quantity ours opened is not established"
+        )
+    if any(later > earlier for earlier, later in pairwise(stamps)):
+        return _Unread(
+            f"history pages in {symbol} are not newest first, so the quantity ours opened is not "
+            "established"
+        )
+    if not edge <= {str(order.id) for order in page}:
+        return _Unread(
+            f"a history page in {symbol} does not hold the orders at the edge of the page before, "
+            "so the quantity ours opened is not established"
+        )
+    return ""
 
 
 def _net_of_ours(symbol: str, orders: list[Order]) -> tuple[Decimal | None, str]:
@@ -601,8 +704,8 @@ def _net_of_ours(symbol: str, orders: list[Order]) -> tuple[Decimal | None, str]
                 if replaced is None:
                     owner = " of ours" if mine else ""
                     return None, _Unread(
-                        f"an order{owner} in {symbol} replaces one the listing of the last "
-                        f"{LINEAGE_LOOKBACK} does not hold, whose fills it carries, so the quantity "
+                        f"an order{owner} in {symbol} replaces one the listing of the current "
+                        "trading week does not hold, whose fills it carries, so the quantity "
                         "ours opened is not established"
                     )
                 earlier = _shown(replaced.filled_qty)
@@ -699,7 +802,7 @@ def read_holdings(trading: TradingClient, now: datetime) -> list[Holding]:
         elif holding.held is not None and holding.held > 0 and holding.held != holding.opened:
             holding.frozen.append(
                 f"{holding.held} {holding.symbol} held, but our orders opened {holding.opened} in the "
-                f"last {LINEAGE_LOOKBACK}"
+                "current trading week"
             )
     for holding in found.values():
         holding.frozen[:] = dict.fromkeys(
