@@ -10236,6 +10236,7 @@ def test_a_mover_window_hands_its_trigger_to_the_strategy(
         part="after-hours",
         pick=mover_pick(),
         entry_notional=Decimal(500),
+        loss_share=PAPER_LOSS_SHARE,
         ends=ends,
     )
     try:
@@ -10337,6 +10338,7 @@ def test_a_print_trigger_turns_the_data_clients_trade_condition_filter_on(
         part="after-hours",
         pick=mover_pick(),
         entry_notional=Decimal(500),
+        loss_share=PAPER_LOSS_SHARE,
         ends=ends,
     )
     try:
@@ -10369,6 +10371,9 @@ def test_a_mover_windows_record_says_whether_the_trade_condition_filter_is_on(
     )
     assert not isinstance(outcome, Exception), outcome
     assert latest["mover"]["trade_condition_filter"] is (trigger == "last_price")
+    # a print trigger's open limits are named in its record, and only in its (xr3 fast reader, note 3)
+    named = set(latest["mover"].get("open_findings", ()))
+    assert (set(session_window.PRINT_TRIGGER_FINDINGS) <= named) is (trigger == "last_price")
 
 
 def test_a_print_trigger_on_a_part_off_the_sip_feed_is_refused_by_name(

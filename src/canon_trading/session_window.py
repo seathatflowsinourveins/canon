@@ -1245,6 +1245,27 @@ LIVE_OPEN_FINDINGS = (
 )
 """What a live-ranking firing's record names as open (the lead's decision of 2026-11-11)."""
 
+PRINT_TRIGGER_FINDINGS = (
+    (
+        "a print trigger elects on a trade print alone: no check against the quote or the NBBO at "
+        "election (ADR 0119)"
+    ),
+    (
+        "under a print trigger a holding with no print of its own since its fill and a cached two-sided "
+        "quote is held until a print or the wind-down; the 60 s unpriced exit reads the cached quote, "
+        "and the adapter discards a quote with a side at or under zero, so a name whose quotes turn "
+        "one-sided keeps its last two-sided one"
+    ),
+    "the SIP print's venue time against Alpaca's fill time at the entry's boundary is UNVERIFIED",
+    (
+        "the guard against a print stamped before the entry covers the strategy's reads at arming, "
+        "remake and hold only; the armed emulator takes each print as received, so a delayed print "
+        "stamped before the fill, or before one already received, can elect an armed stop"
+    ),
+)
+"""What a window under a print trigger names as open, beside `LIVE_OPEN_FINDINGS` (the xr3 fast
+reader's note 3 on the trigger unit, 2026-11-12)."""
+
 
 def _records(run: Mapping[str, Any]) -> list[Mapping[str, Any]]:
     return [r for r in run.get("ranking_records", ()) if isinstance(r, dict)]
@@ -3153,7 +3174,9 @@ def run_window(
         if basis is not None:
             mover["baseline"] = basis
         mover["ranking_source"] = f"live: ADR 0107's actor over the wildcard stream on {feed}"
-        mover["open_findings"] = list(LIVE_OPEN_FINDINGS)
+        mover["open_findings"] = list(LIVE_OPEN_FINDINGS) + (
+            list(PRINT_TRIGGER_FINDINGS) if config.trigger in PRINT_TRIGGERS else []
+        )
         if arm == "registered":
             entry_contexts = mover_entry_contexts(
                 data,

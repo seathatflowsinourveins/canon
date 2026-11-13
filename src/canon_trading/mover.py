@@ -3532,7 +3532,24 @@ class Mover(Strategy):
         # keeps it as it keeps a reached trigger (xr7-r-heldl, P1)
         held_level = None if slot.held_stop is None else stop_trigger_price(slot.held_stop)
         if slot.held_since is not None:
+            # the first followed price meets the held stop before the hold ends, under either trigger
+            # (the lead's H1-H3, 2026-11-12; the xr3 fast reader's SF1 and its BID_ASK twin): at or
+            # under it, the hold's sale at once; above it, the trail starts from it, never lower, so
+            # the held stop goes only by a sale or by a trigger at least as high taking its place
+            level = slot.held_stop
+            kept_level = None if level is None else stop_trigger_price(level)
+            if kept_level is not None and at <= kept_level:
+                slot.exiting = True
+                self._mark_exit(slot, now, at, "held stop (followed price)")
+                if slot.entry_record is not None:
+                    slot.entry_record["held_stop_trigger"] = "followed price"
+                self._end_hold(slot, now, "held_stop")
+                self._limit_sell(slot, held, now, slot.floor, anchor=at)
+                return
             self._end_hold(slot, now, "trail")
+            if kept_level is not None:
+                reached = slot.trail_trigger
+                slot.trail_trigger = kept_level if reached is None else max(reached, kept_level)
         # the reached trigger on Alpaca's step, one value for the check below and for the remade sell
         reached = slot.trail_trigger
         kept = None if reached is None else stop_trigger_price(reached)

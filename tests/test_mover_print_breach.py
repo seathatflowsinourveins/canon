@@ -215,8 +215,11 @@ def test_a_print_after_the_fill_by_the_venues_clock_is_followed_whatever_its_rec
 
 def test_under_a_print_trigger_a_quote_turning_one_sided_mid_hold_sells_at_the_next_step() -> None:
     """The one bound short of the wind-down on a print trigger's hold: two-sided with no print, the
-    holding is held past 60 s; once its quote reads one-sided it sells as `unpriced_exit` at the next
-    step (the lead's counted limit, 2026-11-12)."""
+    holding is held past 60 s; once its cached quote reads one-sided it sells as `unpriced_exit` at the
+    next step (the lead's counted limit, 2026-11-12). This tests the cached quote only: the adapter
+    discards a quote with a side at or under zero (canon_alpaca.data `parse_quote`), so on a live feed
+    the cache keeps the last two-sided quote and the holding waits for a print or the wind-down, as
+    `PRINT_TRIGGER_FINDINGS` names (xr3 fast reader, note 2)."""
     seam, slot, filled, _ = holding(TriggerType.LAST_PRICE, bid="10.05", ask="10.07")
     seam._protect(slot, Decimal(3), filled + SECOND)
     seam._protect(slot, Decimal(3), filled + 61 * SECOND)
@@ -226,3 +229,33 @@ def test_under_a_print_trigger_a_quote_turning_one_sided_mid_hold_sells_at_the_n
     seam._protect(slot, Decimal(3), filled + 62 * SECOND)
     assert [o.kind for o in seam.sent] == ["LIMIT"] and slot.exiting
     assert slot.exit_record.trigger_reason == "unpriced_exit"
+
+
+def test_under_a_print_trigger_the_first_print_through_the_held_stop_sells() -> None:
+    """A fresh holding whose cached print predates its fill is held at 9.80 (10.00 less the 2% trail).
+    The first print of its own, at 9.70, is through that stop: it sells by limit as the held stop, and
+    is not armed as a trail from 9.70 with no trigger, which would protect it at 9.50 (xr3 fast
+    reader, SF1)."""
+    seam, slot, filled, last = holding(TriggerType.LAST_PRICE, bid="9.69", ask="9.71")
+    last.append(stamped("10.0000", filled - SECOND, filled - SECOND))
+    seam._protect(slot, Decimal(3), filled + SECOND)
+    assert slot.held_stop == Decimal("9.80") and seam.sent == []
+    last.append(stamped("9.7000", filled + 2 * SECOND, filled + 2 * SECOND))
+    seam._protect(slot, Decimal(3), filled + 3 * SECOND)
+    assert [o.kind for o in seam.sent] == ["LIMIT"] and slot.exiting
+    assert slot.exit_record.trigger_reason == "held stop (followed price)"
+    assert slot.entry_record is None or slot.entry_record.get("protect_path") == "held_stop"
+
+
+def test_under_a_print_trigger_a_first_print_above_the_held_stop_arms_the_trail_from_it() -> None:
+    """The same hold, its first own print at 9.90, above the 9.80 stop: the trail is armed with its
+    trigger at the held stop on Alpaca's step, so the protection does not fall to 9.90 less the trail
+    (xr3 fast reader, SF1)."""
+    seam, slot, filled, last = holding(TriggerType.LAST_PRICE, bid="9.89", ask="9.91")
+    last.append(stamped("10.0000", filled - SECOND, filled - SECOND))
+    seam._protect(slot, Decimal(3), filled + SECOND)
+    last.append(stamped("9.9000", filled + 2 * SECOND, filled + 2 * SECOND))
+    seam._protect(slot, Decimal(3), filled + 3 * SECOND)
+    assert [o.kind for o in seam.sent] == ["TRAILING"] and not slot.exiting
+    assert seam.sent[0].trigger_price is not None
+    assert Decimal(str(seam.sent[0].trigger_price)) == Decimal("9.80")
