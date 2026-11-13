@@ -5,7 +5,7 @@ decision-makers: repo owner (requirement, 2026-11-11: a breach must persist befo
 review-by: 2026-12-12
 ---
 
-# A breach is the venue's own election, a consolidated print not outside the quote, and here also a second print after a gap, the stop held by the strategy and off by default; open: the quote test, a paper window, the protector's use of it, the gap's value and the silent tape
+# A breach is the venue's own election, a consolidated print not outside the quote, and here also a second print after a gap (under the default arm two spaced two-sided quotes, amended 2026-11-13), the stop held by the strategy and off by default; open: the quote test, a paper window, the protector's use of it, the gap's value and the silent tape
 
 ## Context and Problem Statement
 
@@ -169,7 +169,7 @@ Read 2026-11-12. Resolved means read in a local copy at the commit `canon/upstre
   `crates/execution/src/order_emulator/emulator.rs:598-606`, only `Default`, `BidAsk` and `LastPrice`
   are emulated and any other trigger cancels the order; `:1076-1104`, each quote or trade tick is
   matched as it arrives; `crates/execution/src/matching.rs:555-572`, with the comparison at `:426-436`
-  and `:583-599`, one price and no count or time; `crates/model/src/enums.rs:2219-2222`, the two double
+  and `:583-599`, one price and no count or time; `crates/model/src/enums.rs:2221-2223`, the two double
   types; `docs/concepts/orders/index.md:221-222`, "Requires two consecutive matching last prices";
   `crates/adapters/interactive_brokers/`, the only adapter that names `DoubleLast`;
   `emulator.rs:612-650` and `:704-714`, the trigger instrument and its subscription;
@@ -219,3 +219,123 @@ Read 2026-11-12. Resolved means read in a local copy at the commit `canon/upstre
   https://docs.alpaca.markets/us/docs/245-trading-for-trading-api.md ("8:00 PM ET Sunday to 4:00 AM ET
   Friday"), `fetched` by the evidence-verifier. Its pass corrected the line's cause for no scheduled
   overnight firing, tied the windows to their commits and counted the whole night. Applied.
+
+## Amendment, 2026-11-13: the count moves to two-sided quotes under the default arm, a span joins it, and the protection part is its second carrier
+
+**What this changes in the record above.** The count and the gap stay. What changes is their tape and their
+arm: a breach is counted on two-sided quotes, not trade prints only, so the default paper window stops electing
+on one quote. A span row joins the count and the gap. ADR 0119 stays `proposed`, and nothing is lifted in code
+until this amendment is on `main` and the protection part's seam (ADR 0146) exists.
+
+**The gap (AGENTS.md rule 3).** Upstream at both pins has no multi-observation or span trigger for an emulated
+order. At `nautilus-trader@d53849b216e2` the emulator accepts only `Default`,
+`BidAsk` and `LastPrice` and cancels any other trigger
+(`crates/execution/src/order_emulator/emulator.rs:598-606`); each quote tick replaces the one bid and ask and
+iterates the orders at once (`:1076-1091`); a stop matches one price, with no count or span
+(`crates/execution/src/matching.rs:426-437`, `:555-580`, `:583-599`); release and submission follow in the same tick
+(`emulator.rs:1267-1293`, `:1315-1416`). `DoubleLast` and `DoubleBidAsk` are enum values only
+(`crates/model/src/enums.rs:2221-2223`), and only the Interactive Brokers adapter names them. The v1 pin has the
+same guard (`crates/execution/src/order_emulator/emulator.rs:570-578`) and the same unimplemented doubles
+(`crates/model/src/enums.rs:2019-2021`).
+
+**What `main` refuses today.** `MoverConfig.__init__` refuses `breach_count` or `high_count` above one unless
+the trigger is `LAST_PRICE`, `trail_mode` is `fixed`, `size_from_budget` is false and `protect` is true
+(`mover.py:1137-1158`). The default window is none of those: OWN1 is `atr` over `own`
+(`session_window.py:540-550`), the trigger is `bid_ask` (`:761`), the budget sizes the entry (`:1742`), and no
+breach or high count is passed, so both are one. A default window therefore elects on one quote through the
+emulator (a code reading of 2026-11-13, its first finding).
+
+**The rule.** A breach is `breach_count` counted observations at or under the held level; a new high is
+`high_count` counted observations above the confirmed high. Under the default arm an observation is one
+two-sided quote: a positive bid and ask (`two_sided`, `mover.py:1712-1720`). It is stamped by the earlier of its
+event time and its receipt, as a print is (`stamp_of`, `:1869-1876`). It counts only if it is at least
+`confirm_gap_ms` after the last that counted, and the counted set must lie inside `confirm_span_ms`. A quote
+whose bid is above the level clears the breach count; one at or under the confirmed high clears the high count.
+A one-sided quote, or a crossed one (`bid > ask`), neither counts nor clears; a locked one (`bid == ask`) counts,
+its bid being a price at which the holding can sell. A quote with the last counted quote's stamp may clear and
+never counts; an older one does neither. The count and the high are held by the strategy, and the sale is a DAY
+limit through the bid on the first step after the confirming quote, then the existing chase.
+
+| Row | Value | Source | Status |
+|---|---|---|---|
+| `breach_count` | 2 | ADR 0119's on row, framed on consolidated trade prints | UNCALIBRATED on quotes |
+| `high_count` | 2 | ADR 0119's on row | UNCALIBRATED on quotes |
+| `confirm_gap_ms` | 100 | ADR 0119's on row, bounded by the 2026-11-12 tape tables on prints | UNCALIBRATED on quotes |
+| `confirm_span_ms` | unset: no maximum until the measure sets one | this amendment; no measured source (ADR 0119's option 5 is the nearest, unmeasured on a consolidated quote) | UNCALIBRATED |
+
+The counts are off at one (`mover.py:1013-1014`), the gap's 100 ms is inert while they are, and the span is unset, and none is carried into code before the amendment lands. The
+span is the one row with no measured source; until it has one the count keeps ADR 0119's no-expiry, and every
+exit records the span its counted quotes covered so the measure can set it.
+
+**The carrier.** The Mover's held stop (`_protect`, `mover.py:3933`, and `_persistent_trail`, `:4069`) and,
+once its seam exists, the protection part ADR 0146 opens, which must run the same state machine so a reconciled
+holding gets the same rule. ADR 0146's gap is the part; this amendment does not build it.
+
+**The measure.** A count per arm, never profit and loss: exits by the trailing stop, exits within 60 s of the
+first fill, and re-entries after a stop. The arms are today's one-quote election, the count with the gap, and
+the count with the span once it is calibrated. The first paper windows run the count and the gap with the span
+unbounded.
+
+**Related, handled elsewhere.** The same reading's second finding (the held stop's `chase_cap`, the whole-holding anchors and tightenings, and
+reconciled holdings in `_protect` and `_persistent_trail`) is a fix for the record of the change that builds the held stop. Its third finding
+(`protection_diagnostics` and `d3_check._a3` reading a strategy-held stop as unprotected) is another. Neither is
+proposed here.
+
+### Consequences
+
+* Good: a default window no longer sells on one quote, and the Mover and the protection part share one rule.
+* Good: the rows are named and off by default, and no code is lifted before the amendment lands.
+* Bad: the span has no measured value, so the first windows run without it, with the count and the gap only.
+* Bad: a sale leaves up to one `STEP_SECS` after the confirming quote (`mover.py:507`), where the emulator acts
+  inside the tick.
+* Bad: a quote tape that goes silent at the level holds; only the wind-down or the unpriced exit covers it.
+
+### Confirmation
+
+ADR 0119 stays `proposed` until:
+
+* the quote path is tested first on shaped tapes: one quote under the level holds, two spaced quotes under it
+  sell, a quote above between them holds, one-sided and crossed quotes neither count nor clear, and the
+  equal-stamp and late-quote rules hold;
+* the span has a value from the measure, or the lead records that the count stays unbounded;
+* the protection part's seam exists and the Mover and the protection part produce the same held trigger and sale on the
+  same tape;
+* the paper measure has counted the arms.
+
+### Evidence
+
+Read 2026-11-13. The pins are the local read-only copies from `scripts/canon src`,
+resolved from `canon/upstreams.lock.json`: `nautilus-trader@d53849b216e2` (v2.0.0rc8) and
+`nautilus-trader-v1@27a8e54e7ac3` (v1.231.0).
+
+* https://github.com/nautechsystems/nautilus_trader/blob/d53849b216e20f2c122ca01b4dd0da377638b186/crates/execution/src/order_emulator/emulator.rs
+  — the emulator accepts only `Default`, `BidAsk` and `LastPrice` and cancels any other trigger (`:598-606`); a
+  quote tick sets one bid and ask and iterates the orders (`:1076-1091`); release and submission
+  (`:1267-1293`, `:1315-1416`) — `resolved`; re-read in the pin above.
+* https://github.com/nautechsystems/nautilus_trader/blob/d53849b216e20f2c122ca01b4dd0da377638b186/crates/execution/src/matching.rs
+  — a stop matches one price, with no count and no span (`:555-580`, `:583-599`) — `resolved`; re-read.
+* https://github.com/nautechsystems/nautilus_trader/blob/d53849b216e20f2c122ca01b4dd0da377638b186/crates/model/src/enums.rs
+  — `DoubleLast` and `DoubleBidAsk` exist as values (`:2221-2223`) and are carried only by the Interactive
+  Brokers adapter — `resolved`; re-read.
+* https://github.com/nautechsystems/nautilus_trader/blob/27a8e54e7ac3c57d6cbf8891f0283dfbaee97317/crates/execution/src/order_emulator/emulator.rs
+  — the same three accepted triggers and the same cancellation of any other (`:570-578`) — `resolved`; re-read.
+  `.../crates/model/src/enums.rs:2019-2021` — the same two double values; `.../crates/execution/src/matching_engine/engine.rs:4138`
+  names them in a comment only — `resolved`.
+* `docs/adr/0119` — the count and the gap on trade prints only, and the refused `BID_ASK` and `trail_mode` with
+  persistence (`:59-60`, `:70`, `:103-105`); read in the tree.
+* `docs/handbook/practices.md:42` — "A breach needs a count of observations over a span, never one quote, print
+  or bar"; read in the tree.
+* `src/canon_trading/mover.py` — the four refusals (`:1137-1158`), the one-quote submit (`:4318-4330`), the
+  count, gap and trigger defaults (`:1013-1015`, `:1031`), `persistence` (`:1237-1239`), `two_sided`
+  (`:1712-1720`), `stamp_of` (`:1869-1876`); read in the tree at `e782817a`.
+* `src/canon_trading/session_window.py` — `TRAIL_ARMS` and `DEFAULT_ARM` (`:540-550`), the window trigger
+  (`:761`), `size_from_budget=True` (`:1742`); read in the tree at `e782817a`.
+* `docs/adr/0146` — the protection part's gap and its carrier (`:8`, `:70-78`); read in the tree.
+* Paper account B: 31 exits by the trailing stop in 34 windows, 8 of them within 60 s of the first fill — the
+  lead's read of the by-hand window records, 2026-11-13 15:10, kept outside the repository, so `UNVERIFIED`
+  for a later reader.
+* On the owner's protect practice: per-symbol broker stops elected on one observation sold the whole holding
+  within five minutes of the buy and within two minutes of resting — the lead's read, kept outside the
+  repository, so `UNVERIFIED` for a later reader.
+* A code reading of 2026-11-13, its first finding: the default arm electing on one quote, and the pinned citations above. Its
+  second and third findings are related findings handled elsewhere.
