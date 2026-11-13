@@ -461,6 +461,8 @@ ADDED_SINCE_P1 = {
         "order_refusals",
         "refusals",
         "remakes_under_floor",
+        "late_prints_set_aside",  # late prints: each print set aside, and those stamped ahead
+        "prints_stamped_ahead",
     ),
     "entry": ("profile", "arming", "trail_cap", "spread_floor", "own_measure", "entry_price"),
     "exit": ("sales", "held_stop_kept", "held_stop_from_average"),
