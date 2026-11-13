@@ -56,7 +56,9 @@ pre-market, regular and after-hours use `sip` and overnight `boats` (`MOVER_PART
 spans, 04:00-20:00 on `sip` and 20:00-04:00 on `boats`, and one node runs each span whole: two nodes and
 two hand-overs a day, both outside the regular session, each a planned restart. For a node that carries a
 long this amends ADR 0044's bound of 60 minutes a window (the lead's ruling of 2026-11-13); every other
-window keeps it. A node running sixteen hours has not been run, so its soak (memory, the stream across
+window keeps it. ADR 0044's amendment of 2026-11-13 narrows this: until it is relaxed, only a by-hand
+paper run under a flag of its own runs past 60 minutes, and no scheduled window does, so the two nodes
+a day are by hand for now. A node running sixteen hours has not been run, so its soak (memory, the stream across
 hours, reconnects) is `UNVERIFIED` until it is. The adapter resets its feed on a reconnect, so one node
 switching feeds without a restart may be possible; that is not tried.
 
@@ -147,4 +149,5 @@ repository path is read in the tree at `05905849`.
   closes stop a stray print; the cache database's backings; a day as two nodes; the restart as already
   exercised; the Alpaca quotes, now fetched; two line numbers and two qualifiers. It added the reconnect
   caveat and the first-step check from the plan. Applied. The lead's ruling of the same day then set one
-  node per feed span, amending ADR 0044's 60-minute bound for a carrying node, with the soak `UNVERIFIED`.
+  node per feed span, amending ADR 0044's 60-minute bound for a carrying node, with the soak `UNVERIFIED`;
+  ADR 0044's later amendment of that day limits this to a by-hand paper run under its own flag.
