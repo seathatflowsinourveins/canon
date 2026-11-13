@@ -32,7 +32,9 @@ PATH="$TMP/bin:$PATH"; export PATH
 # `gh pr view --json title|body --jq` prints; that call fails when the file is missing); views (one
 # `gh pr view` answer per line, "<state> <sha>", the last repeated; HEAD and OTHER stand for the current
 # commit and another one); checks
-# (the failed required checks `gh pr checks --jq` would print).
+# (the failed required checks `gh pr checks --jq` would print). A file named for a call's answer on stderr
+# makes that call fail with it: view_err (the wait's `pr view`), checks_err, merge_err (the direct merge,
+# with merge_rc), pr_info_err (`pr view` for --pr).
 cat > "$TMP/bin/mise" <<'FAKE'
 #!/bin/bash
 [ "${1:-} ${2:-} ${3:-}" = "exec -- gh" ] || { echo "fake mise: unexpected call: $*" >&2; exit 99; }
@@ -40,33 +42,45 @@ shift 3
 printf 'gh %s\n' "$*" >> "$FAKE/log"
 rc() { if [ -f "$FAKE/$1" ]; then cat "$FAKE/$1"; else echo 0; fi; }
 case "${1:-} ${2:-}" in
-  "auth status") exit "$(rc auth_rc)" ;;
+  "auth status") [ ! -f "$FAKE/auth_err" ] || cat "$FAKE/auth_err" >&2; exit "$(rc auth_rc)" ;;
   "pr list")     [ ! -f "$FAKE/pr_open" ] || cat "$FAKE/pr_open" ;;
   "pr create")   echo "7 https://github.example/o/r/pull/7" > "$FAKE/pr_open" ;;
-  "pr checks")   [ ! -f "$FAKE/checks" ] || cat "$FAKE/checks" ;;
+  "pr checks")   if [ -f "$FAKE/checks_err" ]; then cat "$FAKE/checks_err" >&2; exit 1; fi
+                 [ ! -f "$FAKE/checks" ] || cat "$FAKE/checks" ;;
   "pr merge")    prev=""; for a in "$@"; do [ "$prev" != "--body-file" ] || cp "$a" "$FAKE/merge_body"; prev=$a; done
                  case "$*" in
                    *--auto*) r=$(rc auto_rc);  [ "$r" -eq 0 ] || echo "auto-merge refused by the fake" >&2 ;;
-                   *)        r=$(rc merge_rc); [ "$r" -eq 0 ] || echo "direct merge refused by the fake" >&2 ;;
+                   *)        r=$(rc merge_rc)
+                             if [ "$r" -ne 0 ]; then
+                               if [ -f "$FAKE/merge_err" ]; then cat "$FAKE/merge_err" >&2; else echo "direct merge refused by the fake" >&2; fi
+                             fi ;;
                  esac
                  exit "$r" ;;
   "pr checkout") b=$(cat "$FAKE/pr_head")
                  git fetch -q origin "+refs/heads/$b:refs/heads/$b" && git worktree add -q "$5" "$b" ;;
   "pr view")
-    case "$*" in *headRefName*) cat "$FAKE/pr_info"; exit 0 ;; esac
+    case "$*" in *headRefName*)
+      if [ -f "$FAKE/pr_info_err" ]; then cat "$FAKE/pr_info_err" >&2; exit 1; fi
+      cat "$FAKE/pr_info"; exit 0 ;;
+    esac
     for f in title body; do
       case "$*" in *"--json $f "*)
         [ -f "$FAKE/pr_$f" ] || { echo "fake: no pull request $f" >&2; exit 1; }
         cat "$FAKE/pr_$f"; exit 0 ;;
       esac
     done
+    if [ -f "$FAKE/view_err" ]; then cat "$FAKE/view_err" >&2; exit 1; fi
     line=$(sed -n 1p "$FAKE/views")
     if [ "$(wc -l < "$FAKE/views")" -gt 1 ]; then tail -n +2 "$FAKE/views" > "$FAKE/views.next" && mv "$FAKE/views.next" "$FAKE/views"; fi
     line=${line/HEAD/$(git rev-parse HEAD)}
     printf '%s\n' "${line/OTHER/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}" ;;
   "api rate_limit") # rate: the spent budgets, "<core|graphql> <limit> <reset>" a line, empty for none;
-                    # rate_late: the same, answered only once a status was posted
+                    # rate_late: the same, answered only once a status was posted; rate_after_auth: once
+                    # gh auth status ran; rate_json_err: gh's way with an error body, which skips --jq,
+                    # prints the body on stdout and exits 1 (gh at its pin, pkg/cmd/api/api_test.go:662-675)
+                    if [ -f "$FAKE/rate_json_err" ]; then printf '{"message": "Bad credentials", "status": "401"}\n'; exit 1; fi
                     if [ -f "$FAKE/rate_late" ] && grep -q statuses "$FAKE/log"; then cat "$FAKE/rate_late"; exit 0; fi
+                    if [ -f "$FAKE/rate_after_auth" ] && grep -q "auth status" "$FAKE/log"; then cat "$FAKE/rate_after_auth"; exit 0; fi
                     [ -f "$FAKE/rate" ] || { echo "gh: HTTP 500" >&2; exit 1; }; cat "$FAKE/rate" ;;
   "api -X")      # api_refuse: a status context (review or signoff) GitHub refuses, as a spent REST budget did
                  if [ -f "$FAKE/api_refuse" ] && case "$*" in *"context=$(cat "$FAKE/api_refuse")"*) true ;; *) false ;; esac; then
@@ -193,6 +207,84 @@ t_status_refused_spent() { # the budget runs out after the checks: the refused s
   fi
 }
 case_ "origin and gh signed out: refused, main not moved"  t_signed_out
+RATE_WORDS="gh: API rate limit exceeded for user ID 1. (HTTP 403)"
+t_wait_view_spent() {      # F1: the wait's pr view meets a spent budget: named, the outcome unknown, no more polling
+  new_repo; change README.md; : > "$FAKE/rate"; echo "core 5000 1763002800" > "$FAKE/rate_late"
+  echo "$RATE_WORDS" > "$FAKE/view_err"; land
+  why="a spent budget in the wait was read as not merged, or polled on"
+  [ "$rc" -ne 0 ] && has "REST budget is spent (0 of 5000)" && has "cannot be read" && ! has "has not marked it merged" \
+    && [ "$(grep -c 'gh pr view 7 --json state' "$FAKE/log")" = 1 ]
+}
+t_auto_unread() {          # R3: --auto succeeded, then the wait cannot read: gh merges at once when CLEAN, so not "auto-merge is on"
+  new_repo; change README.md; : > "$FAKE/rate"; echo "core 5000 1763002800" > "$FAKE/rate_late"
+  echo 1 > "$FAKE/merge_rc"; echo "checks pending" > "$FAKE/merge_err"; echo "$RATE_WORDS" > "$FAKE/view_err"; land
+  why="an accepted auto-merge request was reported as auto-merge armed"
+  [ "$rc" -ne 0 ] && logged "--auto" && has "REST budget is spent (0 of 5000)" && ! has "auto-merge is on" \
+    && has "accepted the auto-merge request"
+}
+t_auto_timeout() {         # R3: --auto succeeded and the wait runs out: the request is named, not "auto-merge is on"
+  new_repo; change README.md; echo 1 > "$FAKE/merge_rc"; echo "checks pending" > "$FAKE/merge_err"
+  echo "OPEN HEAD" > "$FAKE/views"; land
+  why="an accepted auto-merge request was reported as auto-merge on"
+  [ "$rc" -ne 0 ] && has "is not merged after" && has "accepted the auto-merge request" && ! has "uto-merge is on"
+}
+t_auth_words_ignored() {   # R4: gh auth status fails with rate-limit words while /rate_limit shows calls left: signed out
+  new_repo; change README.md; : > "$FAKE/rate"; echo 1 > "$FAKE/auth_rc"; echo "$RATE_WORDS" > "$FAKE/auth_err"; land
+  why="words on gh auth status's stderr were read as a spent budget"
+  [ "$rc" -ne 0 ] && has "not signed in" && ! has "rate limit was exceeded" && ! has "budget is spent"
+}
+t_wait_checks_spent() {    # F1: the wait's pr checks meets a spent budget: named, not read as no failed check
+  new_repo; change README.md; : > "$FAKE/rate"; echo "core 5000 1763002800" > "$FAKE/rate_late"
+  echo "OPEN HEAD" > "$FAKE/views"; echo "$RATE_WORDS" > "$FAKE/checks_err"; land
+  why="a spent budget in the checks read was not named, or polled on"
+  [ "$rc" -ne 0 ] && has "REST budget is spent (0 of 5000)" && ! has "is not merged after" \
+    && [ "$(grep -c 'gh pr checks' "$FAKE/log")" = 1 ]
+}
+t_merge_spent() {          # F1: a direct merge refused on a spent budget is named, and auto-merge is not tried
+  new_repo; change README.md; : > "$FAKE/rate"; echo "core 5000 1763002800" > "$FAKE/rate_late"
+  echo 1 > "$FAKE/merge_rc"; echo "$RATE_WORDS" > "$FAKE/merge_err"; land
+  why="a merge refused on a spent budget was retried as auto-merge, or not named"
+  [ "$rc" -ne 0 ] && has "REST budget is spent (0 of 5000)" && ! logged "--auto"
+}
+t_rate_words_only() {      # F2: GitHub's answer says rate limit while /rate_limit shows calls left: named, reset unknown
+  new_repo; change README.md; : > "$FAKE/rate"; echo review > "$FAKE/api_refuse"; land
+  why="a rate-limited answer was not named as one"
+  [ "$rc" -ne 0 ] && has "the review status" && has "GitHub answered that a primary rate limit was exceeded" && has "its reset are unknown"
+}
+t_pr_info_rate() {         # F2: a --pr read refused on a rate limit is not called "not found"
+  new_repo; : > "$FAKE/rate"; echo "$RATE_WORDS" > "$FAKE/pr_info_err"; land --pr 7
+  why="a rate-limited read of the pull request was called not found"
+  [ "$rc" -ne 0 ] && ! has "not found" && has "GitHub answered that a primary rate limit was exceeded"
+}
+t_wait_secondary() {       # a secondary rate limit in the wait is not a spent budget: the wait goes on and lands
+  new_repo; change README.md; : > "$FAKE/rate"
+  echo "gh: You have exceeded a secondary rate limit. (HTTP 403)" > "$FAKE/checks_err"
+  printf 'OPEN HEAD\nMERGED HEAD\n' > "$FAKE/views"; land
+  why="a secondary rate limit stopped the land"
+  [ "$rc" -eq 0 ] && has "landed:"
+}
+t_merge_core_spent() {     # a merge refused for another reason while REST is spent: auto-merge is still tried
+  new_repo; change README.md; : > "$FAKE/rate"; echo "core 5000 1763002800" > "$FAKE/rate_late"
+  echo 1 > "$FAKE/merge_rc"; echo "MERGED HEAD" > "$FAKE/views"; land
+  why="a merge refused for another reason was blamed on the REST budget"
+  logged "--auto" && [ "$rc" -eq 0 ] && has "landed:"
+}
+t_check_named_rate() {     # a required check whose name says rate limit is not read as GitHub's answer
+  new_repo; change README.md; : > "$FAKE/rate"; echo "OPEN HEAD" > "$FAKE/views"; echo "rate limit replay" > "$FAKE/checks"; land
+  why="a check's name was read as a rate limit"
+  [ "$rc" -ne 0 ] && has "a required check failed" && ! has "GitHub answered"
+}
+t_auth_spent() {           # F3: the budget runs out between the first read and gh auth status: named, not signed out
+  new_repo; change README.md; : > "$FAKE/rate"; echo "core 5000 1763002800" > "$FAKE/rate_after_auth"
+  echo 1 > "$FAKE/auth_rc"; land
+  why="a budget spent at gh's own check was called a sign-out"
+  [ "$rc" -ne 0 ] && has "REST budget is spent (0 of 5000)" && ! has "not signed in"
+}
+t_rate_json_err() {        # F4: an error body gh prints for /rate_limit is not read as a budget
+  new_repo; change README.md; touch "$FAKE/rate_json_err"; land
+  why="gh's error body was read as a spent budget"
+  [ "$rc" -eq 0 ] && has "landed:" && ! has "budget"
+}
 case_ "a spent REST budget is named with its reset, signed in"  t_budget_spent signed-in
 case_ "a spent REST budget is named, not called signed out"  t_budget_spent signed-out
 case_ "a spent GraphQL budget is named, not called signed out"  t_budget_spent signed-out graphql
@@ -200,6 +292,19 @@ case_ "a REST budget with calls left lands"                 t_budget_left
 case_ "a refused review status fails the land by name"     t_status_refused review
 case_ "a refused signoff status fails the land by name"    t_status_refused signoff
 case_ "a status refused on a budget spent after the checks names it"  t_status_refused_spent
+case_ "a spent budget in the merge wait is named; the outcome is unknown"  t_wait_view_spent
+case_ "a spent budget in the checks read is named, not polled on"  t_wait_checks_spent
+case_ "a merge refused on a spent budget is not retried as auto-merge"  t_merge_spent
+case_ "GitHub's own rate-limit answer is named when /rate_limit disagrees"  t_rate_words_only
+case_ "a rate-limited --pr read is not called not found"   t_pr_info_rate
+case_ "a budget spent at gh's own check is not called signed out"  t_auth_spent
+case_ "an accepted auto-merge request is not reported as armed when the wait cannot read"  t_auto_unread
+case_ "an accepted auto-merge request is not reported as armed when the wait runs out"  t_auto_timeout
+case_ "rate-limit words from gh auth status are not read as a spent budget"  t_auth_words_ignored
+case_ "a secondary rate limit in the wait is not a spent budget"  t_wait_secondary
+case_ "a merge refused for another reason while REST is spent still tries auto-merge"  t_merge_core_spent
+case_ "a check named for a rate limit is not GitHub's answer"  t_check_named_rate
+case_ "gh's error body for /rate_limit is not read as a budget"  t_rate_json_err
 case_ "a --pr run with no origin: refused, main not moved"  t_inner_no_origin
 case_ "local path prints the review note it cannot record" t_local_note
 
@@ -762,6 +867,40 @@ t_trailers_url_body() {    # a description ending in a bare URL keeps it as writ
     && [ "$(merged_trailer Fails-before)" = "tests/test_gate.py::test_gate" ] \
     && [ "$(merged_trailer Confirms)" = "round-3/codex-2" ]
 }
+t_trailers_long_body() {   # a long UTF-8 description with a missing trailer is marked in linear time, and kept
+  # bash 3.2's ${text//[[:space:]]/} took 4 s on 2 KB and did not finish 12 KB in 20 s under UTF-8, so a
+  # land with a 48 KB description spun for many minutes. A land here takes seconds; the bound is wide for a
+  # loaded machine. It fails before the fix only where bash is 3.2 (macOS's /bin/bash), not on bash 5.
+  new_repo
+  fix src/canon_trading/ranking.py "Fix the gate's finding" "Fails-before: tests/test_gate.py::test_gate"
+  awk 'BEGIN { print "## Summary\n"; for (i = 0; i < 640; i++) print "Line " i " \342\200\224 a long d\303\251scription, read by a later reader and not by this test." }' \
+    > "$C/body.md"
+  (cd "$W" || exit
+   LC_ALL=en_US.UTF-8 scripts/land --body "$C/body.md" --reviewed "code-review ran" > "$C/out" 2>&1 &
+   echo $! > "$C/pid"; wait $!; echo $? > "$C/rc.tmp"; mv "$C/rc.tmp" "$C/rc") &
+  local wrapper=$! waited=0
+  while [ ! -f "$C/rc" ] && [ "$waited" -lt 120 ]; do sleep 1; waited=$((waited + 1)); done
+  out=$(cat "$C/out")
+  # KILL, since land traps TERM and runs the trap only once the slow expansion ends; then the wrapper
+  if [ ! -f "$C/rc" ]; then
+    pkill -KILL -P "$(cat "$C/pid")" 2>/dev/null; kill -KILL "$(cat "$C/pid")" 2>/dev/null; wait "$wrapper" 2>/dev/null
+    why="the land did not finish in 120 s"; return 1
+  fi
+  wait "$wrapper"; rc=$(cat "$C/rc")
+  why="the long description was not landed whole with its trailer"
+  [ "$(wc -c < "$C/body.md")" -gt 48000 ] && [ "$rc" -eq 0 ] \
+    && [ "$(merged_trailer Fails-before)" = "tests/test_gate.py::test_gate" ] \
+    && [ "$(grep -c '^Line [0-9]* ' "$FAKE/merge_body")" = 640 ]
+}
+t_trailers_latin1_body() {  # a description of bytes that are not UTF-8 is still text, kept beside the trailers
+  new_repo
+  fix src/canon_trading/ranking.py "Fix the gate's finding" "Fails-before: tests/test_gate.py::test_gate"
+  printf '\351\350\n' > "$C/body.md"
+  out=$(cd "$W" && LC_ALL=en_US.UTF-8 scripts/land --body "$C/body.md" --reviewed "code-review ran" 2>&1); rc=$?
+  why="the description was dropped"
+  [ "$rc" -eq 0 ] && [ "$(merged_trailer Fails-before)" = "tests/test_gate.py::test_gate" ] \
+    && [ "$(LC_ALL=C grep -c "$(printf '\351\350')" "$FAKE/merge_body")" = 1 ]
+}
 t_fix_subpackage() {       # an adapter module in a subpackage is on the trading path
   new_repo; fix packages/canon-alpaca/src/canon_alpaca/execution/orders.py "Fix the order path's finding"
   land --reviewed "code-review ran"; [ "$rc" -eq 0 ] && [ "$(warned)" -eq 1 ] && has "no Fails-before trailer"
@@ -812,6 +951,8 @@ case_ "fix-index lists landed commits with their trailers"  t_index
 case_ "fix-index reads a squash commit built from the merge call" t_index_squash
 case_ "fix-index fails loudly on a revision git cannot read" t_index_bad_rev
 case_ "a description ending in a URL keeps it, and gets the trailers" t_trailers_url_body
+case_ "a 48 KB UTF-8 description gets the missing trailers in linear time" t_trailers_long_body
+case_ "a description that is not UTF-8 is kept beside the trailers" t_trailers_latin1_body
 case_ "an adapter module in a subpackage is on the trading path" t_fix_subpackage
 case_ "Fails-before naming a class the file lacks warns"   t_fix_wrong_class
 case_ "a fixed seed is not a fix"                           t_fixed_seed
