@@ -125,7 +125,22 @@ It loads only in a direct first-party session that fetches feature flags, and Or
 feature-flag fetching", env-vars.md). So canon's user settings set `DO_NOT_TRACK` to `"0"` in `env`, which
 overrides the inherited value for Claude Code alone (a settings `env` value replaces one exported by the
 shell, env-vars.md). Claude Code then also sends its own analytics to Anthropic again, which the owner
-accepted on 2026-11-12. Orca and the other runtimes keep `DO_NOT_TRACK=1`. The owner turns it on, never a
+accepted on 2026-11-12. Orca and the other runtimes keep `DO_NOT_TRACK=1`. Fetching flags
+also resumes the sync of the skills enabled for the owner's claude.ai account into
+`~/.claude/skills/synced/` (skills.md, "Where synced skills load"), which would load skills canon has not
+adopted (rule 2). So canon's user settings also set `syncClaudeAiSkills` to `false`, which only user, local or
+managed settings can set (settings-reference.md): Claude Code stops downloading them and moves those already
+synced to `~/.claude/skills/.trash/`. The owner also decided on 2026-11-13 to turn off claude.ai
+connectors in every session, not only in canon's checkouts, whose project settings already set
+`disableClaudeAiConnectors`. So canon's user settings set it to `true` too: a `true` in any settings file
+applies, and a project-level `false` cannot override a user-level `true` (settings-reference.md). It
+reaches only the connectors Claude Code fetches itself, in terminal, IDE and Agent SDK sessions, not the
+ones a cloud host or the desktop app delivers (mcp.md, "How connectors reach Claude Code"). ADR 0103
+already rules out a connector as a path to orders. `scripts/bootstrap --user-config` adds all three
+settings to an existing `settings.json` that lacks them. Checked 2026-11-13: in a session Orca started after the change,
+`/plugin enable cc-plugin-you-should-know@builtin` answered `Enabled cc-plugin-you-should-know`. That
+session's `/plugin` also listed two built-in mods, on by default in Claude Code 2.1.323, that the docs read
+here do not describe, `cc-plugin-easel` and `cc-plugin-privacy`; what they do is UNVERIFIED. The owner turns it on, never a
 session, with `/plugin enable cc-plugin-you-should-know@builtin`, and turns it off with
 `/plugin disable cc-plugin-you-should-know@builtin`. Read 2026-11-12 in
 https://code.claude.com/docs/en/interactive-mode.md ("You should know suggestions") and

@@ -2517,6 +2517,8 @@ check "an existing settings.json gets the missing telemetry variables, keeping i
       jqt "$C3/settings.json" '.model == "mine" and .env.MY_VAR == "1" and .env.CLAUDE_CODE_ENABLE_TELEMETRY == "1" and .env.OTEL_LOGS_EXPORTER == "otlp"'
 check "... and the model keys it lacks, the owner's model kept and named (ADR 0059)" \
       eval 'jqt "$C3/settings.json" ".availableModels == $(jq -c .availableModels "$ROOT/home/.claude/settings.json") and .modelPicker == $(jq -c .modelPicker "$ROOT/home/.claude/settings.json") and (.env | has(\"ANTHROPIC_DEFAULT_FABLE_MODEL\") | not)" && grep -q "KEPT .*sets model to another value than home/.claude/settings.json" "$TMP/bs.out"'
+check "... and DO_NOT_TRACK, syncClaudeAiSkills and disableClaudeAiConnectors, which it lacked, as the template sets them (ADR 0023)" \
+      jqt "$C3/settings.json" '.env.DO_NOT_TRACK == "0" and .syncClaudeAiSkills == false and .disableClaudeAiConnectors == true'
 check "... leaves a value the owner set, and names it" \
       eval 'jqt "$C3/settings.json" ".env.OTEL_METRICS_EXPORTER == \"otlp\"" && grep -q "sets OTEL_METRICS_EXPORTER to another value" "$TMP/bs.out"'
 check "... keeping the previous file beside it" \

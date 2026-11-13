@@ -14,6 +14,8 @@
     "DO_NOT_TRACK": "0"
   },
   "showThinkingSummaries": true,
+  "syncClaudeAiSkills": false,
+  "disableClaudeAiConnectors": true,
   "autoCompactWindow": 300000,
   "statusLine": {
     "type": "command",
