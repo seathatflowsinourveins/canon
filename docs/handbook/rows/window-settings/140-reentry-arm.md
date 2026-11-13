@@ -1,0 +1,1 @@
+| `REENTRY_ARM` | clock by default (existing cooldown plus reclaim); selectable reclaim, turn, vwap | UNCALIBRATED | Source b01f4c4; lead, no primary source; lead's ruling preserves main's clock default | 2026-11-12 |

@@ -1,0 +1,1 @@
+| `PROFILE_MULTIPLIERS` | 1, 1, 1 by RDc_1 bucket; alternate 1, 1.25, 1.5, refused by a window while RDc_1 is not built | UNCALIBRATED | Source 40473e88; lead, no primary source; window selection | 2026-11-12 |

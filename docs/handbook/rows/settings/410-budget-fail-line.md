@@ -1,0 +1,1 @@
+| `BUDGET_FAIL_LINE` | 180 calls in any 60 seconds on one account, for a mover node; a rolling peak at it, or any 429, fails the window | UNCALIBRATED | The owner's requirement; the lead's decision of 2026-11-11 that it governs a mover node, as for `BUDGET_SOFT_LINE`; ADR 0106 | 2026-11-11 |

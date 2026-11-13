@@ -1,0 +1,1 @@
+| `FLOW_CAP` | 5 per cent of the prior five minutes' dollar volume | UNCALIBRATED | The owner's requirement (ADR 0083's starting rows); applied to a paper entry (`MoverConfig.flow_share` of `flow_bars`, ADR 0106), not in the Mover replay (ADR 0101) | 2026-11-11 |

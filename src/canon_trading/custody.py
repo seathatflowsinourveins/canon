@@ -74,7 +74,8 @@ number, account ID, order ID or client order ID is printed; an order is named by
 quantity, type, limit, time in force, position intent, status and lineage. Time in force and position
 intent are Alpaca's returned values, or `not shown` when absent, never inferred from the order's lineage.
 
-The same read also prints ended orders for the current New York trade date, from the preceding 20:00
+The same read also prints the ended orders submitted in the current New York trade date (an order
+submitted on an earlier date is not listed, even if it ended inside this one), from the preceding 20:00
 inclusive to 20:00 exclusive (Alpaca's 24/5 trade-date rule, below), dated by Alpaca's clock. Each row
 shows the returned status, filled quantity, average fill price, submitted/filled/canceled times and
 lineage; an expired, rejected or replaced order also shows its corresponding ending time. Trailing
@@ -85,10 +86,13 @@ read 2026-11-13:
   `alpaca/trading/client.py:107-131,422-437`: orders and clock are GETs;
   `alpaca/trading/requests.py:205-226`: `closed`, the submission bounds, sort and limit.
 * https://docs.alpaca.markets/us/reference/getallorders-1 (from llms.txt): `after` and `until`
-  bound submission, not ending. A GTC stop submitted before today can sell today, so the walk's
-  `after` is not the date's start but `GTC_AGE_LIMIT` before it: Alpaca's aged order policy cancels
-  a GTC order 90 days after creation (orders-at-alpaca, below), so nothing submitted earlier can end
-  inside the date. `until` starts at the trade date's end and moves backwards, with the
+  bound submission, not ending. The walk is bounded to the trade date (the lead, 2026-11-13): its
+  `after` is the date's start, so it reads the date's submissions only; an order submitted at exactly
+  20:00:00.000000 is the one the exclusive bound loses. A GTC stop submitted before the date that
+  ended inside it is not listed, and the printed line says so. Walking back to Alpaca's 90-day GTC
+  cancel (orders-at-alpaca, below) took about 240 s on paper account A on 2026-11-13, and over 300 s
+  on another paper account, where the task's timeout killed it; the date-bounded walk read the same
+  date's 61 ended orders in about a second. A busier date pages more often, at the poll interval. `until` starts at the trade date's end and moves backwards, with the
   overlap/checks/pacing described above. Only ending times inside the trade date are printed.
   Incomplete pagination or a missing ending time is a named read failure, never a claim that the
   date is empty. The account, positions, open orders and configuration are printed before the walk
@@ -390,20 +394,14 @@ def ended_order_line(order: Order) -> str:
     )
 
 
-GTC_AGE_LIMIT = timedelta(days=92)
-"""How far before a trade date's start the ended-order walk reads submissions: Alpaca's 90-day GTC
-cancel (module header), plus two days for the cancel to stay pending at the venue (Canon's margin,
-not a documented figure)."""
-
-
 def ended_orders(trading: TradingClient, start: datetime, end: datetime) -> list[Order]:
-    """Closed history, paged by submission, selected by ending in [start, end).
+    """Closed history submitted in [start, end), paged by submission, selected by ending in it.
 
-    The submission lower bound is `GTC_AGE_LIMIT` before the date, not the date's start: a stop
-    submitted before the date but sold inside it must not vanish. IDs remain only in memory to
-    deduplicate the overlapping pagination boundary.
+    The submission lower bound is the date's start (module header): an order submitted before the
+    date is not read, even if it ended inside it. IDs remain only in memory to deduplicate the
+    overlapping pagination boundary.
     """
-    after = start - GTC_AGE_LIMIT
+    after = start
     until = end
     listed: dict[str, Order] = {}
     selected: list[Order] = []
@@ -449,8 +447,18 @@ def ended_orders(trading: TradingClient, start: datetime, end: datetime) -> list
         time.sleep(session_window.POLL_SECS)
 
 
+ENDED_READING = (
+    "reading the trade date's submissions for its ended orders; if no count line follows, the read "
+    "was not finished"
+)
+"""Flushed before the walk, so a timeout's kill never reads as a date with no ended orders (the lead,
+2026-11-13)."""
+ENDED_NOT_READ = "ended orders: not read; nothing is known of the date's ended orders"
+"""Printed on the output after a failed walk, beside the failure named on stderr."""
+
+
 def ended_order_lines(trading: TradingClient) -> list[str]:
-    """One trade date's endings, including prior-date submissions, or one explicit empty line."""
+    """One trade date's endings of that date's submissions, or one explicit empty line."""
     clock = _read("the account clock", trading.get_clock, Clock)
     local = _dated(clock.timestamp, "the account clock").astimezone(session_window.NEW_YORK)
     trade_date = local.date()
@@ -460,7 +468,10 @@ def ended_order_lines(trading: TradingClient) -> list[str]:
     start = end - timedelta(days=1)
     orders = ended_orders(trading, start.astimezone(UTC), end.astimezone(UTC))
     return [
-        f"ended orders for {trade_date} (New York trade date): {len(orders) if orders else 'none'}",
+        (
+            f"ended orders submitted in {trade_date} (New York trade date; an order submitted "
+            f"earlier is not listed): {len(orders) if orders else 'none'}"
+        ),
         *(f"  {ended_order_line(order)}" for order in orders),
     ]
 
@@ -512,9 +523,11 @@ def account_task(trading: TradingClient | None = None) -> int:
         print(f"paper:account: {e}; nothing else was read", file=sys.stderr)
         return 1
     print("\n".join(lines), flush=True)  # before the history walk, which a failure or timeout ends
+    print(ENDED_READING, flush=True)
     try:
         ended = ended_order_lines(trading)
     except ReadFailed as e:
+        print(ENDED_NOT_READ, flush=True)
         print(
             f"paper:account: {e}; the account, positions, open orders and configuration above "
             "were read",

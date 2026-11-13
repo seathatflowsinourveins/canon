@@ -1,0 +1,1 @@
+| `NIGHTLY_FIRING` | Every 30 minutes | UNCALIBRATED | ADR 0089 | 2026-11-11 |
