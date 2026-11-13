@@ -230,6 +230,10 @@ def test_c2_a_venue_older_breach_of_the_holding_sells_a_hold_at_any_offset(offse
     seam = ClockSeam(offset, bid="9.89", ask="9.91")
     seam.slot.held_since = FILLED + SECOND + seam.offset_ns
     seam.slot.held_stop = STOP
+    seam.slot.holding_from = seam._holding_since(
+        seam.slot
+    )  # as `_hold` sets it beside `held_since`
+    assert seam.slot.holding_from is not None
     seam.deliver("9.90", FILLED + 3 * SECOND)
     seam.deliver("9.70", FILLED + 2 * SECOND, FILLED + 4 * SECOND)
     assert seam.slot.newest_print is not None
