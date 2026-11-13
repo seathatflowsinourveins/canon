@@ -15,9 +15,12 @@ named by an identifier and a type, and changesets
 change in `.changeset/`. A practice is a standing rule, not a release note, so no build step collects the
 files into this page: a collected file would be the shared append point again.
 
-Adding a practice is adding one new file: name it for its first words as a lower-case slug, never a number
-or a sequence, put it in the move's folder, and add nothing here. A file's move is its folder; within a
-move, files read in the order their names sort. No unit's addition touches another unit's file.
+Adding a practice is adding one new file in the move's folder, and nothing here. Its name is a place and
+a slug: three digits, a hyphen, then its first words in lower case, as `045-a-new-practice.md`. The
+places are spaced by ten, so a new practice takes any free number between the two it reads between, and
+nothing is renumbered; two units that pick the same number still write two different files, which read
+in the order of their slugs. A file's move is its folder; within a move, files read in the order their
+names sort. No unit's addition touches another unit's file.
 
 ## Moves
 

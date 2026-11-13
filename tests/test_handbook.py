@@ -27,7 +27,7 @@ MARKER = "<!-- append-only: add new entries below this line; never edit or remov
 ADR = re.compile(r"\bADR (\d{4})\b")
 DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
 SLUG = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
-FRAGMENT = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*\.md")
+FRAGMENT = re.compile(r"\d{3}-[a-z0-9]+(?:-[a-z0-9]+)*\.md")
 LINK = re.compile(r"!?\[[^\]]*\]\(([^)\s]+)\)")
 
 ROWS_HEADER = "| Row | Value | Status | Source or study | Date |"
@@ -279,8 +279,8 @@ def test_a_counted_criterion_row_is_uncalibrated_and_counts_no_profit(name: str)
 
 
 def practice_fragments() -> list[Path]:
-    """Every practice file: one Markdown file, under one folder per move, under `practices/`."""
-    return sorted(PRACTICES.glob("*/*.md"))
+    """Every file under `practices/`, at any depth: `test_one_practice_one_file` holds each to its shape."""
+    return sorted(path for path in PRACTICES.rglob("*") if not path.is_dir())
 
 
 def fragment_line(path: Path) -> str:
@@ -303,18 +303,17 @@ def test_practices_lines_name_a_record_or_a_step() -> None:
 
 
 def test_one_practice_one_file() -> None:
-    """A practice is one file under its move's folder, named by a slug, and the file holds one line."""
+    """A practice is one file directly under its move's folder, named by its place and a slug, holding
+    one line; what the line must say is `test_practices_lines_name_a_record_or_a_step`'s to check."""
     fragments = practice_fragments()
     assert fragments, "no practice files under docs/handbook/practices/"
-    steps = roadmap_steps()
     for path in fragments:
-        assert path.parent.parent == PRACTICES, path
+        assert path.parent.parent == PRACTICES, (
+            f"{path.relative_to(ROOT)} is not under one move folder"
+        )
         assert SLUG.fullmatch(path.parent.name), f"{path.parent.name!r} is not a move slug"
-        assert FRAGMENT.fullmatch(path.name), f"{path.name!r} is not a practice slug and `.md`"
-        line = fragment_line(path)
-        assert check_practices(line, steps) == [], f"{path.relative_to(ROOT)}: {line[:80]!r}"
-        missing = [number for number in ADR.findall(line) if not record_exists(number)]
-        assert missing == [], f"{path.relative_to(ROOT)} cites records that do not exist: {missing}"
+        assert FRAGMENT.fullmatch(path.name), f"{path.name!r} is not a place, a slug and `.md`"
+        fragment_line(path)
 
 
 def test_practices_page_is_an_index_and_lists_no_practice() -> None:
@@ -327,22 +326,6 @@ def test_practices_page_is_an_index_and_lists_no_practice() -> None:
         assert f"(practices/{folder}/)" in text, f"practices.md points at nothing for {folder}"
 
 
-def test_no_handbook_page_copies_a_practice_line() -> None:
-    """A practice line lives in its own file and nowhere else: no page may list the practices again."""
-    fragments = practice_fragments()
-    assert fragments, "no practice files under docs/handbook/practices/"
-    lines = {fragment_line(path) for path in fragments}
-    copies: list[str] = []
-    for page in sorted(HANDBOOK.rglob("*.md")):
-        if PRACTICES in page.parents:
-            continue
-        text = page.read_text()
-        for line in lines:
-            if line in text:
-                copies.append(f"{page.relative_to(ROOT)} repeats a practice: {line[:60]!r}")
-    assert copies == []
-
-
 @pytest.mark.parametrize(
     "page", sorted(path.relative_to(HANDBOOK).as_posix() for path in HANDBOOK.rglob("*.md"))
 )
@@ -353,7 +336,16 @@ def test_every_cited_record_exists(page: str) -> None:
 
 def git_in(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        ["git", "-c", "user.name=handbook", "-c", "user.email=handbook@example.com", *args],
+        [
+            "git",
+            "-c",
+            "user.name=handbook",
+            "-c",
+            "user.email=handbook@example.com",
+            "-c",
+            "commit.gpgsign=false",
+            *args,
+        ],
         cwd=repo,
         capture_output=True,
         text=True,
@@ -394,24 +386,26 @@ def test_two_adds_under_the_same_move_merge_clean(tmp_path: Path) -> None:
 
 
 def tracked_files() -> list[Path]:
-    """Every file git tracks in this checkout, from `git ls-files`."""
-    listed = git("ls-files", "-z") or ""
+    """Every file git tracks in this checkout, from `git ls-files`; a git that cannot answer fails."""
+    listed = git("ls-files", "-z")
+    assert listed, "git ls-files gave nothing, so no tracked file could be checked"
     return [ROOT / name for name in listed.split("\0") if name]
 
 
 def test_no_tracked_file_lists_a_practice_line() -> None:
-    """A practice line lives in its own file: no tracked file repeats one, so no shared list returns."""
+    """A practice lives in its own file: no tracked file repeats one, under any bullet, so no shared
+    list returns. A tracked path absent from the working tree, or not a file, has nothing to read."""
     fragments = practice_fragments()
     assert fragments, "no practice files under docs/handbook/practices/"
-    lines = [fragment_line(path).encode() for path in fragments]
+    texts = [fragment_line(path).removeprefix("* ").encode() for path in fragments]
     copies: list[str] = []
     for path in tracked_files():
-        if PRACTICES in path.parents:
+        if PRACTICES in path.parents or not path.is_file():
             continue
         data = path.read_bytes()
-        for line in lines:
-            if line in data:
-                copies.append(f"{path.relative_to(ROOT)}: {line[:60]!r}")
+        for text in texts:
+            if text in data:
+                copies.append(f"{path.relative_to(ROOT)}: {text[:60]!r}")
     assert copies == []
 
 
