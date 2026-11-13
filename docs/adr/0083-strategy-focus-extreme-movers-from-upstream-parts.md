@@ -283,6 +283,11 @@ landed steps stand, and it carries a dated pointer. ADR 0077's quote study is he
   adapter's `sub_penny_denial` refuses it. On such a name the protection is refused at release and the
   wind-down is the exit, until the adapter rounds to the venue's tick at submit (ADR 0030). Not yet seen
   on paper (UNVERIFIED there).
+* 2026-11-13, the lead's ruling: the vendor movers fallback (`select_mover` over Alpaca's gainers) is a recorded
+  exception with an end. It is admitted for the regular session only, after the stream sample fails or qualifies
+  no name, and the window's record names it (`mover["source"]` is `"screener"`, with the sample's failure in
+  `mover["stream_failed"]`). It ends with the unit in which a window reads the
+  board; `session_window.py` is not changed for it before then. The handbook's named limits list it.
 
 ## Evidence
 
