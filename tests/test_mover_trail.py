@@ -15,6 +15,7 @@ from typing import cast
 import pytest
 from nautilus_trader.indicators import AverageTrueRange
 from nautilus_trader.model import Bar
+from nautilus_trader.model import BarType
 from nautilus_trader.model import ClientOrderId
 from nautilus_trader.model import OrderSide
 from nautilus_trader.model import Price
@@ -1666,3 +1667,128 @@ def test_a_sized_entrys_fill_records_the_distance_l_puts_in_force_not_the_plans(
     )
     assert slot.exit_record is not None
     assert slot.exit_record.trail_distance == D("0.50")
+
+
+# --- the batch A head reader (2026-11-13), A-2 and A-3: a close counts from when its minute ended ---
+
+
+def streamed_minute(opened_ns: int, received_ns: int, close: str, spec: str = "1-MINUTE") -> Bar:
+    """An adapter EXTERNAL bar: stamped at its open, received at `received_ns`
+    (`canon_alpaca.data.parse_bar`), so its close is the last trade before its interval ended."""
+    price = Price.from_str(close)
+    low = Price.from_str("9.9500")
+    kind = BarType.from_str(f"{AAA}-{spec}-LAST-EXTERNAL")
+    return Bar(kind, low, price, low, price, Quantity.from_int(1000), opened_ns, received_ns)
+
+
+def reclaim_after_a_sale(
+    monkeypatch, filled_ns: int, spec: str = "1-MINUTE"
+) -> tuple[Any, Any, list]:
+    """A reclaim Mover whose sale of AAA at 10.00 filled at `filled_ns`, nothing held or working, its
+    last close 9.90, ranked; `_buy` only records that it was asked."""
+    s = strategy(reentry_arm="reclaim", run_bars=1, bar_spec=f"{spec}-LAST-EXTERNAL")
+    kind = BarType.from_str(f"{AAA}-{spec}-LAST-EXTERNAL")
+    slot = mover.Slot(AAA, kind, deque(maxlen=4), deque(maxlen=5))
+    s.slots[AAA] = slot
+    s.sold[AAA] = (filled_ns, Decimal("10.00"))
+    s.sold_fill_ns[AAA] = filled_ns
+    slot.closes.append(Decimal("9.90"))
+    monkeypatch.setattr(s, "_working", lambda _slot: False)
+    monkeypatch.setattr(s, "_held", lambda _slot: Decimal(0))
+    bought: list = []
+    monkeypatch.setattr(s, "_buy", lambda *args: bought.append(args))
+    return s, slot, bought
+
+
+@pytest.mark.parametrize("minute_ends", ["before", "after"])
+def test_a_reentry_close_counts_from_when_its_minute_ended_not_when_it_was_received(
+    monkeypatch, minute_ends
+):
+    """A-2 (P1): the sale filled at 11:10:00.500. The 11:09 minute ended at 11:10:00, before the
+    fill, so its close of 10.10, received at 11:10:01.500, is not a close after the sale: no
+    re-entry. The 11:10 minute's close, ended after the fill, qualifies."""
+    filled = T0 + 10 * MINUTE + SECOND // 2
+    s, _slot, bought = reclaim_after_a_sale(monkeypatch, filled)
+    opened = T0 + (9 if minute_ends == "before" else 10) * MINUTE
+    received = opened + MINUTE + 3 * SECOND // 2
+    s.rank_ns, s.rank = received, [(AAA, Decimal("0.25"))]
+    s.on_bar(streamed_minute(opened, received, "10.1000"))
+    s._enter(received + SECOND // 2, 0)
+    if minute_ends == "before":
+        assert not bought and any("preceded the sale fill" in why for why in s.dropped), s.dropped
+    else:
+        assert len(bought) == 1, s.dropped
+
+
+def test_a_close_whose_minute_ended_before_the_sale_is_not_observed_by_its_reentry_state():
+    """A-2 (P1), the state arms' half: the re-entry state observes only complete closes after the
+    sale, so the 11:09 close received after an 11:10:00.500 fill is not one of them."""
+    s = strategy(reentry_arm="turn", turn_k=2)
+    slot = mover.Slot(AAA, bar_type(AAA), deque(maxlen=4), deque(maxlen=5))
+    s.slots[AAA] = slot
+    filled = T0 + 10 * MINUTE + SECOND // 2
+    state = mover.ReentryState(filled, Decimal("10.00"), Decimal("0.10"))
+    s.reentry_states[AAA] = state
+    s.on_bar(streamed_minute(T0 + 9 * MINUTE, T0 + 10 * MINUTE + 3 * SECOND // 2, "10.1000"))
+    assert state.previous is None
+    s.on_bar(streamed_minute(T0 + 10 * MINUTE, T0 + 11 * MINUTE + SECOND, "10.2000"))
+    assert state.previous == Decimal("10.2000")
+
+
+def test_a_run_whose_minute_ends_after_the_final_fill_survives_the_step_that_flattens(monkeypatch):
+    """A-3 (P1): the sale filled in full at 11:09:59.500; the 11:09 minute, ended at 11:10:00, closes
+    rising and arrives then; the step at 11:10:00.200 finds the name flat. Its run is a close after
+    the sale, so the flattening keeps it for the entry check that follows in the same step."""
+    s = strategy(reentry_arm="reclaim", run_bars=1)
+    slot = mover.Slot(AAA, bar_type(AAA), deque(maxlen=4), deque(maxlen=5))
+    s.slots[AAA] = slot
+    filled = T0 + 10 * MINUTE - SECOND // 2
+    sale = SimpleNamespace(is_closed=True, avg_px=10.0, client_order_id=ClientOrderId("S-1"))
+    slot.protect_id, slot.was_held = sale.client_order_id, True
+    s.fills.append(("S-1", OrderSide.SELL.name, "5", "10.0000", filled))
+    monkeypatch.setattr(s, "_order", lambda cid: sale if cid is not None else None)
+    monkeypatch.setattr(s, "_working", lambda _slot: False)
+    slot.closes.append(Decimal("9.90"))
+    s.on_bar(streamed_minute(T0 + 9 * MINUTE, T0 + 10 * MINUTE, "10.1000"))
+    assert slot.run_ns is not None
+    monkeypatch.setattr(s, "_held", lambda _slot: Decimal(0))
+    bought: list = []
+    monkeypatch.setattr(s, "_buy", lambda *args: bought.append(args))
+    s.rank_ns, s.rank = T0 + 10 * MINUTE, [(AAA, Decimal("0.25"))]
+    step = T0 + 10 * MINUTE + SECOND // 5
+    s._flat(slot, step)
+    assert s.sold_fill_ns[AAA] == filled
+    assert (slot.run_close, slot.run_seen_ns) == (Decimal("10.1000"), T0 + 10 * MINUTE)
+    s._enter(step, 0)
+    assert len(bought) == 1, s.dropped
+
+
+def test_a_reentry_close_of_a_longer_bar_counts_from_when_its_interval_ended(monkeypatch):
+    """The A-2 fix's high review (should-fix 1): a 5-minute EXTERNAL bar opened at 11:06 ends at
+    11:11, so its close, received after that, is after a sale filled at 11:08 and re-enters; a bar's
+    end is its open plus its own interval (`canon_alpaca.data.bar_interval_ns`), not a minute."""
+    s, _slot, bought = reclaim_after_a_sale(monkeypatch, T0 + 8 * MINUTE, "5-MINUTE")
+    received = T0 + 11 * MINUTE + SECOND
+    s.rank_ns, s.rank = received, [(AAA, Decimal("0.25"))]
+    s.on_bar(streamed_minute(T0 + 6 * MINUTE, received, "10.1000", "5-MINUTE"))
+    s._enter(received + SECOND // 2, 0)
+    assert len(bought) == 1, s.dropped
+
+
+def test_the_clock_arms_flattening_clears_a_run_as_before(monkeypatch):
+    """The A-3 fix's high review (nit 3): the clock arm makes no fill comparison, so the step that
+    finds the name flat clears its run whatever its minute's end; the keep is the state arms' only."""
+    s = strategy(reentry_arm="clock", cooldown_secs=0, run_bars=1)
+    slot = mover.Slot(AAA, bar_type(AAA), deque(maxlen=4), deque(maxlen=5))
+    s.slots[AAA] = slot
+    filled = T0 + 10 * MINUTE - SECOND // 2
+    sale = SimpleNamespace(is_closed=True, avg_px=10.0, client_order_id=ClientOrderId("S-1"))
+    slot.protect_id, slot.was_held = sale.client_order_id, True
+    s.fills.append(("S-1", OrderSide.SELL.name, "5", "10.0000", filled))
+    monkeypatch.setattr(s, "_order", lambda cid: sale if cid is not None else None)
+    monkeypatch.setattr(s, "_working", lambda _slot: False)
+    slot.closes.append(Decimal("9.90"))
+    s.on_bar(streamed_minute(T0 + 9 * MINUTE, T0 + 10 * MINUTE, "10.1000"))
+    assert slot.run_ns is not None
+    s._flat(slot, T0 + 10 * MINUTE + SECOND // 5)
+    assert (slot.run_ns, slot.run_close, slot.run_seen_ns, slot.run_closed_ns) == (None,) * 4
