@@ -2580,9 +2580,9 @@ check "check: telemetry settings and codex telemetry ok" \
 check "a new settings.json's status line refreshes on canon's interval" \
       eval 'jqt "$C/settings.json" ".statusLine.refreshInterval == $(jq .statusLine.refreshInterval "$ROOT/home/.claude/settings.json")"'
 C4="$TMP/cfg4"; mkdir -p "$C4"
-check "canon's interval is 30 s, the HUD's floor for several sessions (ADR 0007)" \
+check "canon's interval is 30 s (ADR 0007)" \
       jqt "$ROOT/home/.claude/settings.json" '.statusLine.refreshInterval == 30'
-for case_ in canon mine owner15 earlier5 owner5 text; do
+for case_ in canon mine owner15 earlier5 owner5 text earlier5lit canonlit; do
   rm -f "$C4"/settings.json*
   case "$case_" in
     canon)    sl='{"type":"command","command":"\"'"$C4"'\"/canon/statusline.sh"}' ;;
@@ -2591,6 +2591,10 @@ for case_ in canon mine owner15 earlier5 owner5 text; do
     earlier5) sl='{"type":"command","command":"\"'"$C4"'\"/canon/statusline.sh","refreshInterval":5}' ;;
     owner5)   sl='{"type":"command","command":"/x/mine.sh","refreshInterval":5}' ;;
     text)     sl='"~/x/mine.sh"' ;;
+    # the template's own spelling, as a config folder other than ~/.claude can hold it (an Orca profile): the
+    # same script, since that folder's canon/ is ~/.claude/canon's, and still canon's command
+    earlier5lit) sl='{"type":"command","command":"~/.claude/canon/statusline.sh","refreshInterval":5}' ;;
+    canonlit)    sl='{"type":"command","command":"~/.claude/canon/statusline.sh"}' ;;
   esac
   printf '{"statusLine":%s}\n' "$sl" > "$C4/settings.json"
   CLAUDE_CONFIG_DIR="$C4" bs --user-config; rc=$?
@@ -2605,7 +2609,13 @@ for case_ in canon mine owner15 earlier5 owner5 text; do
     owner5)   check "a 5 s interval on a status line of the owner's own is left as set" \
                     eval 'jqt "$C4/settings.json" ".statusLine.refreshInterval == 5" && ! grep -q "statusLine.refreshInterval" "$TMP/bs.out"' ;;
     text)     check "a status line that is not an object is left as set, and the rest still installs" \
-                    eval '[ "$rc" = 0 ] && jqt "$C4/settings.json" ".statusLine == \"~/x/mine.sh\" and .env.CLAUDE_CODE_ENABLE_TELEMETRY == \"1\""' ;;
+                    eval '[ "$rc" = 0 ] && jqt "$C4/settings.json" ".statusLine == \"~/x/mine.sh\" and .env.CLAUDE_CODE_ENABLE_TELEMETRY == \"1\""'
+              check "... and the copy step names it a gap beside the keys the file lacks, not unchanged" \
+                    eval 'grep -q "EXISTS     $C4/settings.json differs from the template: .*statusLine" "$TMP/bs.out" && grep -q "hook SessionStart" "$TMP/bs.out" && [ -e "$C4/settings.json.canon-proposed" ]' ;;
+    earlier5lit) check "the earlier 5 s on canon's command in the template's own spelling, in another config folder: retired for the template's" \
+                       eval 'jqt "$C4/settings.json" ".statusLine.refreshInterval == $(jq .statusLine.refreshInterval "$ROOT/home/.claude/settings.json")" && grep -q "retired    statusLine.refreshInterval in" "$TMP/bs.out"' ;;
+    canonlit)    check "canon's command in the template's own spelling with no interval gets the template's" \
+                       eval 'jqt "$C4/settings.json" ".statusLine.refreshInterval == $(jq .statusLine.refreshInterval "$ROOT/home/.claude/settings.json")" && grep -q "added      statusLine.refreshInterval to" "$TMP/bs.out"' ;;
   esac
 done
 # a history for the bootstrap copy: an earlier claude-hud.json, then the template's

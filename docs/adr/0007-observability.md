@@ -318,6 +318,10 @@ sets the HUD's options at v0.15.0 (`src/config.ts`, `src/schema.ts`). The choice
   5 s until 2026-11-13 (the interval's cost, below). `scripts/bootstrap --user-config` adds the interval
   only to canon's own status line that sets none, and an interval the owner set is left and not called a
   gap, except the 5 s an earlier template set on canon's command, which it replaces with the template's.
+  Canon's command is the template's spelling, `~/.claude/canon/statusline.sh`, or the one rendered for the
+  config folder; an Orca profile holds the first, and its `canon/` is `~/.claude/canon`, the same scripts.
+  Known limit: a 5 s the owner sets on canon's command reads as the earlier template's and is replaced on
+  the next run; any other value is kept.
   It also replaces an installed `claude-hud.json` that is byte for byte a version committed in canon's
   history, keeping the previous copy, so a display change reaches the machine without a hand merge; one
   the owner edited still gets a `.canon-proposed` copy beside it. Measured 2026-11-12 against a real

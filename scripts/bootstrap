@@ -80,9 +80,9 @@ TELEMETRY_RE='^(CLAUDE_CODE_ENABLE_TELEMETRY$|OTEL_|DO_NOT_TRACK$)'
 # syncClaudeAiPlugins, which only user, local or managed settings can set, and disableClaudeAiConnectors,
 # ADR 0139), and the values an earlier template
 # set that those records retire: --user-config removes one only while it still holds exactly that value and,
-# for an entry with "when", while the file holds the template's value at that path too (the status line's
-# interval only on canon's own command), and a key of CANON_KEYS or the status line's interval removed so is
-# then added from the template. The earlier template's "model": "fable" is
+# for an entry with "when", while the file holds the template's value at that path too, as the template spells
+# it or as rendered for this config folder (the status line's interval only on canon's own command), and a key
+# of CANON_KEYS or the status line's interval removed so is then added from the template. The earlier template's "model": "fable" is
 # not among them: it is also the orchestrator lane's alias, which an owner may choose, so --check names it
 CANON_KEYS='["model", "availableModels", "modelPicker", "autoUpdatesChannel", "autoCompactWindow", "syncClaudeAiSkills", "syncClaudeAiPlugins", "disableClaudeAiConnectors"]'
 # the jq lookup of one top-level key, named by --arg k, as JSON text, or nothing when the key is absent
@@ -1102,7 +1102,9 @@ keep_copy() {
 # the rendered canon settings, it takes the rendered file's bytes, so the copy step after finds it unchanged.
 # A value the owner set otherwise, and an otel setting of Codex's that is not canon's, are left alone and
 # named, as the owner's choice. The template's statusLine.refreshInterval is added the same way, only to a status
-# line that runs canon's command, spelled as the template spells it, and sets no interval (ADR 0007); an interval
+# line that runs canon's command, spelled as the template spells it (~/.claude/canon/statusline.sh, which another
+# config folder can hold too: its canon/ is the same scripts) or as rendered for this folder, and sets no
+# interval (ADR 0007); an interval
 # already there is the owner's and is neither changed nor named as a gap, except the 5 s an earlier template set
 # on that command, which RETIRED replaces. Codex's config is written only when its folder
 # exists (Codex installed).
@@ -1115,17 +1117,20 @@ install_telemetry() {
   else
     # one plan: the merged document, and what was added, removed and kept, so the file is written once
     # shellcheck disable=SC2016  # jq program, not shell
-    plan=$(jq -c --slurpfile w "$1" --arg re "$TELEMETRY_RE" --argjson mk "$CANON_KEYS" --argjson ret "$RETIRED" '
+    plan=$(jq -c --slurpfile w "$1" --slurpfile raw "$ROOT/home/.claude/settings.json" --arg re "$TELEMETRY_RE" \
+                 --argjson mk "$CANON_KEYS" --argjson ret "$RETIRED" '
       def telemetry: with_entries(select(.key | test($re)));
       def at($p): try getpath($p) catch null;   # a path through a value that is not an object reads as absent
+      # the value the template gives at a path, as rendered for this folder or as the template spells it
+      def canon($v; $p): $v != null and ($v == ($w[0] | at($p)) or $v == ($raw[0] | at($p)));
       . as $in | $w[0] as $t
       | ($t.env // {} | telemetry | with_entries(select(($in.env // {})[.key] == null))) as $env
       | [$ret[] | select(. as $r | ($in | at($r.path)) == $r.value
-                         and ($r.when == null or (($in | at($r.when)) == ($t | at($r.when)))))] as $gone
+                         and ($r.when == null or canon($in | at($r.when); $r.when)))] as $gone
       | (reduce $gone[] as $r ($in; delpaths([$r.path]))) as $kept
       | [$mk[] | select($kept[.] == null and $t[.] != null)] as $top
       | ($t.statusLine.refreshInterval? // null) as $ri
-      | (if $ri != null and ($kept.statusLine | type) == "object" and $kept.statusLine.command == $t.statusLine.command
+      | (if $ri != null and ($kept.statusLine | type) == "object" and canon($kept.statusLine.command; ["statusLine", "command"])
             and ($kept.statusLine | has("refreshInterval") | not) then ["statusLine.refreshInterval"] else [] end) as $sl
       | (($kept | if ($env | length) > 0 then .env = ((.env // {}) + $env) else . end)
          | reduce $top[] as $k (.; .[$k] = $t[$k])
@@ -1278,7 +1283,8 @@ settings_gaps() {
     def contains_all($x): all(to_entries[]; .key as $k | $x[$k] == .value);   # every field the template gives
     if type != "object" then error("not a JSON object") else . end
     | . as $l | $w[0] as $t
-    | gaps($t | del(.hooks) | if ($l.statusLine.refreshInterval? | type) == "number" then del(.statusLine.refreshInterval) else . end;
+    | gaps($t | del(.hooks) | if ($l.statusLine | if type == "object" then .refreshInterval else null end | type) == "number"
+                                then del(.statusLine.refreshInterval) else . end;
            $l | del(.hooks); []),
       ($t.hooks // {} | to_entries[] | .key as $ev | .value[] | (.matcher // "") as $m | .hooks[]? as $h
        | select(any(($l.hooks[$ev] // [])[]?; (.matcher // "") == $m and any(.hooks[]?; . as $x | $h | contains_all($x))) | not)
