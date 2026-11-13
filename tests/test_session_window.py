@@ -1716,6 +1716,7 @@ def quiet_window(
     trail=None,
     trigger="bid_ask",
     validate_trade_sequence=False,
+    baseline_dir=None,
 ):
     """A window of `strategy` whose node runs at once, its strategy having seen `quotes`, `trades` and
     `live_bars`, and its node log holding the lines `log`; returns the report or the error, and the
@@ -1782,7 +1783,8 @@ def quiet_window(
                 session=session,
                 mover=mover,
                 slots=slots,
-                baseline_path=baseline,
+                baseline_path=None if baseline_dir is not None else baseline,
+                baseline_dir=baseline_dir,
                 request_limit_per_minute=request_limit_per_minute,
                 **(trail or {}),
                 trigger=trigger,
@@ -2269,6 +2271,224 @@ def test_only_overnight_runs_with_no_baseline_file_and_says_its_rows_rank_on_dol
     else:
         with pytest.raises(session_window.WindowRefused, match="baseline"):
             run()
+
+
+def dated_baselines(root: Path, *sessions: date) -> Path:
+    """`root` holding the evening run's `<session>/sip.json` for each of `sessions`."""
+    from canon_trading.movers_rank import write_baselines
+
+    for session in sessions:
+        (root / session.isoformat()).mkdir(parents=True)
+        write_baselines(root / session.isoformat() / "sip.json", session, {})
+    return root
+
+
+def test_a_baseline_dir_gives_the_window_the_trade_dates_file(monkeypatch, tmp_path) -> None:
+    """The scheduled runner's clone is made anew at every firing, so its baseline is read from the
+    directory the evening baseline run writes, as `<trade date>/<feed>.json` there (the lead's order of
+    2026-11-13 09:28)."""
+    monkeypatch.setattr(session_window, "choose_mover", lambda *a, **k: a_pick())
+    monkeypatch.setattr(session_window, "window_data", lambda: Quoted())
+    root = dated_baselines(tmp_path / "movers-baseline", date(2026, 11, 9), date(2026, 11, 10))
+    outcome, latest, seen = quiet_window(
+        monkeypatch,
+        tmp_path,
+        quotes=5,
+        trades=5,
+        account=Evening(5),
+        session="extended",
+        mover=True,
+        strategy="Mover",
+        baseline_dir=root,
+    )
+    assert not isinstance(outcome, Exception), outcome
+    assert latest["result"] == "ok" and latest["part"] == "pre-market"
+    assert latest["mover"]["baseline_path"] == str(root / "2026-11-10" / "sip.json")
+    assert seen["config"].baseline_path == root / "2026-11-10" / "sip.json"
+
+
+@pytest.mark.parametrize("held", [(), (date(2026, 11, 9),)])
+def test_a_baseline_dir_without_the_trade_dates_file_refuses_by_name(
+    monkeypatch, tmp_path, held
+) -> None:
+    """A missing day's baseline, or only an older day's, refuses the window before any node, naming
+    the trade date, the path the evening run writes and the newest day the directory holds."""
+    monkeypatch.setattr(session_window, "choose_mover", lambda *a, **k: a_pick())
+    monkeypatch.setattr(session_window, "window_data", lambda: Quoted())
+    root = tmp_path / "movers-baseline"
+    root.mkdir()
+    dated_baselines(root, *held)
+    with pytest.raises(session_window.WindowRefused) as refused:
+        quiet_window(
+            monkeypatch,
+            tmp_path,
+            quotes=5,
+            trades=5,
+            account=Evening(5),
+            session="extended",
+            mover=True,
+            strategy="Mover",
+            baseline_dir=root,
+        )
+    text = str(refused.value)
+    assert "no sip baseline for 2026-11-10" in text
+    assert str(root / "2026-11-10" / "sip.json") in text
+    assert ("the newest before it is 2026-11-09" if held else "it holds none before it") in text
+
+
+def test_a_baseline_dir_leaves_overnight_on_the_dollar_tier_with_no_file(
+    monkeypatch, tmp_path
+) -> None:
+    """Overnight ranks with no file on dollars (the lead's decision (A) of 2026-11-12), a dated
+    directory or not: no evening run writes boats.json."""
+    monkeypatch.setattr(session_window, "choose_mover", lambda *a, **k: a_pick())
+    monkeypatch.setattr(session_window, "window_data", lambda: Quoted())
+    root = dated_baselines(tmp_path / "movers-baseline", date(2026, 11, 10))
+    outcome, latest, _ = quiet_window(
+        monkeypatch,
+        tmp_path,
+        quotes=5,
+        trades=5,
+        account=Evening(21),
+        session="extended",
+        mover=True,
+        strategy="Mover",
+        baseline_dir=root,
+    )
+    assert not isinstance(outcome, Exception), outcome
+    assert latest["result"] == "ok" and latest["part"] == "overnight"
+    assert latest["mover"]["baseline"] == "no baseline: dollar tier under the move condition"
+
+
+@pytest.mark.parametrize(
+    ("hour", "part", "asks"),
+    [
+        (5, "pre-market", "2026-11-10/sip.json"),
+        (17, "after-hours", "2026-11-10/sip.json"),
+        (21, "overnight", "2026-11-11/boats.json"),
+        (2, "overnight", "2026-11-10/boats.json"),
+    ],
+)
+def test_a_window_from_20_00_asks_for_the_next_trade_dates_baseline(
+    monkeypatch, tmp_path, hour, part, asks
+) -> None:
+    """The lead's order of 2026-11-13 09:43: the date the runner asks for is the window's trade date,
+    and a window started at or after 20:00 New York belongs to the next one (overnight, from 20:00 the
+    evening before), so the evening baseline run writes the next trade date's directory, as the
+    2026-11-13 file written at 21:18 on 2026-11-12 was. Before 20:00 it is the calendar day's."""
+    monkeypatch.setattr(session_window, "choose_mover", lambda *a, **k: a_pick())
+    monkeypatch.setattr(session_window, "window_data", lambda: Quoted())
+    root = dated_baselines(tmp_path / "movers-baseline", date(2026, 11, 10))
+    outcome, latest, _ = quiet_window(
+        monkeypatch,
+        tmp_path,
+        quotes=5,
+        trades=5,
+        account=Evening(hour),
+        session="extended",
+        mover=True,
+        strategy="Mover",
+        baseline_dir=root,
+    )
+    assert not isinstance(outcome, Exception), outcome
+    assert latest["part"] == part
+    assert latest["mover"]["baseline_path"] == str(root / asks)
+
+
+def test_a_missing_dated_baseline_names_only_a_dated_folder_before_the_trade_date(tmp_path) -> None:
+    """code-review-high-rb/3, /4: a folder not named as an ISO date (20261109) is no day, and a later
+    day's file says nothing of whether the trade date's is old or missing."""
+    root = dated_baselines(tmp_path, date(2026, 11, 6), date(2026, 11, 12))
+    (root / "20261109").mkdir()
+    (root / "20261109" / "sip.json").write_text("{}")
+    text = session_window.missing_dated_baseline(root, date(2026, 11, 10), "sip")
+    assert text.endswith("the newest before it is 2026-11-06")
+    assert "it holds none before it" in session_window.missing_dated_baseline(
+        root, date(2026, 11, 5), "sip"
+    )
+
+
+def test_a_relative_baseline_dir_is_read_and_named_against_the_repository(
+    monkeypatch, tmp_path
+) -> None:
+    """code-review-high-rb/2: a relative --baseline-dir resolves against the checkout, as
+    --baseline-path does, and the refusal lists and names that same folder, whatever the caller's
+    directory."""
+    monkeypatch.setattr(session_window, "choose_mover", lambda *a, **k: a_pick())
+    monkeypatch.setattr(session_window, "window_data", lambda: Quoted())
+    monkeypatch.setattr(session_window, "SOURCE_ROOT", tmp_path / "checkout")
+    root = dated_baselines(tmp_path / "checkout" / "baselines", date(2026, 11, 9))
+    elsewhere = tmp_path / "elsewhere"
+    (elsewhere / "baselines").mkdir(parents=True)
+    monkeypatch.chdir(elsewhere)
+    with pytest.raises(session_window.WindowRefused) as refused:
+        quiet_window(
+            monkeypatch,
+            tmp_path,
+            quotes=5,
+            trades=5,
+            account=Evening(5),
+            session="extended",
+            mover=True,
+            strategy="Mover",
+            baseline_dir=Path("baselines"),
+        )
+    assert str(root / "2026-11-10" / "sip.json") in str(refused.value)
+    assert "the newest before it is 2026-11-09" in str(refused.value)
+
+
+def test_a_dated_baseline_for_another_session_is_refused_naming_the_trade_date(
+    monkeypatch, tmp_path
+) -> None:
+    """code-review-high-rb/7: a file in the trade date's folder that was written for another session is
+    refused, the refusal saying which trade date's dated file it was read as."""
+    from canon_trading.movers_rank import write_baselines
+
+    monkeypatch.setattr(session_window, "choose_mover", lambda *a, **k: a_pick())
+    monkeypatch.setattr(session_window, "window_data", lambda: Quoted())
+    root = tmp_path / "movers-baseline"
+    (root / "2026-11-10").mkdir(parents=True)
+    write_baselines(root / "2026-11-10" / "sip.json", date(2026, 11, 11), {})
+    with pytest.raises(session_window.WindowRefused) as refused:
+        quiet_window(
+            monkeypatch,
+            tmp_path,
+            quotes=5,
+            trades=5,
+            account=Evening(5),
+            session="extended",
+            mover=True,
+            strategy="Mover",
+            baseline_dir=root,
+        )
+    assert "the dated file for 2026-11-10" in str(refused.value)
+
+
+def test_a_window_config_takes_a_baseline_path_or_a_baseline_dir_not_both(tmp_path) -> None:
+    """code-review-high-rb/5: the two exclude each other in code, as on the command line."""
+    with pytest.raises(ValueError, match="baseline"):
+        WindowConfig(baseline_path=tmp_path / "x.json", baseline_dir=tmp_path)
+
+
+def test_the_baseline_dir_reaches_the_window_and_excludes_a_baseline_path(tmp_path, capsys) -> None:
+    common = ["--strategy", "Mover", "--mover", "--log-dir", str(tmp_path)]
+    args = session_window._args([*common, "--baseline-dir", str(tmp_path / "movers-baseline")])
+    assert args.baseline_dir == tmp_path / "movers-baseline"
+    assert session_window.window_config(args, "regular").baseline_dir == args.baseline_dir
+    with pytest.raises(SystemExit):
+        session_window._args(
+            [*common, "--baseline-dir", str(tmp_path), "--baseline-path", str(tmp_path / "x.json")]
+        )
+    assert "not allowed with argument" in capsys.readouterr().err
+
+
+def test_the_schedule_reads_the_baseline_from_the_automation_folders_dated_directory() -> None:
+    """The scheduled agent names `$CANON_HOME/movers-baseline`, where the evening baseline run writes
+    each day's file: the clone it runs in is emptied at every firing (paper-session.sh's `fresh`), and
+    no checkout a person uses is read (ADR 0050)."""
+    automation = (session_window.SOURCE_ROOT / "scripts/automation").read_text()
+    named = "<string>--baseline-dir</string>\n    <string>$c/movers-baseline</string>"
+    assert named in automation
 
 
 @pytest.mark.parametrize(("part", "expected"), [("overnight", True), ("after-hours", False)])
