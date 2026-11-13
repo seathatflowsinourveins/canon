@@ -2866,6 +2866,7 @@ class Seam:
     _end_hold = Mover._end_hold
     _held_anchor = Mover._held_anchor
     _last_known = Mover._last_known
+    _last_print = Mover._last_print
     _position_average = Mover._position_average
 
     def __init__(self, bid: str, **rows: Any) -> None:

@@ -482,9 +482,13 @@ def confirmed(bid: str, last: str | None) -> tuple[Any, Any]:
     """One step of the sale path after two prints confirmed a breach at 10.27: the cached quote's bid
     (`"0"` for a one-sided quote) and the cache's last trade."""
     seam = cast(Any, Seam(bid, breach_count=2, trigger=TriggerType.LAST_PRICE))
-    seam.last = last
+    seam.last, seam.last_ns = last, T0
     seam.cache.trade = lambda _: (
-        None if seam.last is None else SimpleNamespace(price=Price.from_str(seam.last))
+        None
+        if seam.last is None
+        else SimpleNamespace(
+            price=Price.from_str(seam.last), ts_event=seam.last_ns, ts_init=seam.last_ns
+        )
     )
     slot = seam_slot(seam)
     slot.exiting, slot.breach_price = True, Decimal("10.27")
@@ -527,6 +531,86 @@ def test_with_no_bid_a_remade_sale_follows_the_last_trade_down_and_never_back_up
     seam.last = "10.50"
     seam._protect(slot, Decimal(5), T0 + 12 * SECOND)
     assert seam.sent[-1] is not second and seam.sent[-1].price == Price.from_str("10.0900")
+
+
+def no_bid_sale(*later: TradeTick) -> tuple[Any, list]:
+    """Two prints, 10.28 and 10.27, confirm the breach under a one-sided quote, then `later`."""
+    first = START + 100 * MS
+    s, orders, _ = replay(
+        [
+            one_sided_at(START + 50 * MS),
+            print_at(first, "10.28"),
+            print_at(first + 100 * MS, "10.27"),
+            *later,
+        ]
+    )
+    return s, sells(orders)
+
+
+def test_with_no_bid_an_older_print_that_arrives_late_is_not_a_fall_after_the_confirmation() -> (
+    None
+):
+    """A second reader, 2026-11-12: a print at 9.90 whose own time is before the confirming print
+    arrives after it. It is history, not a fall: the sale is priced from the confirming print,
+    10.26, and not from the last trade received, 9.89."""
+    first = START + 100 * MS
+    s, sales = no_bid_sale(print_at(first + 50 * MS, "9.90", received=first + 200 * MS))
+    assert sales and sales[0].price.as_decimal() == Decimal("10.26")
+    floor = chase_floor(Decimal("10.26"), s.settings.chase_cap)
+    assert all(order.price.as_decimal() >= floor for order in sales)
+
+
+def test_with_no_bid_a_late_older_print_does_not_lift_the_sale_over_a_newer_fall_either() -> None:
+    """The other way round: trades fell to 9.90 after the confirmation, and a print from before the
+    fall, 10.40, arrives last. The newest trade by its own time is still 9.90: the sale is 9.89."""
+    first = START + 100 * MS
+    _, sales = no_bid_sale(
+        print_at(first + 200 * MS, "9.90"),
+        print_at(first + 150 * MS, "10.40", received=first + 250 * MS),
+    )
+    assert sales and sales[0].price.as_decimal() == Decimal("9.89")
+
+
+def test_with_no_bid_two_prints_of_one_time_are_read_in_the_order_they_arrived() -> None:
+    """Prints that share a time, as a sweep's do, cannot be ordered by it: the later arrival is the
+    newer, as the cache has it."""
+    first = START + 100 * MS
+    _, sales = no_bid_sale(
+        print_at(first + 200 * MS, "9.90"),
+        print_at(first + 200 * MS, "9.95", received=first + 250 * MS),
+    )
+    assert sales and sales[0].price.as_decimal() == Decimal("9.94")
+
+
+def test_with_no_bid_a_trade_the_cache_holds_from_before_the_slots_first_print_still_counts() -> (
+    None
+):
+    """The slot's first print can itself be a late report, older than a trade the cache already
+    holds: the newer of the two by its own time stands in for the bid."""
+    seam, slot = confirmed("0", "9.90")
+    slot.newest_print = (T0 - SECOND, Decimal("10.40"))
+    seam._protect(slot, Decimal(5), T0)
+    assert seam.sent[-1].price == Price.from_str("9.8900")
+
+
+def test_with_no_bid_a_sale_remade_without_an_anchor_reads_the_same_newest_trade() -> None:
+    """The wind-down remakes a sale through the plain limit with no anchor. With the arm on it reads
+    the trade newest by its own time too, not the one received last: a late report of an older 9.90
+    does not take a sale from 10.26 to 9.89."""
+    seam, slot = confirmed("0", "9.90")
+    seam.last_ns = T0 - SECOND
+    slot.newest_print = (T0, Decimal("10.27"))
+    seam._limit_sell(slot, Decimal(5), T0, None)
+    assert seam.sent[-1].price == Price.from_str("10.2600")
+
+
+def test_with_no_print_kept_the_plain_sale_reads_the_cache_as_before() -> None:
+    """Nothing is kept with the arm off, and nothing before a slot's first print: the plain sale then
+    prices from the cache's last trade, as it did."""
+    seam, slot = confirmed("0", "9.90")
+    assert slot.newest_print is None
+    seam._limit_sell(slot, Decimal(5), T0, None)
+    assert seam.sent[-1].price == Price.from_str("9.8900")
 
 
 def test_a_floor_released_after_its_wait_is_not_put_back_by_the_persistence_arm() -> None:
