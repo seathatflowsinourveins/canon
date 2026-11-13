@@ -593,3 +593,107 @@ def test_a_holding_this_node_did_not_see_fill_holds_60_s_from_the_venues_fill_ti
     seam._protect(slot, Decimal(3), filled + 61 * SECOND)
     assert [o.kind for o in seam.sent] == ["LIMIT"]
     assert slot.exit_record.trigger_reason == "unpriced_exit"
+
+
+def test_a_locked_quote_is_two_sided_so_a_print_trigger_hold_waits_past_60_s() -> None:
+    """w3-d-succ2/P2: a locked quote (bid == ask) has both sides; the adapter refuses only a side at or
+    under zero (`canon_alpaca.data.parse_quote`). The 60 s `unpriced_exit` is for a holding with no
+    two-sided quote (Mover._hold's comment, the handbook's counted limit), so a locked quote keeps the
+    wait for a print or the wind-down."""
+    seam, slot, filled, _last = holding(TriggerType.LAST_PRICE, bid="10.00", ask="10.00")
+    seam._protect(slot, Decimal(3), filled + SECOND)
+    assert slot.held_stop == Decimal("9.80") and seam.sent == []
+    seam._protect(slot, Decimal(3), filled + 61 * SECOND)
+    assert seam.sent == [] and not slot.exiting
+
+
+def test_a_crossed_quote_is_two_sided_so_a_print_trigger_hold_waits_past_60_s() -> None:
+    """The delta review's P3-3: a crossed quote (bid over ask) has both sides too, so it keeps the
+    wait for a print or the wind-down as a locked one does."""
+    seam, slot, filled, _last = holding(TriggerType.LAST_PRICE, bid="10.10", ask="10.00")
+    seam._protect(slot, Decimal(3), filled + SECOND)
+    assert slot.held_stop == Decimal("9.80") and seam.sent == []
+    seam._protect(slot, Decimal(3), filled + 61 * SECOND)
+    assert seam.sent == [] and not slot.exiting
+
+
+def test_an_unsized_holding_records_the_held_stop_it_kept() -> None:
+    """w3-d-succ2/P3-1: the exit record's held_stop_kept and held_stop_from_average name the stop a
+    holding kept (the lead's ruling of 2026-11-13 08:24). A holding the strategy did not size
+    (`sized_loss` None, MoverConfig's default) still holds a stop and sells through it, so its exit
+    record carries the level and its distance from the average too."""
+    seam, slot, filled, last = holding(TriggerType.LAST_PRICE, bid="9.89", ask="9.91")
+    seam._protect(slot, Decimal(3), filled + SECOND)
+    assert slot.sized_loss is None and slot.held_stop == Decimal("9.80")
+    last.append(stamped("9.7000", filled + 2 * SECOND, filled + 2 * SECOND))
+    seam._protect(slot, Decimal(3), filled + 3 * SECOND)
+    assert slot.exit_record.trigger_reason == "held stop (followed price)"
+    record = slot.exit_record.record()
+    assert Decimal(record["held_stop_kept"]) == Decimal("9.80")
+    assert Decimal(record["held_stop_from_average"]) == Decimal("0.20")
+
+
+def test_a_step_with_no_anchor_keeps_the_held_stops_recorded_distance() -> None:
+    """The delta review's P2: a hold step that cannot read the average (the entry gone from the cache,
+    no position average, no limit price) keeps the distance the record already holds, so the record
+    never names a kept level with no distance beside it."""
+    seam, slot, filled, _last = holding(TriggerType.LAST_PRICE, bid="9.89", ask="9.91")
+    seam._protect(slot, Decimal(3), filled + SECOND)
+    assert slot.held_stop == Decimal("9.80")
+    assert slot.exit_record.held_stop_from_average == Decimal("0.20")
+    seam._held_anchor = lambda slot: None
+    seam._protect(slot, Decimal(3), filled + 2 * SECOND)
+    assert slot.held_stop == Decimal("9.80")
+    record = slot.exit_record.record()
+    assert Decimal(record["held_stop_kept"]) == Decimal("9.80")
+    assert record["held_stop_from_average"] is not None
+    assert Decimal(record["held_stop_from_average"]) == Decimal("0.20")
+
+
+def test_a_step_with_no_anchor_keeps_a_newer_distance_after_the_average_moved() -> None:
+    """The DeepSeek reader's P2 (r-dsh-heldrec): a cheaper fill moved the average to 9.70 and the record
+    named -0.10 (the stop over the average, H1). A later step that cannot read the average keeps that,
+    and does not measure from the first step's anchor 10.00 and report +0.20."""
+    seam, slot, filled, _last = holding(TriggerType.LAST_PRICE, bid="9.89", ask="9.91")
+    seam._protect(slot, Decimal(3), filled + SECOND)
+    assert slot.held_stop == Decimal("9.80")
+    assert slot.exit_record.held_stop_from_average == Decimal("0.20")
+    seam._held_anchor = lambda slot: Decimal("9.70")  # the average moved, and this step reads it
+    seam._protect(slot, Decimal(3), filled + 2 * SECOND)
+    assert slot.exit_record.held_stop_from_average == Decimal("-0.10")
+    seam._held_anchor = lambda slot: None  # the entry is gone: no average to read
+    seam._protect(slot, Decimal(3), filled + 3 * SECOND)
+    record = slot.exit_record.record()
+    assert Decimal(record["held_stop_kept"]) == Decimal("9.80")
+    assert Decimal(record["held_stop_from_average"]) == Decimal("-0.10")
+
+
+def test_a_recorded_distance_is_no_average_when_the_anchor_came_from_the_bid() -> None:
+    """The DeepSeek reader's P3 (r-dsh-heldrec): `_trail_anchor` may set the protection anchor from the
+    current bid when no average is readable. A held stop whose level comes from a kept trigger does not
+    report the bid as an average fill: with no average read, no distance is recorded."""
+    seam, slot, filled, _last = holding(TriggerType.LAST_PRICE, bid="12.00", ask="12.02")
+    slot.protection_anchor = Decimal("12.00")  # set by an earlier `_trail` from the current bid
+    slot.trail_trigger = Decimal("11.76")  # a trailed sale had reached this trigger
+    seam._held_anchor = lambda slot: None  # no entry average, no position average, no limit price
+    seam._protect(slot, Decimal(3), filled + SECOND)
+    record = slot.exit_record.record()
+    assert Decimal(record["held_stop_kept"]) == Decimal("11.76")
+    assert record["held_stop_from_average"] is None
+
+
+def test_a_second_hold_with_no_average_measures_its_kept_level_from_the_last_average_read() -> None:
+    """The fix's /code-review (high, finding 1): a hold that read the average 10.00 ends in the trail;
+    a later hold on the same holding reads no average and keeps a reached trigger 11.76. The record
+    pairs that level with its distance from the last average read (-1.76, the stop over it, H1), not
+    with the first hold's 0.20, which was measured from another stop."""
+    seam, slot, filled, _last = holding(TriggerType.LAST_PRICE, bid="9.89", ask="9.91")
+    seam._protect(slot, Decimal(3), filled + SECOND)
+    assert slot.exit_record.held_stop_from_average == Decimal("0.20")
+    seam._end_hold(slot, filled + 2 * SECOND, "trail")
+    slot.trail_trigger = Decimal("11.76")  # the trailed sale reached this trigger
+    seam._held_anchor = lambda slot: None  # the entry is gone: no average to read
+    seam._protect(slot, Decimal(3), filled + 3 * SECOND)
+    record = slot.exit_record.record()
+    assert Decimal(record["held_stop_kept"]) == Decimal("11.76")
+    assert Decimal(record["held_stop_from_average"]) == Decimal("-1.76")

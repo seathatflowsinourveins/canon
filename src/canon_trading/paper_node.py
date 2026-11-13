@@ -24,6 +24,10 @@ Read 2026-11-11 at the same pin: `crates/live/src/python/config.rs`
 (`max_notional_per_order`, a map by instrument): one node loads, reconciles and caps every window name,
 with one shared submit and modify budget.
 
+Read 2026-11-13 at the same pin: `docs/developer_guide/python_adapters.md:87-109`:
+adapter fields are keyword arguments of a `DataClientConfig` subclass, and the factory receives that
+original subclass instance; instance fields participate in serialization.
+
 The numbers and why each was chosen are ADR 0049's. This is an end-to-end check of the stack on paper,
 not a strategy evaluation; ADR 0010 governs that, and nothing here ranks or recommends a strategy.
 
@@ -187,22 +191,35 @@ def alpaca_paper_builder(
     delay_post_stop_secs: int = DELAY_POST_STOP_SECS,
     data_load_all: bool = False,
     trade_condition_filter: bool = False,
+    validate_trade_sequence: bool = False,
 ) -> LiveNodeBuilder:
     """A builder with the Alpaca data and execution clients for one or several `instrument_id`s, `risk_limits`,
     `exec_engine_config` and the timeouts every paper node here uses; the caller adds logging and builds.
     `delay_post_stop_secs` is longer for a strategy whose managed stop runs a market exit, which the node
     runs only inside that delay (`session_window.MANAGED_DELAY_POST_STOP_SECS`).
+    `validate_trade_sequence` opts into ADR 0134's adapter check; with it and `trade_condition_filter`
+    both False the data config is the plain one.
     The calls are the ones upstream's live examples make (`examples/live/sandbox/exec_tester.py`)."""
+    if not isinstance(validate_trade_sequence, bool):
+        raise TypeError(
+            f"validate_trade_sequence must be True or False, not {validate_trade_sequence!r}"
+        )
     provider = InstrumentProviderConfig(load_ids=_instrument_ids(instrument_id))
     # `data_load_all`: the data client loads every active US equity (`AlpacaInstrumentProvider.load_all_async`,
     # one GET of the asset list), so a ranking actor's wildcard bars are tallied for the whole market; the
     # execution client keeps the listed instruments (the lead's order of 2026-11-12 for the 04:00 firing).
     data_provider = InstrumentProviderConfig(load_all=True) if data_load_all else provider
     # `trade_condition_filter`: only a print Alpaca's minute bars take becomes a tick
-    # (`AlpacaDataClientConfig`), for a strategy that elects on prints; off, the plain config as before.
+    # (`AlpacaDataClientConfig`), for a strategy that elects on prints. `validate_trade_sequence`: a
+    # streamed print older than the newest passed on is set aside (ADR 0134). Either, or both, is named
+    # on the adapter's config; with both off, the plain config as before.
     data_config = (
-        AlpacaDataClientConfig(instrument_provider=data_provider, trade_condition_filter=True)
-        if trade_condition_filter
+        AlpacaDataClientConfig(
+            instrument_provider=data_provider,
+            trade_condition_filter=trade_condition_filter,
+            validate_trade_sequence=validate_trade_sequence,
+        )
+        if trade_condition_filter or validate_trade_sequence
         else DataClientConfig(instrument_provider=data_provider)
     )
     return (

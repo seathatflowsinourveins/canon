@@ -337,7 +337,13 @@ Each is stated where it is implemented, with its source.
   (per symbol the count, the most any was behind in milliseconds, their shares, and the prints passed
   on unordered), which a Mover window's record carries as `late_prints_set_aside_by_the_adapter`. A
   bar built from ticks does not hold a print set aside; Alpaca's own bars are not affected. A request's
-  trades are not checked. Off by default, and no node sets it yet.
+  trades are not checked. Off by default; the paper and sandbox node builders accept
+  `validate_trade_sequence=True`, and a session window passes it only when run with
+  `--validate-trade-sequence`, which is refused together with `--trigger last_price`: under a print
+  trigger Mover judges a late print itself (one counts toward a held stop's low) and must see every
+  print, and this check sets a late one aside before any strategy sees it. Its bound for a print
+  stamped ahead is against receipt, where Mover's is against its name's quotes; that difference is a
+  limit until this bound moves to the same reference (ADR 0134).
   Corrections and cancels are not applied to ticks already sent. Results are
   requested in ascending timestamp order and delivered in one `TradesResponse`, preserving the request
   ID, bounds and params. The inclusive window is cut at now, and a missing start uses midnight New York
