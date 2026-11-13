@@ -122,20 +122,33 @@ ten fields as list lines, in this order, each with a value:
 * supersedes: none
 * source: lead
 
-### L0007: The account read could not show what a protective stop did once it ended
+### L0007: A copy bound left a long window's log behind with no word
+
+* area: execution
+* session: 2026-11-13
+* result: The scheduled runner kept each window's records outside the temp folder with a copy bounded at 1 MB, and a window log over that bound was left behind silently; a long window's log is often around 10 MB, so the log of the windows most worth reading was the one lost on a restart
+* evidence: scripts/test-lanes, the cases a log over 1 MB is never dropped silently and the log over 1 MB that cannot be kept is named on stderr with its size
+* lesson: A bound on what is kept says what it left out and where it still is; a silent bound reads later as a record that never existed
+* change: a log over the bound is kept as its first and last 512000 bytes with a line naming what was left out, and one that cannot be kept is named on stderr (mise.toml, kept)
+* next: none
+* status: adopted
+* supersedes: none
+* source: lead
+
+### L0008: The account read could not show what a protective stop did once it ended, and its first fix was proven against no bound
 
 * area: exits
 * session: 2026-11-13
-* result: The paper account read showed only open orders, so a protective stop that had sold or been canceled left no trace in it; with the ended orders added, one read of a paper account listed 58 ended orders for the trade date, among them two canceled protective stops with their trail and high-water mark; that first read, walking the whole order history, took about four of its five allowed minutes
-* evidence: `src/canon_trading/custody.py` and `tests/test_custody.py`; the paper read's output, kept outside the repository
-* lesson: A stop's result has to be readable from the venue's ended orders, chosen by the time of the final event rather than of submission, and a walk over the venue's history needs a bound the venue documents (its 90-day cancel of an aged GTC order), with what must not be lost printed before it
-* change: the account read prints the trade date's ended orders after the flat read, bounded 92 days back
-* next: Read the trade date's protective stops from this section when judging a window, not from the dashboard
+* result: The paper account read showed only open orders, so a protective stop that had sold or been canceled left no trace in it; the first fix walked 92 days of order history and its proof read took about four of its five allowed minutes, which was judged a pass because it ended; on a busier paper account the same walk met the timeout; bounded to the trade date's submissions, the read listed the date's ended orders in about a second
+* evidence: `src/canon_trading/custody.py` and `tests/test_custody.py`; the paper reads' output, kept outside the repository
+* lesson: A read's proof is judged against its stated bound, its duration included, on an account with a full day's history; a walk the venue cannot bound by the event's time is bounded by the date, with what it leaves out named on its output, and a read that is killed must say it did not finish
+* change: the account read prints the ended orders submitted in the trade date after the flat read, says when its walk did not finish, and names that an order submitted earlier is not listed
+* next: Read an earlier-date protective stop's sale from the venue's fill activities, a next unit
 * status: adopted
 * supersedes: none
 * source: review
 
-### L0008: The default window sells on one quote because persistence is refused on its arm
+### L0009: The default window sells on one quote because persistence is refused on its arm
 
 * area: exits
 * session: 2026-11-13
