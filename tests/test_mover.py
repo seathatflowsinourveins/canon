@@ -3967,7 +3967,7 @@ def test_a_name_unwatched_after_its_sale_keeps_its_sale_price_for_state_reentry(
 # xfail is strict so that the fix turns it into a failure here until the mark is removed.
 
 
-@pytest.mark.no_position_without_its_exit
+@pytest.mark.no_position_without_its_exit(clause=1)
 @pytest.mark.xfail(
     strict=True,
     raises=AssertionError,
@@ -3987,7 +3987,7 @@ def test_no_entry_is_sent_into_a_name_whose_trading_is_halted() -> None:
     assert buys == [], f"a buy was sent into the halt: {sides(buys)}"
 
 
-@pytest.mark.no_position_without_its_exit
+@pytest.mark.no_position_without_its_exit(clause=1)
 @pytest.mark.xfail(
     strict=True,
     raises=AssertionError,
@@ -4021,7 +4021,7 @@ def test_no_overnight_entry_into_an_on_demand_name_that_is_not_overnight_tradabl
     assert buys == [], f"an overnight buy was sent on an ineligible name: {sides(buys)}"
 
 
-@pytest.mark.no_position_without_its_exit
+@pytest.mark.no_position_without_its_exit(clause=1)
 @pytest.mark.xfail(
     strict=True,
     raises=AssertionError,
@@ -4042,7 +4042,7 @@ def test_no_entry_is_sent_within_its_timeout_and_a_step_of_the_wind_down() -> No
     assert late == [], f"a buy was sent {(wind_down - late[0].ts_init) / SECOND:.0f} s before it"
 
 
-@pytest.mark.no_position_without_its_exit
+@pytest.mark.no_position_without_its_exit(clause=1)
 @pytest.mark.xfail(
     strict=True,
     raises=AssertionError,
@@ -4083,7 +4083,7 @@ def test_a_late_buys_shares_are_covered_by_a_sale_while_the_old_legs_cancel_stay
     assert covering, f"5 late shares were held {bound} s with no sale sent for them"
 
 
-@pytest.mark.no_position_without_its_exit
+@pytest.mark.no_position_without_its_exit(clause=3)
 def test_a_sale_resting_above_a_gapped_bid_follows_it_within_the_floor_wait_and_two_chases() -> (
     None
 ):
@@ -4110,7 +4110,7 @@ def test_a_sale_resting_above_a_gapped_bid_follows_it_within_the_floor_wait_and_
     assert flat
 
 
-@pytest.mark.no_position_without_its_exit
+@pytest.mark.no_position_without_its_exit(clause=3)
 def test_a_held_stop_with_no_two_sided_quote_sells_within_hold_most_secs_of_the_fill() -> None:
     """Bounded today: after the entry fills every quote is one-sided (no bid), so no trailing sell can
     be armed and the strategy holds a stop (`_hold`, mover.py:4358) above which the bars close; with no

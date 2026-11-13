@@ -5,7 +5,7 @@ decision-makers: repo owner (requirement, 2026-11-13, as the lead relays it); le
 review-by: 2027-02-11
 ---
 
-# No position without its exit, in any session, on any account: seven clauses, each held by a record and marked built, in review or not built; open: the clauses not built
+# No position without its exit, in any session, on any account: seven clauses, each held by a record, with each clause's status printed from the case set's marks; open: the clauses printed not built or with no case
 
 ## Context and Problem Statement
 
@@ -13,13 +13,13 @@ On 2026-11-13 a long went over the close with no working exit, as the lead relay
 requirement the same day is that no position exists without its exit, in any session and on any
 account. The parts that make an exit already sit in several records (ADR 0083, 0088, 0091, 0119, 0142,
 0146, 0148), each with its own scope. This record states the requirement once, as seven clauses, cites
-what holds each, and marks each built, in review or not built as of 2026-11-13, so every unit names the
-clause it makes true.
+what holds each, and leaves each clause's status to a command that reads the case set, so every unit
+names the clause it makes true and no status here goes stale.
 
 ## Decision Drivers
 
 * The requirement is the owner's; this record restates it and invents no mechanism.
-* Each clause cites the record that decides its means; where none does, the clause is not built.
+* Each clause cites the record that decides its means; its status is what its cases show, not a word kept here.
 * Paper only (rule 8): every clause is built and proven on paper first.
 
 ## Considered Options
@@ -34,31 +34,46 @@ clauses 2, 4 and 5 reach past it (the owner's holdings, the gain lock, the re-en
 requirement needs a home that cites 0146 rather than one that stretches it. The rule is the first
 practice of the Protect move in the handbook.
 
-| # | Clause | Held by | As of 2026-11-13 |
-|---|---|---|---|
-| 1 | Every order of ours that opens or adds to a long carries its trailing exit: armed at the first fill, held by our engine, only rising, around the clock on weekdays. An entry whose exit cannot be armed is not sent. | philosophy.md move 3; ADR 0083; ADR 0088; ADR 0146 | Built for the Mover inside a window, held by the engine and only rising, but armed at the next one-second step after the fill, not at the fill; around the clock not built (the lead's plan, units 5, 7 to 9, on branches); for other templates not built (units 11, 12); the refusal partly built: an entry whose trail cannot be planned is refused, but not one whose arming fails |
-| 2 | A holding the owner opens gets the same exit within seconds, by itself. One that cannot be planned is named unprotected at once and every minute until it is, never silently. | philosophy.md, Custody; ADR 0142; ADR 0146 | By hand only (ADR 0142's protect task, a broker stop); by itself not built (the plan's unit 10, in work); the minute-by-minute naming not built |
-| 3 | The exit is a fast sell: a managed limit that chases within its cap on a confirmed breach; after hours, a limit marked for extended hours. | philosophy.md move 3; ADR 0088; ADR 0119 | Partly built for the Mover: the chase and its floor (ADR 0088) and every protective sell marked for extended hours (the plan's unit 6) are in effect; the confirmed breach (ADR 0119) is in the class behind arms that are off and refused under every paper window's sizing, so a window's sell elects on one quote: not in effect |
-| 4 | Once the gain covers its costs, it is locked. | philosophy.md move 3; ADR 0083 | Not built on `main` (ADR 0088 lists it as a departure); a unit in review, as relayed (`UNVERIFIED`) |
-| 5 | Every protective sale arms a re-entry on a reclaim while the name still ranks. | philosophy.md move 4; ADR 0088; ADR 0091 | Built for the Mover's own sales inside a window, by the clock and state arms, unranked names refused (ADR 0088, 0091); after the protect lineage's sale on account C, ADR 0148 proposes re-entry triggered by the sale, not by a ranking, so "while the name still ranks" is not met there |
-| 6 | The exit survives window ends, restarts and feed changes. Only a market break ends a holding. | ADR 0146 ("only a market break ends a holding" is the owner's, in no record yet) | Not built: the carried level's rebuild is on `main` with no caller yet (the plan's unit 4); the carry, the claim at start and the hand-over between feeds are on branches (units 7 to 9) |
-| 7 | The broker's own stop is only the backstop. | philosophy.md move 3; ADR 0129; ADR 0146 | Not met on account C: there the protect task's broker stop is the only cover ADR 0142 provides, and it does not trigger outside the regular session, so after the close C has no working exit (whether a stop rests there now is `UNVERIFIED`); the engine's stop replaces it with the plan's unit 10 |
+Each clause's status is printed, not kept here: `uv run --locked python -m canon_trading.exit_rule` runs
+the case set (every test marked `no_position_without_its_exit(clause=N)`) and prints each clause as
+`built` (it has cases and every one passes), `not built` (one of its cases is a strict expected failure,
+whose reason is the open gap) or `no case`, and exits 1 when a case is broken: one that fails or is skipped, one
+that passes while still marked an expected failure, an expected failure with no strict mark (an imperative
+`pytest.xfail` among them), a case naming no clause, or a set with no case at all.
+"In review" is not a state the marks show: run on a unit's branch, the command prints what that unit
+would make built. A clause is built only as far as its cases reach; a gap this record's first version
+named without a case (the arming at the fill, around the clock and outside a window; the confirmed
+breach in effect; clauses 4 to 7) is seen once its case is written.
+
+| # | Clause | Held by |
+|---|---|---|
+| 1 | Every order of ours that opens or adds to a long carries its trailing exit: armed at the first fill, held by our engine, only rising, around the clock on weekdays. An entry whose exit cannot be armed is not sent. | philosophy.md move 3; ADR 0083; ADR 0088; ADR 0146 |
+| 2 | A holding the owner opens gets the same exit within seconds, by itself. One that cannot be planned is named unprotected at once and every minute until it is, never silently. | philosophy.md, Custody; ADR 0142; ADR 0146 |
+| 3 | The exit is a fast sell: a managed limit that chases within its cap on a confirmed breach; after hours, a limit marked for extended hours. | philosophy.md move 3; ADR 0088; ADR 0119 |
+| 4 | Once the gain covers its costs, it is locked. | philosophy.md move 3; ADR 0083 |
+| 5 | Every protective sale arms a re-entry on a reclaim while the name still ranks. | philosophy.md move 4; ADR 0088; ADR 0091 |
+| 6 | The exit survives window ends, restarts and feed changes. Only a market break ends a holding. | ADR 0146 ("only a market break ends a holding" is the owner's, in no record yet) |
+| 7 | The broker's own stop is only the backstop. | philosophy.md move 3; ADR 0129; ADR 0146 |
 
 ### Consequences
 
 * Good: one sentence, with its clauses, that every unit of the 24/5 plan and every protection unit
-  names; a reader sees at once which clauses are still open.
+  names; one command shows a reader which clauses are still open.
 * Good: a gap like the day's is named against a clause, not rediscovered.
-* Bad: a status column goes stale; it is restated in this record whenever a unit lands that changes it.
-* Open: clauses 1 (at the fill, outside a window, beyond the Mover, and the arming refusal), 2 (by
-  itself, and the naming), 3 (the confirmed breach in effect), 4, 5 on account C, 6 and 7 on account C
-  are not built.
+* Good: no status is kept by hand, so none goes stale: the command reads the case set as it stands.
+* Bad: a clause reads `built` when its cases pass, however few they are; a gap is seen only once its case
+  is in the set.
+* Open: the clauses the command prints `not built` or `no case`.
 
 ### Confirmation
 
 * The Protect move's first practice names this record (`tests/test_handbook.py` checks that it names a
   record that exists).
-* Each unit's report names the clause it makes true, and the row in the table above moves with it.
+* Each unit's report names the clause it makes true. A landing that closes a gap removes its case's
+  expected-failure mark in the same pull request, and updates only its own practice file
+  (`docs/handbook/practices/`, one file each); this record and its table are not edited for a status.
+* `tests/test_exit_rule.py` runs the command on the repository's own set and fails if it is broken, and
+  checks that this record keeps no status column.
 * Paper evidence per clause, as ADR 0146's Confirmation lists for clauses 1, 3 and 6.
 
 ## Evidence
