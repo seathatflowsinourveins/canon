@@ -638,7 +638,9 @@ def test_a_breach_confirmed_by_prints_marks_the_exit_record_at_the_confirming_pr
     )
     assert held == 0 and len(s.exits) == 1
     row = s.exits[0]
-    assert row.trigger_reason == "trailing stop (breach confirmed by prints)"
+    assert row.trigger_reason == (
+        "trailing stop (persistence: breach confirmed by 2 prints at or under 10.2900)"
+    )
     assert row.trigger_price == Decimal("10.27") and row.trigger_ns == T0 + first + 100 * MS
     assert [entry["stopped_out"] for entry in s.entries_sent] == [True]
 
@@ -1032,3 +1034,28 @@ def test_a_breach_sale_keeps_the_confirmed_level_beside_its_fill() -> None:
     record = s.record()
     trigger = record["sell_triggers"].get(sales[0].client_order_id.value)
     assert trigger is not None and Decimal(trigger) == LEVEL, record["sell_triggers"]
+
+
+def test_a_confirmed_breach_names_its_exits_reason_trigger_and_time() -> None:
+    """The lead's D3 terms of 2026-11-12, A5: every exit carries its evidence and a reason. A breach
+    the persistence arm confirms is the strategy's own trailing stop; its exit row names it, with the
+    confirming print's own time and price, and the entry is marked stopped out."""
+    first = START + 100 * MS
+    s, orders, held = replay(
+        [
+            print_at(first, "10.35"),
+            quote_at(first + 50 * MS, "9.99", "10.01"),
+            print_at(first + 100 * MS, "10.00"),
+            print_at(first + 200 * MS, "10.00"),
+            quote_at(START + SECOND + 100 * MS, "9.99", "10.01"),
+        ],
+        end=first + 3 * SECOND,
+    )
+    assert held == 0 and len(sells(orders)) == 1
+    record = s.record()
+    (row,) = record["exits"]
+    assert row["trigger_reason"] is not None, row
+    assert row["trigger_reason"].startswith("trailing stop (persistence"), row["trigger_reason"]
+    assert Decimal(row["trigger_price"]) == Decimal("10.00")
+    assert row["trigger_ns"] == T0 + first + 200 * MS
+    assert record["entries"][0]["stopped_out"] is True

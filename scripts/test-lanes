@@ -604,8 +604,8 @@ aged() { local t; t=$(tstamp $(( $(date +%s) - $1 ))) && TZ=UTC touch -t "$t" "$
 # the plist status reads (install rewrites it as it reloads the job), kept aside meanwhile if there is one
 SPP="$HOME/Library/LaunchAgents/local.canon.paper-session.plist"; mkdir -p "${SPP%/*}"; spp_kept=""
 if [ -e "$SPP" ]; then spp_kept="$TMP/spp.kept"; cp -p "$SPP" "$spp_kept"; fi
-aged 900 "$PD/latest.json" "$PD/last-firing.json" "$PD/scheduled-firing.json" "$SPP"; status
-check "the last firing 15 minutes ago, the job not running: not yet overdue (a sleep, or a reload restarting the interval)" \
+aged 300 "$PD/latest.json" "$PD/last-firing.json" "$PD/scheduled-firing.json" "$SPP"; status
+check "the last firing 5 minutes ago, the job not running: not yet overdue (a sleep, or a reload restarting the interval)" \
       eval '! grep -q "overdue" "$TMP/status.out"'
 aged 1800 "$PD/latest.json" "$PD/last-firing.json" "$PD/scheduled-firing.json" "$SPP"; status; rc=$?
 check "the last firing ended 30 minutes ago, the job not running: STALE, overdue, exit 1" \
@@ -734,12 +734,12 @@ if command -v plutil >/dev/null 2>&1; then
         eval '[ "$(git -C "$CK" rev-parse HEAD)" = "$(git -C "$O" rev-parse main)" ] && ! git -C "$CK" symbolic-ref -q HEAD >/dev/null && [ "$(git -C "$CK" config canon.paperCheckout)" = true ]'
   # launchd counts StartInterval from the end of the last firing, not its start (observed on macOS 27.2: a
   # 20 s interval and a 15 s job started every 35 s), so the interval is the pause after a firing: at least
-  # session_window.GAP_SECS, and with a 25-minute window and about two minutes of start-up and stop, a
-  # window every 35 minutes or so
+  # session_window.GAP_SECS, so the firing after a window is not skipped, and short, so account B is idle
+  # about a minute and its start-up between two windows while a session is open (ADR 0050, 2026-11-13)
   piv=$(plutil -extract StartInterval raw -o - "$PP"); pmin=$(plutil -extract ProgramArguments.8 raw -o - "$PP")
   pgap=$(sed -n 's/^GAP_SECS = \([0-9]*\).*/\1/p' "$ROOT/src/canon_trading/session_window.py")
-  check "... 10 minutes after each firing ends (${piv} s): above session_window's gap (${pgap} s), a ${pmin}-minute window about every 35 minutes" \
-        eval '[ "$piv" = 600 ] && [ -n "$pgap" ] && [ "$piv" -ge "$pgap" ] && [ $((pmin * 60 + 120 + piv)) -le 2300 ]'
+  check "... ${piv} s after each firing ends: above session_window's gap (${pgap} s) and at most 90 s, so a ${pmin}-minute window follows the last within about two minutes" \
+        eval '[ "$piv" = 70 ] && [ -n "$pgap" ] && [ "$piv" -gt "$pgap" ] && [ "$piv" -le 90 ]'
   check "... from the automation folder, not a checkout" test "$(plutil -extract WorkingDirectory raw -o - "$PP")" = "$AH/canon"
   check "... not at load"                         test "$(plutil -extract RunAtLoad raw -o - "$PP")" = false
   check "... marked as the schedule's (CANON_PAPER_SCHEDULED=1), which a run by hand is not" \
@@ -1424,6 +1424,10 @@ EOF
     owner paper:session "$SD" 40 1 "$SD" 2 || { src=owner; took=0; return 0; }
     # NOKEYS: both keychain items empty, as mise renders a missing one
     [ -z "${NOKEYS:-}" ] || sed -i.bak 's/= "stand-in"$/= ""/' "$SD/mise.toml"
+    # GAPS, LOCKW: a shorter gap and lock wait; MARK: a window ended just now (its marker in the log folder)
+    [ -z "${GAPS:-}" ] || sed -i.bak "s/^gap=[0-9]*\$/gap=$GAPS/" "$SD/mise.toml"
+    [ -z "${LOCKW:-}" ] || sed -i.bak "s/^lockwait=[0-9]*\$/lockwait=$LOCKW/" "$SD/mise.toml"
+    [ -z "${MARK:-}" ] || { mkdir -p "$SD/canon-paper-session"; touch "$SD/canon-paper-session/last-window-end"; }
     [ "$v" = - ] || printf '%s\n# a note under the value\n' "$v" > "$SD/canon/paper-schedule"
     printf '#!/bin/bash\nprintf "%%s\\n" "$*" >> "%s/uv-ran"\n%s\n' "$SD" "${SUV:-}" > "$SD/bin/uv"; chmod +x "$SD/bin/uv"
     if [ "$lock" = held ]; then
@@ -1456,6 +1460,21 @@ EOF
   sched by-hand off free by-hand --session regular --minutes 25
   check "a run by hand while the schedule is off: it runs, the switch not read" \
         eval '[ "$src" = 0 ] && grep -q "canon_trading.session_window .*--session regular --minutes 25" "$SD/uv-ran" && [ ! -e "$SD/canon-paper-session/last-firing.json" ]'
+  # The gap (ADR 0050, 2026-11-13): a run that takes B's lock under session_window.GAP_SECS after the last
+  # window's end waits out the rest of the gap, from what is left of the lock wait, so a run that was waiting
+  # for the lock as the window before it ended takes its turn rather than reaching the window's check and
+  # skipping
+  check "paper:session's gap is session_window.GAP_SECS" \
+        eval 'g=$(sed -n "s/^GAP_SECS = \([0-9]*\).*/\1/p" "$ROOT/src/canon_trading/session_window.py"); [ -n "$g" ] && [ "$(task_part paper:session run | sed -n "s/^gap=\([0-9]*\)\$/\1/p")" = "$g" ]'
+  GAPS=4 LOCKW=10 MARK=1 sched gap-wait off free by-hand --session regular --minutes 25
+  check "a run by hand that takes B's lock as the last window has just ended: it waits out the gap (${took} s of 4), then runs" \
+        eval '[ "$src" = 0 ] && [ "$took" -ge 3 ] && grep -q "^paper:session: waiting [345] s for the gap after the last window.s end" "$SD/out" && grep -q "canon_trading.session_window .*--session regular" "$SD/uv-ran"'
+  GAPS=6 LOCKW=2 MARK=1 sched gap-capped off free by-hand --session regular --minutes 25
+  check "... for no longer than is left of the lock wait (${took} s, lockwait 2), the window's own check deciding" \
+        eval '[ "$src" = 0 ] && [ "$took" -lt 5 ] && grep -q "^paper:session: waiting [12] s for the gap" "$SD/out" && grep -q "canon_trading.session_window" "$SD/uv-ran"'
+  GAPS=4 LOCKW=10 sched gap-none off free by-hand --session regular --minutes 25
+  check "... and with no window ended within the gap, it does not wait" \
+        eval '[ "$src" = 0 ] && ! grep -q "for the gap" "$SD/out" && grep -q "canon_trading.session_window" "$SD/uv-ran"'
   sched mover-without mover held scheduled --session auto --minutes 25
   check "a scheduled firing without --mover while the schedule is the mover's (a plist older than main): refused by name, exit 1, nothing started" \
         eval '[ "$src" = 1 ] && [ "$took" -lt 20 ] && [ ! -e "$SD/uv-ran" ] && grep -q "^paper:session: refused: the schedule is the mover.s (canon/paper-schedule) and this firing carries no --mover" "$SD/out"'
