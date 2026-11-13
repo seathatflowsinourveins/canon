@@ -137,8 +137,11 @@ UNCALIBRATED (ADR 0088; the persistence rows are ADR 0119's).
    its high and its breach by their own times, not the timer's. The sale goes out in the first step
    after the confirming print, so up to `STEP_SECS` later. The floor's reference is the lower of the
    confirming print and the current bid, so a recovery in the same step cannot lift it and the sale
-   follows a fast fall below the stop the entry was sized against. `exit_ticks` prices that
-   reference and the sale; `exit_through` still shapes entry risk sizing.
+   follows a fast fall below the stop the entry was sized against. A one-sided quote's zero bid is
+   no price, and neither is no quote: the last trade then stands in for the bid, in the reference
+   and as the sale's anchor, on every remake; it is the trade newest by its own time, not the one
+   received last. The floor is set once; released, it stays released.
+   `exit_ticks` prices that reference and the sale; `exit_through` still shapes entry risk sizing.
 3. *Entries.* A slot whose bars have just closed `run_bars` times in a row above the close before is a
    candidate under the explicitly selected `entry_arm="bridge"`. The default `registered` arm is
    selected from `early_entry_study.ARMS`: listing needs both move and cumulative dollar-volume
@@ -1183,6 +1186,11 @@ class Slot:
     breach_observations: deque[int] = field(default_factory=deque)
     breach_price: Decimal | None = None
     """The confirming print's price: a later recovery cannot lift the position's chase floor."""
+    newest_print: tuple[int, Decimal] | None = None
+    """The trade newest by its own time among those received with an arm on, with that time: what
+    stands in for a missing bid (`_last_print`). The cache's last trade is the last one received,
+    which a late report of an older print can be. It is the name's, not a holding's, so going flat
+    does not clear it. Two prints of one time are read in the order they arrived."""
     observed_ns: int = 0
     """Only strictly newer print times are read; duplicates, older prints and timers never count."""
     sized_loss: Decimal | None = None
@@ -1505,11 +1513,16 @@ class Mover(Strategy):
         self.trades += 1
         if self.persistence:
             slot = self.slots.get(trade.instrument_id)
-            if slot is not None and slot.trail_trigger is not None and not slot.exiting:
-                # No print happened after it was received: one stamped ahead of its receipt is read
-                # at its receipt, so it cannot hide the prints that follow it behind the watermark.
-                stamp = min(int(trade.ts_event), int(trade.ts_init))
-                slot.observations.append((stamp, trade.price.as_decimal()))
+            if slot is None:
+                return
+            # No print happened after it was received: one stamped ahead of its receipt is read
+            # at its receipt, so it cannot hide the prints that follow it behind the watermark.
+            stamp = min(int(trade.ts_event), int(trade.ts_init))
+            price = trade.price.as_decimal()
+            if slot.newest_print is None or stamp >= slot.newest_print[0]:
+                slot.newest_print = (stamp, price)
+            if slot.trail_trigger is not None and not slot.exiting:
+                slot.observations.append((stamp, price))
 
     def record(self) -> dict[str, Any]:
         """What a run's report keeps of the strategy, in plain values: its rows, the ranking it last
@@ -2089,15 +2102,34 @@ class Mover(Strategy):
             ):
                 return  # a sale the engine or the venue refused is sent again, every `chase_secs`
             if slot.exiting:
-                if self.persistence and slot.floor is None:
+                anchor = None
+                if self.persistence:
+                    # The lower of the confirming print and the bid. A one-sided quote's zero bid
+                    # is no price, and neither is no quote: the trade newest by its own time
+                    # (`_last_print`) then stands in for the bid, so a recovery cannot lift the
+                    # sale and a fall under the print is followed, and the sale is given that
+                    # basis as its anchor (`_limit_sell`).
                     quote = self.cache.quote(slot.instrument_id)
-                    if quote is not None:
-                        basis = quote.bid_price.as_decimal()
-                        if slot.breach_price is not None:
-                            basis = min(basis, slot.breach_price)
+                    basis = None if quote is None else quote.bid_price.as_decimal()
+                    quoted = basis is not None and basis > 0
+                    if not quoted:
+                        basis = self._last_print(slot)
+                    if slot.breach_price is not None:
+                        basis = (
+                            slot.breach_price if basis is None else min(basis, slot.breach_price)
+                        )
+                    if not quoted and basis is not None:
+                        anchor = basis
+                        self._note(
+                            slot,
+                            f"{slot.instrument_id}: no bid at a confirmed sale; priced from the "
+                            "lower of the confirming print and the newest trade",
+                        )
+                    # set once, for the first sale: a floor released after its wait stays released
+                    if basis is not None and slot.floor is None and not slot.floor_released:
                         first = exit_price(basis, self.settings.exit_ticks, None)
                         slot.floor = chase_floor(first, self.settings.chase_cap)
-                self._limit_sell(slot, held, now, slot.floor)
+                self._limit_sell(slot, held, now, slot.floor, anchor=anchor)
             else:
                 self._trail(slot, held, now)
         elif order.is_emulated:
@@ -2192,6 +2224,10 @@ class Mover(Strategy):
                     slot.breach_price = price
                     slot.exit_trigger = slot.trail_trigger
                     slot.observations.clear()
+                    # the decision to sell, at the confirming print's own time and price
+                    self._mark_exit(
+                        slot, stamp, price, "trailing stop (breach confirmed by prints)"
+                    )
                     self._say(
                         f"{slot.instrument_id}: breach confirmed at {stamp}, trigger "
                         f"{slot.trail_trigger}; selling by limit"
@@ -2408,6 +2444,21 @@ class Mover(Strategy):
         price = None if entry is None else getattr(entry, "price", None)
         return None if price is None else price.as_decimal()
 
+    def _last_print(self, slot: Slot) -> Decimal | None:
+        """The price of the trade newest by its own time: of the one kept for the slot from the
+        prints received with an arm on (`Slot.newest_print`) and the cache's last trade, whichever is
+        later, else what the held stop reads (`_last_known`). The cache's trade is the one received
+        last, which an older print reported late can be: such a print is history, and neither lowers
+        a sale priced with no bid nor lifts one over a newer fall. With no arm on nothing is kept,
+        and this is the cache's last trade as before."""
+        kept = slot.newest_print
+        trade = self.cache.trade(slot.instrument_id)
+        if trade is not None and (
+            kept is None or min(int(trade.ts_event), int(trade.ts_init)) > kept[0]
+        ):
+            return trade.price.as_decimal()
+        return kept[1] if kept is not None else self._last_known(slot)[0]
+
     def _last_known(self, slot: Slot) -> tuple[Decimal | None, str]:
         """The last trade the cache has, else the latest minute close: what the held stop reads."""
         trade = self.cache.trade(slot.instrument_id)
@@ -2543,8 +2594,8 @@ class Mover(Strategy):
         bid = None if quote is None else quote.bid_price.as_decimal()
         quoted = bid is not None and bid > 0
         if not quoted:
-            # no bid: the given anchor, else the last trade or minute close, else the entry's anchor
-            bid = anchor if anchor is not None else self._last_known(slot)[0]
+            # no bid: the given anchor, else the newest trade or minute close, else the entry's anchor
+            bid = anchor if anchor is not None else self._last_print(slot)
             if bid is None:
                 bid = slot.protection_anchor
         if bid is None:

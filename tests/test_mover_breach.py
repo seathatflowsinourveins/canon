@@ -10,7 +10,9 @@ from __future__ import annotations
 from datetime import UTC
 from datetime import datetime
 from decimal import Decimal
+from types import SimpleNamespace
 from typing import Any
+from typing import cast
 
 import pytest
 from nautilus_trader.model import AggressorSide
@@ -37,10 +39,12 @@ from tests.test_mover import SECOND
 from tests.test_mover import T0
 from tests.test_mover import Borrowed
 from tests.test_mover import Recording
+from tests.test_mover import Seam
 from tests.test_mover import engine
 from tests.test_mover import rank
 from tests.test_mover import ranker
 from tests.test_mover import run
+from tests.test_mover import seam_slot
 from tests.test_mover import strategy
 from tests.test_mover import tape
 from tests.test_mover import trade_tape
@@ -435,6 +439,208 @@ def test_confirmation_latches_and_the_floor_uses_the_lower_of_print_and_bid(bid:
     assert sells(orders) and held == 0 and floors and set(floors) == {expected}
     confirmed = [state for state in s.states if state["breach_price"] is not None]
     assert confirmed and all(state["breach_price"] == Decimal("10.27") for state in confirmed)
+
+
+def one_sided_at(offset: int, ask: str = "10.36") -> QuoteTick:
+    """A quote with no bid: a zero price and no size on that side, beside a real ask."""
+    return QuoteTick(
+        AAA,
+        Price.from_str("0.0000"),
+        Price.from_str(f"{Decimal(ask):.4f}"),
+        Quantity.from_int(0),
+        Quantity.from_int(100),
+        T0 + offset,
+        T0 + offset,
+    )
+
+
+def test_a_one_sided_quotes_zero_bid_is_no_price_for_the_first_sale_or_its_floor() -> None:
+    """Two prints, 10.28 and 10.27, confirm the breach while the cached quote is one-sided. A zero bid
+    is no price: the first sale is priced from the confirming print, `exit_ticks` through 10.27, and
+    the floor is `chase_cap` under that sale, never under one priced from zero."""
+    first = START + 100 * MS
+    s, orders, _ = replay(
+        [
+            one_sided_at(START + 50 * MS),
+            print_at(first, "10.28"),
+            print_at(first + 100 * MS, "10.27"),
+            quote_at(START + 2 * SECOND, "10.27", "10.29"),
+        ],
+        end=START + 4 * SECOND,
+    )
+    sale = exit_price(Decimal("10.27"), 1, None)
+    expected = chase_floor(sale, s.settings.chase_cap)
+    floors = [state["floor"] for state in s.states if state["floor"] is not None]
+    assert floors and set(floors) == {expected}
+    sales = sells(orders)
+    assert sales and sales[0].order_type.name == "LIMIT"
+    assert sales[0].price.as_decimal() == sale == Decimal("10.26")
+    assert all(order.price.as_decimal() >= expected for order in sales)
+
+
+def confirmed(bid: str, last: str | None) -> tuple[Any, Any]:
+    """One step of the sale path after two prints confirmed a breach at 10.27: the cached quote's bid
+    (`"0"` for a one-sided quote) and the cache's last trade."""
+    seam = cast(Any, Seam(bid, breach_count=2, trigger=TriggerType.LAST_PRICE))
+    seam.last, seam.last_ns = last, T0
+    seam.cache.trade = lambda _: (
+        None
+        if seam.last is None
+        else SimpleNamespace(
+            price=Price.from_str(seam.last), ts_event=seam.last_ns, ts_init=seam.last_ns
+        )
+    )
+    slot = seam_slot(seam)
+    slot.exiting, slot.breach_price = True, Decimal("10.27")
+    return seam, slot
+
+
+def test_with_no_bid_a_recovery_after_the_confirming_print_does_not_lift_the_sale() -> None:
+    """The last trade is back at 10.90 and the quote has no bid. The sale and its floor are priced from
+    the confirming print, 10.27, never from the recovery."""
+    seam, slot = confirmed("0", "10.90")
+    seam._protect(slot, Decimal(5), T0)
+    assert seam.sent[-1].price == Price.from_str("10.2600")
+    assert slot.floor == chase_floor(Decimal("10.26"), seam.settings.chase_cap)
+
+
+def test_with_no_bid_the_sale_and_its_floor_follow_a_fall_under_the_confirming_print() -> None:
+    """Prints after the confirming one took the last trade to 9.90 in the same step, and the quote has
+    no bid. The sale goes `exit_ticks` through 9.90 with its floor under that, as it would through a
+    bid of 9.90: it does not rest at 10.26 above the market."""
+    seam, slot = confirmed("0", "9.90")
+    seam._protect(slot, Decimal(5), T0)
+    assert seam.sent[-1].price == Price.from_str("9.8900")
+    assert slot.floor == chase_floor(Decimal("9.89"), seam.settings.chase_cap)
+
+
+def test_with_no_bid_a_remade_sale_follows_the_last_trade_down_and_never_back_up() -> None:
+    """The first sale, 10.26 from the confirming print, is refused. Trades print at 10.10: the remake
+    is 10.09, from the newest trade and not from the old print. The trades recover to 10.50: the next
+    remake stays at 10.09."""
+    seam, slot = confirmed("0", "10.27")
+    seam._protect(slot, Decimal(5), T0)
+    first = seam.sent[-1]
+    assert first.price == Price.from_str("10.2600")
+    seam.refuse(first)
+    seam.last = "10.10"
+    seam._protect(slot, Decimal(5), T0 + 6 * SECOND)
+    second = seam.sent[-1]
+    assert second is not first and second.price == Price.from_str("10.0900")
+    seam.refuse(second)
+    seam.last = "10.50"
+    seam._protect(slot, Decimal(5), T0 + 12 * SECOND)
+    assert seam.sent[-1] is not second and seam.sent[-1].price == Price.from_str("10.0900")
+
+
+def no_bid_sale(*later: TradeTick) -> tuple[Any, list]:
+    """Two prints, 10.28 and 10.27, confirm the breach under a one-sided quote, then `later`."""
+    first = START + 100 * MS
+    s, orders, _ = replay(
+        [
+            one_sided_at(START + 50 * MS),
+            print_at(first, "10.28"),
+            print_at(first + 100 * MS, "10.27"),
+            *later,
+        ]
+    )
+    return s, sells(orders)
+
+
+def test_with_no_bid_an_older_print_that_arrives_late_is_not_a_fall_after_the_confirmation() -> (
+    None
+):
+    """A second reader, 2026-11-12: a print at 9.90 whose own time is before the confirming print
+    arrives after it. It is history, not a fall: the sale is priced from the confirming print,
+    10.26, and not from the last trade received, 9.89."""
+    first = START + 100 * MS
+    s, sales = no_bid_sale(print_at(first + 50 * MS, "9.90", received=first + 200 * MS))
+    assert sales and sales[0].price.as_decimal() == Decimal("10.26")
+    floor = chase_floor(Decimal("10.26"), s.settings.chase_cap)
+    assert all(order.price.as_decimal() >= floor for order in sales)
+
+
+def test_with_no_bid_a_late_older_print_does_not_lift_the_sale_over_a_newer_fall_either() -> None:
+    """The other way round: trades fell to 9.90 after the confirmation, and a print from before the
+    fall, 10.40, arrives last. The newest trade by its own time is still 9.90: the sale is 9.89."""
+    first = START + 100 * MS
+    _, sales = no_bid_sale(
+        print_at(first + 200 * MS, "9.90"),
+        print_at(first + 150 * MS, "10.40", received=first + 250 * MS),
+    )
+    assert sales and sales[0].price.as_decimal() == Decimal("9.89")
+
+
+def test_with_no_bid_two_prints_of_one_time_are_read_in_the_order_they_arrived() -> None:
+    """Prints that share a time, as a sweep's do, cannot be ordered by it: the later arrival is the
+    newer, as the cache has it."""
+    first = START + 100 * MS
+    _, sales = no_bid_sale(
+        print_at(first + 200 * MS, "9.90"),
+        print_at(first + 200 * MS, "9.95", received=first + 250 * MS),
+    )
+    assert sales and sales[0].price.as_decimal() == Decimal("9.94")
+
+
+def test_with_no_bid_a_trade_the_cache_holds_from_before_the_slots_first_print_still_counts() -> (
+    None
+):
+    """The slot's first print can itself be a late report, older than a trade the cache already
+    holds: the newer of the two by its own time stands in for the bid."""
+    seam, slot = confirmed("0", "9.90")
+    slot.newest_print = (T0 - SECOND, Decimal("10.40"))
+    seam._protect(slot, Decimal(5), T0)
+    assert seam.sent[-1].price == Price.from_str("9.8900")
+
+
+def test_with_no_bid_a_sale_remade_without_an_anchor_reads_the_same_newest_trade() -> None:
+    """The wind-down remakes a sale through the plain limit with no anchor. With the arm on it reads
+    the trade newest by its own time too, not the one received last: a late report of an older 9.90
+    does not take a sale from 10.26 to 9.89."""
+    seam, slot = confirmed("0", "9.90")
+    seam.last_ns = T0 - SECOND
+    slot.newest_print = (T0, Decimal("10.27"))
+    seam._limit_sell(slot, Decimal(5), T0, None)
+    assert seam.sent[-1].price == Price.from_str("10.2600")
+
+
+def test_with_no_print_kept_the_plain_sale_reads_the_cache_as_before() -> None:
+    """Nothing is kept with the arm off, and nothing before a slot's first print: the plain sale then
+    prices from the cache's last trade, as it did."""
+    seam, slot = confirmed("0", "9.90")
+    assert slot.newest_print is None
+    seam._limit_sell(slot, Decimal(5), T0, None)
+    assert seam.sent[-1].price == Price.from_str("9.8900")
+
+
+def test_a_floor_released_after_its_wait_is_not_put_back_by_the_persistence_arm() -> None:
+    """The sale rested at its floor for the wait and the floor was released: later sales follow the
+    bid. The persistence arm's own floor is set once, for the first sale, and not again."""
+    seam, slot = confirmed("9.50", "9.50")
+    slot.floor, slot.floor_released = None, True
+    seam._protect(slot, Decimal(5), T0)
+    assert seam.sent[-1].price == Price.from_str("9.4900")
+    assert slot.floor is None and slot.floor_released
+
+
+def test_a_breach_confirmed_by_prints_marks_the_exit_record_at_the_confirming_print() -> None:
+    """The exit's record carries the decision to sell: the confirming print's own time and price, and a
+    reason that counts the holding as stopped out."""
+    first = START + 100 * MS
+    s, _, held = replay(
+        [
+            print_at(first, "10.28"),
+            print_at(first + 100 * MS, "10.27"),
+            quote_at(START + 2 * SECOND, "10.27", "10.29"),
+        ],
+        liquid=True,
+        end=START + 6 * SECOND,
+    )
+    assert held == 0 and len(s.exits) == 1
+    row = s.exits[0]
+    assert row.trigger_reason == "trailing stop (breach confirmed by prints)"
+    assert row.trigger_price == Decimal("10.27") and row.trigger_ns == T0 + first + 100 * MS
+    assert [entry["stopped_out"] for entry in s.entries_sent] == [True]
 
 
 def test_a_gap_through_the_level_sells_on_the_first_limit_priced_through_the_bid() -> None:
