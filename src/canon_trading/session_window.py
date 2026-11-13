@@ -2056,13 +2056,25 @@ def _mark_request_interrupted(report: WindowReport, error: BaseException) -> Non
         report.request_budget["measurement_status"] = "interrupted"
 
 
+CLOCK_NOTE_MOST_MS = 2_000
+"""The lead's rule of 2026-11-13, 08:40: a window whose record shows the venue's clock and this host's
+more than 2 s apart goes to the lead. Read on the median of the Mover's `host_clock`, which includes
+the feed's latency (tens of milliseconds)."""
+
+
 def clock_notes(run: dict[str, Any]) -> dict[str, Any]:
-    """Report Mover prints whose venue times exceeded the ahead-of-receipt bound, when any did.
-    These prints could not be ordered; the count names the clock discrepancy beside the run."""
+    """Name beside the Mover's record the prints whose venue times exceeded the ahead-of-receipt bound,
+    when any did, and the clocks' difference, when its median passes `CLOCK_NOTE_MOST_MS` either way.
+    The prints ahead could not be ordered; the difference is the one the lead reads."""
+    notes: dict[str, Any] = {}
     ahead = run.get("prints_stamped_ahead") or {}
-    return (
-        {"prints_stamped_ahead": dict(ahead)} if any(count > 0 for count in ahead.values()) else {}
-    )
+    if any(count > 0 for count in ahead.values()):
+        notes["prints_stamped_ahead"] = dict(ahead)
+    clock = run.get("host_clock") or {}
+    seen = clock.get("venue_minus_receipt_ms") or {}
+    if abs(seen.get("median") or 0) > CLOCK_NOTE_MOST_MS:
+        notes["host_clock"] = dict(clock)
+    return notes
 
 
 def write_heartbeat(log_dir: Path, outcome: str) -> None:

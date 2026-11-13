@@ -445,7 +445,11 @@ def test_exit_record_uses_release_event_and_all_partial_fills_across_reprices():
     slot.entry_record = {"client_order_id": "BUY-1", "stopped_out": False}
     s._ensure_exit(slot, D(5))
     slot.protect_id = ClientOrderId("SELL-1")
-    s.on_quote(SimpleNamespace(instrument_id=AAA, bid_price=Price.from_str("11.0000")))
+    s.on_quote(
+        SimpleNamespace(
+            instrument_id=AAA, bid_price=Price.from_str("11.0000"), ts_event=T0, ts_init=T0
+        )
+    )
     s.on_order_released(
         SimpleNamespace(
             instrument_id=AAA,
@@ -1216,8 +1220,14 @@ def test_a_one_sided_quote_leaves_the_last_positive_bid():
     s = strategy()
     slot = mover.Slot(AAA, bar_type(AAA), deque(maxlen=4), deque(maxlen=5))
     s.slots[AAA] = slot
-    s.on_quote(SimpleNamespace(instrument_id=AAA, bid_price=Price.from_str("10.0000")))
-    s.on_quote(SimpleNamespace(instrument_id=AAA, bid_price=Price.from_str("0")))
+    s.on_quote(
+        SimpleNamespace(
+            instrument_id=AAA, bid_price=Price.from_str("10.0000"), ts_event=T0, ts_init=T0
+        )
+    )
+    s.on_quote(
+        SimpleNamespace(instrument_id=AAA, bid_price=Price.from_str("0"), ts_event=T0, ts_init=T0)
+    )
     assert slot.last_bid == D("10.0000")
 
 

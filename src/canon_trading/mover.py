@@ -240,6 +240,7 @@ from decimal import localcontext
 from itertools import groupby
 from itertools import pairwise
 from pathlib import Path
+from statistics import median_low
 from types import NoneType
 from typing import TYPE_CHECKING
 from typing import Any
@@ -1666,38 +1667,63 @@ class HistoryLoad:
 
 
 PRINT_AHEAD_MOST_NS = 5 * SECOND_NS
-"""How far a print's venue time may run ahead of its receipt and still order it: 5 s, UNCALIBRATED,
+"""How far a print's venue time may run ahead of the stream's and still order it: 5 s, UNCALIBRATED,
 matched to the adapter's `STAMP_AHEAD_MOST_NS` in its late-print setting, which lands with the
-adapter's part. A print further ahead has no usable time: it is neither the newest
-nor set aside. Persistence still reads it at its receipt, and `prints_stamped_ahead` counts it.
-With this host's clock more than 5 s behind the venue's, every print is ahead: the readers hold the
-last kept print, or with none kept read the cache's last trade by receipt (`_newest_trade`), until the
-clock is set right; the count makes that limit visible in the window."""
+adapter's part. "Ahead" is measured on the venue's time as the stream shows it (the lead's ruling of
+2026-11-13, 08:49): a print's venue time less its receipt here, less the same of its name's newest
+quote (`Slot.quote_lag`), so this host's clock offset cancels, whatever its size. A print further
+ahead has no usable time: it is neither the newest nor set aside, and `prints_stamped_ahead` counts it.
+With no quote of the name yet, the venue's time cannot be had, and the print is measured against its
+receipt as before; `prints_timed_on_receipt` counts each print so judged. A quote reported more than
+5 s late moves its name's reference until the next quote. NautilusTrader at the pin corrects no clock
+offset (crates/common, data, live and core read none), so the rule is ours."""
+CLOCK_QUOTES = 101
+"""The latest quotes, of every name, whose venue time less their receipt on this host (`ts_event` less
+`ts_init`) the run record summarises as `host_clock`: their median, with the least and most of every
+quote. Quotes, not prints: a print reported late, as off-exchange prints are, reads below the clocks'
+difference. A record only; the lead reads it past 2 s (`session_window.CLOCK_NOTE_MOST_MS`)."""
 
 
-def print_time(trade: Any) -> int | None:
-    """The venue's time, regardless of this host's clock, unless over the ahead-of-receipt bound.
+def print_time(trade: Any, quote_lag: int | None = None) -> int | None:
+    """The venue's time, regardless of this host's clock, unless over the ahead bound
+    (`PRINT_AHEAD_MOST_NS`): measured against its name's newest quote, `quote_lag`, else its receipt.
 
     TradeTick's `ts_event` is when the trade occurred and `ts_init` when the instance was created
     (crates/model/src/data/trade.rs:55-58 at the pin).
     """
     event = int(trade.ts_event)
-    return None if event - int(trade.ts_init) > PRINT_AHEAD_MOST_NS else event
+    lag = event - int(trade.ts_init) - (0 if quote_lag is None else quote_lag)
+    return None if lag > PRINT_AHEAD_MOST_NS else event
+
+
+def quote_lag(quote: Any) -> int | None:
+    """A quote's venue time less its receipt on this host, the reference `print_time` measures a print
+    against; None with no quote."""
+    return None if quote is None else int(quote.ts_event) - int(quote.ts_init)
 
 
 class Print(NamedTuple):
     """One price with the two times its readers need. `event_ns` orders prints and compares with
     an entry fill, both at the venue. `ns`, the earlier of event and receipt, is persistence's own
-    stamp: a print stamped ahead of receipt cannot hide the prints after it behind that watermark."""
+    stamp: a print stamped ahead of receipt cannot hide the prints after it behind that watermark. The
+    receipt is read on the venue's clock through the name's newest quote (`quote_lag`) when there is
+    one, so with this host's clock behind, a print reported late still stamps below the newer ones."""
 
     ns: int
     price: Decimal
     event_ns: int
 
     @classmethod
-    def of(cls, trade: Any) -> Print:
+    def of(cls, trade: Any, quote_lag: int | None = None) -> Print:
         event = int(trade.ts_event)
-        return cls(min(event, int(trade.ts_init)), trade.price.as_decimal(), event)
+        return cls(stamp_of(trade, quote_lag), trade.price.as_decimal(), event)
+
+
+def stamp_of(trade: Any, quote_lag: int | None) -> int:
+    """Persistence's stamp of a print (`Print`): the earlier of its venue time and its receipt, the
+    receipt on the venue's clock through its name's newest quote when there is one."""
+    receipt = int(trade.ts_init) + (0 if quote_lag is None else quote_lag)
+    return min(int(trade.ts_event), receipt)
 
 
 @dataclass
@@ -1799,6 +1825,9 @@ class Slot:
     stamp_seen: int = 0
     """The highest persistence stamp (`Print.ns`) of every print received for the slot, kept, set aside
     or ahead: persistence's own watermark at arming, apart from the readers' venue-time order (P2)."""
+    quote_lag: int | None = None
+    """The name's newest quote's venue time less its receipt on this host (`on_quote`, else the
+    cache's quote at the opening): the reference a print is measured against (`print_time`)."""
     sized_loss: Decimal | None = None
     """L, the loss per share the entry was sized for (`sizing.plan_for_loss`): the planned entry less its
     stepped stop, on Alpaca's step. The trailing sell holds its trigger L under the fill, then L under the
@@ -1955,6 +1984,14 @@ class Mover(Strategy):
         in whole milliseconds rounded up, so even under 1 ms reads 1."""
         self.prints_ahead: dict[str, int] = {}
         """Per symbol, prints over `PRINT_AHEAD_MOST_NS` ahead of receipt: neither newest nor late."""
+        self.prints_on_receipt: dict[str, int] = {}
+        """Per symbol, prints measured against their receipt for want of a quote (`print_time`)."""
+        self.quote_lags: deque[int] = deque(maxlen=CLOCK_QUOTES)
+        """The latest quotes' venue time less their receipt, of every name (`CLOCK_QUOTES`)."""
+        self.quote_lag_least: int | None = None
+        self.quote_lag_most: int | None = None
+        """The least and most venue time less receipt of every quote in the run, so a clock's step
+        shows; one quote reported late sets them too."""
         self.refused: list[tuple[str, str]] = []
         self.order_refusals: list[dict[str, Any]] = []
         """Each order refusal in `refused`, with who refused it and its cause (the D3 terms, A7)."""
@@ -2329,8 +2366,15 @@ class Mover(Strategy):
 
     def on_quote(self, quote: Any) -> None:
         self.quotes += 1
+        # the clocks' difference, in plain attributes: a handler may run while the strategy is borrowed
+        lag = int(quote.ts_event) - int(quote.ts_init)
+        self.quote_lags.append(lag)
+        least, most = self.quote_lag_least, self.quote_lag_most
+        self.quote_lag_least = lag if least is None else min(least, lag)
+        self.quote_lag_most = lag if most is None else max(most, lag)
         slot = self.slots.get(quote.instrument_id)
         if slot is not None:
+            slot.quote_lag = lag
             bid = quote.bid_price.as_decimal()
             if bid > 0:  # a one-sided quote's zero bid is no price: keep the last real one
                 slot.last_bid = bid
@@ -2346,7 +2390,11 @@ class Mover(Strategy):
         if slot is None:
             return
         event = int(trade.ts_event)
-        stamp = min(event, int(trade.ts_init))
+        name = str(trade.instrument_id)
+        lag = slot.quote_lag
+        if lag is None:
+            self.prints_on_receipt[name] = self.prints_on_receipt.get(name, 0) + 1
+        stamp = stamp_of(trade, lag)
         price = trade.price.as_decimal()
         slot.stamp_seen = max(slot.stamp_seen, stamp)
         if self.persistence and slot.trail_trigger is not None and not slot.exiting:
@@ -2354,8 +2402,7 @@ class Mover(Strategy):
             # the readers' venue-time order. Even ahead and late prints reach that watermark.
             slot.observations.append((stamp, price))
         kept = slot.newest_print
-        name = str(trade.instrument_id)
-        if print_time(trade) is None:
+        if print_time(trade, lag) is None:
             self.prints_ahead[name] = self.prints_ahead.get(name, 0) + 1
             return
         late_print = kept is not None and event < kept.event_ns
@@ -2457,6 +2504,8 @@ class Mover(Strategy):
             "protect_paths": dict(self.protect_paths),
             "late_prints_set_aside": {name: dict(row) for name, row in self.late_prints.items()},
             "prints_stamped_ahead": dict(self.prints_ahead),
+            "prints_timed_on_receipt": dict(self.prints_on_receipt),
+            "host_clock": self._host_clock(),
             "sell_triggers": dict(self.sell_triggers),
             "trail_notes": self._trail_notes(),
             "exits": [row.record() for row in self.exits],
@@ -3019,6 +3068,7 @@ class Mover(Strategy):
     def _open_slot(self, instrument_id: InstrumentId) -> None:
         bar_type = BarType.from_str(f"{instrument_id}-{self.spec_suffix}")
         self.opened_slots.add(instrument_id)
+        reference = quote_lag(self.cache.quote(instrument_id))
         self.slots[instrument_id] = Slot(
             instrument_id=instrument_id,
             bar_type=bar_type,
@@ -3030,7 +3080,8 @@ class Mover(Strategy):
             subscribed_ns=self.clock.timestamp_ns(),
             # Cache.trades is in reverse insertion order, not venue-time order
             # (crates/common/src/cache/mod.rs:6218-6228 at the pin).
-            newest_print=self._newest_cached(instrument_id),
+            newest_print=self._newest_cached(instrument_id, reference),
+            quote_lag=reference,
         )
         if (state := self.reentry_states.get(instrument_id)) is not None:
             state.restart()  # only closes this slot observes count toward a turn or a crossing
@@ -3062,19 +3113,36 @@ class Mover(Strategy):
             if slot.history is not None:
                 slot.history.cached = len(slot.atr_minutes)  # what the cache fed, before any answer
 
-    def _newest_cached(self, instrument_id: InstrumentId) -> Print | None:
+    def _host_clock(self) -> dict[str, Any]:
+        """The venue's time less this host's receipt of the latest quotes (`CLOCK_QUOTES`), in whole
+        milliseconds rounded to the nearest: their median (`median_of` quotes), with the least and most
+        of every quote in the run (`quotes`). It is the clocks' difference less the feed's latency."""
+        least, most = self.quote_lag_least, self.quote_lag_most
+        if not self.quote_lags or least is None or most is None:
+            return {"venue_minus_receipt_ms": None, "median_of": 0, "quotes": self.quotes}
+        return {
+            "venue_minus_receipt_ms": {
+                "median": round(median_low(self.quote_lags) / 1_000_000),
+                "least": round(least / 1_000_000),
+                "most": round(most / 1_000_000),
+            },
+            "median_of": len(self.quote_lags),
+            "quotes": self.quotes,
+        }
+
+    def _newest_cached(self, instrument_id: InstrumentId, quote_lag: int | None) -> Print | None:
         """Seed from all cached trades by venue time, the later received on a tie. Only prints
         received after this slot opens are counted; cached older or ahead prints are passed over."""
         newest = max(
             (
                 trade
                 for trade in self.cache.trades(instrument_id) or []
-                if print_time(trade) is not None
+                if print_time(trade, quote_lag) is not None
             ),
             key=lambda trade: int(trade.ts_event),
             default=None,
         )
-        return None if newest is None else Print.of(newest)
+        return None if newest is None else Print.of(newest, quote_lag)
 
     # --- the ATR's warm-up (F-2) ---------------------------------------------------------------------
 
@@ -3955,9 +4023,9 @@ class Mover(Strategy):
         venue time is unusable (`print_time`), that trade stands, as the cache's last trade did."""
         kept = slot.newest_print
         trade = self.cache.trade(slot.instrument_id)
-        at = None if trade is None else print_time(trade)
+        at = None if trade is None else print_time(trade, slot.quote_lag)
         if trade is not None and (kept is None or (at is not None and at > kept.event_ns)):
-            return Print.of(trade)
+            return Print.of(trade, slot.quote_lag)
         return kept
 
     def _last_print(self, slot: Slot) -> Decimal | None:

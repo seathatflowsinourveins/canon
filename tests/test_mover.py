@@ -2540,6 +2540,10 @@ class Borrowed:
         self.slots: dict = {}
         self.late_prints: dict = {}
         self.prints_ahead: dict = {}
+        self.prints_on_receipt: dict = {}
+        self.quote_lags: deque = deque(maxlen=101)
+        self.quote_lag_least = None
+        self.quote_lag_most = None
         self.opening_states: dict = {}
         self.opening_outcomes: dict = {}
         self.sale_rows: dict = {}
@@ -2563,6 +2567,7 @@ def test_no_order_event_handler_reads_the_engine() -> None:
         released_price=Price.from_str("10.00"),
         reason="no",
         ts_event=1,
+        ts_init=1,
     )
     own = [
         name
@@ -2930,6 +2935,11 @@ class Seam:
         self.protect_paths = {"held_stop": 0, "unpriced_exit": 0, "trail": 0}
         self.late_prints: dict[str, dict[str, Any]] = {}
         self.prints_ahead: dict[str, int] = {}
+        self.prints_on_receipt: dict[str, int] = {}
+        self.quotes = 0
+        self.quote_lags: deque[int] = deque(maxlen=101)
+        self.quote_lag_least: int | None = None
+        self.quote_lag_most: int | None = None
         self.fills: list = []
         self.recent = 0
         self.baseline_dollar_volume_per_minute: dict = {}

@@ -83,6 +83,11 @@ class PrintSeam(Seam):
         self.cache.trade = self.cached_trade
         self.cache.trades = self.cached_trades
         self.cache.bars = lambda _: None
+        # Not the blind tester's: the builder of the host-clock unit (L6) stamps the cache's quote at
+        # one time for venue and receipt, the clocks agreeing, so each print here is measured as P5
+        # states it, against its receipt.
+        quote = self.cache.quote
+        self.cache.quote = lambda i: SimpleNamespace(**vars(quote(i)), ts_event=T0, ts_init=T0)
 
     def __getattr__(self, name: str) -> Any:
         return MethodType(getattr(Mover, name), self)
