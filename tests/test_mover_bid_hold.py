@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from typing import Any
 from typing import cast
 
+import pytest
 from nautilus_trader.model import OrderSide
 from nautilus_trader.model import Price
 
@@ -50,6 +51,47 @@ def test_under_the_bid_a_returning_bid_above_the_held_stop_arms_the_trail_from_i
     assert [o.kind for o in seam.sent] == ["TRAILING"] and not slot.exiting
     assert seam.sent[0].trigger_price is not None
     assert Decimal(str(seam.sent[0].trigger_price)) == Decimal("9.80")
+
+
+def test_under_the_bid_an_off_step_held_stop_never_falls_when_trailing_resumes() -> None:
+    """The BID_ASK twin of xr7-cx-succ/F3: ending the 9.8049 hold remakes the trigger at 9.81."""
+    seam = cast(Any, Seam("0"))
+    slot = cast(Any, seam_slot(seam, bought="10.0149"))
+    filled = T0 + 10 * SECOND
+    seam.fills = [("E-1", OrderSide.BUY.name, "3", "10.0149", filled)]
+    seam.orders["E-1"].client_order_id = slot.entry_id
+    assert slot.sized_loss is None
+    seam._protect(slot, Decimal(3), filled + SECOND)
+    old_level = slot.held_stop
+    assert old_level == Decimal("9.8049") and seam.sent == []
+
+    seam.bid = "9.90"
+    seam._protect(slot, Decimal(3), filled + 3 * SECOND)
+    assert [o.kind for o in seam.sent] == ["TRAILING"]
+    assert seam.sent[0].trigger_price.as_decimal() >= old_level
+    assert seam.sent[0].trigger_price.as_decimal() == Decimal("9.81")
+    assert slot.held_stop is None and slot.held_since is None and not slot.exiting
+
+
+@pytest.mark.parametrize("bid", ["9.8050", "9.8100"])
+def test_under_the_bid_a_bid_meeting_the_rounded_up_held_stop_sells_by_limit(bid: str) -> None:
+    """A bid above 9.8049 but at or below the rounded 9.81 meets the replacement immediately."""
+    seam = cast(Any, Seam("0"))
+    slot = cast(Any, seam_slot(seam, bought="10.0149"))
+    filled = T0 + 10 * SECOND
+    seam.fills = [("E-1", OrderSide.BUY.name, "3", "10.0149", filled)]
+    seam.orders["E-1"].client_order_id = slot.entry_id
+    seam._protect(slot, Decimal(3), filled + SECOND)
+    assert slot.held_stop == Decimal("9.8049") and seam.sent == []
+
+    seam.bid = bid
+    seam._protect(slot, Decimal(3), filled + 3 * SECOND)
+    assert [o.kind for o in seam.sent] == ["LIMIT"]
+    assert slot.exiting and slot.held_stop is None and slot.held_since is None
+    assert slot.trail_trigger is None and slot.trail_limit is None
+    assert slot.exit_trigger == Decimal("9.81")
+    assert seam.sent[0].quantity.as_decimal() == Decimal(3)
+    assert Decimal(seam.sell_triggers[seam.sent[0].client_order_id.value]) == Decimal("9.81")
 
 
 def test_a_sale_through_the_held_stop_at_the_holds_end_records_its_trigger_and_drops_the_trail() -> (

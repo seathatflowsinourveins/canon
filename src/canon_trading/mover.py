@@ -3581,13 +3581,18 @@ class Mover(Strategy):
             self._note(slot, str(error))
             return
         # the stop held while no price was followed, read before `_end_hold` clears it: the remade sell
-        # keeps it as it keeps a reached trigger (xr7-r-heldl, P1)
-        held_level = None if slot.held_stop is None else stop_trigger_price(slot.held_stop)
+        # keeps it as it keeps a reached trigger (xr7-r-heldl, P1). Round a held level up, never down
+        # (xr7-cx-succ/F3); first ceil to the finest step so `up_on_step`'s float nudge cannot lower
+        # a level derived from an average fill finer than that step.
+        held_level = (
+            None
+            if slot.held_stop is None
+            else up_on_step(slot.held_stop.quantize(SUB_DOLLAR, rounding=ROUND_CEILING))
+        )
         if slot.held_since is not None:
             # above the held stop, the trail starts from it, never lower, so the held stop goes only
             # by a sale or by a trigger at least as high taking its place
-            level = slot.held_stop
-            kept_level = None if level is None else stop_trigger_price(level)
+            kept_level = held_level
             self._end_hold(slot, now, "trail")
             if kept_level is not None:
                 reached = slot.trail_trigger

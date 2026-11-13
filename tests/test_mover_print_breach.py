@@ -20,6 +20,7 @@ from types import SimpleNamespace
 from typing import Any
 from typing import cast
 
+import pytest
 from nautilus_trader.model import OrderSide
 from nautilus_trader.model import Price
 from nautilus_trader.model import TriggerType
@@ -320,6 +321,62 @@ def test_under_a_print_trigger_a_first_print_above_the_held_stop_arms_the_trail_
     assert [o.kind for o in seam.sent] == ["TRAILING"] and not slot.exiting
     assert seam.sent[0].trigger_price is not None
     assert Decimal(str(seam.sent[0].trigger_price)) == Decimal("9.80")
+
+
+def test_off_step_held_stop_never_falls_when_trailing_resumes() -> None:
+    """xr7-cx-succ/F3: the unsized hold at 9.8049 must hand off at 9.81, never 9.80."""
+    seam, slot, filled, last = holding(TriggerType.LAST_PRICE, bid="9.89", ask="9.91")
+    seam.orders["E-1"].avg_px = 10.0149
+    seam.fills[:] = [("E-1", "BUY", "3", "10.0149", filled)]
+    assert slot.sized_loss is None
+    seam._protect(slot, Decimal(3), filled + SECOND)
+    old_level = slot.held_stop
+    assert old_level == Decimal("9.8049")
+
+    last.append(stamped("9.9000", filled + 2 * SECOND, filled + 2 * SECOND))
+    seam._protect(slot, Decimal(3), filled + 3 * SECOND)
+    assert [o.kind for o in seam.sent] == ["TRAILING"]
+    assert seam.sent[0].trigger_price.as_decimal() >= old_level
+    assert seam.sent[0].trigger_price.as_decimal() == Decimal("9.81")
+    assert slot.held_stop is None and slot.held_since is None and not slot.exiting
+
+
+def test_a_finer_than_tick_average_fill_keeps_the_held_stop_when_trailing_resumes() -> None:
+    """An average can be finer than a print: 9.800001 must round up despite the scheme's nudge."""
+    seam, slot, filled, last = holding(TriggerType.LAST_PRICE, bid="9.89", ask="9.91")
+    seam.orders["E-1"].avg_px = 10.010001
+    seam.fills[:] = [
+        ("E-1", "BUY", "99", "10.0100", filled),
+        ("E-1", "BUY", "1", "10.0101", filled + 1),
+    ]
+    seam._protect(slot, Decimal(100), filled + SECOND)
+    old_level = slot.held_stop
+    assert old_level == Decimal("9.800001")
+
+    last.append(stamped("9.9000", filled + 2 * SECOND, filled + 2 * SECOND))
+    seam._protect(slot, Decimal(100), filled + 3 * SECOND)
+    assert [o.kind for o in seam.sent] == ["TRAILING"]
+    assert seam.sent[0].trigger_price.as_decimal() >= old_level
+    assert seam.sent[0].trigger_price.as_decimal() == Decimal("9.81")
+
+
+@pytest.mark.parametrize("price", ["9.8050", "9.8100"])
+def test_a_print_meeting_the_rounded_up_held_stop_sells_at_once_by_limit(price: str) -> None:
+    """Above the old 9.8049 but at or below its 9.81 replacement, the first print elects a sale."""
+    seam, slot, filled, last = holding(TriggerType.LAST_PRICE, bid="9.80", ask="9.82")
+    seam.orders["E-1"].avg_px = 10.0149
+    seam.fills[:] = [("E-1", "BUY", "3", "10.0149", filled)]
+    seam._protect(slot, Decimal(3), filled + SECOND)
+    assert slot.held_stop == Decimal("9.8049") and seam.sent == []
+
+    last.append(stamped(price, filled + 2 * SECOND, filled + 2 * SECOND))
+    seam._protect(slot, Decimal(3), filled + 3 * SECOND)
+    assert [o.kind for o in seam.sent] == ["LIMIT"]
+    assert slot.exiting and slot.held_stop is None and slot.held_since is None
+    assert slot.trail_trigger is None and slot.trail_limit is None
+    assert slot.exit_trigger == Decimal("9.81")
+    assert seam.sent[0].quantity.as_decimal() == Decimal(3)
+    assert Decimal(seam.sell_triggers[seam.sent[0].client_order_id.value]) == Decimal("9.81")
 
 
 def test_a_print_of_the_entrys_own_fill_stamped_before_alpacas_fill_time_is_followed() -> None:
