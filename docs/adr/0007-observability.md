@@ -288,8 +288,8 @@ sets the HUD's options at v0.15.0 (`src/config.ts`, `src/schema.ts`). The choice
   window tuned for the model when none is set or the model's entry is `"auto"`; there the bar, like
   canon's own line and `ctx_pct`, measures the full window. Amended 2026-11-12: a fixed 300000 pinned a
   model compacting at 600000 at a red 100% from 300k on. The session cost: `cost.total_cost_usd`. The
-  duration: the elapsed session time. Usage compact, always, both windows, with countdown and 24-hour reset
-  time: one short line at any width. The Claude Code version: the running CLI. A newer installed version
+  duration: the elapsed session time. Usage, compact, both windows with countdown and 24-hour reset time,
+  until 2026-11-13 (below). The Claude Code version: the running CLI. A newer installed version
   waiting on a restart is not available, since no documented input field or command gives it.
 * **Off, for identifiers.** `showAuth` and `showAuthUser` (plan and account; v0.15.0 has no other
   account key, and an unknown key is dropped),
@@ -345,8 +345,12 @@ sets the HUD's options at v0.15.0 (`src/config.ts`, `src/schema.ts`). The choice
   The cache's TTL decides what a returning session pays to re-cache its context, and idle compaction
   runs just before a one-hour cache expires (settings-reference.md, `idleCompaction`), so the time is
   when an idle lane's next message gets dearer or its context gets summarised.
-* **Off, the owner's decision of 2026-11-13: usage pace.** `usagePace`, which colours the usage windows
-  when the rate so far would run them out before the reset, was on for a day and is off again.
+* **Off, the owner's decisions of 2026-11-13: usage pace, then the usage segment.** `usagePace`, which
+  colours the usage windows when the rate so far would run them out before the reset, was on for a day and
+  is off again. The owner then hid the segment itself: `showUsage` is `false`, so the 5-hour and 7-day
+  figures leave the status line. `statusline.sh` still writes each session's windows to
+  `~/.claude/canon/rate-limits/` before the HUD renders, so `scripts/lanes` reports usage as before
+  (checked 2026-11-13: the files kept updating after the segment was hidden).
 * **Off, for cost or space.** Memory (it runs `vm_stat`), daily and weekly cost, the token breakdown,
   config counts, output style, the custom line and jj.
 
