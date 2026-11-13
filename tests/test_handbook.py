@@ -4,12 +4,13 @@ The contract is the pages' own: the rows table's columns and its two states, one
 `rows/` with `rows.md` only the introduction and the two tables' headers, each practice file under
 `practices/` holding one line that names a record that exists or says "not yet built" with a roadmap
 step, with `practices.md` only the introduction and the index of move folders, the
-journal's ten fields and the nightly study's six (`journal.md`, `nights.md`), and both of those
-append-only, so the entries already on `main` stay as they were, and the named limits' one table
-(`limits.md`), each line a case, its reader, a reproducing test that exists or `none`, and a date. No
-upstream reads these pages, so the parsing is the standard library's `re` and `ast`; what is on `main` is asked of git through its own plumbing,
-`git rev-parse --verify`, `git merge-base` and `git show <rev>:<path>` (all in `git help`). No test here
-touches the network.
+journal's ten fields (`journal.md`, closed at `L0009`) and twelve in each later entry, one per file
+under `journal/`, and the nightly study's six (`nights.md`), and both of those append-only, so the
+entries already on `main` stay as they were, and the named limits' one table (`limits.md`), each line
+a case, its reader, a reproducing test that exists or `none`, and a date. No upstream reads these
+pages, so the parsing is the standard library's `re` and `ast`; what is on `main` is asked of git
+through its own plumbing, `git rev-parse --verify`, `git merge-base`, `git ls-tree -r --name-only -z`
+and `git show <rev>:<path>` (all in `git help`). No test here touches the network.
 """
 
 from __future__ import annotations
@@ -31,6 +32,7 @@ ROWS = HANDBOOK / "rows"
 ROWS_TABLES = ("settings", "window-settings")
 PRACTICES = HANDBOOK / "practices"
 MARKER = "<!-- append-only: add new entries below this line; never edit or remove one above it -->"
+JOURNAL_MARKER = "<!-- append-only: closed; new entries go in docs/handbook/journal/ -->"
 ADR = re.compile(r"\bADR (\d{4})\b")
 DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
 SLUG = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
@@ -43,6 +45,8 @@ ROW_SEPARATOR = re.compile(r"\|(?:\s*:?-+:?\s*\|){5}")
 ROW_STATES = {"UNCALIBRATED", "calibrated"}
 
 JOURNAL_HEADING = re.compile(r"### L(\d{4}): \S.*")
+JOURNAL_FRAGMENT_ID = r"\d{4}-\d{2}-\d{2}-[a-z0-9]+(?:-[a-z0-9]+)*"
+JOURNAL_FRAGMENT = re.compile(rf"{JOURNAL_FRAGMENT_ID}\.md")
 JOURNAL_FIELDS = (
     "area",
     "session",
@@ -55,6 +59,15 @@ JOURNAL_FIELDS = (
     "supersedes",
     "source",
 )
+TRACKED_FIELDS = ("owner", "closes")
+"""Google SRE's terms for a postmortem's action items, an owner and "a verifiable end state"
+(https://sre.google/workbook/postmortem-culture/, "Concrete Action Items"), asked of every fragment
+after `source`: who closes it, and the test or unit that does. An open entry names both; a closed one
+says `none` in both, since the entry that closes it is the record of its closure."""
+UNNAMED = {"none", "n/a", "na", "nobody", "tbd", "todo", "later", "pending", "?", "-", "unknown"}
+"""Values that name no one and nothing, refused on an open entry's two tracked fields."""
+LAST_LEGACY = 9
+"""`journal.md`'s entries end at `L0009`: the page is closed and every later entry is a fragment."""
 AREAS = {"ranking", "entries", "exits", "sizing", "execution", "data", "risk", "strategies"}
 STATUSES = {"open", "confirmed", "refuted", "adopted", "superseded"}
 SOURCES = {"reflection", "nightly", "review", "lead", "owner"}
@@ -63,7 +76,8 @@ NIGHT_HEADING = re.compile(r"### (\d{4}-\d{2}-\d{2})")
 NIGHT_FIELDS = ("sessions", "data", "ran", "result", "proposals", "journal")
 # An absolute or home path: evidence points inside the repository or names a record kept outside it.
 PRIVATE_PATH = re.compile(r"(^|[\s(`'\"])(/|~/)[A-Za-z]")
-JOURNAL_REFS = re.compile(r"none|L\d{4}(, L\d{4})*")
+JOURNAL_ID = rf"(?:L\d{{4}}|{JOURNAL_FRAGMENT_ID})"
+JOURNAL_REFS = re.compile(rf"none|{JOURNAL_ID}(, {JOURNAL_ID})*")
 
 
 def record_exists(number: str) -> bool:
@@ -85,16 +99,31 @@ def iso_date(value: str) -> bool:
     return True
 
 
-def entries(text: str) -> list[str]:
-    """The entry blocks below the append-only marker, each from its `### ` heading, trailing space cut.
-    Anything else between the marker and the first heading is refused."""
-    _, sep, tail = text.partition(MARKER)
+def entries(text: str, markers: tuple[str, ...] = (MARKER,)) -> list[str]:
+    """The entry blocks below the first of `markers` the text holds, each from its `### ` heading,
+    trailing space cut. Anything else between the marker and the first heading is refused."""
+    sep, tail = "", ""
+    for marker in markers:
+        _, sep, tail = text.partition(marker)
+        if sep:
+            break
     if not sep:
         raise ValueError("no append-only marker")
     blocks = re.split(r"(?m)^(?=### )", tail)
     if blocks[0].strip():
         raise ValueError(f"text between the marker and the first entry: {blocks[0].strip()[:60]!r}")
     return [block.rstrip() for block in blocks[1:]]
+
+
+def journal_entries(text: str) -> list[str]:
+    """`journal.md`'s entries, below its closed marker or, at a revision before it closed, the open one."""
+    return entries(text, (JOURNAL_MARKER, MARKER))
+
+
+def unnamed(value: str) -> bool:
+    """A tracked field's value that names no one and nothing, read the same way on both sides."""
+    value = value.strip().rstrip(".").strip().lower()
+    return value in UNNAMED or value.startswith("none ")
 
 
 def fields(block: str, names: tuple[str, ...]) -> tuple[dict[str, str], list[str]]:
@@ -114,10 +143,43 @@ def fields(block: str, names: tuple[str, ...]) -> tuple[dict[str, str], list[str
     return found, errors
 
 
-def check_journal(text: str) -> list[str]:
+def check_journal_entry(
+    block: str, name: str, targets: set[str], tracked: bool = False
+) -> list[str]:
+    """One check for a legacy entry (ten fields) and a fragment (twelve, `tracked`); a `supersedes`
+    must name one of `targets`."""
+    found, problems = fields(block, JOURNAL_FIELDS + (TRACKED_FIELDS if tracked else ()))
+    errors = [f"{name}: {p}" for p in problems]
+    if found.get("area", "") not in AREAS:
+        errors.append(f"{name}: area {found.get('area')!r}")
+    if not iso_date(found.get("session", "")):
+        errors.append(f"{name}: session {found.get('session')!r} is not a date")
+    if found.get("status", "") not in STATUSES:
+        errors.append(f"{name}: status {found.get('status')!r}")
+    if found.get("source", "") not in SOURCES:
+        errors.append(f"{name}: source {found.get('source')!r}")
+    if PRIVATE_PATH.search(found.get("evidence", "")):
+        errors.append(f"{name}: evidence names a path outside the repository")
+    supersedes = found.get("supersedes", "")
+    if supersedes != "none" and supersedes not in targets:
+        errors.append(f"{name}: supersedes {supersedes!r} is not none or another existing entry")
+    if tracked:
+        is_open = found.get("status") == "open"
+        for field in TRACKED_FIELDS:
+            value = found.get(field, "none")
+            if is_open and unnamed(value):
+                errors.append(f"{name}: an open entry names its {field}")
+            elif not is_open and value.strip().rstrip(".").strip().lower() != "none":
+                errors.append(f"{name}: a closed entry says none for its {field}")
+    return errors
+
+
+def check_journal(text: str, fragments: Mapping[str, str] | None = None) -> list[str]:
+    """`journal.md`'s closed legacy entries, `L0001` to `LAST_LEGACY` in order, then each fragment by
+    filename: one entry headed by its own id, with the twelve fields."""
     errors: list[str] = []
-    ids: list[int] = []
-    for block in entries(text):
+    ids: set[str] = set()
+    for block in journal_entries(text):
         heading = block.splitlines()[0]
         match = JOURNAL_HEADING.fullmatch(heading)
         if not match:
@@ -126,24 +188,49 @@ def check_journal(text: str) -> list[str]:
         number = int(match.group(1))
         name = f"L{number:04d}"
         if number != len(ids) + 1:
-            errors.append(f"{name}: expected L{len(ids) + 1:04d}")
-        ids.append(number)
-        found, problems = fields(block, JOURNAL_FIELDS)
-        errors += [f"{name}: {p}" for p in problems]
-        if found.get("area", "") not in AREAS:
-            errors.append(f"{name}: area {found.get('area')!r}")
-        if not iso_date(found.get("session", "")):
-            errors.append(f"{name}: session {found.get('session')!r} is not a date")
-        if found.get("status", "") not in STATUSES:
-            errors.append(f"{name}: status {found.get('status')!r}")
-        if found.get("source", "") not in SOURCES:
-            errors.append(f"{name}: source {found.get('source')!r}")
-        if PRIVATE_PATH.search(found.get("evidence", "")):
-            errors.append(f"{name}: evidence names a path outside the repository")
-        supersedes = found.get("supersedes", "")
-        earlier = re.fullmatch(r"L(\d{4})", supersedes)
-        if supersedes != "none" and not (earlier and 0 < int(earlier.group(1)) < number):
-            errors.append(f"{name}: supersedes {supersedes!r} is not none or an earlier entry")
+            errors.append(
+                f"{name}: expected L{len(ids) + 1:04d}; add new entries under docs/handbook/journal/"
+            )
+        if number > LAST_LEGACY:
+            errors.append(f"journal.md: {name}: closed; add a file under docs/handbook/journal/")
+        errors += check_journal_entry(block, name, ids)
+        ids.add(name)
+    fragments = fragments or {}
+    targets = ids | {Path(filename).stem for filename in fragments}
+    superseded: dict[str, str] = {}
+    for filename, content in sorted(fragments.items()):
+        name = Path(filename).stem
+        try:
+            blocks = entries(MARKER + "\n" + content)
+        except ValueError as error:
+            errors.append(f"{filename}: {error}")
+            continue
+        if len(blocks) != 1:
+            errors.append(f"{filename}: {len(blocks)} entries, expected exactly one")
+            continue
+        block = blocks[0]
+        if not re.fullmatch(rf"### {re.escape(name)}: \S.*", block.splitlines()[0]):
+            errors.append(f"{filename}: heading must be `### {name}: <subject>`")
+        errors += [
+            f"{filename}: {error}"
+            for error in check_journal_entry(block, name, targets - {name}, tracked=True)
+        ]
+        found, _ = fields(block, JOURNAL_FIELDS + TRACKED_FIELDS)
+        if found.get("session") != name[:10]:
+            errors.append(f"{filename}: session {found.get('session')!r} is not its name's date")
+        target = found.get("supersedes", "none")
+        if target != "none":
+            superseded[name] = target
+            if iso_date(target[:10]) and target[:10] > name[:10]:
+                errors.append(f"{filename}: supersedes {target!r}, an entry of a later date")
+    for start in sorted(superseded):
+        seen, current = {start}, superseded[start]
+        while current in superseded:
+            if current in seen:
+                errors.append(f"{start}.md: a supersedes cycle through {current!r}")
+                break
+            seen.add(current)
+            current = superseded[current]
     return errors
 
 
@@ -513,7 +600,23 @@ def test_every_relative_link_in_the_handbook_resolves() -> None:
 
 
 def test_journal_form() -> None:
-    assert check_journal((HANDBOOK / "journal.md").read_text()) == []
+    folder = HANDBOOK / "journal"
+    fragments: dict[str, str] = {}
+    for path in sorted(folder.rglob("*")):
+        relative = path.relative_to(folder)
+        if any(part.startswith(".") for part in relative.parts) or not path.is_file():
+            continue
+        assert path.parent == folder, (
+            f"journal/{relative}: must be directly under docs/handbook/journal/"
+        )
+        assert JOURNAL_FRAGMENT.fullmatch(path.name) and iso_date(path.name[:10]), (
+            f"journal/{relative}: expected <YYYY-MM-DD>-<slug>.md with a valid date and lowercase slug"
+        )
+        try:
+            fragments[path.name] = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError as error:
+            raise AssertionError(f"journal/{relative}: not UTF-8 ({error.reason})") from error
+    assert check_journal((HANDBOOK / "journal.md").read_text(), fragments) == []
 
 
 def test_nights_form() -> None:
@@ -521,8 +624,9 @@ def test_nights_form() -> None:
 
 
 def git(*args: str) -> str | None:
-    result = subprocess.run(["git", *args], cwd=ROOT, capture_output=True, text=True, check=False)
-    return result.stdout if result.returncode == 0 else None
+    # Decode without text mode's newline conversion, so a fragment's bytes stay comparable.
+    result = subprocess.run(["git", *args], cwd=ROOT, capture_output=True, check=False)
+    return result.stdout.decode() if result.returncode == 0 else None
 
 
 def bases() -> dict[str, str]:
@@ -549,13 +653,30 @@ def test_entries_are_only_appended(page: str) -> None:
     revisions = bases()
     if not revisions:
         pytest.skip("no `main` or `origin/main` to compare the entries with")
-    now = entries((HANDBOOK / page).read_text())
+    read = journal_entries if page == "journal.md" else entries
+    now = read((HANDBOOK / page).read_text())
     for label, sha in revisions.items():
         before_text = git("show", f"{sha}:docs/handbook/{page}")
-        if before_text is None:  # the page did not exist at that revision
-            continue
-        before = entries(before_text)
-        assert now[: len(before)] == before, f"{page}: an entry at {label} was edited or removed"
+        if before_text is not None:  # the page may not have existed at that revision
+            before = read(before_text)
+            assert now[: len(before)] == before, (
+                f"{page}: an entry at {label} was edited or removed"
+            )
+        if page == "journal.md":
+            listed = git("ls-tree", "-r", "--name-only", "-z", sha, "--", "docs/handbook/journal/")
+            assert listed is not None, f"journal/: cannot list the fragments at {label}"
+            for filename in listed.split("\0"):
+                if not filename or any(part.startswith(".") for part in Path(filename).parts):
+                    continue
+                before_fragment = git("show", f"{sha}:{filename}")
+                assert before_fragment is not None, (
+                    f"{filename}: cannot read the fragment at {label}"
+                )
+                path = ROOT / filename
+                assert path.is_file(), f"{filename}: an entry at {label} was removed"
+                assert path.read_bytes() == before_fragment.encode(), (
+                    f"{filename}: an entry at {label} was edited"
+                )
 
 
 JOURNAL_ENTRY = """\
@@ -610,6 +731,342 @@ def test_journal_check_refuses_text_outside_an_entry() -> None:
         check_journal(journal_page("a stray line\n", JOURNAL_ENTRY))
 
 
+TRACKED = "* owner: the lane that builds the stop\n* closes: a replay test\n"
+
+
+# Contract: towncrier's news-fragment convention (https://towncrier.readthedocs.io/en/stable/),
+# which ADR 0145 already follows for the practice and row files: one file per entry, read in
+# filename order, with dotfiles skipped; the journal names a file by a date and a slug, not a place.
+@pytest.fixture
+def journal_tree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """All journal writes stay in pytest's temporary tree, including the historical snapshots."""
+    handbook = tmp_path / "docs" / "handbook"
+    folder = handbook / "journal"
+    folder.mkdir(parents=True)
+    (handbook / "journal.md").write_text(
+        journal_page(
+            *(JOURNAL_ENTRY.replace("L0001", f"L{n:04d}") for n in range(1, LAST_LEGACY + 1))
+        )
+    )
+    monkeypatch.setitem(globals(), "ROOT", tmp_path)
+    monkeypatch.setitem(globals(), "HANDBOOK", handbook)
+    return folder
+
+
+def fragment_entry(name: str, supersedes: str = "none") -> str:
+    """A well-formed fragment: the ten fields, then `owner` and `closes` for an open entry."""
+    entry = (JOURNAL_ENTRY + TRACKED).replace("L0001", name)
+    if iso_date(name[:10]):
+        entry = entry.replace("session: 2026-11-12", f"session: {name[:10]}")
+    return entry.replace("supersedes: none", f"supersedes: {supersedes}")
+
+
+def test_journal_fragments_match_their_filenames(journal_tree: Path) -> None:
+    # Two independently chosen slugs on the same date require no shared counter or page edit.
+    first = journal_tree / "2026-11-13-first-lesson.md"
+    second = journal_tree / "2026-11-13-second-lesson.md"
+    first.write_text(fragment_entry(first.stem))
+    second.write_text(fragment_entry(second.stem))
+    test_journal_form()
+    second.write_text(fragment_entry(first.stem))
+    with pytest.raises(AssertionError, match=re.escape(second.name)):
+        test_journal_form()
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "2026-13-01-lesson.md",
+        "2026-02-30-lesson.md",
+        "2026-11-13-.md",
+        "2026-11-13-Bad_slug.md",
+        "2026-11-13 lesson.md",
+        "L0010.md",
+        "nested/2026-11-13-lesson.md",
+    ],
+)
+def test_journal_fragment_names_are_dates_and_slugs(journal_tree: Path, name: str) -> None:
+    path = journal_tree / name
+    path.parent.mkdir(exist_ok=True)
+    path.write_text(fragment_entry(path.stem))
+    with pytest.raises(AssertionError, match=re.escape(name)):
+        test_journal_form()
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "complaint"),
+    [
+        ("area: exits", "area: luck", "area"),
+        ("session: 2026-11-13", "session: 2026-02-30", "session"),
+        ("status: open", "status: maybe", "status"),
+        ("source: reflection", "source: a hunch", "source"),
+        ("* next: a replay\n", "", "fields"),
+        ("* next: a replay", "* next: a replay\n* next: twice", "fields"),
+        ("* lesson: a lesson\n* change: none", "* change: none\n* lesson: a lesson", "fields"),
+        ("* lesson: a lesson", "* lesson:", "not a field line"),
+        ("evidence: docs/adr/", "evidence: /tmp/notes/", "outside the repository"),
+        ("evidence: docs/adr/", "evidence: see ~/notes/", "outside the repository"),
+    ],
+)
+def test_journal_fragment_reuses_the_field_check(
+    journal_tree: Path, old: str, new: str, complaint: str
+) -> None:
+    path = journal_tree / "2026-11-13-field-check.md"
+    path.write_text(fragment_entry(path.stem).replace(old, new))
+    with pytest.raises(AssertionError, match=re.escape(path.name)) as error:
+        test_journal_form()
+    assert complaint in str(error.value)
+
+
+@pytest.mark.parametrize("content", ["empty", "two", "preamble", "tail"])
+def test_journal_fragment_holds_exactly_one_entry(journal_tree: Path, content: str) -> None:
+    path = journal_tree / "2026-11-13-one-lesson.md"
+    block = fragment_entry(path.stem)
+    texts = {
+        "empty": "",
+        "two": block + "\n" + block,
+        "preamble": "stray\n" + block,
+        "tail": block + "\nstray\n",
+    }
+    path.write_text(texts[content])
+    with pytest.raises(AssertionError, match=re.escape(path.name)):
+        test_journal_form()
+
+
+@pytest.mark.parametrize("number", [1, LAST_LEGACY, LAST_LEGACY + 1])
+def test_journal_legacy_append_point_is_closed(number: int) -> None:
+    page = journal_page(
+        *(JOURNAL_ENTRY.replace("L0001", f"L{n:04d}") for n in range(1, LAST_LEGACY + 1)),
+        JOURNAL_ENTRY.replace("L0001", f"L{number:04d}"),
+    )
+    errors = check_journal(page)
+    assert any(
+        f"L{number:04d}" in error and "docs/handbook/journal/" in error for error in errors
+    ), errors
+
+
+@pytest.mark.parametrize("supersedes", [f"L{LAST_LEGACY:04d}", "2026-11-13-z-original"])
+def test_journal_fragments_resolve_both_kinds_of_supersedes(
+    journal_tree: Path, supersedes: str
+) -> None:
+    # An existing target can sort after its correction on the same date: slugs are not a counter.
+    original = journal_tree / "2026-11-13-z-original.md"
+    correction = journal_tree / "2026-11-13-a-correction.md"
+    original.write_text(fragment_entry(original.stem))
+    correction.write_text(fragment_entry(correction.stem, supersedes))
+    test_journal_form()
+    correction.write_text(fragment_entry(correction.stem, "2026-11-13-missing"))
+    with pytest.raises(AssertionError, match="supersedes") as error:
+        test_journal_form()
+    assert correction.name in str(error.value)
+    assert "2026-11-13-missing" in str(error.value)
+
+
+@pytest.mark.parametrize("supersedes", ["L0000", f"L{LAST_LEGACY + 1:04d}", "2026-11-13-self"])
+def test_journal_fragments_refuse_a_missing_or_self_reference(
+    journal_tree: Path, supersedes: str
+) -> None:
+    path = journal_tree / "2026-11-13-self.md"
+    path.write_text(fragment_entry(path.stem, supersedes))
+    with pytest.raises(AssertionError, match="supersedes"):
+        test_journal_form()
+
+
+def test_an_open_fragment_names_its_owner_and_end_state_and_a_closed_one_says_none(
+    journal_tree: Path,
+) -> None:
+    path = journal_tree / "2026-11-13-tracked.md"
+    path.write_text(fragment_entry(path.stem))
+    test_journal_form()
+    closed = (
+        fragment_entry(path.stem)
+        .replace("status: open", "status: adopted")
+        .replace("owner: the lane that builds the stop", "owner: none")
+        .replace("closes: a replay test", "closes: none")
+    )
+    path.write_text(closed)
+    test_journal_form()
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "complaint"),
+    [
+        ("owner: the lane that builds the stop", "owner: None", "names its owner"),
+        ("owner: the lane that builds the stop", "owner: TBD.", "names its owner"),
+        ("closes: a replay test", "closes: n/a", "names its closes"),
+        ("status: open", "status: adopted", "a closed entry says none"),
+        ("* owner: the lane that builds the stop\n", "", "fields"),
+        ("* closes: a replay test\n", "", "fields"),
+        ("owner: the lane that builds the stop", "owner: none", "names its owner"),
+        ("closes: a replay test", "closes: none", "names its closes"),
+        ("owner: the lane that builds the stop", "owner: none yet", "names its owner"),
+        ("closes: a replay test", "closes: later", "names its closes"),
+        ("owner: the lane that builds the stop", "owner: ?", "names its owner"),
+    ],
+)
+def test_a_fragment_without_its_owner_or_end_state_is_refused(
+    journal_tree: Path, old: str, new: str, complaint: str
+) -> None:
+    path = journal_tree / "2026-11-13-untracked.md"
+    path.write_text(fragment_entry(path.stem).replace(old, new))
+    with pytest.raises(AssertionError, match=re.escape(path.name)) as error:
+        test_journal_form()
+    assert complaint in str(error.value)
+
+
+def test_a_legacy_entry_keeps_ten_fields() -> None:
+    assert check_journal(journal_page(JOURNAL_ENTRY)) == []
+    assert any("fields" in e for e in check_journal(journal_page(JOURNAL_ENTRY + TRACKED)))
+
+
+@pytest.mark.parametrize("value", ["None", "none.", " none "])
+def test_a_closed_fragment_may_write_none_as_an_open_one_reads_it(
+    journal_tree: Path, value: str
+) -> None:
+    # The two sides read a value the same way: what an open entry refuses as naming no one, a
+    # closed one accepts as its none (code review, 2026-11-13).
+    path = journal_tree / "2026-11-13-closed.md"
+    path.write_text(
+        fragment_entry(path.stem)
+        .replace("status: open", "status: adopted")
+        .replace("owner: the lane that builds the stop", f"owner: {value.strip()}")
+        .replace("closes: a replay test", "closes: none")
+    )
+    test_journal_form()
+
+
+def test_a_fragments_name_carries_its_session_date(journal_tree: Path) -> None:
+    # Filename order is the journal's reading order, so the name's date is the session's.
+    path = journal_tree / "2026-11-13-dated.md"
+    path.write_text(fragment_entry(path.stem).replace("session: 2026-11-13", "session: 2026-11-12"))
+    with pytest.raises(AssertionError, match=re.escape(path.name)) as error:
+        test_journal_form()
+    assert "session" in str(error.value)
+
+
+def test_a_fragment_supersedes_no_later_date(journal_tree: Path) -> None:
+    earlier = journal_tree / "2026-11-12-earlier.md"
+    later = journal_tree / "2026-11-13-later.md"
+    later.write_text(fragment_entry(later.stem))
+    earlier.write_text(fragment_entry(earlier.stem, later.stem))
+    with pytest.raises(AssertionError, match=re.escape(earlier.name)) as error:
+        test_journal_form()
+    assert "later date" in str(error.value)
+
+
+def test_fragments_that_supersede_each_other_are_refused(journal_tree: Path) -> None:
+    first = journal_tree / "2026-11-13-first.md"
+    second = journal_tree / "2026-11-13-second.md"
+    first.write_text(fragment_entry(first.stem, second.stem))
+    second.write_text(fragment_entry(second.stem, first.stem))
+    with pytest.raises(AssertionError, match="cycle"):
+        test_journal_form()
+
+
+def test_a_fragment_that_is_not_utf8_is_named(journal_tree: Path) -> None:
+    path = journal_tree / "2026-11-13-latin.md"
+    path.write_bytes(fragment_entry(path.stem).replace("a lesson", "caf\u00e9").encode("latin-1"))
+    with pytest.raises(AssertionError, match=re.escape(path.name)):
+        test_journal_form()
+
+
+def test_the_closed_journal_marker_is_the_journals_alone() -> None:
+    # `nights.md` keeps the open marker: the journal's closed one there is refused.
+    with pytest.raises(ValueError, match="marker"):
+        check_nights(JOURNAL_MARKER + "\n")
+
+
+@pytest.mark.parametrize("label", ["merge-base with main", "HEAD~1"])
+@pytest.mark.parametrize("change", ["edit", "delete", "rename", "trailing-space", "line-endings"])
+def test_journal_fragments_already_landed_cannot_change(
+    journal_tree: Path, monkeypatch: pytest.MonkeyPatch, label: str, change: str
+) -> None:
+    path = journal_tree / "2026-11-13-kept.md"
+    before = fragment_entry(path.stem)
+    path.write_text(before)
+    legacy = (journal_tree.parent / "journal.md").read_text()
+    relative = "docs/handbook/journal/2026-11-13-kept.md"
+
+    def read_revision(*args: str) -> str:
+        replies = {
+            ("show", "base:docs/handbook/journal.md"): legacy,
+            ("ls-tree", "-r", "--name-only", "-z", "base", "--", "docs/handbook/journal/"): relative
+            + "\0",
+            ("show", f"base:{relative}"): before,
+        }
+        return replies[args]
+
+    monkeypatch.setitem(globals(), "bases", lambda: {label: "base"})
+    monkeypatch.setitem(globals(), "git", read_revision)
+    test_entries_are_only_appended("journal.md")
+    # Adding another fragment leaves the landed one intact.
+    added = journal_tree / "2026-11-13-added.md"
+    added.write_text(fragment_entry(added.stem))
+    test_entries_are_only_appended("journal.md")
+    if change == "edit":
+        path.write_text(before.replace("a lesson", "a different lesson"))
+    elif change == "trailing-space":
+        path.write_text(before + "\n")
+    elif change == "line-endings":
+        path.write_bytes(before.replace("\n", "\r\n").encode())
+    elif change == "rename":
+        path.rename(journal_tree / "2026-11-13-renamed.md")
+    else:
+        path.unlink()
+    with pytest.raises(AssertionError, match=re.escape(path.name)) as error:
+        test_entries_are_only_appended("journal.md")
+    assert label in str(error.value)
+
+
+def test_journal_fragment_dotfiles_are_skipped(journal_tree: Path) -> None:
+    path = journal_tree / "2026-11-13-unfinished.md"
+    path.write_text("an unfinished entry\n")
+    with pytest.raises(AssertionError, match=re.escape(path.name)):
+        test_journal_form()
+    path.rename(journal_tree / ".unfinished.md")
+    (journal_tree / ".DS_Store").write_bytes(b"\xff")
+    test_journal_form()
+
+
+@pytest.mark.parametrize("name", ["notes.txt", "2026-11-13-lesson.MD", "2026-11-13-lesson"])
+def test_journal_fragments_refuse_non_markdown_files(journal_tree: Path, name: str) -> None:
+    (journal_tree / name).write_bytes(b"\xff")  # Reject the name before trying to decode it.
+    with pytest.raises(AssertionError, match=re.escape(name)):
+        test_journal_form()
+
+
+def journal_section(section: str) -> str:
+    text = (HANDBOOK / "journal.md").read_text()
+    return text.split(f"## {section}\n", 1)[1].split("\n## ", 1)[0]
+
+
+@pytest.mark.parametrize(
+    "section", ["The learn step", "The session-end reflection", "An entry's form"]
+)
+def test_journal_instructions_name_the_fragment_destination(section: str) -> None:
+    text = journal_section(section)
+    assert "docs/handbook/journal/" in text
+    assert "<YYYY-MM-DD>-<slug>.md" in text
+
+
+def test_journal_form_gives_the_two_tracked_fields_and_their_source() -> None:
+    text = journal_section("An entry's form")
+    for field in TRACKED_FIELDS:
+        assert f"\n* {field}: <" in text, field
+    assert "https://sre.google/workbook/postmortem-culture/" in text
+    assert f"`L{LAST_LEGACY:04d}`" in text
+
+
+def test_journal_marker_is_closed_and_keeps_the_legacy_entries() -> None:
+    text = (HANDBOOK / "journal.md").read_text()
+    assert JOURNAL_MARKER in text
+    assert MARKER not in text
+    assert f"Closed: `L0001` through `L{LAST_LEGACY:04d}`" in text
+    assert [block.split(":", 1)[0] for block in journal_entries(text)] == [
+        f"### L{n:04d}" for n in range(1, LAST_LEGACY + 1)
+    ]
+
+
 NIGHT_ENTRY = """\
 ### 2026-11-12
 
@@ -629,6 +1086,11 @@ def test_nights_check_takes_and_refuses() -> None:
     assert any(
         "journal" in e for e in check_nights(journal_page(NIGHT_ENTRY.replace("L0001", "J1")))
     )
+
+
+def test_nights_check_accepts_fragment_ids() -> None:
+    page = journal_page(NIGHT_ENTRY.replace("L0001", "L0001, 2026-11-13-a-lesson"))
+    assert check_nights(page) == []
 
 
 def test_rows_check_refuses_a_malformed_row() -> None:
