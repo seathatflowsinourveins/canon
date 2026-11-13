@@ -19,6 +19,7 @@ from nautilus_trader.model import Quantity
 from nautilus_trader.model import QuoteTick
 
 from canon_trading import mover
+from canon_trading.price_step import down_on_step
 from tests.test_mover import AAA
 from tests.test_mover import BBB
 from tests.test_mover import MINUTE
@@ -474,6 +475,21 @@ def test_chase_uses_the_entry_plans_scaled_cap():
     assert slot.floor == mover.chase_floor(D(10), seam.settings.chase_cap)
 
 
+@pytest.mark.parametrize("sized_loss", ["0.02", "0.01"], ids=["equal-under-l", "wider-than-l"])
+def test_a_ratchet_is_not_spent_unless_it_tightens_the_offsets_l_put_in_force(sized_loss: str):
+    """The landing review of the fix on S2, finding 5: an entry sized for a loss L trails L under the
+    fill until a ratchet, so the offsets in force are L's, not the initial plan's. A candidate of 0.002
+    (offsets 0.02 and 0.03) tightens the plan's 0.04 and 0.05, but equals L = 0.02's offsets and is
+    wider than L = 0.01's (0.01 and 0.02); neither tightens the sale, so the ratchet is kept."""
+    seam, slot = ratchet_seam("10.0800", "10.0850")
+    slot.sized_loss = D(sized_loss)
+    assert mover.Mover._ratchet(seam, slot, T0) is False
+    assert slot.ratcheted is False and "ratchet" not in (slot.entry_record or {})
+    slot.sized_loss = D("0.03")
+    assert mover.Mover._ratchet(seam, slot, T0 + SECOND) is True
+    assert slot.ratcheted is True
+
+
 def test_ratchet_remakes_the_emulated_sale_and_records_when_and_from_what():
     eng = engine()
     s = strategy(trail_mode="ratchet", atr_n=3, atr_k=D(1), ratchet_r=D(2), ratchet_g=D("0.5"))
@@ -487,6 +503,9 @@ def test_ratchet_remakes_the_emulated_sale_and_records_when_and_from_what():
     assert len(sells) == 2 and sells[0].status.name == "CANCELED"
     assert sells[1].trailing_offset < sells[0].trailing_offset
     assert all(a <= b for a, b in zip(s.triggers, s.triggers[1:]))
+    # the real emulator takes the remade sale with the limit the canceled one had reached, and
+    # never moves it lower (Astra second read of #316, finding 1)
+    assert sells[1].price is not None and sells[1].price >= sells[0].price
     eng.dispose()
 
 
@@ -588,6 +607,106 @@ def test_ratchet_tightens_from_the_protection_anchor_when_the_entry_price_is_unk
     slot.initial_trail = mover.TrailPlan(D("0.02"), D("0.005"), D("0.02"), None, None, "atr", None)
     assert mover.Mover._ratchet(cast(Any, seam), slot, T0) is True
     assert slot.trail_plan is not None and slot.trail_plan.trail < D("0.02")
+
+
+class RatchetSeam(Seam):
+    """A Seam whose protection may ratchet, and whose cancel of an emulated sale is seen at once."""
+
+    _ratchet = mover.Mover._ratchet
+
+    def cancel_order(self, client_order_id: Any) -> None:
+        super().cancel_order(client_order_id)
+        self.orders[client_order_id.value].is_closed = True
+
+
+def ratchet_seam(bid: str, ask: str) -> tuple[Any, mover.Slot]:
+    """Entry filled at 10.00 on an ATR plan of 0.004 (offsets 0.04 and 0.05), with the quote given."""
+    seam = RatchetSeam(bid, trail_mode="ratchet")
+    seam.cache.quote = lambda _: SimpleNamespace(
+        bid_price=Price.from_str(bid), ask_price=Price.from_str(ask)
+    )
+    slot = seam_slot(seam)
+    plan = mover.TrailPlan(D("0.004"), D("0.001"), D("0.02"), None, None, "atr", None)
+    slot.initial_trail = slot.trail_plan = plan
+    slot.entry_record = {"client_order_id": "E-1", "stopped_out": False}
+    return seam, slot
+
+
+def test_a_ratchet_remake_after_a_pullback_keeps_the_release_limit_the_sale_had_reached():
+    """Astra second read of #316, finding 1: the bid reached 10.14 and pulled back to 10.11 between
+    steps, so the working sale holds trigger 10.10 and limit 10.09. The ratchet remakes it with offsets
+    0.02 and 0.03. The emulator seeds a trailing limit from the order's own price
+    (`crates/execution/src/trailing.rs:61-65` at the pin) and moves it only to a better one, so a remake
+    with no price would release at 10.11 - 0.03 = 10.08, under the 10.09 already reached."""
+    seam, slot = ratchet_seam("10.1100", "10.1200")
+    working = seam._new(
+        "TRAILING",
+        quantity=Quantity.from_int(5),
+        trigger_price=Price.from_str("10.1000"),
+        price=Price.from_str("10.0900"),
+        trailing_offset=D("0.04"),
+        limit_offset=D("0.05"),
+    )
+    seam.orders[working.client_order_id.value] = working
+    slot.protect_id = working.client_order_id
+    seam._protect(slot, D(5), T0)
+    assert seam.canceled == [working.client_order_id.value]
+    remade = seam.sent[-1]
+    assert (remade.kind, remade.trailing_offset, remade.limit_offset) == (
+        "TRAILING",
+        D("0.02"),
+        D("0.03"),
+    )
+    assert remade.trigger_price == Price.from_str("10.1000")
+    assert remade.price == Price.from_str("10.0900")
+
+
+def test_a_kept_release_limit_is_never_above_the_kept_trigger_on_alpacas_step():
+    """The landing review of the fix (high), finding 1: a sale bought under $1 has a sub-cent trail, so
+    its reached limit can sit within a cent of its trigger. Once the price is over $1 the remade
+    trigger is rounded down to Alpaca's step (1.0599 to 1.05); the kept limit 1.0536 would sit above
+    it and release a sale over the bid. The kept limit is capped at the kept trigger."""
+    seam = Seam("1.0560")
+    slot = seam_slot(seam, bought="0.9000")
+    slot.trail_trigger, slot.trail_limit = D("1.0599"), D("1.0536")
+    seam._protect(slot, D(5), T0)
+    remade = seam.sent[-1]
+    assert remade.kind == "TRAILING" and remade.trigger_price == Price.from_str("1.0500")
+    assert remade.price is not None and remade.price <= remade.trigger_price
+
+
+def test_a_kept_release_limit_is_on_alpacas_step():
+    """The landing review of the cap, finding 1: the kept trigger is on whole cents over $1, but a
+    sale bought under $1 has a sub-cent trailing offset, so the trigger less the spread between the
+    offsets (1.05 - (0.03 - 0.0180) = 1.0380) is off Alpaca's step. The adapter floors a sell limit,
+    so it would release at 1.03 unseen. The kept limit is rounded down to the step where it is made."""
+    seam = Seam("1.0560")
+    slot = seam_slot(seam, bought="0.9000")
+    slot.trail_trigger, slot.trail_limit = D("1.0599"), D("1.0536")
+    seam._protect(slot, D(5), T0)
+    remade = seam.sent[-1]
+    assert remade.price is not None
+    price = remade.price.as_decimal()
+    assert price == down_on_step(price) == D("1.03")
+
+
+def test_a_ratchet_whose_rounded_offsets_are_unchanged_is_not_spent():
+    """Astra second read of #316, finding 2: a gain of 0.08 over a 0.019 spread gives a candidate trail
+    of 0.0038, under 0.004, but both round to offsets 0.04 and 0.05. Nothing tightens, so the one
+    ratchet is not spent or recorded, and a later narrower spread still tightens the sale."""
+    seam, slot = ratchet_seam("10.0800", "10.0990")
+    assert mover.offsets(D(10), D("0.0038"), D("0.00095")) == mover.offsets(
+        D(10), D("0.004"), D("0.001")
+    )
+    assert mover.Mover._ratchet(seam, slot, T0) is False
+    assert slot.ratcheted is False and "ratchet" not in (slot.entry_record or {})
+    assert slot.trail_plan is not None and slot.trail_plan.trail == D("0.004")
+    seam.cache.quote = lambda _: SimpleNamespace(
+        bid_price=Price.from_str("10.0800"), ask_price=Price.from_str("10.0850")
+    )
+    assert mover.Mover._ratchet(seam, slot, T0 + SECOND) is True
+    assert slot.ratcheted is True
+    assert slot.trail_plan is not None and slot.trail_plan.trail == D("0.002")
 
 
 def test_unusable_entry_spread_falls_back_to_the_configured_fixed_plan():

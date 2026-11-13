@@ -2926,7 +2926,7 @@ class Seam:
             "TRAILING",
             quantity=qty,
             trigger_price=kw["trigger_price"],
-            price=None,
+            price=_price,
             trailing_offset=kw["trailing_offset"],
             limit_offset=kw["limit_offset"],
         )

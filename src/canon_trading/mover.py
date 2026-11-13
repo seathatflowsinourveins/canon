@@ -236,6 +236,7 @@ from .movers_rank_signal import encode_ranking
 from .paper_node import REQUEST_CEILING
 from .price_step import CENT
 from .price_step import SUB_DOLLAR
+from .price_step import down_on_step
 from .price_step import entry_price
 from .price_step import exit_price
 from .price_step import stop_trigger_price
@@ -1170,6 +1171,10 @@ class Slot:
     trail_trigger: Decimal | None = None
     """The trigger a trailing sell had reached when it was canceled to be made again: the next one starts
     from it, so the trigger never falls; with persistence on, the local confirmed trigger itself."""
+    trail_limit: Decimal | None = None
+    """The release limit that canceled trailing sell had reached, kept beside its trigger: the remade
+    sell starts from it, so the price a release may sell at never falls either (Astra second read of
+    #316, finding 1)."""
     trail_high: Decimal | None = None
     """The confirmed high with persistence on; the emulator owns it when both arms are off."""
     observations: deque[tuple[int, Decimal]] = field(default_factory=deque)
@@ -2039,7 +2044,8 @@ class Mover(Strategy):
             self.sold[slot.instrument_id] = (now, price)
             slot.was_held = False
             slot.exiting = False
-            slot.floor = slot.trail_trigger = slot.sized_loss = slot.exit_trigger = None
+            slot.floor = slot.trail_trigger = slot.trail_limit = None
+            slot.sized_loss = slot.exit_trigger = None
             slot.trail_high = None
             slot.observations.clear()
             slot.high_observations.clear()
@@ -2105,6 +2111,9 @@ class Mover(Strategy):
                     reached = order.trigger_price.as_decimal()
                     slot.trail_trigger = max(reached, slot.trail_trigger or reached)
                     self.sell_triggers[order.client_order_id.value] = str(reached)
+                if order.price is not None:
+                    limit = order.price.as_decimal()
+                    slot.trail_limit = max(limit, slot.trail_limit or limit)
                 self.cancel_order(order.client_order_id)
                 # The emulator cancels its own order before the call returns, so the cancel is seen
                 # terminal here and the new sell follows in this step, not a second later.
@@ -2226,7 +2235,7 @@ class Mover(Strategy):
             kept, origin = anchor, f"{slot.sized_loss} under the fill {bought}"
         if kept is not None and at <= kept:
             # the market is at the trigger the canceled sell had reached: its sale is due now
-            slot.exiting, slot.trail_trigger = True, None
+            slot.exiting, slot.trail_trigger, slot.trail_limit = True, None, None
             # a reached trigger is retained; with none, or with L under the fill above it, the stop L
             # under the fill is met as the sale is armed
             retained = reached is not None and kept == stop_trigger_price(reached)
@@ -2260,11 +2269,26 @@ class Mover(Strategy):
             f"{'bid' if trigger == TriggerType.BID_ASK else 'trade'}, its limit {limit} under it"
             + ("" if kept is None else f", from the trigger {kept} ({origin}) on the step")
         )
+        # The pinned emulator seeds a trailing limit from the order's own price and moves it only to a
+        # better one (`crates/execution/src/trailing.rs:61-65`); with no price the remade sell's first
+        # limit is the bid less its offset, under the one already reached after a pullback.
+        # Capped at the kept trigger less this sell's own spread between its offsets, the limit the
+        # emulator would seed beside that trigger: the kept trigger is rounded down to Alpaca's step,
+        # so a sub-cent trail can leave the reached limit above it (the landing review of this fix,
+        # finding 1), and a released sale keeps the room its limit offset gives it under the trigger.
+        # Without a ratchet over $1 the cap is the lower, by what the trigger lost to the step. The
+        # cap is rounded down to Alpaca's step, which a sub-cent offset leaves it off (the review of
+        # the cap, finding 1); the adapter would otherwise floor it out of sight.
+        kept_limit = (
+            None
+            if kept is None or slot.trail_limit is None
+            else down_on_step(min(slot.trail_limit, kept - (limit - trailing)))
+        )
         order = self.order_factory.trailing_stop_limit(
             slot.instrument_id,
             OrderSide.SELL,
             instrument.make_qty(held),
-            None,
+            None if kept_limit is None else instrument.make_price(kept_limit),
             limit_offset=limit,
             trailing_offset=trailing,
             trailing_offset_type=TrailingOffsetType.PRICE,
@@ -3069,6 +3093,22 @@ class Mover(Strategy):
             return False
         plan = ratchet_trail(initial, bought, followed, spread, self.settings)
         if plan is None:
+            return False
+        current = slot.trail_plan or initial
+        # The offsets in force are `_trail`'s: L under the fill while it has room and nothing has
+        # ratcheted (the landing review of this fix on S2, finding 5), else the plan's.
+        in_force = offsets(
+            bought,
+            current.trail,
+            current.exit_through,
+            distance=None
+            if slot.ratcheted or fill_trigger(bought, slot.sized_loss) is None
+            else slot.sized_loss,
+        )
+        if not offsets(bought, plan.trail, plan.exit_through) < in_force:
+            # Rounded, the candidate's trigger and then its limit are no closer than those in force:
+            # the one ratchet is kept for a later step that can tighten (Astra second read of #316,
+            # finding 2).
             return False
         slot.trail_plan, slot.ratcheted = plan, True
         if slot.entry_record is not None:
