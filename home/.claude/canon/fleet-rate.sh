@@ -3,8 +3,9 @@
 # fleet's output speed and how many Claude Code sessions are working, e.g. "+156 -23 │ Fleet out 108 tok/s · 9
 # working" (ADR 0007). The speed is the report's fleet GEN: the output tokens of every timed request in its window
 # over those requests' durations, the ratio Claude HUD's own "out:" takes for its session's latest response
-# (src/speed.ts at v0.15.0); the HUD leaves out subagents' requests and takes no reading under 500 ms of API
-# time, where the fleet counts every timed request. A report with no timed request, a speed under 0.5 tok/s
+# (src/speed.ts at v0.15.0); the HUD folds into its baseline the API time of requests that leave its usage
+# untouched (subagents') and takes no reading under 500 ms, where the fleet counts every timed request of the
+# report's listed workers, on any model. A report with no timed request, a speed under 0.5 tok/s
 # (which would show as 0), or no such summary shows the working sessions alone. The fleet's TOK/S is its
 # work, not a speed, and stays in scripts/lanes --rates.
 # Usage: fleet-rate.sh [<lines added> <lines removed>]. statusline.sh passes the input's documented
