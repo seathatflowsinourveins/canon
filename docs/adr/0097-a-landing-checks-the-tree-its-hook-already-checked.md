@@ -55,10 +55,16 @@ the registry, Turborepo signs its remote cache with an HMAC key that every machi
 would not meet the second need either (seen as a search summary only: UNVERIFIED). The gap stays
 open; nothing is built until an upstream that documents such a cache is adopted (`adopt-upstream`).
 
+Addition, 2026-11-13 (ADR 0138, proposed): a commit's hook no longer runs the whole suite, so the tree is
+checked in full once on this Mac, at landing, and the second pass this record weighs is gone. The cache
+stays a later unit of ADR 0138, still bound by the two needs above.
+
 ### Consequences
 
 * Good: the gate's answer still means the checks ran on the landed bytes.
-* Bad: each landing repeats the hook's run, minutes per landing under load; slot order softens the wait.
+* Bad: when this was written, each landing repeated the hook's run, minutes per landing under load; slot
+  order softened the wait. Since 2026-11-13 the hook runs only the fast checks and the landing's run is the
+  one full run on this Mac (ADR 0138).
 
 ### Confirmation
 

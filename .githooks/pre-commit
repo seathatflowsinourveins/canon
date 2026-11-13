@@ -2,9 +2,11 @@
 # git pre-commit hook. Contract: githooks(5) — a non-zero exit aborts the commit.
 # Enabled per clone with `git config core.hooksPath .githooks` (scripts/automation install does this).
 #
-# Runs scripts/ci, the same script CI runs, with the secret scan limited to what is staged. About eight
-# seconds, offline. `git commit --no-verify` would skip it here; GitHub runs the same script before anything
-# merges, so a skipped commit still cannot land (ADR 0020).
+# Runs scripts/ci --staged, the same script CI runs, in a commit's scope (ADR 0138): the canon lint, the lock
+# check, ruff, its format, ty, pytest's collection, the shell checks and a secret scan of what is staged.
+# The self-tests, the full pytest and actionlint are left to scripts/land and GitHub, which run every check.
+# `git commit --no-verify` would skip it here; GitHub runs the same script before anything merges, so a
+# skipped commit still cannot land (ADR 0020).
 #
 # A commit in the primary checkout is refused: the maintenance agent keeps that checkout on main and
 # fast-forwards it (ADR 0065), and work belongs in a worktree. The primary checkout is git's own fact: the

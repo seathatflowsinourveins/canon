@@ -54,6 +54,10 @@ if [ "$1 $2 $3" = "run --locked ty" ] && [ -z "$dir" ]; then
   [ -z "${FAKE_TY_DONE:-}" ] || { sleep 0.5; : >"$FAKE_TY_DONE"; echo "ty finished" >>"$UV_LOG"; }
   [ -z "${FAKE_TY_FAIL:-}" ] || { echo "error[invalid-assignment]: a typing line"; exit 1; }
 fi
+if [ "$1 $2 $3 $4" = "run --locked pytest --collect-only" ]; then
+  [ -z "${FAKE_COLLECT_FAIL:-}" ] || { echo "ERROR collecting tests/test_x.py"; exit 2; }
+  echo "2 tests collected"; exit 0
+fi
 if [ "$1 $2 $3" = "run --locked pytest" ]; then
   for a in "$@"; do
     case "$a" in -r*s*) echo "SKIPPED tests/test_x.py::test_net - Skipped: no credentials" ;; esac
@@ -316,6 +320,72 @@ first_after=$(awk '/^ty finished$/ { t = NR } /^run --locked pytest/ && !p { p =
 check "pytest starts only after ty finished"       test "$first_after" = 1
 }
 
+# --- a commit's run (--staged) runs the seconds-long checks and leaves the rest to the landing (ADR 0138) ---
+case_commitscope() {
+fresh commitscope
+printf '#!/bin/bash\n: >"%s"\n' "$C.lanes.ran" >"$C/scripts/lanes"
+printf '#!/bin/bash\n: >"%s"\n' "$C.selftest.ran" >"$C/scripts/test-zz"; chmod +x "$C/scripts/test-zz"
+gitq -C "$C" add -A; gitq -C "$C" commit -q -m scope
+runci --staged
+check "a commit's run passes"                      test "$RC" = 0
+check "it runs no self-test"                       test ! -e "$C.lanes.ran"
+check "and no test script"                         test ! -e "$C.selftest.ran"
+check "and no full pytest"                         test "$(grep -cE '^run --locked pytest -q' "$C.uv.log")" = 0
+check "it collects the tests"                      test "$(grep -c '^run --locked pytest --collect-only -q' "$C.uv.log")" = 1
+check "collection has its line"                    has '^  ok    pytest collection$'
+check "ruff, format and ty run"                    test "$(grep -cE '^run --locked (ruff check|ruff format|ty check)' "$C.uv.log")" = 3
+check "the canon lint runs"                        has '^  ok    canon registry, lock and ADRs$'
+check "and the shell checks"                       has '^  ok    shellcheck$'
+check "actionlint is left to the landing"          has '^  skip  actionlint .*\(not run at commit; the landing runs it\)$'
+check "so are the canon and survey self-tests"     test "$(printf '%s\n' "$OUT" | grep -cE '^  skip  (release-rule|practice survey) self-test \(not run at commit')" = 2
+check "the verdict says what was left"             has '^ci: all commit checks passed; [0-9]+ checks NOT RUN here, left to the landing'
+check "and is not the whole suite's verdict"       test "$(printf '%s\n' "$OUT" | grep -c '^ci: all checks passed$')" = 0
+check "a test script left to the landing says so"  has '^  skip  test-zz \(not run at commit; the landing runs it\)$'
+check "pytest too"                                 has '^  skip  pytest \(not run at commit; the landing runs it\)$'
+check "and the lane self-test"                     has '^  skip  lane report self-test \(not run at commit; the landing runs it\)$'
+check "the staged secret scan runs"                has '^  ok    gitleaks \(staged changes\)$'
+}
+case_collectfail() {
+fresh collectfail
+FAKE_COLLECT_FAIL=1; export FAKE_COLLECT_FAIL
+runci --staged
+unset FAKE_COLLECT_FAIL
+check "a test file that fails to import fails at commit" has '^  FAIL  pytest collection$'
+check "and the run fails"                          test "$RC" = 1
+}
+case_stagedlock() {
+fresh stagedlock
+FAKE_LOCK_FAIL=1; export FAKE_LOCK_FAIL
+runci --staged
+unset FAKE_LOCK_FAIL
+check "a commit with a stale lock names its collection too" has '^  skip  pytest collection \(uv.lock does not match the manifests\)$'
+check "and fails"                                  test "$RC" = 1
+}
+case_stagedtool() {
+fresh stagedtool
+mkdir -p "$C.tools"; cp "$TMP/tools/uv" "$TMP/tools/shellcheck" "$TMP/tools/gitleaks" "$C.tools/"
+TOOLS="$C.tools" runci --staged
+check "a missing actionlint fails a commit by name"  has '^  FAIL  actionlint \(not found\)$'
+check "and the commit fails"                       test "$RC" = 1
+}
+case_stagedapart() {
+apart_copy stagedapart
+runci --staged
+check "a project apart is collected at commit"     test "$(grep -cx -- '--directory apart run --locked pytest --collect-only -q' "$C.uv.log")" = 1
+check "with its line"                              has '^  ok    pytest collection in apart$'
+check "its full pytest is left to the landing"     has '^  skip  pytest in apart \(not run at commit; the landing runs it\)$'
+}
+case_landingall() {
+fresh landingall
+printf '#!/bin/bash\n: >"%s"\n' "$C.lanes.ran" >"$C/scripts/lanes"
+gitq -C "$C" add -A; gitq -C "$C" commit -q -m all
+runci --landing
+check "a landing runs the self-tests"              test -e "$C.lanes.ran"
+check "and the full pytest"                        test "$(grep -cE '^run --locked pytest -q' "$C.uv.log")" = 1
+check "and no collection run of its own"           test "$(grep -c -- '--collect-only' "$C.uv.log")" = 0
+check "nothing is left to a landing"               test "$(printf '%s\n' "$OUT" | grep -c 'not run at commit')" = 0
+}
+
 # --- a fast failure still names what fails at once: a test script not executable, a tool not found ---
 case_fastnamed() {
 fresh fastnamed
@@ -365,17 +435,17 @@ check "nothing ran from its folder after that"     test "$(grep -c -- '^--direct
 check "the root's lock and pytest still pass"      has '^  ok    pytest$'
 }
 
-# --- run from a commit hook, test scripts do not see git's repository variables ---
+# --- run from a commit hook, checks do not see git's repository variables (the canon lint, run at commit) ---
 case_hookenv() {
 fresh hookenv
-cat >"$C/scripts/test-env" <<'EOF'
+cat >"$C/scripts/canon" <<'EOF'
 #!/bin/bash
+[ "$1" = lint ] || exit 0
 env | grep '^GIT_' >"$ENV_LOG"
 d=$(mktemp -d) && cd "$d" && git init -q && git config test.touched yes
 rm -rf "$d"
 exit 0
 EOF
-chmod +x "$C/scripts/test-env"
 gitq -C "$C" add -A; gitq -C "$C" commit -q -m env
 cp "$C/.git/config" "$C.config.before"
 export ENV_LOG="$C.env.log"
@@ -383,7 +453,7 @@ export GIT_DIR="$C/.git" GIT_INDEX_FILE="$C/.git/index"
 runci --staged
 unset GIT_DIR GIT_INDEX_FILE
 check "staged run under a hook environment passes" test "$RC" = 0
-check "the test script ran"                        test -f "$ENV_LOG"
+check "the canon lint ran"                         test -f "$ENV_LOG"
 check "it saw no GIT_DIR or GIT_INDEX_FILE"        test "$(grep -cE '^GIT_(DIR|INDEX_FILE)=' "$ENV_LOG")" = 0
 check "the repository config is unchanged"         cmp -s "$C.config.before" "$C/.git/config"
 }
@@ -510,9 +580,12 @@ printf '#!/bin/bash\nps -o nice= -p $$ | tr -d " " >"%s"\n' "$C.nice" >"$C/scrip
 chmod +x "$C/scripts/test-nice"
 gitq -C "$C" add -A; gitq -C "$C" commit -q -m nice
 base=$(ps -o nice= -p $$ | tr -d ' ')
+# the value is clamped at 20 (setpriority(2): "-20 to 20"; PRIO_MAX in sys/resource.h), so a caller
+# already at 16 or above sees 20, as under `nice -n 20`
+want=$((base + 5)); [ "$want" -le 20 ] || want=20
 unset CANON_CI_NICED   # a run inside scripts/ci has it set; this case runs the copy as a first run
 runci
-check "a check of scripts/ci runs 5 above the caller's nice value" test "$(cat "$C.nice" 2>/dev/null)" = "$((base + 5))"
+check "a check of scripts/ci runs 5 above the caller's nice value" test "$(cat "$C.nice" 2>/dev/null)" = "$want"
 check "... and the run passes"                     test "$RC" = 0
 }
 
@@ -586,12 +659,12 @@ case_priority() {
 fresh priority
 local S="$C.signals" staged_pid landing_pid holder_pid plain_pid
 mkdir -p "$S" "$C.tmp"
-cat >"$C/scripts/test-priority" <<'EOF'
+cat >"$C/scripts/canon" <<'EOF'
 #!/bin/bash
+[ "$1" = lint ] || exit 0
 touch "$SIGNALS/$RUN_KIND.started"
 while [ ! -e "$SIGNALS/$RUN_KIND.release" ]; do sleep 0.05; done
 EOF
-chmod +x "$C/scripts/test-priority"
 gitq -C "$C" add -A; gitq -C "$C" commit -q -m priority
 # shellcheck disable=SC2016  # expanded by the holder's own shell
 local hold='touch "$1/held"; while [ ! -e "$1/holder.release" ]; do sleep 0.05; done'
@@ -638,12 +711,12 @@ wait "$plain_pid"
 case_prioritycapacity() {
 fresh prioritycapacity
 local S="$C.signals" landing_pid staged_pid
-mkdir -p "$S" "$C.tmp"; cat >"$C/scripts/test-priority" <<'EOF'
+mkdir -p "$S" "$C.tmp"; cat >"$C/scripts/canon" <<'EOF'
 #!/bin/bash
+[ "$1" = lint ] || exit 0
 touch "$SIGNALS/$RUN_KIND.started"
 while [ ! -e "$SIGNALS/release" ]; do sleep 0.05; done
 EOF
-chmod +x "$C/scripts/test-priority"
 gitq -C "$C" add -A; gitq -C "$C" commit -q -m capacity
 (cd "$C" && env -u CANON_CI_SLOT_HELD CANON_CI_SLOTS=2 PATH="$FAKE:$PATH" TOOLS="$TMP/tools" \
   UV_LOG="$C.landing.uv.log" TMPDIR="$C.tmp" SIGNALS="$S" RUN_KIND=landing scripts/ci --landing >"$C.landing.out" 2>&1) &
@@ -658,8 +731,256 @@ check "a landing leaves shared capacity for a staged run" test -e "$S/staged.sta
 : >"$S/release"; wait "$landing_pid"; wait "$staged_pid"
 }
 
+# --- commit/landing split (ADR 0138, unit 2): only the public command, its output and tool calls ---
+# Contracts read for these cases: githooks(5), pre-commit (nonzero aborts the commit), and pytest 9.2.0,
+# doc/en/how-to/usage.rst plus src/_pytest/main.py at ae1d0ff57b8bd4252da9ade7353523ac0ac73281:
+# --collect-only / --collectonly / --co collect tests without executing their bodies.
+# P6: these cases wait only for runci to exit; no sleeps, deadlines or elapsed-time assertions.
+case_commitfast() {
+fresh commitfast
+local label command
+mkdir -p "$C.tools"; cp "$TMP/tools"/* "$C.tools/"
+cat >"$C.tools/gitleaks" <<'EOF'
+#!/bin/bash
+printf '%s\n' "$*" >"$UV_LOG.gitleaks"
+EOF
+cat >"$C.tools/shellcheck" <<'EOF'
+#!/bin/bash
+printf '%s\n' "$*" >"$UV_LOG.shellcheck"
+EOF
+cat >"$C/scripts/canon" <<'EOF'
+#!/bin/bash
+[ "$1" != lint ] || printf '%s\n' "$*" >"$UV_LOG.canon"
+exit 0
+EOF
+TOOLS="$C.tools" runci --staged
+check "P1 staged fast checks pass" test "$RC" = 0
+for label in 'canon registry, lock and ADRs' 'uv.lock matches the manifests' \
+  'Python environment [(]uv run --locked[)]' 'ruff lint' 'ruff format' 'ty type check' \
+  'shell syntax [(][0-9]+ files[)]' 'shellcheck' 'gitleaks [(]staged changes[)]'; do
+  check "P1 staged reports $label" has "^  ok    $label\$"
+done
+check "P1 staged reports pytest collection success" has '^  ok    pytest([[:space:]].*)?$'
+for command in 'lock --check' 'run --locked python -c pass' 'run --locked ruff check .' \
+  'run --locked ruff format --check .' 'run --locked ty check'; do
+  check "P1 staged invokes $command once" test "$(grep -cxF -- "$command" "$C.uv.log")" = 1
+done
+check "P1 staged invokes canon lint" test "$(cat "$C.uv.log.canon")" = lint
+check "P1 staged invokes shellcheck on shell files" test -s "$C.uv.log.shellcheck"
+check "P1 staged scans the index" test "$(cat "$C.uv.log.gitleaks")" = 'git --pre-commit --staged --no-banner --redact'
+check "P1 staged calls pytest once, for collection only" test "$(awk '
+  /^run --locked pytest( |$)/ { calls++; for (i = 4; i <= NF; i++)
+    if ($i == "--collect-only" || $i == "--collectonly" || $i == "--co") collect++ }
+  END { print calls + 0 ":" collect + 0 }' "$C.uv.log")" = 1:1
+}
+
+case_commitmodes() {
+fresh commitmodes
+local mode s name label count
+mkdir -p "$C.tools"; cp "$TMP/tools"/* "$C.tools/"
+cat >"$C/scripts/canon" <<'EOF'
+#!/bin/bash
+printf '%s\n' "$*" >>"$UV_LOG.canon"
+EOF
+for s in "$C/scripts/lanes" "$C/scripts/survey-github" "$C"/scripts/test-* "$C.tools/actionlint"; do
+  [ -f "$s" ] || continue
+  cat >"$s" <<'EOF'
+#!/bin/bash
+printf '%s\n' "$*" >>"$UV_LOG.${0##*/}"
+EOF
+done
+for mode in --staged --landing plain; do
+  rm -f "$C.uv.log."*
+  if [ "$mode" = plain ]; then TOOLS="$C.tools" runci
+  else TOOLS="$C.tools" runci "$mode"; fi
+  check "P2/P3 $mode succeeds with passing tools" test "$RC" = 0
+  check "P3 $mode always runs canon lint once" test "$(grep -cx lint "$C.uv.log.canon")" = 1
+  for label in 'release-rule self-test' 'lane report self-test' 'practice survey self-test' pytest actionlint \
+    $(git -C "$C" ls-files 'scripts/test-*' | awk '$0 !~ /^scripts\/.*\// { sub("scripts/", ""); print }'); do
+    if [ "$mode" = --staged ]; then
+      count=$(printf '%s\n' "$OUT" | grep -cE "^  skip  $label([[:space:]]|$).*not run at commit")
+      check "P2 staged names $label as not run at commit once" test "$count" = 1
+    elif [ "$label" = test-ci ]; then
+      check "P3 $mode retains the test-ci recursion guard" has '^  skip  test-ci [(]running inside scripts/test-ci[)]$'
+    else
+      check "P3 $mode runs $label" has "^  ok    $label( [(].*[)])?\$"
+    fi
+  done
+  count=1; [ "$mode" != --staged ] || count=0
+  check "P2/P3 $mode release-rule self-test invocation count" test "$(grep -cx selftest "$C.uv.log.canon")" = "$count"
+  for name in lanes survey-github actionlint \
+    $(git -C "$C" ls-files 'scripts/test-*' | awk '$0 !~ /^scripts\/.*\// && $0 != "scripts/test-ci" { sub("scripts/", ""); print }'); do
+    if [ "$mode" = --staged ]; then
+      check "P2 staged never invokes $name" test ! -e "$C.uv.log.$name"
+    else
+      check "P3 $mode invokes $name once" test "$(wc -l <"$C.uv.log.$name" | tr -d ' ')" = 1
+    fi
+  done
+  if [ "$mode" != --staged ]; then
+    for label in 'uv.lock matches the manifests' 'Python environment [(]uv run --locked[)]' \
+      'ruff lint' 'ruff format' 'ty type check' 'shell syntax [(][0-9]+ files[)]' shellcheck \
+      'gitleaks [(]git history[)]' 'gitleaks [(]working tree[)]'; do
+      check "P3 $mode retains $label" has "^  ok    $label\$"
+    done
+    check "P3 $mode invokes full pytest once" test "$(grep -c '^run --locked pytest ' "$C.uv.log")" = 1
+    check "P3 $mode does not replace pytest with collection" test "$(grep -cE -- '(^| )(--collect-only|--collectonly|--co)( |$)' "$C.uv.log")" = 0
+  fi
+done
+}
+
+case_commitslowfailure() {
+local kind mode label
+for kind in script selftest; do
+  fresh "commitslowfailure-$kind"
+  if [ "$kind" = script ]; then
+    label=test-commit-failure
+    printf '#!/bin/bash\necho "slow script failed"\nexit 1\n' >"$C/scripts/$label"
+    chmod +x "$C/scripts/$label"; gitq -C "$C" add "scripts/$label"
+  else
+    label='release-rule self-test'
+    cat >"$C/scripts/canon" <<'EOF'
+#!/bin/bash
+if [ "$1" = selftest ]; then echo "slow self-test failed"; exit 1; fi
+exit 0
+EOF
+  fi
+  for mode in --staged --landing plain; do
+    if [ "$mode" = plain ]; then runci; else runci "$mode"; fi
+    if [ "$mode" = --staged ]; then
+      check "P2 a failing $kind cannot fail staged CI" test "$RC" = 0
+      check "P2 staged explains the omitted failing $kind" has "^  skip  $label.*not run at commit"
+    else
+      check "P2/P3 the same failing $kind fails $mode" test "$RC" -ne 0
+      check "P2/P3 $mode names the failing $kind" has "^  FAIL  $label\$"
+    fi
+  done
+done
+}
+
+case_commitfastfailure() {
+local failure label
+for failure in ruff format ty lock environment collection; do
+  fresh "commitfastfailure-$failure"
+  mkdir -p "$C.tools"; cp "$TMP/tools"/* "$C.tools/"
+  cp "$TMP/tools/uv" "$C.tools/uv-pass"
+  cat >"$C.tools/uv" <<'EOF'
+#!/bin/bash
+fail=0
+case "$COMMIT_FAILURE:$*" in
+  'ruff:run --locked ruff check '*|'format:run --locked ruff format '*|\
+  'ty:run --locked ty check'*|'lock:lock --check'|'environment:run --locked python -c pass') fail=1 ;;
+  'collection:run --locked pytest '*)
+    for a in "$@"; do case "$a" in --collect-only|--collectonly|--co) fail=1 ;; esac; done ;;
+esac
+if [ "$fail" = 1 ]; then
+  echo "$*" >>"$UV_LOG"
+  echo "$COMMIT_FAILURE fixture failed"
+  exit 2
+fi
+exec "$(dirname "$0")/uv-pass" "$@"
+EOF
+  case "$failure" in
+    ruff) label='ruff lint' ;; format) label='ruff format' ;; ty) label='ty type check' ;;
+    lock) label='uv.lock matches the manifests' ;;
+    environment) label='Python environment [(]uv run --locked[)]' ;; collection) label='pytest.*' ;;
+  esac
+  COMMIT_FAILURE="$failure" TOOLS="$C.tools" runci --staged
+  check "P1/P4 staged $failure failure returns nonzero" test "$RC" -ne 0
+  check "P1/P4 staged $failure failure names its check and diagnostic" \
+    line_after "^  FAIL  $label\$" "^        $failure fixture failed\$"
+done
+}
+
+case_commitpytest() {
+fresh commitpytest
+local mode
+mkdir -p "$C.tools"; cp "$TMP/tools"/* "$C.tools/"
+cp "$TMP/tools/uv" "$C.tools/uv-pass"
+cat >"$C.tools/uv" <<'EOF'
+#!/bin/bash
+if [ "$1 $2 $3" = 'run --locked pytest' ]; then
+  echo "$*" >>"$UV_LOG"
+  for a in "$@"; do
+    case "$a" in --collect-only|--collectonly|--co) echo '1 test collected'; exit 0 ;; esac
+  done
+  echo 'FAILED test_collects_but_fails - test body executed'
+  exit 1
+fi
+exec "$(dirname "$0")/uv-pass" "$@"
+EOF
+for mode in --staged --landing plain; do
+  if [ "$mode" = plain ]; then TOOLS="$C.tools" runci
+  else TOOLS="$C.tools" runci "$mode"; fi
+  if [ "$mode" = --staged ]; then
+    check "P4 a collected test with a failing body permits the commit" test "$RC" = 0
+    check "P4 staged never executes that test body" test "$(printf '%s\n' "$OUT" | grep -c 'test body executed')" = 0
+  else
+    check "P3/P4 $mode executes the failing test body" has 'test body executed'
+    check "P3/P4 the failing test body fails $mode" test "$RC" -ne 0
+  fi
+done
+}
+
+case_commitcanon() {
+local mode broken_lock
+for mode in --staged --landing plain; do
+  for broken_lock in 0 1; do
+    fresh "commitcanon-$mode-$broken_lock"
+    cat >"$C/scripts/canon" <<'EOF'
+#!/bin/bash
+if [ "$1" = lint ]; then
+  echo lint >>"$UV_LOG.canon"
+  echo 'canon lint fixture failed'
+  exit 1
+fi
+exit 0
+EOF
+    if [ "$broken_lock" = 1 ]; then export FAKE_LOCK_FAIL=1; fi
+    if [ "$mode" = plain ]; then runci; else runci "$mode"; fi
+    unset FAKE_LOCK_FAIL
+    if [ "$broken_lock" = 0 ]; then
+      check "P5 $mode runs canon lint" test -s "$C.uv.log.canon"
+      check "P5 $mode reports canon lint failure" \
+        line_after '^  FAIL  canon registry, lock and ADRs$' '^        canon lint fixture failed$'
+    else
+      # narrowed by the owning lane: a failed fast check (here the lock) gates every later check in every
+      # mode, canon lint among them (ADR 0013 rule 7); the gate says so, and the run still fails
+      check "P5 $mode gates canon lint behind the failed lock check" test ! -e "$C.uv.log.canon"
+      check "P5 $mode names canon lint as gated" has '^  skip  canon registry, lock and ADRs [(]a fast check failed[)]$'
+    fi
+    check "P5 canon lint failure fails $mode with broken_lock=$broken_lock" test "$RC" -ne 0
+  done
+done
+}
+
+case_commitshellfailure() {
+local failure label
+for failure in syntax shellcheck gitleaks; do
+  fresh "commitshellfailure-$failure"
+  mkdir -p "$C.tools"; cp "$TMP/tools"/* "$C.tools/"
+  if [ "$failure" = syntax ]; then
+    printf '#!/bin/bash\nif then\n' >"$C/commit-invalid-shell"
+    gitq -C "$C" add commit-invalid-shell
+    label='shell syntax [(][0-9]+ files[)]'
+  else
+    printf '#!/bin/bash\necho "fast tool failed"\nexit 1\n' >"$C.tools/$failure"
+    label=$failure
+    [ "$failure" != gitleaks ] || label='gitleaks [(]staged changes[)]'
+  fi
+  TOOLS="$C.tools" runci --staged
+  check "P1/P2 staged $failure failure fails the commit" test "$RC" -ne 0
+  check "P1/P2 staged $failure failure is named" has "^  FAIL  $label\$"
+  check "P2 staged $failure failure never starts a full pytest run" test "$(awk '
+    /^run --locked pytest( |$)/ { collect = 0; for (i = 4; i <= NF; i++)
+      if ($i == "--collect-only" || $i == "--collectonly" || $i == "--co") collect = 1
+      if (!collect) runs++ }
+    END { print runs + 0 }' "$C.uv.log")" = 0
+done
+}
+
 # Every case above works in its own copy, so they run concurrently; their output prints in this order.
-CASES="yaml noflows shell staged untracked tests testdir testgone notes skipsum died symlink deleted deleted2 lockfail fastfirst fastorder fastnamed apart apartlock hookenv parallel order missing pathorder strayconfig longfail slots nice priority prioritycapacity"
+CASES="yaml noflows shell staged untracked tests testdir testgone notes skipsum died symlink deleted deleted2 lockfail fastfirst fastorder fastnamed commitscope collectfail stagedlock stagedtool stagedapart landingall apart apartlock hookenv parallel order missing pathorder strayconfig longfail slots nice priority prioritycapacity"
+CASES="$CASES commitfast commitmodes commitslowfailure commitfastfailure commitpytest commitcanon commitshellfailure"
 for c in $CASES; do ( "case_$c" ) >"$TMP/out.$c" 2>&1 & done
 wait
 for c in $CASES; do cat "$TMP/out.$c"; done

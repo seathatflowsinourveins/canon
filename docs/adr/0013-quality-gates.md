@@ -46,7 +46,9 @@ Rules:
 
 1. **One entry point.** `.githooks/pre-commit` runs `scripts/ci --staged`; the workflow runs `scripts/ci`
    and `scripts/land` runs `scripts/ci --landing`, which takes the last of several CI slots first, so a
-   landing starts ahead of waiting hooks (2026-11-11).
+   landing starts ahead of waiting hooks (2026-11-11). Since 2026-11-13 `--staged` is a commit's scope:
+   the checks that take seconds, each other check a skip line that the landing and the hosted run take
+   up (ADR 0138, proposed).
 2. **A missing tool is a failure**, never a skipped check.
 3. **Ruff:** its default rules plus import sorting. Line length 100 and single-line imports follow
    NautilusTrader's own config, so adapter code reads like upstream. (NautilusTrader itself selects every
@@ -80,7 +82,8 @@ Not adopted, with the reason:
 
 ### Consequences
 
-* Good: about seven to nine seconds, offline; shellcheck's first run found 20 style findings in this repo's
+* Good: about seven to nine seconds, offline, when written. By 2026-11-13 the hosted run took about 19
+  minutes; ADR 0138 takes the whole run out of the commit hook, and the landing and hosted runs keep it; shellcheck's first run found 20 style findings in this repo's
   scripts, all fixed or marked with a reason.
 * Bad: actionlint does not check an action's inputs when the action is referenced by SHA, so those four inputs were checked by hand against each `action.yml`.
 

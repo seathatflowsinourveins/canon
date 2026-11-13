@@ -38,7 +38,10 @@
 # sets, except the staged secret scan, which needs them.
 #
 # Usage: scripts/ci            check everything; the secret scan covers the whole git history
-#        scripts/ci --staged   same, but the secret scan covers only what is staged (used by pre-commit)
+#        scripts/ci --staged   a commit's run (used by pre-commit, ADR 0138): the canon lint, the lock check
+#                              and environment, ruff, its format, ty, pytest's collection, the shell checks
+#                              and a secret scan of what is staged; each other check is a skip line, and the
+#                              landing and the hosted run run it
 #        scripts/ci --landing  full checks, called by scripts/land
 # A tool that is missing is a failure, never a skip. Exit 0 only if every check passes.
 # Slots: one of CANON_CI_SLOTS (default 3) machine-wide slots is held for the whole run; when N > 1,
@@ -227,6 +230,7 @@ skip_line() { n=$((n+1)); KIND[n]="skip"; TEXT[n]="$1"; NOTE[n]=""; }
 # (test-maintenance off macOS), so a skip inside a check stays visible.
 NOTES='^  skip  |^[a-z][a-z-]*: skip \('
 GATED=0   # 1 once a fast check has failed (below)
+LEFT=()   # checks a commit's run leaves to the landing (landing_only)
 job() {
   local note="" keep=0
   while :; do
@@ -246,6 +250,17 @@ job() {
   n=$((n+1)); KIND[n]="job"; TEXT[n]="$1"; NOTE[n]="$note"; shift
   ( [ "$keep" -eq 1 ] || without_git_env; "$@" >"$WORK/$n.out" 2>&1; echo "$?" >"$WORK/$n.rc" ) &
   PIDS+=("$!")
+}
+# landing_only [job options] <label> <command...>: a check a commit's run (--staged) leaves to the landing
+# and the hosted run, which run every check (ADR 0138); it is a skip line at commit, and a job otherwise.
+# A shut gate (a failed fast check) still prints its own reason, through job.
+landing_only() {
+  if [ "$STAGED" -eq 1 ] && [ "$GATED" -eq 0 ]; then
+    while :; do case "$1" in --skips|--notes|--git-env) shift ;; *) break ;; esac; done
+    skip_line "$1 (not run at commit; the landing runs it)"; LEFT+=("$1")
+  else
+    job "$@"
+  fi
 }
 # now <label> <command...>: run a check in the foreground, without git's local variables
 now() {
@@ -343,17 +358,22 @@ else
   skip_line "Python environment ($why)"
 fi
 if [ "$py_ok" -eq 0 ]; then
-  for label in "ruff lint" "ruff format" "ty type check" "pytest"; do skip_line "$label ($why)"; done
+  for label in "ruff lint" "ruff format" "ty type check"; do skip_line "$label ($why)"; done
+  [ "$STAGED" -eq 0 ] || skip_line "pytest collection ($why)"
+  skip_line "pytest ($why)"
 else
   fast_from=$((n+1))
   job "ruff lint"                        tool uv run --locked ruff check .
   job "ruff format"                      tool uv run --locked ruff format --check .
   job "ty type check"                    tool uv run --locked ty check
-  # all three are reaped here, so their process IDs leave PIDS: stop_jobs must not signal a reused one
+  # at commit, pytest's collection is a fast check too: every test file imports and every test is found,
+  # as NautilusTrader's hook does (its python-test-collection)
+  [ "$STAGED" -eq 0 ] || job "pytest collection"  tool uv run --locked pytest --collect-only -q
+  # all are reaped here, so their process IDs leave PIDS: stop_jobs must not signal a reused one
   wait "${PIDS[@]}"; PIDS=()
   for ((j = fast_from; j <= n; j++)); do [ "$(cat "$WORK/$j.rc" 2>/dev/null)" = 0 ] || py_ok=0; done
   if [ "$py_ok" -eq 1 ]; then
-    job --skips "pytest"                 tool uv run --locked pytest -q -rfEs --no-fold-skipped
+    landing_only --skips "pytest"        tool uv run --locked pytest -q -rfEs --no-fold-skipped
   else
     skip_line "pytest (a fast check failed)"
   fi
@@ -361,15 +381,18 @@ fi
 # A failed fast check gates the rest (job, above): each later check is a skip line, except those that fail
 # by name at once without running anything (ADR 0013): a test script not executable or missing, a failed
 # file list, and a tool missing from the toolchain, named here since its own check does not run.
+absent() { echo "$1: not found in the mise toolchain (mise.toml, mise.lock). Run scripts/bootstrap --install."; return 127; }
 if [ "$py_ok" -eq 0 ]; then
   GATED=1
-  absent() { echo "$1: not found in the mise toolchain (mise.toml, mise.lock). Run scripts/bootstrap --install."; return 127; }
   for t in shellcheck gitleaks actionlint; do has_tool "$t" || job "$t (not found)" absent "$t"; done
+elif [ "$STAGED" -eq 1 ]; then
+  # actionlint's own check is left to the landing, so a missing actionlint is named here
+  has_tool actionlint || job "actionlint (not found)" absent actionlint
 fi
 
 head_line "Canon and harness:"
 job "canon registry, lock and ADRs"      scripts/canon lint
-job "release-rule self-test"             scripts/canon selftest
+landing_only "release-rule self-test"    scripts/canon selftest
 if [ "$list_ok" -eq 1 ]; then
   job "shell syntax (${#SHELL_FILES[@]} files)"  syntax
   job "shellcheck"                       lint_shell
@@ -379,8 +402,8 @@ if [ "$list_ok" -eq 1 ]; then
 else
   job "shell file list"                  list_failed
 fi
-job "lane report self-test"              scripts/lanes --selftest
-job "practice survey self-test"          scripts/survey-github selftest
+landing_only "lane report self-test"     scripts/lanes --selftest
+landing_only "practice survey self-test" scripts/survey-github selftest
 if [ "$tests_ok" -eq 0 ]; then
   job "test script list"                 tests_failed
 fi
@@ -391,10 +414,11 @@ if [ "${#TESTS[@]}" -gt 0 ]; then
       job "$name (not executable)"       not_executable "$t" "${TEST_MODES[j]}"
     elif [ ! -f "$t" ]; then
       job "$name (missing)"              not_present "$t"
-    elif [ "$name" = test-ci ] && [ -n "${CANON_TEST_CI:-}" ]; then
+    elif [ "$name" = test-ci ] && [ -n "${CANON_TEST_CI:-}" ] && { [ "$STAGED" -eq 0 ] || [ "$GATED" -eq 1 ]; }; then
+      # a commit's run leaves test-ci to the landing in any case, and says so (landing_only)
       skip_line "$name (running inside scripts/test-ci)"
     else
-      job --notes "$name"                "$t"
+      landing_only --notes "$name"       "$t"
     fi
   done
 fi
@@ -403,7 +427,7 @@ head_line "Supply chain:"
 WORKFLOWS=()
 for f in .github/workflows/*.yml .github/workflows/*.yaml; do [ -f "$f" ] && WORKFLOWS+=("$f"); done
 if [ "${#WORKFLOWS[@]}" -gt 0 ]; then
-  job "actionlint (${#WORKFLOWS[@]} workflow files)"  tool actionlint "${WORKFLOWS[@]}"
+  landing_only "actionlint (${#WORKFLOWS[@]} workflow files)"  tool actionlint "${WORKFLOWS[@]}"
 else
   skip_line "actionlint (no workflow files in .github/workflows)"
 fi
@@ -435,9 +459,11 @@ elif [ "${#APART[@]}" -gt 0 ]; then
     fi
     if [ -z "$why" ]; then
       job "ty type check in $p"            tool uv --directory "$p" run --locked ty check
-      job --skips "pytest in $p"           tool uv --directory "$p" run --locked pytest -q -rfEs --no-fold-skipped
+      [ "$STAGED" -eq 0 ] || job "pytest collection in $p"  tool uv --directory "$p" run --locked pytest --collect-only -q
+      landing_only --skips "pytest in $p"  tool uv --directory "$p" run --locked pytest -q -rfEs --no-fold-skipped
     else
       for label in "ty type check in $p" "pytest in $p"; do skip_line "$label ($why)"; done
+      [ "$STAGED" -eq 0 ] || skip_line "pytest collection in $p ($why)"
     fi
   done
 fi
@@ -510,4 +536,7 @@ if [ "${#SKIPPED[@]}" -gt 0 ]; then
   fi
   echo "ci: ${#SKIPPED[@]} self-test case(s) skipped, so NOT CHECKED here: $list"
 fi
-if [ "$fail" -eq 0 ]; then echo "ci: all checks passed"; else echo "ci: FAILED"; exit 1; fi
+# A commit's run says how much it left to the landing, so its green verdict is not read as the whole suite's.
+if [ "$fail" -eq 0 ] && [ "${#LEFT[@]}" -gt 0 ]; then
+  echo "ci: all commit checks passed; ${#LEFT[@]} checks NOT RUN here, left to the landing (ADR 0138)"
+elif [ "$fail" -eq 0 ]; then echo "ci: all checks passed"; else echo "ci: FAILED"; exit 1; fi

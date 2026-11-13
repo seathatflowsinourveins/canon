@@ -85,8 +85,8 @@ shape the system.
 
 ## Automation
 
-These run without being asked (ADR 0011, ADR 0013, ADR 0026). Every commit runs `scripts/ci` through
-`.githooks/pre-commit`. Every push runs `scripts/check-addresses` through `.githooks/pre-push`, which
+These run without being asked (ADR 0011, ADR 0013, ADR 0026). Every commit runs `scripts/ci --staged` through
+`.githooks/pre-commit`: the checks that take seconds, with the rest left to the landing and GitHub (ADR 0138). Every push runs `scripts/check-addresses` through `.githooks/pre-push`, which
 refuses an email address that is not a known service or example address in what the push would publish.
 Every edit to a Python file runs ruff on it, and every edit under `canon/` or
 `docs/adr/` runs the canon lint. Once a day a session-start hook compares the canon with upstream and the

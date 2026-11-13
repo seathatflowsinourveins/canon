@@ -32,7 +32,7 @@ Chosen: **option 3**.
 
 | Layer | Runs | Mechanism | Tokens | Result goes to |
 |---|---|---|---|---|
-| Commit gate | Every `git commit` | `.githooks/pre-commit` through `core.hooksPath` | None | Aborts the commit |
+| Commit gate | Every `git commit` | `.githooks/pre-commit` through `core.hooksPath`; since 2026-11-13 the fast checks and test collection (`scripts/ci --staged`, ADR 0138) | None | Aborts the commit |
 | Address check | Every `git push` | `.githooks/pre-push` running `scripts/check-addresses`, through `core.hooksPath` | None | Aborts the push |
 | Hosted CI | Every pull request and push to `main` | GitHub Actions running `scripts/ci` (ADR 0014) | None | A required check |
 | Edit lint | Every edit under `canon/`, `docs/adr/` | `PostToolUse` hook (ADR 0003) | None | Feedback to Claude |
