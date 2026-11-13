@@ -803,7 +803,8 @@ def test_the_reference_pre_read_reads_every_loaded_asset_for_the_actors_key(monk
         found = {
             s: movers_rank_actor.movers_rank.Reference(close=1.0, session=cutoff) for s in symbols
         }
-        return movers_rank_actor.ReferenceRead(cutoff, found, None, 7)
+        splits = movers_rank_actor.movers_rank.SplitRead(cutoff, session, ())
+        return movers_rank_actor.ReferenceRead(cutoff, found, splits, 7)
 
     monkeypatch.setattr(movers_rank_actor, "alpaca_reference_reader", read)
     requests_seen: list[object] = []

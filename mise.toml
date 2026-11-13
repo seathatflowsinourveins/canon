@@ -484,7 +484,9 @@ bounded() {
 # kept [logs]: copy the window records out of the temp folder, which a restart empties, into
 # <config>/canon/watch/windows/, beside the runner's log (CLAUDE_CONFIG_DIR, else ~/.claude, as scripts/automation
 # names it): every window-*.json here and in by-hand/. With `logs`, each window-*.log of 1 MB or less too: only
-# at a window's end, with account B's lock still held, so a log is copied once it is whole. The tool is macOS's
+# once the window's process group has ended, at its end or after a stop (the task's EXIT trap, which runs after
+# bounded has waited for or killed the group), with account B's lock still held, so a log is copied once no
+# process writes it. Those two copies hold the lock, on a stop too, for at most 40 s more. The tool is macOS's
 # /usr/bin/rsync (openrsync; `man rsync` here: -a, --include, --exclude, --max-size), which copies only what is
 # not there yet or has changed, so a run that ended before its copy is caught by the next; each call is held to
 # 20 s. The patterns are anchored to those two levels. A copy that fails is said on stderr
@@ -529,9 +531,12 @@ window() {
   left=$((deadline - ($(/bin/date +%s) - start)))
   [ "$left" -gt 0 ] || { echo "paper:session: no time left before the deadline" >&2; exit 1; }
   wrc=0
+  # the records and logs are kept on every exit, a stop's included: bounded's stop() exits the shell from
+  # its trap, after the window's wind-down, and a kept-logs line after the call would never run (a second
+  # reader of #323). Set before the call, never from inside a trap (bounded's note on bash 3.2).
+  trap 'kept logs' EXIT
   stopgrace=$grace
   bounded "$left" uv run --locked ${CANON_COMMIT:+--exact} python -m canon_trading.session_window --log-dir "${tmp}canon-paper-session" "$@" || wrc=$?
-  kept logs
   exit "$wrc"
 }
 window
