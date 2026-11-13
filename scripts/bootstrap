@@ -31,10 +31,11 @@
 # key and hook entry the template sets (settings_gaps), which is unchanged; an EXISTS line names each gap. It does add to an existing settings.json the
 # telemetry variables (CLAUDE_CODE_ENABLE_TELEMETRY, OTEL_*; DO_NOT_TRACK, ADR 0139) of home/.claude/settings.json's
 # env block that it lacks (ADR 0007, tier 3; Claude Code reads them only from user or managed settings,
-# https://code.claude.com/docs/en/monitoring-usage.md), and the keys it lacks of CANON_KEYS (model,
+# https://code.claude.com/docs/en/monitoring-usage.md), the retry watchdog variable it lacks (CANON_ENV_RE,
+# ADR 0141), and the keys it lacks of CANON_KEYS (model,
 # availableModels and modelPicker, ADR 0059; autoUpdatesChannel, ADR 0065; autoCompactWindow, ADR 0059;
-# syncClaudeAiSkills, syncClaudeAiPlugins and disableClaudeAiConnectors, ADR 0139), with a NOTE line for
-# each of ADR 0139's four that says what it changes. It replaces two values an
+# syncClaudeAiSkills, syncClaudeAiPlugins and disableClaudeAiConnectors, ADR 0139; advisorModel, ADR 0141),
+# with a NOTE line for each of ADR 0139's four and ADR 0141's two that says what it changes. It replaces two values an
 # earlier template set (RETIRED: autoUpdatesChannel "stable", ADR 0065; env.ANTHROPIC_DEFAULT_FABLE_MODEL
 # "claude-fable-5-2", ADR 0059), keeping a copy of the previous file; a value the owner set otherwise is
 # left alone and named. It
@@ -75,18 +76,25 @@ CODEX_DIR="${CODEX_HOME:-$HOME/.codex}"
 # existing settings.json and what the telemetry row checks. No model alias pin is among them: ADR 0059 pins
 # none, --check labels one PINNED, and --user-config removes only the one an earlier template set (RETIRED)
 TELEMETRY_RE='^(CLAUDE_CODE_ENABLE_TELEMETRY$|OTEL_|DO_NOT_TRACK$)'
+# the other env keys of home/.claude/settings.json that --user-config adds to an existing settings.json when it
+# lacks them: the retry watchdog, which waits out a usage limit's reset instead of failing (ADR 0141;
+# https://code.claude.com/docs/en/env-vars.md). The telemetry row does not check it; the retry watchdog row does
+CANON_ENV_RE='^CLAUDE_CODE_RETRY_WATCHDOG$'
 # the top-level keys of home/.claude/settings.json that --user-config adds to an existing settings.json when
 # it lacks them (the model keys, ADR 0059; the update channel, ADR 0065; syncClaudeAiSkills and
 # syncClaudeAiPlugins, which only user, local or managed settings can set, and disableClaudeAiConnectors,
-# ADR 0139), and the values an earlier template
+# ADR 0139; the advisor, ADR 0141), and the values an earlier template
 # set that those records retire: --user-config removes one only while it still holds exactly that value, and
 # a key of CANON_KEYS removed so is then added from the template. The earlier template's "model": "fable" is
 # not among them: it is also the orchestrator lane's alias, which an owner may choose, so --check names it
-CANON_KEYS='["model", "availableModels", "modelPicker", "autoUpdatesChannel", "autoCompactWindow", "syncClaudeAiSkills", "syncClaudeAiPlugins", "disableClaudeAiConnectors"]'
+CANON_KEYS='["model", "availableModels", "modelPicker", "autoUpdatesChannel", "autoCompactWindow", "syncClaudeAiSkills", "syncClaudeAiPlugins", "disableClaudeAiConnectors", "advisorModel"]'
 # the jq lookup of one top-level key, named by --arg k, as JSON text, or nothing when the key is absent
 # (`.[$k] // empty` would read a false as absent)
 # shellcheck disable=SC2016  # a jq program, not shell
 JQ_TOP='if type == "object" and has($k) then .[$k] | tojson else empty end'
+# the same for one key of the env block, nothing when there is no env object
+# shellcheck disable=SC2016  # a jq program, not shell
+JQ_ENV='if type == "object" and (.env | type) == "object" and (.env | has($k)) then .env[$k] | tojson else empty end'
 RETIRED='[{"path": ["autoUpdatesChannel"], "value": "stable"}, {"path": ["env", "ANTHROPIC_DEFAULT_FABLE_MODEL"], "value": "claude-fable-5-2"}]'
 # the variables that turn Claude Code's background updates off (https://code.claude.com/docs/en/env-vars.md)
 UPDATE_OFF_VARS="DISABLE_AUTOUPDATER DISABLE_UPDATES CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"
@@ -382,21 +390,75 @@ claudeai_rows() {
   return "$rc"
 }
 
-# claudeai_notes <settings.json> <keys>: a NOTE line for each of ADR 0139's four settings among the keys
-# (space-separated) that the file sets to that record's value, saying what it changes, so the change is not
-# made silently (https://code.claude.com/docs/en/env-vars.md, data-usage.md, settings-reference.md). The trash
-# folders are in the configuration folder, which CLAUDE_CONFIG_DIR replaces (env-vars.md). Other keys and
-# values pass without a line.
-claudeai_notes() {
+# advisor_rows: ADR 0141's two settings in the installed settings.json against the template, each only when
+# the template sets it. The advisor (advisorModel; https://code.claude.com/docs/en/settings-reference.md and
+# advisor.md) is ok as the template sets it, and OWNER when the file sets another model, which is what /advisor
+# saves there, or when CLAUDE_CODE_DISABLE_ADVISOR_TOOL, the documented switch ("Set to `1`", env-vars.md), has
+# a value other than 0 or false in the file or this environment, named as it is. The retry watchdog
+# (CLAUDE_CODE_RETRY_WATCHDOG; env-vars.md) is ok as the template sets it, and OWNER otherwise. A key the file
+# lacks, or sets to null, is NOT SET and fails, as ADR 0139's are: --user-config reads null as unset and adds
+# the template's value. A file --user-config leaves as it is (not a JSON object with an object env) is MISSING
+# and says so; a template that cannot be read is UNKNOWN and fails.
+advisor_rows() {
+  local s="$CLAUDE_HOME/settings.json" t="$ROOT/home/.claude/settings.json" rc=0 want have dis gap=""
+  if ! jq -e 'type == "object"' "$t" >/dev/null 2>&1; then
+    row "advisor settings" UNKNOWN "home/.claude/settings.json is not a readable JSON object, so ADR 0141's settings are not checked"; return 1
+  fi
+  if [ ! -f "$s" ]; then gap="no $s; run: scripts/bootstrap --user-config"
+  elif ! jq -e 'type == "object" and ((.env // {}) | type == "object")' "$s" >/dev/null 2>&1; then
+    gap="$s is not a JSON object with an object env, which scripts/bootstrap --user-config leaves as it is; mend it by hand"
+  fi
+  want=$(jq -r --arg k advisorModel "$JQ_TOP" "$t")
+  if [ -n "$want" ]; then
+    # shellcheck disable=SC2016  # a jq program, not shell
+    [ -n "$gap" ] || dis=$(jq -r '.env.CLAUDE_CODE_DISABLE_ADVISOR_TOOL // empty | tostring' "$s")
+    if [ -n "$gap" ]; then
+      row "advisor model" MISSING "$gap"; rc=1
+    elif case "${dis:-0}" in 0|false|FALSE|False) false ;; *) true ;; esac; then
+      row "advisor model" OWNER "$s sets CLAUDE_CODE_DISABLE_ADVISOR_TOOL to $dis; set to 1 it turns the advisor off in every session and ignores advisorModel (ADR 0141); left as the owner set it"
+    elif case "${CLAUDE_CODE_DISABLE_ADVISOR_TOOL:-0}" in 0|false|FALSE|False) false ;; *) true ;; esac; then
+      row "advisor model" OWNER "this environment sets CLAUDE_CODE_DISABLE_ADVISOR_TOOL to $CLAUDE_CODE_DISABLE_ADVISOR_TOOL; set to 1 it turns the advisor off and ignores advisorModel in a session that inherits it (ADR 0141)"
+    else
+      have=$(jq -r --arg k advisorModel "$JQ_TOP" "$s")
+      case "$have" in
+        "$want")  row "advisor model" ok "$(jq -r . <<<"$have"): a session whose main model ranks at or below it may consult it at decision points, and a Fable main model takes none; a trading-path landing lane's workspace names canon/models.json's final-landing advisor (ADR 0141)" ;;
+        ""|null)  row "advisor model" "NOT SET" "$s sets no advisorModel, or null, so sessions do not take canon's routine advisor (ADR 0141); run: scripts/bootstrap --user-config"; rc=1 ;;
+        *)        row "advisor model" OWNER "$s sets advisorModel to $(jq -r . <<<"$have"), which every session reads and /advisor saves; home/.claude/settings.json sets $(jq -r . <<<"$want") (ADR 0141); left as the owner set it" ;;
+      esac
+    fi
+  fi
+  want=$(jq -r --arg k CLAUDE_CODE_RETRY_WATCHDOG "$JQ_ENV" "$t")
+  if [ -n "$want" ]; then
+    if [ -n "$gap" ]; then
+      row "retry watchdog" MISSING "$gap"; rc=1
+    else
+      have=$(jq -r --arg k CLAUDE_CODE_RETRY_WATCHDOG "$JQ_ENV" "$s")
+      case "$have" in
+        "$want")  row "retry watchdog" ok "CLAUDE_CODE_RETRY_WATCHDOG $(jq -r . <<<"$have"): a session waits out an overload, rate or usage limit instead of failing; a spend limit or exhausted usage credits still fail at once (ADR 0141)" ;;
+        ""|null)  row "retry watchdog" "NOT SET" "$s sets no CLAUDE_CODE_RETRY_WATCHDOG, or null, so a session that meets a usage limit fails after its retries (ADR 0141); run: scripts/bootstrap --user-config"; rc=1 ;;
+        *)        row "retry watchdog" OWNER "$s sets CLAUDE_CODE_RETRY_WATCHDOG to $(jq -r . <<<"$have"); home/.claude/settings.json sets $(jq -r . <<<"$want") (ADR 0141); left as the owner set it" ;;
+      esac
+    fi
+  fi
+  return "$rc"
+}
+
+# setting_notes <settings.json> <keys>: a NOTE line for each of ADR 0139's four settings and ADR 0141's two
+# among the keys (space-separated) that the file sets to that record's value, saying what it changes, so the
+# change is not made silently (https://code.claude.com/docs/en/env-vars.md, data-usage.md,
+# settings-reference.md, advisor.md). The trash folders are in the configuration folder, which
+# CLAUDE_CONFIG_DIR replaces (env-vars.md). Other keys and values pass without a line.
+setting_notes() {
   local f="$1" k v vals
-  # every value of the four as key=JSON, read once
+  # every value of the six as key=JSON, read once
   # shellcheck disable=SC2016  # a jq program, not shell
   vals=$(jq -r '. as $d | select(type == "object")
-           | ((.env // {}) | if type == "object" and has("DO_NOT_TRACK") then "DO_NOT_TRACK=\(.DO_NOT_TRACK | tojson)" else empty end),
-             ("syncClaudeAiSkills", "syncClaudeAiPlugins", "disableClaudeAiConnectors"
+           | ((.env // {}) | select(type == "object") | . as $e
+              | ("DO_NOT_TRACK", "CLAUDE_CODE_RETRY_WATCHDOG") | . as $k | select($e | has($k)) | "\($k)=\($e[$k] | tojson)"),
+             ("syncClaudeAiSkills", "syncClaudeAiPlugins", "disableClaudeAiConnectors", "advisorModel"
               | . as $k | select($d | has($k)) | "\($k)=\($d[$k] | tojson)")' "$f" 2>/dev/null)
   for k in $2; do
-    case "$k" in DO_NOT_TRACK|syncClaudeAiSkills|syncClaudeAiPlugins|disableClaudeAiConnectors) ;; *) continue ;; esac
+    case "$k" in DO_NOT_TRACK|syncClaudeAiSkills|syncClaudeAiPlugins|disableClaudeAiConnectors|advisorModel|CLAUDE_CODE_RETRY_WATCHDOG) ;; *) continue ;; esac
     v=$(printf '%s\n' "$vals" | sed -n "s/^$k=//p")
     case "$k=$v" in
       'DO_NOT_TRACK="0"')
@@ -407,6 +469,10 @@ claudeai_notes() {
         note "  NOTE       syncClaudeAiPlugins false: Claude Code stops downloading the claude.ai account's plugins and moves those already synced to $CLAUDE_HOME/plugins/.trash/ (ADR 0139)" ;;
       disableClaudeAiConnectors=true)
         note "  NOTE       disableClaudeAiConnectors true: no terminal, IDE or Agent SDK session fetches the claude.ai account's connectors; the desktop app and cloud sessions get theirs another way (ADR 0139)" ;;
+      advisorModel='"'*)
+        note "  NOTE       advisorModel $v: a session whose main model ranks at or below it may consult it at decision points, each call reading the whole conversation afresh at the advisor's rates or toward a plan's usage limits, and its subagents inherit it; a Fable main model takes none (ADR 0141)" ;;
+      'CLAUDE_CODE_RETRY_WATCHDOG="1"')
+        note "  NOTE       CLAUDE_CODE_RETRY_WATCHDOG \"1\": a session that meets an overload, rate or usage limit retries and waits for the reset instead of failing, with no message, an interactive one too; a spend limit or exhausted usage credits still fail at once (ADR 0141)" ;;
     esac
   done
 }
@@ -940,6 +1006,7 @@ check() {
   update_row || missing=1
   compact_row || missing=1
   claudeai_rows || missing=1
+  advisor_rows || missing=1
   if [ -f "$CLAUDE_HOME/CLAUDE.md" ]; then row "user CLAUDE.md" ok ""; else row "user CLAUDE.md" MISSING "run: scripts/bootstrap --user-config"; missing=1; fi
   telemetry_rows || missing=1
   note "Alpaca paper key pairs (ADR 0029, ADR 0069), optional:"
@@ -1112,7 +1179,7 @@ install_telemetry() {
   else
     # one plan: the merged document, and what was added, removed and kept, so the file is written once
     # shellcheck disable=SC2016  # jq program, not shell
-    plan=$(jq -c --slurpfile w "$1" --arg re "$TELEMETRY_RE" --argjson mk "$CANON_KEYS" --argjson ret "$RETIRED" '
+    plan=$(jq -c --slurpfile w "$1" --arg re "$TELEMETRY_RE|$CANON_ENV_RE" --argjson mk "$CANON_KEYS" --argjson ret "$RETIRED" '
       def telemetry: with_entries(select(.key | test($re)));
       . as $in | $w[0] as $t
       | ($t.env // {} | telemetry | with_entries(select(($in.env // {})[.key] == null))) as $env
@@ -1138,10 +1205,10 @@ install_telemetry() {
       cat "$tmp" > "$s" || { rm -f "$tmp"; die "could not write $s; its previous content is in the copy kept above"; }
       rm -f "$tmp"
       [ "$(jq '.env | length' <<<"$plan")" = 0 ] || note "  added      $(jq -r '.env | join(", ")' <<<"$plan") to the env of $s"
-      [ "$(jq '.top | length' <<<"$plan")" = 0 ] || note "  added      $(jq -r '.top | join(", ")' <<<"$plan") to $s (ADR 0059, ADR 0065, ADR 0139)"
+      [ "$(jq '.top | length' <<<"$plan")" = 0 ] || note "  added      $(jq -r '.top | join(", ")' <<<"$plan") to $s (ADR 0059, ADR 0065, ADR 0139, ADR 0141)"
       [ "$(jq '.sl | length' <<<"$plan")" = 0 ] || note "  added      statusLine.refreshInterval to $s (ADR 0007)"
       [ "$(jq '.gone | length' <<<"$plan")" = 0 ] || note "  retired    $(jq -r '.gone | join(", ")' <<<"$plan") in $s, values an earlier canon template set (ADR 0059, ADR 0065); a key retired here is then added from the template"
-      claudeai_notes "$s" "$(jq -r '(.env + .top) | join(" ")' <<<"$plan")"
+      setting_notes "$s" "$(jq -r '(.env + .top) | join(" ")' <<<"$plan")"
     else
       note "  unchanged  telemetry and model settings in $s"
     fi
@@ -1316,7 +1383,7 @@ install_user_config() {
     local from="$src/$f"; [ "$f" = settings.json ] && from="$tmp"
     if [ ! -e "$CLAUDE_HOME/$f" ]; then
       cp "$from" "$CLAUDE_HOME/$f"; note "  installed  $CLAUDE_HOME/$f"
-      [ "$f" != settings.json ] || claudeai_notes "$CLAUDE_HOME/$f" "DO_NOT_TRACK syncClaudeAiSkills syncClaudeAiPlugins disableClaudeAiConnectors"
+      [ "$f" != settings.json ] || setting_notes "$CLAUDE_HOME/$f" "DO_NOT_TRACK syncClaudeAiSkills syncClaudeAiPlugins disableClaudeAiConnectors advisorModel CLAUDE_CODE_RETRY_WATCHDOG"
     elif cmp -s "$from" "$CLAUDE_HOME/$f"; then
       note "  unchanged  $CLAUDE_HOME/$f"
     elif [ "$f" = settings.json ] && gaps=$(settings_gaps "$from" "$CLAUDE_HOME/$f" 2>/dev/null) && [ -z "$gaps" ]; then

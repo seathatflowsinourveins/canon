@@ -148,7 +148,9 @@ be used within these limits (ADR 0021):
   waits on it. Its findings are claims the owning lane reproduces before changing anything. Codex runs
   on the model and effort ADR 0045 names; the others run on the defaults ADR 0059 names: Antigravity's
   is in its settings file, and Muse is started with `--model muse-wonder-1.0 --effort max`.
-* The review lifecycle (ADR 0045): a Claude lane builds, runs `/code-review` and lands. For a change on
+* The review lifecycle (ADR 0045): a Claude lane builds, runs `/code-review` and lands; a trading-path
+  change is landed by a Claude lane started for it, with Fable as its advisor (ADR 0141, rule 8 of
+  `.claude/rules/dispatch-practices.md`). For a change on
   the paths that get `/code-review` at high effort, the coordinator creates the review as a task that
   depends on the build (`task-create --deps`) and starts it when `task-list --ready` shows it and the
   change is on `main`: Codex and Muse there, Antigravity in place of either. The owning lane reproduces

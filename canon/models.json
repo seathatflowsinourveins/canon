@@ -69,7 +69,15 @@
     "why_fable_by_id": "the picker's own Fable row was a server-provided claude-fable-5-1[1m]; an allowlist entry for the orchestrator lane's ID hides it, and the picker row names that ID",
     "lead_session": "claude --model claude-fable-5-2; /status shows Model: claude-fable-5-2",
     "update_channel": "latest (ADR 0065), set by name: with no key the settings reference says latest and the setup page the channel chosen at install time",
-    "update_floor": "minimumVersion = the registry's claude-code pin (ADR 0065)"
+    "update_floor": "minimumVersion = the registry's claude-code pin (ADR 0065)",
+    "advisor": {
+      "decided_by": "docs/adr/0141-every-claude-code-session-takes-opus-as-its-advisor-and-waits-out-a-usage-limit-and-a-lane-landing-a-trading-path-change-takes-fable.md",
+      "routine": "opus",
+      "routine_set_in": "home/.claude/settings.json advisorModel, which every Claude Code session on the machine reads",
+      "final_landing": "claude-fable-5-2",
+      "final_landing_for": "a Claude lane started to land a change on scripts/land's TRADING_PATHS; the coordinator writes it to the .claude/settings.local.json at that worktree's own root, never the main checkout's, before the lane starts, and removes it once the lane has landed or stopped (.claude/rules/dispatch-practices.md rule 8)",
+      "pairing": "an Opus main model takes an Opus or Fable advisor; a Fable main model takes only Fable, so a Fable lead outside a landing runs with none (https://code.claude.com/docs/en/advisor.md)"
+    }
   },
   "runtimes": [
     {
