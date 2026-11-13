@@ -68,7 +68,9 @@ request ceiling the window records already hold (`paper_node.REQUEST_CEILING`, 1
 Mover's soft line and then that ceiling bind first. No new number is introduced; a paper test's tighter
 budget, `EmaCross`'s among them, is unchanged. The table above and the reasoning under it are the
 2026-11-10 values. `tests/test_risk_limits.py` checks 180 and 181, and that seven slots' 98 submits in a
-minute are never denied.
+minute are never denied. Since the lead's decision of 2026-11-12 (under the request budget below), sales
+are exempt from the soft line, so for a sale this throttle is the only gate and it can deny a submit
+beyond that modelled minute; that case is not re-derived.
 
 ### ADR 0083
 
@@ -215,7 +217,9 @@ from two firings' measured peaks. NautilusTrader's own throttle is raised to the
 submits and modifies on paper nodes (ADR 0049's dated line), since at 50 its failure handler denies an
 over-limit submit, an exit included (`crates/common/src/throttler.rs`, `crates/risk/src/engine/mod.rs` at
 the pin). No separate Mover submit gate is added. The backstop: at `soft_line` (140 in the last 60 s)
-`Mover` sends no new entry and no chase; exits and cancels still go. **Limit:** failing a window only
+`Mover` sends no new entry; sales, their re-prices and cancels still go, bounded only by the engine's
+submit throttle (not cancels), not by `soft_line` (the lead, 2026-11-12; ADR 0091). The 175/196
+figures above were not re-derived with sales exempt from the soft line. **Limit:** failing a window only
 when an exit is refused for rate is not built; `request_failure` (a rolling peak of 180 or any 429)
 stays the failure for the first firings.
 

@@ -172,6 +172,7 @@ import argparse
 import asyncio
 import contextlib
 import functools
+import hashlib
 import json
 import logging
 import math
@@ -326,6 +327,8 @@ from .session_ma_cross import WARM_UP_SPARE_BARS
 from .session_ma_cross import SessionMaCross
 from .session_ma_cross import SessionMaCrossConfig
 from .session_ma_cross import through_the_touch
+from .trail import PROFILE_SETTINGS
+from .trail import profile_session_date
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -744,6 +747,8 @@ class WindowConfig:
     """ADR 0087's baseline file; None selects catalog/movers-baseline/<feed>.json for the part."""
     arm: str | None = None
     """A name of `TRAIL_ARMS`, written to the record and the heartbeat; its rows must be the window's."""
+    trail_profile_path: Path | None = None
+    """T5's strict profile file; None selects catalog/movers-baseline/trail-profile-v1.json."""
     trail_mode: str = "fixed"
     trail_cap: str = TRAIL_CAP_DEFAULT
     """What `Mover` does with a non-fixed trail over the 0.02 cap (`mover.TRAIL_CAPS`): `clamp`, main's
@@ -756,8 +761,21 @@ class WindowConfig:
     ratchet_r: Decimal = Decimal(2)
     ratchet_g: Decimal = Decimal("0.5")
     ratchet_base: str = "atr"
+    profile_k: Decimal = Decimal(2)
+    profile_pctl: str = "p75"
+    profile_floor: str = "median"
+    profile_multipliers: tuple[Decimal, Decimal, Decimal] = (Decimal(1), Decimal(1), Decimal(1))
+    cooldown_secs: int = 300
+    reentry_arm: str = "clock"
+    turn_k: int = 2
+    turn_d: Decimal = Decimal(1)
+    opening_arm: str = "off"
+    opening_minutes: int = 30
+    opening_f: Decimal = Decimal(1)
+    """Opening: lead: the owner's observation; UNCALIBRATED; regular only, off by default."""
     flow_share: Decimal = Decimal("0.05")
-    """T1/T2's UNCALIBRATED window rows; fixed trail and clock cooldown remain the defaults.
+    """T1/T2 and amendment 10's UNCALIBRATED window rows; fixed trail and clock cooldown remain the defaults.
+    State re-entry arms: lead, no primary source; no clock delay when selected. VWAP is tape-only: a window refuses it.
     ATR multiples and the spread floor: lead, no primary source; fixed 0.02 remains a paired arm.
     The liquidity cut is baseline dollar volume per minute, a stand-in for size, not market cap."""
     request_limit_per_minute: int = TRADING_REQUEST_LIMIT_PER_MINUTE
@@ -768,9 +786,26 @@ class WindowConfig:
             max_notional=Decimal(1),
             max_move=Decimal(1),
             trail_cap=self.trail_cap,
+            extended_hours=self.session == "extended",
             **{name: getattr(self, name) for name in TRAIL_SETTINGS},
         )
         check_limit(self.request_limit_per_minute)
+        if self.reentry_arm == "vwap":
+            raise ValueError(
+                "reentry_arm vwap reads a tape's session VWAP; a paper window has no live source"
+            )
+        if self.profile_multipliers != PROFILE_SETTINGS["profile_multipliers"]["default"]:
+            raise ValueError(
+                "profile_multipliers scale by RDc_1's bucket, and RDc_1 is not built on this tree: "
+                "every name would take the first bucket's 1"
+            )
+        if self.opening_arm != "off":
+            # The lead's condition, 2026-11-12: the arm lands off and stays off until it reads
+            # Alpaca's minute bars from 09:30; the change that adds that request removes this.
+            raise ValueError(
+                f"opening_arm {self.opening_arm!r} is refused: the opening is judged on Alpaca's "
+                "minute bars from 09:30, which this window does not request yet"
+            )
         if self.session not in SESSIONS:
             raise ValueError(f"session must be one of {SESSIONS}, got {self.session!r}")
         if (runs := WINDOW_STRATEGIES.get(self.strategy)) is None:
@@ -1385,6 +1420,49 @@ def mover_baseline_path(config: WindowConfig, feed: str) -> Path:
     return (SOURCE_ROOT / path).resolve()
 
 
+def mover_trail_profile_path(config: WindowConfig) -> Path:
+    """Resolve T5's file by the same checkout-relative rule as the ranking baseline."""
+    path = config.trail_profile_path or Path("catalog/movers-baseline/trail-profile-v1.json")
+    return (SOURCE_ROOT / path).resolve()
+
+
+def _file_sha256(path: Path) -> str | None:
+    """The SHA-256 of a file's bytes, or None when it cannot be read."""
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+def read_window_trail_profile(
+    config: WindowConfig, *, as_of: date
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Read and identify one strict snapshot, or stop before node construction by name. The file is
+    hashed before and after the strict reader has it, however the reader opens it; a file that is not
+    the same bytes both times was replaced during the read, and the window is refused rather than
+    recorded under a hash that may not be of the text it parsed."""
+    from . import trail_profile
+    from .history_load import HistoryStopped
+
+    path = mover_trail_profile_path(config)
+    before = _file_sha256(path)  # a file that cannot be read is named by the strict reader, below
+    try:
+        document = trail_profile.read_profile(path, as_of=as_of)
+    except HistoryStopped as error:
+        raise WindowRefused(str(error)) from error
+    if before is None or _file_sha256(path) != before:
+        raise WindowRefused(f"the trail profile {path} changed while it was read")
+    return document, {
+        "path": str(path),
+        "sha256": before,
+        "as_of": document["as_of"],
+        "written_at": document["written_at"],
+        "symbols": len(document["symbols"]),
+        # The builder writes `windows` only on a recent-only file; a full file has no such field.
+        "windows": document.get("windows", "recent and long"),
+    }
+
+
 @dataclass(frozen=True)
 class MoverAllocation:
     """One startup account read, shared by selection, entries, monitors, actor and engine."""
@@ -1470,6 +1548,7 @@ def window_node(
     entry_notional: Decimal | None = None,
     reference_reader: ReferenceReader | None = None,
     loss_share: Decimal | None = None,
+    profile_document: dict[str, Any] | None = None,
 ) -> tuple[LiveNode, SessionMaCross | Mover | CachedData, PositionCap | tuple[PositionCap, ...]]:
     """The node, Alpaca's clients, the native risk limits and runtime checks, with the strategy and its
     position caps (one monitor, or a tuple for several names). They are returned too: the node does not
@@ -1506,6 +1585,19 @@ def window_node(
             raise RuntimeError(
                 "a Mover node requires its loss share (`window_loss_share`): there is no default"
             )
+        if config.trail_mode == "profile" and profile_document is None:
+            profile_document, details = read_window_trail_profile(
+                config,
+                as_of=profile_session_date(int(wind_down_at.timestamp() * 1_000_000_000)),
+            )
+            pick.record["trail_profile"] = {
+                **details,
+                "window_instruments": sum(
+                    p.symbol in profile_document["symbols"] for p in pick.picks
+                ),
+            }
+        pick.record["rdc_1"] = "absent"
+        pick.record["trail_mode"] = config.trail_mode
         order_cap = entry_notional * OUTER_BOUND_MULTIPLE
         prices = {InstrumentId.from_str(f"{p.symbol}.{VENUE}"): p.price for p in pick.picks}
         instruments = tuple(prices)
@@ -1539,6 +1631,7 @@ def window_node(
             for p in pick.picks
             if (normal := baseline_per_minute(p.record)) is not None
         }
+        mover.trail_profile = profile_document if config.trail_mode == "profile" else None
     node = (
         alpaca_paper_builder(
             "CANON-PAPER-SESSION",
@@ -2820,9 +2913,10 @@ def run_window(
     entry_contexts: dict[InstrumentId, Day] = {}
     allocation: MoverAllocation | None = None
     loss_share: Decimal | None = None
+    profile_document: dict[str, Any] | None = None
+    profile_details: dict[str, Any] | None = None
     window_symbols = (config.symbol,)
     if config.mover:  # chosen once, before the node is built (ADR 0083's dated line of 2026-11-11)
-        at = clock.timestamp + timedelta(seconds=time.monotonic() - read_at)
         days = _trading_days(calendar)
         now_ny = clock.timestamp.astimezone(NEW_YORK)
         trade_date = now_ny.date()
@@ -2840,6 +2934,10 @@ def run_window(
             from .movers_rank import NO_BASELINE
             from .movers_rank import read_baselines
 
+            if config.trail_mode == "profile":
+                profile_document, profile_details = read_window_trail_profile(
+                    config, as_of=trade_date
+                )
             baseline = mover_baseline_path(config, feed)
             read = read_baselines(baseline, trade_date)
             if read.absent and part == "overnight":
@@ -2857,6 +2955,8 @@ def run_window(
                 reference_reader, reference_read = start_reference_read(trading, reference_notes)
             except Exception as e:  # noqa: BLE001
                 reference_notes.append(f"not pre-read: {type(e).__name__}: {e}")
+        # timed after the reads above (the profile's included), so none of them ages the pick
+        at = clock.timestamp + timedelta(seconds=time.monotonic() - read_at)
         pick = choose_mover(
             trading,
             at,
@@ -2975,6 +3075,15 @@ def run_window(
         arm, reason = mover_entry_arm(part)
         mover["entry_arm"], mover["entry_arm_reason"] = arm, reason
         mover["baseline_path"] = str(mover_baseline_path(config, feed))
+        if profile_document is not None and profile_details is not None:
+            mover["trail_profile"] = {
+                **profile_details,
+                "window_instruments": sum(
+                    symbol in profile_document["symbols"] for symbol in window_symbols
+                ),
+            }
+        mover["rdc_1"] = "absent"
+        mover["trail_mode"] = config.trail_mode
         if basis is not None:
             mover["baseline"] = basis
         mover["ranking_source"] = f"live: ADR 0107's actor over the wildcard stream on {feed}"
@@ -3071,6 +3180,7 @@ def run_window(
             entry_notional=None if allocation is None else allocation.entry_notional,
             reference_reader=reference_reader,
             loss_share=loss_share,
+            profile_document=profile_document,
         )
         cache = node.cache
         startup_requests = endpoint_counts()
@@ -4577,7 +4687,7 @@ def _parser() -> argparse.ArgumentParser:
         "--trail-mode",
         choices=TRAIL_SETTINGS["trail_mode"]["arms"],
         default=TRAIL_SETTINGS["trail_mode"]["default"],
-        help=f"{MOVER}'s trail: fixed (default), atr over the spread floor, tier or ratchet",
+        help=f"{MOVER}'s trail: fixed (default), atr over the spread floor, tier, ratchet or profile",
     )
     parser.add_argument(
         "--trail-cap",
@@ -4602,8 +4712,102 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--baseline-path", type=Path, help="default: catalog/movers-baseline/<feed>.json"
     )
+    parser.add_argument(
+        "--trail-profile-path",
+        type=Path,
+        help="default: catalog/movers-baseline/trail-profile-v1.json",
+    )
+    profile_k = PROFILE_SETTINGS["profile_k"]
+    parser.add_argument(
+        "--profile-k",
+        type=_decimal_argument,
+        choices=sorted((profile_k["default"], *profile_k["alternates"])),
+        default=profile_k["default"],
+    )
+    for name in ("profile_pctl", "profile_floor"):
+        parser.add_argument(
+            "--" + name.replace("_", "-"),
+            choices=PROFILE_SETTINGS[name]["arms"],
+            default=PROFILE_SETTINGS[name]["default"],
+        )
+    parser.add_argument(
+        "--profile-multipliers",
+        type=_decimal_argument,
+        nargs=3,
+        default=PROFILE_SETTINGS["profile_multipliers"]["default"],
+    )
     parser.add_argument("--log-dir", type=Path, help="default: `default_log_dir()`")
+    for name in ARM_FLAGS:
+        parser.add_argument(
+            f"--{name.replace('_', '-')}",
+            choices=[str(arm) for arm in TRAIL_SETTINGS[name]["arms"]],
+            help=f"{MOVER}'s registered {name} (default: the code's)",
+        )
     return parser
+
+
+ARM_FLAGS = ("reentry_arm", "opening_arm")
+"""Registered arms a run may select on the command line, until a settings file carries them; each is
+validated as a `MoverConfig` row. The opening is a regular-session arm, so another part keeps it off."""
+
+
+def window_config(args: argparse.Namespace, session: str) -> WindowConfig:
+    """The window's configuration from the parsed arguments and the session resolved for this run. The
+    arms reach only a Mover window, as `slots` does; an auto run's part that is not regular keeps the
+    opening off and says so on stderr, so the arm asked for is never dropped unsaid."""
+    rows: dict[str, Any] = {}
+    trail = {"trail_mode": args.trail_mode} | {
+        name: getattr(args, name) for name in PROFILE_SETTINGS
+    }
+    if args.strategy == MOVER:
+        rows.update(
+            trail,
+            trail_profile_path=args.trail_profile_path,
+            trail_cap=args.trail_cap,
+            atr_k=args.atr_k,
+            arm=args.arm,
+        )
+        for name in ARM_FLAGS:
+            if (arm := getattr(args, name)) is None:
+                continue
+            if name == "opening_arm" and session != "regular":
+                print(
+                    f"paper:session: --opening-arm {arm} is the regular session's arm; this "
+                    f"{session} window keeps it {WindowConfig.opening_arm}",
+                    file=sys.stderr,
+                )
+                continue
+            rows[name] = arm
+    elif any(value != getattr(WindowConfig, name) for name, value in trail.items()):
+        print(
+            f"paper:session: the trail rows are {MOVER}'s; this {args.strategy} window keeps "
+            "the fixed trail",
+            file=sys.stderr,
+        )
+    return WindowConfig(
+        symbol=args.symbol,
+        session=session,
+        minutes=args.minutes,
+        log_dir=args.log_dir,
+        strategy=args.strategy,
+        mover=args.mover,
+        slots=args.slots if args.strategy == MOVER else None,
+        spares=args.spares,
+        baseline_path=args.baseline_path,
+        **rows,
+    )
+
+
+def _decimal_argument(text: str) -> Decimal:
+    """A finite decimal from the command line; argparse reports a ValueError as a usage error, and
+    `Decimal` raises `InvalidOperation`, which is not one."""
+    try:
+        value = Decimal(text)
+    except InvalidOperation:
+        raise ValueError(text) from None
+    if not value.is_finite():
+        raise ValueError(text)
+    return value
 
 
 def _args(argv: Sequence[str] | None) -> argparse.Namespace:
@@ -4612,6 +4816,14 @@ def _args(argv: Sequence[str] | None) -> argparse.Namespace:
     (an empty `getconf` in the caller's shell leaves only the folder's name)."""
     parser = _parser()
     args = parser.parse_args(argv)
+    args.profile_multipliers = tuple(args.profile_multipliers)
+    multipliers = PROFILE_SETTINGS["profile_multipliers"]
+    if args.profile_multipliers not in (multipliers["default"], *multipliers["alternates"]):
+        registered = " or ".join(
+            " ".join(str(value) for value in row)
+            for row in (multipliers["default"], *multipliers["alternates"])
+        )
+        parser.error(f"--profile-multipliers takes a registered row: {registered}")
     if args.regular_strategy is not None and args.session != "auto":
         parser.error("--regular-strategy names a part's strategy, so it needs --session auto")
     if args.regular_strategy == MOVER and not args.mover:
@@ -4630,6 +4842,16 @@ def _args(argv: Sequence[str] | None) -> argparse.Namespace:
                 f"{flag} is {MOVER}'s, so it needs --strategy or --regular-strategy {MOVER}, or "
                 "--mover outside the regular session"
             )
+    # where Mover runs: the regular session under `--regular-strategy Mover`, or `--strategy Mover`
+    # where no regular strategy is named; every extended part under `--mover`
+    regular = args.session != "extended" and MOVER == (
+        args.regular_strategy if args.regular_strategy is not None else args.strategy
+    )
+    extended = args.session != "regular" and (args.mover or args.strategy == MOVER)
+    if args.reentry_arm is not None and not (regular or extended):
+        parser.error(f"--reentry-arm is {MOVER}'s, so it needs a part that runs {MOVER}")
+    if args.opening_arm is not None and not regular:
+        parser.error(f"--opening-arm is the regular session's, so it needs {MOVER} to run there")
     if args.log_dir is None:
         args.log_dir = default_log_dir()
     elif not args.log_dir.is_absolute():
@@ -4684,22 +4906,7 @@ def _main(args: argparse.Namespace) -> int:
             session = resolved
         if args.mover and session == "extended":
             args.strategy = MOVER
-        config = WindowConfig(
-            symbol=args.symbol,
-            session=session,
-            minutes=args.minutes,
-            log_dir=args.log_dir,
-            strategy=args.strategy,
-            mover=args.mover,
-            slots=args.slots if args.strategy == MOVER else None,
-            spares=args.spares,
-            baseline_path=args.baseline_path,
-            # Mover's rows; another strategy keeps the defaults, which `WindowConfig` checks
-            trail_mode=args.trail_mode if args.strategy == MOVER else "fixed",
-            trail_cap=args.trail_cap if args.strategy == MOVER else TRAIL_CAP_DEFAULT,
-            atr_k=args.atr_k if args.strategy == MOVER else TRAIL_SETTINGS["atr_k"]["default"],
-            arm=args.arm if args.strategy == MOVER else None,
-        )
+        config = window_config(args, session)
         # an auto schedule's part that runs another strategy runs none of Mover's trail flags; it
         # says so, rather than drop them unseen (AGENTS.md rule 5)
         unrun = [] if args.strategy == MOVER else _trail_flags_given(args)

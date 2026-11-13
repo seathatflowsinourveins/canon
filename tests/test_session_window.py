@@ -9824,3 +9824,67 @@ def test_a_windows_signal_does_not_reach_a_later_window_in_the_process() -> None
         assert session_window._SIGNALS.first == "SIGTERM"
     assert session_window._SIGNALS.first is None
     assert session_window._SIGNALS.record is None
+
+
+def test_the_reentry_and_opening_arms_reach_the_window_from_the_command_line(tmp_path) -> None:
+    """The 09:30 firing selects registered arms without a settings file (L4, 2026-11-12)."""
+    mover_args = ["--session", "auto", "--regular-strategy", "Mover", "--mover"]
+    args = session_window._args(
+        [*mover_args, "--reentry-arm", "turn", "--opening-arm", "on", "--log-dir", str(tmp_path)]
+    )
+    args.strategy = "Mover"  # as `_main` sets it from --regular-strategy, or for --mover's extended
+    # the opening arm reaches the window, which refuses it until it reads Alpaca's bars from 09:30
+    with pytest.raises(ValueError, match="opening_arm 'on' is refused"):
+        session_window.window_config(args, "regular")
+    # the opening is a regular-session arm: an extended part of the same run keeps it off
+    extended = session_window.window_config(args, "extended")
+    assert (extended.reentry_arm, extended.opening_arm) == ("turn", "off")
+    plain_args = session_window._args([*mover_args, "--log-dir", str(tmp_path)])
+    plain_args.strategy = "Mover"
+    plain = session_window.window_config(plain_args, "regular")
+    defaults = WindowConfig()
+    assert (plain.reentry_arm, plain.opening_arm) == (defaults.reentry_arm, defaults.opening_arm)
+    with pytest.raises(SystemExit):
+        session_window._args(["--reentry-arm", "turn", "--log-dir", str(tmp_path)])
+    with pytest.raises(SystemExit):
+        session_window._args(
+            [*mover_args, "--reentry-arm", "sometimes", "--log-dir", str(tmp_path)]
+        )
+
+
+def test_an_arm_flag_is_refused_where_mover_cannot_run_it_and_said_where_a_part_drops_it(
+    tmp_path, capsys
+) -> None:
+    """An arm reaches only a Mover window; an opening arm only a regular one, and an auto run's
+    extended part says it keeps the opening off (no silent fallback)."""
+    log = ["--log-dir", str(tmp_path)]
+    # --mover runs Mover in every extended part, so a re-entry arm has a window to reach
+    args = session_window._args(["--session", "auto", "--mover", "--reentry-arm", "turn", *log])
+    assert session_window.window_config(args, "regular").reentry_arm == WindowConfig().reentry_arm
+    args.strategy = "Mover"  # as `_main` sets it for an extended part under --mover
+    assert session_window.window_config(args, "extended").reentry_arm == "turn"
+    # an opening arm needs Mover in the regular session
+    for argv in (
+        ["--session", "extended", "--strategy", "Mover", "--opening-arm", "on"],
+        ["--session", "auto", "--mover", "--opening-arm", "on"],
+        [
+            "--session",
+            "auto",
+            "--strategy",
+            "Mover",
+            "--mover",
+            "--regular-strategy",
+            "SessionMaCross",
+            "--opening-arm",
+            "on",
+        ],
+    ):
+        with pytest.raises(SystemExit):
+            session_window._args([*argv, *log])
+    args = session_window._args(
+        ["--session", "auto", "--regular-strategy", "Mover", "--mover", "--opening-arm", "on", *log]
+    )
+    args.strategy = "Mover"
+    capsys.readouterr()
+    assert session_window.window_config(args, "extended").opening_arm == "off"
+    assert "--opening-arm on" in capsys.readouterr().err

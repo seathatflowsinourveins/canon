@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import replace
 from datetime import date
 from datetime import datetime
@@ -1545,12 +1546,29 @@ def test_p0_bars_replay_refuses_non_fixed_trail_by_name(mode: str) -> None:
         BarsReplayMover(config)
 
 
+@pytest.mark.parametrize("mode", ["reclaim", "turn", "vwap"])
+def test_p0_bars_replay_and_trial_refuse_state_reentry_by_name(mode: str) -> None:
+    from canon_trading.ledger import trial_config
+    from canon_trading.mover import MoverConfig
+    from canon_trading.tuning_study import BarsReplayMover
+
+    cfg = p0_trial()
+    settings = MoverConfig(max_notional=Decimal(1000), max_move=Decimal(1000), reentry_arm=mode)
+    for run in (
+        lambda: BarsReplayMover(settings),
+        lambda: trial_config([replace(cfg, settings=settings)], starting_balances=["100000 USD"]),
+    ):
+        with pytest.raises(ValueError, match=f"reentry_arm.*{mode}"):
+            run()
+
+
 def test_p0_window_rows_do_not_move_the_trial_key_or_replay_settings() -> None:
     from canon_trading.ledger import config_key
     from canon_trading.ledger import trial_config
     from canon_trading.mover import TRAIL_SETTINGS
     from canon_trading.tuning_contract import BARS_REPLAY_FIXED_ROWS
     from canon_trading.tuning_contract import RankedConfiguration
+    from canon_trading.tuning_contract import check_bars_replay_modes
     from canon_trading.tuning_study import BarsReplayMover
 
     cfg = p0_trial()
@@ -1566,25 +1584,38 @@ def test_p0_window_rows_do_not_move_the_trial_key_or_replay_settings() -> None:
         "planned_loss": {"alternates": (Decimal(20),)},
         "loss_share": {"alternates": (PAPER_LOSS_SHARE,)},
     }
+    # Every fixed row either leaves the trial key and the replay unchanged or is refused by name in
+    # both (the lead's rule of 2026-11-12). A row with no registered arms is checked at its default;
+    # the piece that adds it tests its other values.
     for name, pinned in BARS_REPLAY_FIXED_ROWS.items():
-        rows = TRAIL_SETTINGS.get(name) or window_only[name]
-        values = (pinned, *rows.get("alternates", rows.get("arms", ())))
-        for value in values:
+        rows = TRAIL_SETTINGS.get(name) or window_only.get(name, {})
+        values = (pinned, *rows.get("alternates", ()), *rows.get("arms", ()))
+        for value in dict.fromkeys(values):
             from canon_trading.ma_cross import BASE_FIELDS
             from canon_trading.mover import OWN_FIELDS
             from canon_trading.mover import MoverConfig
 
             own = {field: getattr(cfg.settings, field) for field in OWN_FIELDS}
             base = {field: getattr(cfg.settings, field) for field in BASE_FIELDS}
-            settings = MoverConfig(**(own | {name: value}), **base)
-            if name in ("trail_mode", "reentry_arm") and value != pinned:
-                with pytest.raises(ValueError, match=f"{name}.*{value}"):
+            try:
+                settings = MoverConfig(**(own | {name: value}), **base)
+            except ValueError as unbuilt:  # a setting no Mover can hold reaches no trial or replay
+                assert value != pinned and name in str(unbuilt), unbuilt
+                continue
+            named = f"{re.escape(name)}.*{re.escape(str(value))}"
+            try:
+                check_bars_replay_modes(settings)
+            except ValueError as refused:
+                assert value != pinned and re.search(named, str(refused)), refused
+                with pytest.raises(ValueError, match=named):
                     BarsReplayMover(settings)
-                with pytest.raises(ValueError, match=f"{name}.*{value}"):
+                with pytest.raises(ValueError, match=named):
                     trial_config(
                         [replace(cfg, settings=settings)], starting_balances=["100000 USD"]
                     )
                 continue
+            # The two pre-port modes stay refused: a replay may never rank them as fixed and clock.
+            assert name not in ("trail_mode", "reentry_arm") or value == pinned
             changed = trial_config(
                 [replace(cfg, settings=settings)], starting_balances=["100000 USD"]
             )
