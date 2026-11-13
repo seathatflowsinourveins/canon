@@ -1862,6 +1862,8 @@ class Mover(Strategy):
         self.sell_triggers_read: set[str] = set()
         """Released orders already read: a released sell's trigger is final at its release."""
         self.fills: list[tuple[str, str, str, str, int]] = []
+        # this host's receipt of each entry's first fill (its `ts_init`), the clock the hold's bound reads
+        self.entry_fill_received_ns: dict[str, int] = {}
         """Each fill as its event gave it: client order ID, side, quantity, price, time. The session's
         reflection reads a sale's counterfactuals (held on, flat, managed) from these and the tape."""
         self.unreported: list[tuple[int, Decimal]] = []
@@ -2089,6 +2091,11 @@ class Mover(Strategy):
         if slot is None:
             return
         if event.order_side == OrderSide.BUY:
+            # NautilusTrader d53849b216e2: OrderFilled's venue/event and initialization clocks are
+            # distinct (crates/model/src/events/order/filled.rs:78-81); the live client supplies
+            # its host clock for ts_init (python/nautilus_trader/live/clients.py:585-613). Keep the
+            # first receipt per entry for the hold, without changing the venue times in `fills`.
+            self.entry_fill_received_ns.setdefault(event.client_order_id.value, event.ts_init)
             row = (
                 self._ensure_exit(slot, Decimal(0))
                 if slot.exit_record is None
@@ -3691,18 +3698,13 @@ class Mover(Strategy):
         else the entry's limit, less the trail distance in force. It sells at once only when the last
         known price (the last trade the cache has, else the latest minute close) is through that level,
         so it does not depend on the missing side and adds no subscription. With no two-sided quote
-        within `HOLD_MOST_SECS` of the fill it sells by limit as an `unpriced_exit`."""
+        within `HOLD_MOST_SECS` of receiving the first fill it sells by limit as an `unpriced_exit`."""
         if slot.held_since is None:
-            entry = self._order(slot.entry_id)
-            fills = [
-                at
-                for cid, side, *_, at in self.fills
-                if entry is not None
-                and cid == entry.client_order_id.value
-                and side == OrderSide.BUY.name
-            ]
-            # 60 s from the fill (the lead's bound); a hold after the holding was trailed, from now
-            slot.held_since = now if slot.trailed else min(fills, default=now)
+            entry = None if slot.entry_id is None else slot.entry_id.value
+            received = self.entry_fill_received_ns.get(entry, now)
+            # Both receipt and `now` use this host's clock; venue times in `fills` do not.
+            # A hold after the holding was trailed still starts now, as does one with no receipt.
+            slot.held_since = now if slot.trailed else received
             anchor = self._held_anchor(slot)
             if anchor is not None:
                 plan = slot.trail_plan

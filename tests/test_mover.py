@@ -2926,6 +2926,7 @@ class Seam:
         self.protection_fallbacks = {"position average price": 0, "current bid": 0}
         self.protect_paths = {"held_stop": 0, "unpriced_exit": 0, "trail": 0}
         self.fills: list = []
+        self.entry_fill_received_ns: dict = {}
         self.recent = 0
         self.baseline_dollar_volume_per_minute: dict = {}
         self.positions: list = []
