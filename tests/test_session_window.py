@@ -7,6 +7,7 @@ session and account checks run against hand-built alpaca-py `Clock` and `Calenda
 for the paper `TradingClient`; the times are New York's.
 """
 
+import contextlib
 import json
 import math
 import os
@@ -15,6 +16,7 @@ import subprocess
 import sys
 import time
 import tomllib
+from dataclasses import asdict
 from dataclasses import dataclass
 from dataclasses import field
 from dataclasses import replace
@@ -75,6 +77,7 @@ from nautilus_trader.trading import Strategy
 from requests import Response
 from requests.adapters import HTTPAdapter
 
+from canon_trading import price_step
 from canon_trading import session_ma_cross
 from canon_trading import session_window
 from canon_trading.paper_node import MAX_ORDER_SUBMIT_RATE
@@ -420,6 +423,11 @@ def test_the_native_runtime_checks_are_turned_on() -> None:
 def test_a_window_config_refuses_what_is_not_run(changes: dict, message: str) -> None:
     with pytest.raises(ValueError, match=message):
         WindowConfig(**changes)
+
+
+@pytest.fixture(autouse=True)
+def _references_in(references_in: None) -> None:
+    """Every window here has its references in before its node (`references_in`, tests/conftest.py)."""
 
 
 @pytest.fixture
@@ -4633,6 +4641,71 @@ class Quotes:
         }
 
 
+@pytest.mark.parametrize(
+    ("side", "bid", "ask", "raw", "expected"),
+    [
+        ("sell", "0.2737", "0.2763", "0.2237", "0.2237"),
+        ("buy", "0.2737", "0.2763", "0.3263", "0.3263"),
+        ("sell", "6000.237", "6000.241", "6000.187", "6000.18"),
+        ("buy", "6000.237", "6000.241", "6000.291", "6000.30"),
+        ("sell", "1.0537", "1.0563", "1.0037", "1.00"),
+        ("buy", "0.9437", "0.9463", "0.9963", "0.9963"),
+        ("sell", "0.055", "0.06", "0.005", "0.0050"),
+        # a quote finer than the step: a buy close is never under the price it asks for
+        ("buy", "0.2737", "0.27371", "0.3238", "0.3238"),
+        ("buy", "2.26", "2.270005", "2.3201", "2.33"),
+    ],
+)
+def test_close_limits_use_the_shared_venue_step_for_each_side(
+    monkeypatch, side: str, bid: str, ask: str, raw: str, expected: str
+) -> None:
+    """Both direct alpaca-py closers (the account check after a stop, and `custody`'s close-only form
+    for paper:close) price through `close_limit`, and it through `price_step`: four decimals below a
+    dollar, cents from a dollar up, and cents above the tick scheme's top too, where a buy's entry is
+    refused but a close is not (the lead's ruling (ii), 2026-11-12)."""
+    calls: list[tuple[str, Decimal]] = []
+    up, down = price_step.up_on_step, price_step.down_on_step
+
+    def buy(at: Decimal) -> Decimal:
+        calls.append(("buy", at))
+        return up(at)
+
+    def sell(at: Decimal) -> Decimal:
+        calls.append(("sell", at))
+        return down(at)
+
+    monkeypatch.setattr(price_step, "up_on_step", buy)
+    monkeypatch.setattr(price_step, "down_on_step", sell)
+    quotes = Quotes(bid, ask)
+    limit, source = session_window.close_limit(quotes, "SPY", side, "after-hours")
+    assert calls == [(side, Decimal(raw))]
+    assert str(limit) == expected
+    assert limit <= Decimal(raw) if side == "sell" else limit >= Decimal(raw)
+    assert "sip quote" in source and len(quotes.asked) == 1
+
+
+@pytest.mark.parametrize(("bid", "raw"), [("0.05005", "0.00005"), ("0.04", "-0.01")])
+def test_a_close_sell_under_the_finest_step_goes_at_the_lowest_and_says_so(
+    bid: str, raw: str
+) -> None:
+    """The lead, 2026-11-12: a close exists to close. A bid less the five-cent offset under Alpaca's
+    finest step is sent at the lowest step, 0.0001, and the record names that; it is not refused."""
+    limit, source = session_window.close_limit(Quotes(bid, "0.06"), "SPY", "sell", "after-hours")
+    assert limit == Decimal("0.0001")
+    assert f"less 0.05 is {raw}, under Alpaca's finest step" in source
+    assert "sent at the lowest, 0.0001" in source
+
+
+@pytest.mark.parametrize("ask", ["52.10", "0.10", "0"])
+def test_a_close_sell_under_the_finest_step_with_an_ask_not_in_pennies_is_refused_by_name(
+    ask: str,
+) -> None:
+    """The lead, 2026-11-12: the clamp is for a name truly worth pennies. A bid of 0.04 with an ask of
+    52.10 (or none) is a quote too wide to close on: refused by name, and the next poll asks again."""
+    with pytest.raises(ValueError, match="a quote too wide to close on"):
+        session_window.close_limit(Quotes("0.04", ask), "SPY", "sell", "after-hours")
+
+
 def after_hours(fake_time, **kw: Any) -> Venue:
     venue = Venue(fake_time, is_open=False, **kw)
     venue.starts = AFTER_HOURS
@@ -7328,6 +7401,37 @@ def test_the_record_keeps_each_fill_and_the_worst_submit_delay() -> None:
     assert report.fills == 1
 
 
+def test_the_record_counts_the_instrument_notifications_upstream_refused_apart_from_the_stream(
+    tmp_path,
+) -> None:
+    """A whole-market start logs one error for each instrument past the 1,024 its execution client's
+    command queue holds (NautilusTrader `d53849b216e2`, `crates/live/src/python/runtime.rs:39`,
+    `:187-192`; `crates/live/src/python/client/mod.rs:1960-1972`; the adapter's README, "Instrument load
+    and the command queue"). The record keeps their number in a field of its own; they are not stream
+    lines, so they neither fail the window nor crowd out a line that should, and the other notification
+    a full queue refuses, an external order's registration (`client/mod.rs:1953-1957`), is not among
+    them. That the node logs the instrument line in this form is held on a real node's log by the
+    adapter's `test_instrument_load.py`, through the same `INSTRUMENT_REFUSAL`."""
+    refusal = (
+        "2026-11-12T15:56:11.000000000Z [ERROR] B-001.nautilus_live::python::client: Client ALPACA "
+        "instrument update failed: RuntimeError: Client ALPACA command queue is full"
+    )
+    other = (
+        "2026-11-12T15:56:12.000000000Z [ERROR] B-001.nautilus_live::python::client: Client ALPACA "
+        "external order registration failed: RuntimeError: Client ALPACA command queue is full"
+    )
+    stream = "2026-11-12T15:56:13.000000000Z [ERROR] B-001.ALPACA: Alpaca stream on feed sip ended"
+    log = tmp_path / "window.log"
+    log.write_text("\n".join([*([refusal] * 13_389), other, stream]) + "\n")
+    report = session_window.WindowReport("regular", "LLL", started="s")
+
+    session_window._read_stream_lines(report, log)
+
+    assert report.instrument_refusals == 13_389
+    assert report.stream == [stream]
+    assert json.loads(json.dumps(asdict(report)))["instrument_refusals"] == 13_389
+
+
 def test_a_sample_whose_stream_logs_a_reconnect_fails() -> None:
     """A reconnect drops minutes of bars: the sample fails (and `choose_mover` falls back) rather than
     rank a partial dollar volume, as `movers_stream.run` fails on what alpaca-py's stream logs."""
@@ -9430,26 +9534,33 @@ def test_paper_session_gives_a_stop_the_windows_longest_wind_down_before_it_kill
 
 
 _TERM_CHILD = """
-import signal, sys, time
+import os, signal, sys, time
 def wind_down(signum, frame):
     print("wind-down started", flush=True)
     time.sleep(1)
     print("wind-down finished", flush=True)
     sys.exit(0)
 signal.signal(signal.SIGTERM, wind_down)
-print("running", flush=True)
+print("running", os.getpid(), flush=True)
 time.sleep(30)
 """
 
 
+@pytest.mark.parametrize("shell_path", ["/bin/sh", "/bin/dash"])
 @pytest.mark.parametrize("stopgrace", ["37", ""])
 def test_bounded_passes_a_stop_on_as_terminate_and_waits_its_grace_only_when_given_one(
     stopgrace: str,
+    shell_path: str,
 ) -> None:
     """The first rework's tenth finding: `bounded()` answered a stop with KILL to the whole group, so the
     window's handler never ran when the firing was stopped. With `stopgrace` the command gets TERM and the
-    grace to end; without it (paper:test) the kill is at once, as before."""
+    grace to end; without it (paper:test) the kill is at once, as before. Under dash, the /bin/sh of a Linux
+    runner, `kill -KILL -- -pgid` is refused ("Illegal number"), so the group outlived the stop; POSIX's
+    `kill -s KILL -- -pgid` is the form both shells take."""
     import signal as signal_module
+
+    if not Path(shell_path).exists():
+        pytest.skip(f"{shell_path} is not on this machine")
 
     body, _ = _paper_session_bounded()
     script = (
@@ -9457,22 +9568,33 @@ def test_bounded_passes_a_stop_on_as_terminate_and_waits_its_grace_only_when_giv
         'bounded 60 "$0" -c "$1"\n'  # sh -c's $0 and $1: the python and its script
     )
     shell = subprocess.Popen(
-        ["/bin/sh", "-c", script, sys.executable, _TERM_CHILD],
+        [shell_path, "-c", script, sys.executable, _TERM_CHILD],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
     )
     assert shell.stdout is not None
-    line = _read_line(shell.stdout, 30)
-    assert line.strip() == "running", line
-    started = time.monotonic()
-    shell.send_signal(signal_module.SIGTERM)
-    if stopgrace:
-        # a second stop in the grace, as mise passes one on: noted, and the grace still runs (bash 3.2, the
-        # /bin/sh here, killed itself when the trap was changed from inside it)
-        time.sleep(0.3)
+    child = 0
+    try:
+        line = _read_line(shell.stdout, 30)
+        word, _, pid = line.strip().partition(" ")
+        assert word == "running", line
+        child = int(pid)
+        started = time.monotonic()
         shell.send_signal(signal_module.SIGTERM)
-    out, _ = shell.communicate(timeout=30)
+        if stopgrace:
+            # a second stop in the grace, as mise passes one on: noted, and the grace still runs (bash 3.2,
+            # the /bin/sh here, killed itself when the trap was changed from inside it)
+            time.sleep(0.3)
+            shell.send_signal(signal_module.SIGTERM)
+        out, _ = shell.communicate(timeout=30)
+    finally:
+        # a red run leaves nothing behind: the shell and the command under it, by pid, whatever the group
+        # kill did (the lead's finding of 2026-11-12: a failed group kill leaves its children running)
+        shell.kill()
+        if child:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(child, signal_module.SIGKILL)
     assert shell.returncode == 143, (shell.returncode, out)
     if stopgrace:
         assert "wind-down finished" in out, out
@@ -9615,3 +9737,33 @@ def test_a_window_stopped_by_a_signal_exits_as_a_shell_would_for_it(monkeypatch,
     monkeypatch.setattr(session_window, "_ABANDONED", [])
     monkeypatch.setattr(session_window, "run_window", signalled)
     assert session_window.main(["--log-dir", str(tmp_path)]) == 128 + signal_module.SIGTERM
+
+
+def test_a_window_a_signal_reached_after_its_node_exits_as_a_shell_would_for_it(
+    monkeypatch, tmp_path
+) -> None:
+    """Code review of the snapshot round, finding 1: a signal after the node was recorded `failed` and the
+    wind-down finished, but `_main` returned 0, so the process said it succeeded."""
+    import signal as signal_module
+
+    def stopped_after_the_node(args) -> int:
+        session_window._SIGNALS.left_node()
+        session_window._SIGNALS.handle(signal_module.SIGINT, None)  # noted, not raised
+        return 0
+
+    monkeypatch.setattr(session_window, "_ABANDONED", [])
+    monkeypatch.setattr(session_window, "_main", stopped_after_the_node)
+    assert session_window.main(["--log-dir", str(tmp_path)]) == 128 + signal_module.SIGINT
+
+
+def test_a_windows_signal_does_not_reach_a_later_window_in_the_process() -> None:
+    """Code review of the snapshot round, finding 6: `_SIGNALS` kept the first signal's name after the
+    window, so a later window in the same process showed `stopping` and ended failed."""
+    import signal as signal_module
+
+    with session_window.window_signals():
+        session_window._SIGNALS.left_node()
+        session_window._SIGNALS.handle(signal_module.SIGTERM, None)
+        assert session_window._SIGNALS.first == "SIGTERM"
+    assert session_window._SIGNALS.first is None
+    assert session_window._SIGNALS.record is None

@@ -1188,6 +1188,26 @@ def test_l5_complete_ranked_configuration_round_trips_through_the_promotion_cont
         RankedConfiguration.decode(changed, expected_key=candidate.key)
 
 
+def test_a_configuration_keyed_with_both_persistence_arms_off_holds_no_persistence_row(
+    alpaca_bars: AlpacaBars,
+) -> None:
+    """A trial keyed before the persistence rows existed has none of them, and one keyed now with both
+    arms off has none either: the same key, and a stored configuration that decodes as off."""
+    from canon_trading.ledger import trial_config
+    from canon_trading.mover import PERSISTENCE_FIELDS
+    from canon_trading.tuning_contract import RankedConfiguration
+
+    cfg, _ = replay_inputs(alpaca_bars, [tape_bar("AAPL", date(2025, 3, 10), 570, 10.5)])
+    ranked = trial_config([cfg], starting_balances=["100000 USD"])
+    assert not set(PERSISTENCE_FIELDS) & set(ranked["strategies"][0]["config"])
+    promoted = RankedConfiguration.decode(
+        json.loads(json.dumps(RankedConfiguration.from_config(ranked).encode()))
+    )
+    settings = promoted.mover_config
+    assert settings.persistence is False
+    assert (settings.breach_count, settings.high_count) == (1, 1)
+
+
 def test_l5_catalog_history_is_read_once_per_feed_in_a_study_run(
     tmp_path: Path,
     alpaca_bars: AlpacaBars,

@@ -7,7 +7,7 @@ them at the pin (`nautilus-trader@d53849b216e2`). Instruments come from an Alpac
 `canon_alpaca.providers.parse_equity` and bars through `canon_alpaca.data.parse_bar`, as the node gets them
 (`tests/conftest.py`). The reference reader is a stub and the baseline is a file written through
 `movers_rank.write_baselines` into `tmp_path`, as the nightly job writes it: the actor's own REST reads are
-tested against stub clients with alpaca-py's own response models (`BarSet`, `CorporateActionsSet`).
+tested against stub clients with alpaca-py's own response models (`Snapshot`, `CorporateActionsSet`).
 
 The prices and volumes are invented. Antigravity's review findings 1 to 7 are each taken by a test here:
 a behaviour test that failed before the fix, or, where the code was already right, by an assertion that
@@ -28,20 +28,19 @@ from datetime import datetime
 from datetime import timedelta
 from decimal import Decimal
 from typing import TYPE_CHECKING
+from typing import Any
 from zoneinfo import ZoneInfo
 
 import pytest
-from alpaca.data.enums import Adjustment
 from alpaca.data.enums import CorporateActionsType
 from alpaca.data.enums import DataFeed
 from alpaca.data.models import Bar as AlpacaBar
-from alpaca.data.models import BarSet
 from alpaca.data.models.corporate_actions import CorporateActionsSet
 from alpaca.data.models.corporate_actions import ForwardSplit
 from alpaca.data.models.corporate_actions import ReverseSplit
+from alpaca.data.models.snapshots import Snapshot
 from alpaca.data.requests import CorporateActionsRequest
-from alpaca.data.requests import StockBarsRequest
-from alpaca.data.timeframe import TimeFrame
+from alpaca.data.requests import StockSnapshotRequest
 from alpaca.trading.models import Asset
 from canon_alpaca.constants import STREAM_FEEDS
 from canon_alpaca.data import named_feed
@@ -454,7 +453,7 @@ def reference_reader_from_bars(
     def read(symbols: Sequence[str], cutoff: date, session: date) -> ReferenceRead:
         if calls is not None:
             calls.append((cutoff, session))
-        references = read_references(StubBars(dict(bars)), symbols, cutoff)
+        references = read_references(StubSnapshots(dict(bars)), symbols, cutoff)
         splits = read_splits(StubActions(dict(actions or {})), references, session)
         return ReferenceRead(cutoff=cutoff, references=references, splits=splits, read_ns=0)
 
@@ -500,6 +499,31 @@ def test_item_1_a_split_since_the_reference_and_a_warrant_are_not_ranked(tmp_pat
     rankings = published(subscriber)
     assert rankings
     assert rankings[-1] == ("UPA", "UPB")
+
+
+SPLIT_ON_CUTOFF_RANKED = False
+"""The lead's ruling (1) of 2026-11-12: a name with a split on the cutoff date (the trade date) is left out,
+not ranked on an adjusted close. Ranking it would be a proposal; this line is its switch."""
+
+
+def test_a_split_on_the_cutoff_date_through_the_snapshot_read_is_excluded_by_name_and_counted(
+    tmp_path: Path,
+) -> None:
+    rows = {s: [daily(PREVIOUS, 10.0), daily(SESSION, 11.0)] for s in CLOSES}
+    split = {"forward_splits": [{**SPLIT_RECORD, "ex_date": SESSION.isoformat()}]}
+    actor, subscriber = run(
+        market(10),
+        baseline_path=write_stub_baseline(tmp_path),
+        reader=reference_reader_from_bars(rows, split),
+    )
+    ranking = published(subscriber)[-1]
+    assert actor.last_record is not None
+    if SPLIT_ON_CUTOFF_RANKED:
+        assert "SPLT" in ranking and actor.last_record["corporate_action_count"] == 0
+    else:
+        assert "SPLT" not in ranking and ranking, ranking
+        assert actor.last_record["corporate_action_symbols"] == ["SPLT"]
+        assert actor.last_record["corporate_action_count"] == 1
 
 
 def test_item_2_an_updated_bar_invalidates_the_generation_and_nothing_is_published_for_it(
@@ -728,15 +752,26 @@ def test_an_empty_reference_read_publishes_nothing_and_is_read_again(tmp_path: P
     assert actor.last_record is not None and actor.last_record["published"] is True
 
 
-class StubBars:
+class StubSnapshots:
+    """Answers `get_stock_snapshot` from each symbol's daily rows, oldest first: the last row is the
+    snapshot's `dailyBar` and the one before it its `prevDailyBar`, as Alpaca's snapshot carries the
+    current and the previous daily bar (stocksnapshots-1.md:260)."""
+
     def __init__(self, data: dict[str, list[dict[str, object]]]) -> None:
         self.data = data
-        self.requests: list[StockBarsRequest] = []
+        self.requests: list[StockSnapshotRequest] = []
 
-    def get_stock_bars(self, request_params: StockBarsRequest) -> BarSet:
+    def get_stock_snapshot(self, request_params: StockSnapshotRequest) -> dict[str, Snapshot]:
         self.requests.append(request_params)
         symbols = request_params.symbol_or_symbols
-        return BarSet({s: rows for s, rows in self.data.items() if s in symbols})
+        answer: dict[str, Snapshot] = {}
+        for symbol, rows in self.data.items():
+            if symbol in symbols:
+                raw: dict[str, dict[str, Any]] = {"dailyBar": rows[-1]} if rows else {}
+                if len(rows) > 1:
+                    raw["prevDailyBar"] = rows[-2]
+                answer[symbol] = Snapshot(symbol, raw)
+        return answer
 
 
 def daily(day: date, close: float) -> dict[str, object]:
@@ -753,24 +788,93 @@ def daily(day: date, close: float) -> dict[str, object]:
     }
 
 
-def test_read_references_asks_for_split_adjusted_daily_sip_bars_and_takes_the_latest_before_the_cutoff() -> (
+def test_read_references_asks_for_sip_snapshots_and_takes_the_later_daily_bar_before_the_cutoff() -> (
     None
 ):
-    client = StubBars(
+    client = StubSnapshots(
         {
-            "UPA": [daily(date(2026, 11, 9), 9.0), daily(PREVIOUS, 10.0), daily(SESSION, 11.0)],
-            "UPB": [daily(date(2026, 11, 6), 7.0)],
+            "UPA": [daily(PREVIOUS, 10.0), daily(SESSION, 11.0)],
+            "UPB": [daily(date(2026, 11, 6), 7.0), daily(PREVIOUS, 8.0)],
+            "OLD": [daily(date(2026, 11, 5), 6.0), daily(date(2026, 11, 6), 6.5)],
         }
     )
-    found = read_references(client, ["UPA", "UPB", "FLAT"], SESSION)
+    found = read_references(client, ["UPA", "UPB", "OLD", "FLAT"], SESSION)
     assert found == {
         "UPA": movers_rank.Reference(close=10.0, session=PREVIOUS),
-        "UPB": movers_rank.Reference(close=7.0, session=date(2026, 11, 6)),
+        "UPB": movers_rank.Reference(close=8.0, session=PREVIOUS),
+        "OLD": movers_rank.Reference(close=6.5, session=date(2026, 11, 6)),
     }
     request = client.requests[0]
-    assert request.timeframe.value == TimeFrame.Day.value
-    assert request.adjustment == Adjustment.SPLIT
     assert request.feed == DataFeed.SIP
+    assert list(request.symbol_or_symbols) == ["UPA", "UPB", "OLD", "FLAT"]
+
+
+def test_a_name_whose_two_snapshot_bars_are_both_on_or_after_the_cutoff_has_no_reference_and_is_counted() -> (
+    None
+):
+    client = StubSnapshots(
+        {
+            "UPA": [daily(PREVIOUS, 10.0), daily(SESSION, 11.0)],
+            "NEW": [daily(SESSION, 4.0), daily(date(2026, 11, 12), 5.0)],
+        }
+    )
+    found = read_references(client, ["UPA", "NEW"], SESSION)
+    assert found == {"UPA": movers_rank.Reference(close=10.0, session=PREVIOUS)}
+    read = ReferenceRead(
+        cutoff=SESSION, references=found, splits=None, read_ns=0, asked=2, wall_secs=1.234
+    )
+    assert read.counts() == {
+        "wall_secs": 1.23,
+        "names_asked": 2,
+        "with_close": 1,
+        "without_close": 1,
+    }
+
+
+def test_a_failed_snapshot_request_is_asked_again_alone_and_the_read_is_not_restarted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(actor_module, "REF_BATCH", 2)
+    failures = {2: 2}  # the second request fails twice, then answers
+
+    class Flaky(StubSnapshots):
+        def get_stock_snapshot(self, request_params: StockSnapshotRequest) -> dict[str, Snapshot]:
+            batch = tuple(request_params.symbol_or_symbols)
+            asked = sum(1 for r in self.requests if tuple(r.symbol_or_symbols) == batch)
+            self.requests.append(request_params)
+            if batch == ("UPC",) and asked < failures[2]:
+                raise TimeoutError("read timed out")
+            self.requests.pop()
+            return super().get_stock_snapshot(request_params)
+
+    rows = {s: [daily(PREVIOUS, 10.0), daily(SESSION, 11.0)] for s in ("UPA", "UPB", "UPC")}
+    client = Flaky(rows)
+    pauses: list[float] = []
+    lines: list[str] = []
+    found = read_references(
+        client, ["UPA", "UPB", "UPC"], SESSION, log=lines.append, pause=pauses.append
+    )
+    assert set(found) == {"UPA", "UPB", "UPC"}
+    asked = [tuple(r.symbol_or_symbols) for r in client.requests]
+    assert asked == [("UPA", "UPB"), ("UPC",), ("UPC",), ("UPC",)], asked
+    assert pauses == [actor_module.SNAPSHOT_RETRY_SECS] * 2
+    assert sum("failed after" in line for line in lines) == 2, lines
+
+    failures[2] = actor_module.SNAPSHOT_TRIES
+    client = Flaky(rows)
+    with pytest.raises(TimeoutError):
+        read_references(client, ["UPA", "UPB", "UPC"], SESSION, pause=pauses.append)
+    asked = [tuple(r.symbol_or_symbols) for r in client.requests]
+    assert asked == [("UPA", "UPB")] + [("UPC",)] * actor_module.SNAPSHOT_TRIES, asked
+
+
+def test_read_references_refuses_raw_snapshot_data() -> None:
+    class Raw:
+        def get_stock_snapshot(self, request_params: StockSnapshotRequest) -> object:
+            return {"UPA": {"dailyBar": daily(PREVIOUS, 10.0)}}
+
+    with pytest.raises(TypeError, match="raw_data=False"):
+        read_references(Raw(), ["UPA"], SESSION)  # type: ignore[arg-type]
 
 
 class StubActions:
@@ -1236,24 +1340,26 @@ def test_read_references_logs_each_batch_with_its_time_duration_and_outcome(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(actor_module, "REF_BATCH", 2)
-    client = StubBars({"UPA": [daily(PREVIOUS, 10.0)], "UPB": [daily(PREVIOUS, 7.0)]})
+    client = StubSnapshots({"UPA": [daily(PREVIOUS, 10.0)], "UPB": [daily(PREVIOUS, 7.0)]})
     lines: list[str] = []
     read_references(client, ["UPA", "UPB", "FLAT"], SESSION, log=lines.append)
     assert len(lines) == 2, lines
     assert lines[0].startswith("reference batch 1/2 ") and "2 symbols" in lines[0], lines
     assert "2 with a close" in lines[0] and " s" in lines[0], lines
     assert lines[1].startswith("reference batch 2/2 ") and "1 symbols" in lines[1], lines
-    assert all("T" in line.split()[3] and line.split()[3].endswith("Z") for line in lines), lines
+    assert all("T" in line.split()[5] and line.split()[5].endswith("Z") for line in lines), lines
 
-    class Failing(StubBars):
-        def get_stock_bars(self, request_params: StockBarsRequest) -> BarSet:
+    class Failing(StubSnapshots):
+        def get_stock_snapshot(self, request_params: StockSnapshotRequest) -> dict[str, Snapshot]:
             if self.requests:
                 raise TimeoutError("read timed out")
-            return super().get_stock_bars(request_params)
+            return super().get_stock_snapshot(request_params)
 
     lines.clear()
     with pytest.raises(TimeoutError):
-        read_references(Failing({}), ["UPA", "UPB", "FLAT"], SESSION, log=lines.append)
+        read_references(
+            Failing({}), ["UPA", "UPB", "FLAT"], SESSION, log=lines.append, pause=lambda _: None
+        )
     assert "failed after" in lines[-1] and "TimeoutError: read timed out" in lines[-1], lines
 
 
@@ -1422,3 +1528,55 @@ def run_bounded(
         inline_reads=False,
         reference_read_bound_secs=bound_secs,
     )
+
+
+def test_a_snapshot_bar_older_than_the_lookback_or_with_no_positive_close_gives_no_reference() -> (
+    None
+):
+    """Code review of the snapshot read, finding 2: the daily-bars read was bounded to
+    `REFERENCE_LOOKBACK_DAYS` and the snapshot read was not, so a name halted for months ranked on a
+    months-old close; a close of zero or less is no reference either (`movers_stream.reference_close`)."""
+    stale = SESSION - timedelta(days=actor_module.REFERENCE_LOOKBACK_DAYS + 1)
+    edge = SESSION - timedelta(days=actor_module.REFERENCE_LOOKBACK_DAYS)
+    client = StubSnapshots(
+        {
+            "UPA": [daily(PREVIOUS, 10.0), daily(SESSION, 11.0)],
+            "HALT": [daily(stale - timedelta(days=1), 7.0), daily(stale, 8.0)],
+            "EDGE": [daily(edge, 6.0)],
+            "ZERO": [daily(PREVIOUS, 0.0)],
+        }
+    )
+    found = read_references(client, ["UPA", "HALT", "EDGE", "ZERO"], SESSION)
+    assert found == {
+        "UPA": movers_rank.Reference(close=10.0, session=PREVIOUS),
+        "EDGE": movers_rank.Reference(close=6.0, session=edge),
+    }
+
+
+@pytest.mark.parametrize(
+    ("status", "tries"),
+    [(403, 1), (422, 1), (429, actor_module.SNAPSHOT_TRIES), (503, actor_module.SNAPSHOT_TRIES)],
+)
+def test_a_snapshot_request_refused_with_a_4xx_is_raised_at_once_and_not_asked_again(
+    status: int, tries: int
+) -> None:
+    """Code review of the snapshot read, finding 8: every failure was asked again, a 403 or a malformed
+    request too; only a 429, a 5xx or the connection is (`_transient`)."""
+    import requests
+    from alpaca.common.exceptions import APIError
+
+    response = requests.Response()
+    response.status_code = status
+    error = APIError("refused", requests.HTTPError(response=response))
+
+    class Refusing(StubSnapshots):
+        def get_stock_snapshot(self, request_params: StockSnapshotRequest) -> dict[str, Snapshot]:
+            self.requests.append(request_params)
+            raise error
+
+    client = Refusing({"UPA": [daily(PREVIOUS, 10.0)]})
+    pauses: list[float] = []
+    with pytest.raises(APIError):
+        read_references(client, ["UPA"], SESSION, pause=pauses.append)
+    assert len(client.requests) == tries
+    assert len(pauses) == tries - 1

@@ -995,3 +995,19 @@ def test_main_prints_the_night_s_line_and_exits_by_its_status(
     assert main(["--ledger", str(ledger), "--catalog", str(tmp_path / "c")]) == 1
     assert seen["catalog_path"] == tmp_path / "c"
     assert capsys.readouterr().err == "s\n"
+
+
+def test_a_window_a_signal_stopped_whose_wind_down_never_finished_is_counted_as_not_ended(
+    tmp_path: Path,
+) -> None:
+    """Code review of the snapshot round, finding 4: a `stopping` record (session_window._shown_record) was
+    counted as ran but as neither ok, failed nor running, so the night's tally lost it."""
+    records = tmp_path / "windows"
+    records.mkdir()
+    (records / "window-20261111T143000Z.json").write_text(
+        json.dumps(
+            {"result": "stopping: SIGTERM received; the window has not finished", "fills": 1}
+        )
+    )
+    found = windows_to(records, FIRST_CLOSE)
+    assert (found["ran"], found["ok"], found["failed"], found["running"]) == (1, 0, 0, 1)

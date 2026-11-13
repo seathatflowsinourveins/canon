@@ -454,7 +454,8 @@ def windows_to(records: Path | None, until: datetime) -> dict[str, Any]:
         found["ran"] += 1
         found["ok"] += result == "ok"
         found["failed"] += result.startswith("failed")
-        found["running"] += result == RUNNING
+        # a window a signal stopped whose wind-down never finished (session_window._shown_record) did not end
+        found["running"] += result == RUNNING or result.startswith("stopping")
         found["fills"] += fills
     return found
 

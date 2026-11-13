@@ -28,13 +28,33 @@ A composition of upstream parts (ADR 0083, ADR 0088). What each part is, at Naut
   `share_caps` where the window sets them), the free balance
   and `flow_share` of the dollar volume of the last `flow_bars` bars. No entry is sent into a quote whose
   bid is already under that planned sale: the quote is then wider than the plan the size rests on.
-* **The protection** is the engine's order emulator holding a `TRAILING_STOP_LIMIT` sell
+* **The protection with both persistence arms off** is the engine's order emulator holding a
+  `TRAILING_STOP_LIMIT` sell
   (`OrderFactory.trailing_stop_limit`, `common/__init__.pyi:1523-1547`; concepts/orders/emulated and
   trailing_stop_limit): its trigger follows the bid (`BID_ASK`) or the last trade (`LAST_PRICE`) up and
   never down, and at the trigger the emulator releases a `LIMIT` through the risk engine. A release
   keeps the submit command's params (`crates/execution/src/order_emulator/emulator.rs:1368` and
   `:1522-1531`; upstream's test of it, `:4513`, covers stop orders), so the `extended_hours` mark is given
   once, on the submit.
+* **Persistence**, when either arm is on, composes `Strategy.on_trade`
+  (`trading/__init__.pyi:638`), the step timer and `OrderFactory.limit` / `submit_order`. The
+  emulator elects on one tick
+  (`crates/execution/src/order_emulator/emulator.rs:1076-1104`), accepts only DEFAULT, BID_ASK and
+  LAST_PRICE (`:598-606`), and the trigger test has no count or time
+  (`crates/execution/src/matching.rs:555-572`), read at the pin 2026-11-12. No upstream part confirms
+  a breach on N observations, so the strategy holds the stop itself and emulates no order in this
+  arm. Only trade prints count; persistence requires LAST_PRICE. Handlers queue plain (timestamp,
+  price) pairs and the step confirms consecutive prints, independently for a breach and a new high.
+  The level is armed from the entry's own average fill, never from a cached print: one print is
+  one observation. Each print is read at the earlier of its event time and its receipt, so one
+  stamped ahead cannot hide those after it. Counted prints are at least `confirm_gap_ms` apart;
+  zero means any strictly newer time.
+  A recovery resets the breach even inside the gap; a print at or under the confirmed high resets
+  the high arm. Counts never expire. N supporting prints raise the level to their lowest price less
+  the trail, on Alpaca's price step, never down; a confirmed breach latches a DAY limit due in that
+  step through the existing floor and chase. Each count defaults to one (off); G defaults to 100 ms.
+  The on row for both arms is N=2, G=100 ms, UNCALIBRATED (ADR 0119). An arm runs on the fixed
+  trail only.
 * **The chase** of a released limit that rests is `cancel_order`, the cancel seen terminal at a later
   step, then a new limit for all that is held (`chase="resend"`, the default). No order is modified: the
   lead's decision of 2026-11-11, until the adapter's replace chain has passed two clean outside reviews.
@@ -58,8 +78,9 @@ orders are accepted as extended hours eligible", so every order there is a DAY l
 Max Decimals = 4" (`tick`).
 
 What is written here, since no upstream ships it (ADR 0083, gap 3): the rule that reads a rising run from
-bars, the slots, the re-entry and rotation rules, the chase's price and its cap, and the yield of entries
-to the request budget. Every number of them is a registered row, UNCALIBRATED (ADR 0088).
+bars, the slots, the two persistence confirmations, the re-entry and rotation rules, the chase's price
+and its cap, and the yield of entries to the request budget. Every number of them is a registered row,
+UNCALIBRATED (ADR 0088; the persistence rows are ADR 0119's).
 
 **How it runs.** `on_signal` keeps the latest ranking. Once a second (`STEP_SECS`) a timer steps:
 
@@ -82,7 +103,13 @@ to the request budget. Every number of them is a registered row, UNCALIBRATED (A
    so no share is without its sale and none has two. A limit that still rests after `chase_secs` is
    re-priced `exit_ticks` through the bid, never below the position's floor: `chase_cap` under its
    first sale price, kept whether that first sale filled, rests or was refused. Below it the sale rests.
-   A sale the risk engine or the venue refuses is sent again every `chase_secs`.
+   A sale the risk engine or the venue refuses is sent again every `chase_secs`. With persistence on,
+   the entry's average fill arms a local trigger, and the prints delivered after that step confirm
+   its high and its breach by their own times, not the timer's. The sale goes out in the first step
+   after the confirming print, so up to `STEP_SECS` later. The floor's reference is the lower of the
+   confirming print and the current bid, so a recovery in the same step cannot lift it and the sale
+   follows a fast fall below the stop the entry was sized against. `exit_ticks` prices that
+   reference and the sale; `exit_through` still shapes entry risk sizing.
 3. *Entries.* A slot whose bars have just closed `run_bars` times in a row above the close before is a
    candidate under the explicitly selected `entry_arm="bridge"`. The default `registered` arm is
    selected from `early_entry_study.ARMS`: listing needs both move and cumulative dollar-volume
@@ -105,7 +132,8 @@ held, one sell works at a time for a name, and nothing is sold while flat.
 (`crates/trading/src/python/strategy.rs:2016-2037`), and reading `cache`, `portfolio`, `clock` or `log`
 there raises "Already mutably borrowed"; a signal can reenter an actor too (concepts/message_bus,
 "Signal callback reentry"). So every handler of an order event or a signal only stores what the event
-carries, in plain attributes, and all reading of the engine and every command happens in the timer's
+carries, in plain attributes. The trade handler likewise queues only event timestamps and prices,
+without reading engine attributes. All reading of the engine and every command happens in the timer's
 step and in `on_bar`.
 
 Measured at the pin, offline, 2026-11-11 (ADR 0088): on bars alone the emulator cannot activate a
@@ -120,11 +148,10 @@ node builds a bar for every clock minute, a paused one too, flat and without vol
 (`time_bars_build_with_no_updates`, on by default): a repeated close is not a rise, so a pause restarts
 the run, and its minute counts as no flow.
 
-Not built, and said so: a re-priced entry; the gain lock; a breach that must persist before the sale (the emulator
-releases on the first quote at the trigger); a broker-held stop as an outage backstop (a second sell for
-the same shares is refused while the first works); slots reserved for the newest movers; no order into
-a halt (ADR 0083, gap 4). Known limits: the strategy does not know the session calendar (the run checks
-it); a partly filled entry is protected only from the next step.
+Not built, and said so: a re-priced entry; the gain lock; a broker-held stop as an outage backstop (a
+second sell for the same shares is refused while the first works); slots reserved for the newest
+movers; no order into a halt (ADR 0083, gap 4). Known limits: the strategy does not know the session
+calendar (the run checks it); a partly filled entry is protected only from the next step.
 Selectable trail modes (source b01f4c4, lead's ruling 2026-11-12): the fixed trail remains the
 main default. ATR uses rc8 AverageTrueRange(period).handle_bar / initialized / value
 (indicators/__init__.pyi:155-185); tier selects by baseline dollars per minute, and ratchet tightens
@@ -136,6 +163,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
+from dataclasses import field
 from dataclasses import replace
 from datetime import datetime
 from datetime import timedelta
@@ -540,6 +568,11 @@ def requests_sent() -> int:
     return sum(count.total for count in request_counts() if count.api == TRADING_API)
 
 
+PERSISTENCE_FIELDS = ("breach_count", "high_count", "confirm_gap_ms")
+"""The persistence rows. With both counts at one the arms are off and no run reads any of the three, so
+a trial's key leaves them out and a stored configuration without them decodes as off
+(`ledger._strategy_fields`, `tuning_contract.RankedConfiguration.mover_config`): a configuration
+recorded before these rows existed keeps its key."""
 OWN_FIELDS: dict[str, type | tuple[type, ...]] = {
     "max_notional": Decimal,
     "max_move": Decimal,
@@ -567,6 +600,9 @@ OWN_FIELDS: dict[str, type | tuple[type, ...]] = {
     "chase_cap": Decimal,
     "chase_secs": int,
     "chase": str,
+    "breach_count": int,
+    "high_count": int,
+    "confirm_gap_ms": int,
     "flow_share": Decimal,
     "flow_bars": int,
     "entry_ticks": int,
@@ -611,7 +647,13 @@ class MoverConfig(StrategyConfig):
     `FixedRiskSizer`'s fraction of the balance. `trail`, `exit_through` and `chase_cap` are fractions of
     a price; `flow_share` of the last `flow_bars` bars' dollar volume caps the size. `protect=False` is
     the hold-to-close row: no trailing sell, sold at the wind-down. `wind_down_at` is an aware
-    `datetime`. Any other keyword must be a base `StrategyConfig` field, and each field takes one type.
+    `datetime`. `breach_count` confirms a breach and `high_count` confirms a new high, on trade
+    prints only and only with LAST_PRICE. Each defaults to one (off); both off preserve the emulator
+    path. `confirm_gap_ms` is the minimum gap between counted prints in either arm (default 100 ms;
+    zero admits any strictly newer event time); counts have no expiry. The on row is N=2, G=100 ms
+    for both arms, UNCALIBRATED. With either on, `exit_through` shapes planned-stop sizing and
+    `exit_ticks` prices the actual sale. Any other keyword must be a base `StrategyConfig` field,
+    and each field takes one type.
 
     `entry_arm` defaults to `registered`, or is `bridge` (the existing run-only rule) or another key
     of ADR 0092's `ARMS`. Registered
@@ -661,6 +703,9 @@ class MoverConfig(StrategyConfig):
         chase_cap: Decimal = Decimal("0.02"),
         chase_secs: int = 5,
         chase: str = "resend",
+        breach_count: int = 1,
+        high_count: int = 1,
+        confirm_gap_ms: int = 100,
         flow_share: Decimal = Decimal("0.05"),
         flow_bars: int = 5,
         entry_ticks: int = 0,
@@ -717,10 +762,10 @@ class MoverConfig(StrategyConfig):
         ):
             raise ValueError("a non-fixed trail_mode requires 1-MINUTE-LAST bars")
         for name in ("slots", "run_bars", "flow_bars", "chase_secs", "entry_timeout_secs",
-                     "rank_max_age_secs", "soft_line"):  # fmt: skip
+                     "rank_max_age_secs", "soft_line", "breach_count", "high_count"):  # fmt: skip
             if fields[name] <= 0:
                 raise ValueError(f"{name} must be positive, got {fields[name]}")
-        for name in ("entry_ticks", "exit_ticks", "cooldown_secs"):
+        for name in ("entry_ticks", "exit_ticks", "cooldown_secs", "confirm_gap_ms"):
             if fields[name] < 0:
                 raise ValueError(f"{name} must not be negative, got {fields[name]}")
         if not slots <= watch <= RANK_MOST:
@@ -746,6 +791,22 @@ class MoverConfig(StrategyConfig):
         if trigger not in TRIGGERS:
             raise ValueError(
                 f"trigger must be BID_ASK or LAST_PRICE, which the emulator accepts, got {trigger}"
+            )
+        if (breach_count > 1 or high_count > 1) and trigger != TriggerType.LAST_PRICE:
+            raise ValueError(
+                "BID_ASK is refused with persistence: breach_count and high_count "
+                "require trigger=LAST_PRICE when either is above one"
+            )
+        if (breach_count > 1 or high_count > 1) and trail_mode != "fixed":
+            raise ValueError(
+                f"trail_mode={trail_mode!r} is refused with persistence: breach_count and "
+                "high_count hold the level at the fixed trail's distance, and a trail plan's "
+                "distance, tighten and chase cap are not carried into it (ADR 0119)"
+            )
+        if (breach_count > 1 or high_count > 1) and not protect:
+            raise ValueError(
+                "protect=False is refused with persistence: breach_count and high_count confirm "
+                "the protective sale, and a hold-to-close row has none"
             )
         if wind_down_at is not None and wind_down_at.tzinfo is None:
             raise ValueError("wind_down_at must be an aware datetime")
@@ -781,6 +842,9 @@ class MoverConfig(StrategyConfig):
         self.chase_cap = chase_cap
         self.chase_secs = chase_secs
         self.chase = chase
+        self.breach_count = breach_count
+        self.high_count = high_count
+        self.confirm_gap_ms = confirm_gap_ms
         self.flow_share = flow_share
         self.flow_bars = flow_bars
         self.entry_ticks = entry_ticks
@@ -794,6 +858,11 @@ class MoverConfig(StrategyConfig):
         self.extended_hours = extended_hours
         self.wind_down_at = wind_down_at
         self.feed = feed
+
+    @property
+    def persistence(self) -> bool:
+        """Whether either persistence arm is on: the strategy then holds the stop itself."""
+        return self.breach_count > 1 or self.high_count > 1
 
 
 @dataclass(frozen=True)
@@ -904,11 +973,21 @@ class Slot:
     exiting: bool = False
     """The trigger has been met, or the wind-down has begun: from here every sell is a plain limit."""
     floor: Decimal | None = None
-    """The lowest price this position's sale is chased to, from its first sale price (`chase_floor`). It
-    belongs to the position: a sale that is refused or re-sent keeps it."""
+    """The lowest price this position's sale is chased to (`chase_floor`), from its first released price
+    or persistence confirmation reference. A sale that is refused or re-sent keeps it."""
     trail_trigger: Decimal | None = None
     """The trigger a trailing sell had reached when it was canceled to be made again: the next one starts
-    from it, so the trigger never falls."""
+    from it, so the trigger never falls; with persistence on, the local confirmed trigger itself."""
+    trail_high: Decimal | None = None
+    """The confirmed high with persistence on; the emulator owns it when both arms are off."""
+    observations: deque[tuple[int, Decimal]] = field(default_factory=deque)
+    """Trade events delivered since the last step, stored without reading engine attributes."""
+    high_observations: deque[tuple[int, Decimal]] = field(default_factory=deque)
+    breach_observations: deque[int] = field(default_factory=deque)
+    breach_price: Decimal | None = None
+    """The confirming print's price: a later recovery cannot lift the position's chase floor."""
+    observed_ns: int = 0
+    """Only strictly newer print times are read; duplicates, older prints and timers never count."""
     priced_ns: int = 0
     was_held: bool = False
     entry_start: int | None = None
@@ -926,6 +1005,7 @@ class Mover(Strategy):
     def __init__(self, config: MoverConfig) -> None:
         super().__init__(config)
         self.settings = config
+        self.persistence = config.persistence
         self.spec_suffix = config.bar_spec
         self.submit_params = dict(EXTENDED_HOURS) if config.extended_hours else None
         self.feed_params = {"feed": config.feed} if config.feed else None
@@ -1144,6 +1224,13 @@ class Mover(Strategy):
 
     def on_trade(self, trade: Any) -> None:
         self.trades += 1
+        if self.persistence:
+            slot = self.slots.get(trade.instrument_id)
+            if slot is not None and slot.trail_trigger is not None and not slot.exiting:
+                # No print happened after it was received: one stamped ahead of its receipt is read
+                # at its receipt, so it cannot hide the prints that follow it behind the watermark.
+                stamp = min(int(trade.ts_event), int(trade.ts_init))
+                slot.observations.append((stamp, trade.price.as_decimal()))
 
     def record(self) -> dict[str, Any]:
         """What a run's report keeps of the strategy, in plain values: its rows, the ranking it last
@@ -1153,6 +1240,17 @@ class Mover(Strategy):
                 name: str(getattr(self.settings, name))
                 for name in OWN_FIELDS
                 if name != "max_shares" or not self.settings.size_from_budget
+            },
+            "persistence_arms": {
+                arm: {
+                    "state": "on" if count > 1 else "off",
+                    "count": count,
+                    "gap_ms": self.settings.confirm_gap_ms,
+                }
+                for arm, count in (
+                    ("breach", self.settings.breach_count),
+                    ("high", self.settings.high_count),
+                )
             },
             "rank": format_rank(self.rank),
             "rank_ns": self.rank_ns,
@@ -1609,6 +1707,12 @@ class Mover(Strategy):
             slot.was_held = False
             slot.exiting = False
             slot.floor = slot.trail_trigger = None
+            slot.trail_high = None
+            slot.observations.clear()
+            slot.high_observations.clear()
+            slot.breach_observations.clear()
+            slot.breach_price = None
+            slot.observed_ns = 0
             slot.entry_id = slot.protect_id = None
             slot.entry_cancel_ns = slot.priced_ns = 0
             slot.run_ns = slot.run_close = slot.run_seen_ns = None
@@ -1617,6 +1721,10 @@ class Mover(Strategy):
             slot.protection_anchor = None
 
     def _protect(self, slot: Slot, held: Decimal, now: int) -> None:
+        if self.persistence and not slot.exiting:
+            self._persistent_trail(slot, now)
+            if not slot.exiting:
+                return
         order = self._order(slot.protect_id)
         if slot.exiting and slot.floor is None and order is not None and order.price is not None:
             # the released sale's own price, whether it is open, filled or was refused
@@ -1632,6 +1740,14 @@ class Mover(Strategy):
             ):
                 return  # a sale the engine or the venue refused is sent again, every `chase_secs`
             if slot.exiting:
+                if self.persistence and slot.floor is None:
+                    quote = self.cache.quote(slot.instrument_id)
+                    if quote is not None:
+                        basis = quote.bid_price.as_decimal()
+                        if slot.breach_price is not None:
+                            basis = min(basis, slot.breach_price)
+                        first = exit_price(basis, self.settings.exit_ticks, None)
+                        slot.floor = chase_floor(first, self.settings.chase_cap)
                 self._limit_sell(slot, held, now, slot.floor)
             else:
                 self._trail(slot, held, now)
@@ -1653,6 +1769,84 @@ class Mover(Strategy):
                     self._trail(slot, held, now)
         elif slot.exiting:
             self._chase(slot, order, held, now, slot.floor)
+
+    def _persistent_trail(self, slot: Slot, now: int) -> None:
+        """Confirm queued trades in the step; no order is emulated with either persistence arm on.
+
+        Consecutive counted prints have at least G milliseconds between their times, with no expiry.
+        Any recovery resets the breach, even inside G or at the last print's own time; any print at
+        or under the confirmed high resets the high arm. A print with an older time than the last
+        read, a late report, is dropped: it neither counts nor resets. A new high is the lowest of
+        N supporting prints, so a spike alone cannot lift the level; with `high_count` at one
+        that arm is off and one higher print does lift it, a limit of a row with only the breach
+        arm on. The level is armed from the entry's average fill as it stands at the arming step and
+        is not re-based as a partly filled entry fills further. Confirmation latches through later
+        recoveries in this batch, and `_protect` sends the plain DAY limit in this same step.
+        """
+        entry = self._order(slot.entry_id)
+        if entry is None or entry.avg_px is None:
+            self._note(
+                slot,
+                f"{slot.instrument_id}: held with no filled entry of this strategy to size a "
+                "trailing sell from; not protected, and sold only at the wind-down",
+            )
+            return
+        trailing, _ = offsets(
+            Decimal(str(entry.avg_px)), self.settings.trail, self.settings.exit_through
+        )
+        if slot.trail_high is None or slot.trail_trigger is None:
+            # The level starts from the entry's own average fill, the one price here that is a trade
+            # of ours. A cached last print is a single observation: taken as the high, one stray
+            # print above the market would put the level over it and the next ordinary prints
+            # would sell. Prints after this step raise the high only as N of them confirm it.
+            bought = Decimal(str(entry.avg_px))
+            slot.trail_high = bought
+            slot.trail_trigger = stop_trigger_price(bought - trailing)
+            slot.observed_ns = 0
+            slot.observations.clear()
+            self._say(f"{slot.instrument_id}: persistence armed, trigger {slot.trail_trigger}")
+            return
+        gap_ns = self.settings.confirm_gap_ms * 1_000_000
+        # These prints have arrived already; exchange timestamps need not match the timer's clock.
+        while slot.observations:
+            stamp, price = slot.observations.popleft()
+            if stamp < slot.observed_ns:
+                continue  # an older time, a late report: it neither counts nor resets
+            # A print sharing the last time, as a sweep's prints can, is not a second observation:
+            # it may reset either arm and never counts.
+            fresh = stamp > slot.observed_ns
+            slot.observed_ns = stamp
+            highs = slot.high_observations
+            if price > slot.trail_high:
+                spaced = self.settings.high_count == 1 or not highs
+                if fresh and (spaced or stamp - highs[-1][0] >= gap_ns):
+                    highs.append((stamp, price))
+                    if len(highs) > self.settings.high_count:
+                        highs.popleft()
+                    if len(highs) == self.settings.high_count:
+                        slot.trail_high = max(slot.trail_high, min(p for _, p in highs))
+                        slot.trail_trigger = stop_trigger_price(
+                            max(slot.trail_trigger, slot.trail_high - trailing)
+                        )
+            else:
+                highs.clear()
+            breaches = slot.breach_observations
+            if price <= slot.trail_trigger:
+                if fresh and (not breaches or stamp - breaches[-1] >= gap_ns):
+                    breaches.append(stamp)
+                if len(breaches) >= self.settings.breach_count:
+                    slot.exiting = True
+                    slot.breach_price = price
+                    slot.observations.clear()
+                    self._say(
+                        f"{slot.instrument_id}: breach confirmed at {stamp}, trigger "
+                        f"{slot.trail_trigger}; selling by limit"
+                    )
+                    if not entry.is_closed:
+                        self._time_out(slot, entry, now)
+                    return
+            else:
+                breaches.clear()
 
     def _trail(self, slot: Slot, held: Decimal, now: int) -> None:
         """Submit the emulated trailing stop-limit for what is held, once the emulator has a price to

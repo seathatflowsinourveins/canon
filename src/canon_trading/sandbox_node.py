@@ -172,7 +172,7 @@ def rank_check(feed: str, baseline_path: str, minutes: int) -> dict[str, object]
     # the node, for at most the stream sample's span, which is what a window gives the pre-read.
     notes: list[str] = []
     reading = time.monotonic()
-    reader = start_reference_read(paper_trading(), notes)
+    reader, _ = start_reference_read(paper_trading(), notes)
     while not notes and time.monotonic() - reading < SAMPLE_MINUTES * 60:
         time.sleep(1)
     pre_read_wait = time.monotonic() - reading

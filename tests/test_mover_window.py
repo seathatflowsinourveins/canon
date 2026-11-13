@@ -4,6 +4,7 @@ import json
 import time
 from dataclasses import replace
 from datetime import UTC
+from datetime import date
 from datetime import datetime
 from datetime import timedelta
 from decimal import Decimal
@@ -803,9 +804,10 @@ def test_the_reference_pre_read_reads_every_loaded_asset_for_the_actors_key(monk
         return [SimpleNamespace(symbol="BBB"), SimpleNamespace(symbol="AAA")]
 
     notes: list[str] = []
-    reader = session_window.start_reference_read(
+    reader, read_future = session_window.start_reference_read(
         cast("TradingClient", SimpleNamespace(get_all_assets=get_all_assets)), notes
     )
+    assert read_future.result(timeout=10).read_ns == 7
     now = time.time_ns()
     key = (movers_rank_actor.reference_cutoff(now), movers_rank_actor.trade_date(now))
     assert reader(["AAA", "BBB"], *key).read_ns == 7
@@ -843,6 +845,67 @@ def test_the_reference_pre_read_runs_on_a_daemon_thread_and_names_a_failure(monk
         release.set()
     thread.join(10)
     assert notes == ["pre-read failed: RuntimeError: refused"]
+
+
+def _reference_read(found: int, asked: int, *, splits_read: bool = True):
+    from concurrent.futures import Future
+
+    from canon_trading import movers_rank_actor
+
+    refs = {
+        f"S{i}": movers_rank_actor.movers_rank.Reference(close=1.0, session=date(2026, 11, 11))
+        for i in range(found)
+    }
+    splits = (
+        movers_rank_actor.movers_rank.SplitRead(date(2026, 11, 11), date(2026, 11, 12), ())
+        if splits_read
+        else None
+    )
+    future: Future = Future()
+    future.set_result(
+        movers_rank_actor.ReferenceRead(
+            date(2026, 11, 12),
+            refs,
+            splits,
+            1_794_500_000_000_000_000,
+            asked=asked,
+            wall_secs=44.567,
+        )
+    )
+    return future
+
+
+def test_a_mover_window_has_its_references_in_before_the_node_and_records_the_read() -> None:
+    """The lead's hold of 2026-11-12, item (i): every reference in before the node starts, with the
+    read's wall time and its three counts in the record."""
+    got = session_window.references_before_node(_reference_read(3, 5), [], 1.0)
+    assert got["before_node"] is True
+    assert got["wall_secs"] == 44.57
+    assert (got["names_asked"], got["with_close"], got["without_close"]) == (5, 3, 2)
+    assert got["in_at"] == "2026-11-12T16:13:20.000+00:00"
+    waited = got["waited_secs"]
+    assert isinstance(waited, float) and 0 <= waited < 1
+
+
+def test_a_mover_window_without_its_references_in_is_refused_before_any_node() -> None:
+    from concurrent.futures import Future
+
+    pending: Future = Future()
+    with pytest.raises(session_window.WindowRefused, match="not in within 0.05 s"):
+        session_window.references_before_node(pending, [], 0.05)
+    failed: Future = Future()
+    failed.set_exception(TimeoutError("read timed out"))
+    with pytest.raises(session_window.WindowRefused, match="failed: TimeoutError: read timed out"):
+        session_window.references_before_node(failed, [], 1.0)
+    with pytest.raises(session_window.WindowRefused, match="did not start .not pre-read: X"):
+        session_window.references_before_node(None, ["not pre-read: X"], 1.0)
+    with pytest.raises(
+        session_window.WindowRefused, match="not usable: no reference close was read"
+    ):
+        session_window.references_before_node(_reference_read(0, 5), [], 1.0)
+    # code review of the snapshot read, finding 3: the gate refuses what the actor would refuse
+    with pytest.raises(session_window.WindowRefused, match="not usable: the splits were not read"):
+        session_window.references_before_node(_reference_read(3, 5, splits_read=False), [], 1.0)
 
 
 def test_the_record_times_the_first_publication_from_the_actors_start() -> None:

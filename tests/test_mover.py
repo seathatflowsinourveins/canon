@@ -2514,6 +2514,8 @@ class Borrowed:
         self.rankings: list = []
         self.quotes = 0
         self.trades = 0
+        self.persistence = False
+        self.slots: dict = {}
 
     def __getattr__(self, name: str):
         raise RuntimeError(f"Already mutably borrowed: {name}")
@@ -2841,6 +2843,7 @@ class Seam:
 
     _protect = Mover._protect
     _trail = Mover._trail
+    _persistent_trail = Mover._persistent_trail
     _followed = Mover._followed
     _limit_sell = Mover._limit_sell
     _sell_out = Mover._sell_out
@@ -2850,6 +2853,7 @@ class Seam:
 
     def __init__(self, bid: str, **rows: Any) -> None:
         self.settings = MoverConfig(max_notional=Decimal(50_000), max_move=Decimal(5), **rows)
+        self.persistence = self.settings.breach_count > 1 or self.settings.high_count > 1
         self.submit_params = None
         self.winding_down = False
         self.bid = bid

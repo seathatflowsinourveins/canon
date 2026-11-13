@@ -103,9 +103,10 @@ A, 2026-11-11), a market order would only queue ("Orders not eligible for extend
 4:00pm ET will be queued up for release the next trading day"), and Alpaca takes for extended hours "Only
 limit orders with `time_in_force` set to `day` or `gtc`" with `extended_hours` true (orders-at-alpaca); so,
 in a part of the extended session open by that clock and the window's calendar (`session_part`), the close
-is a DAY limit so marked, `LIMIT_OFFSET` through the latest quote on the part's feed, as the strategy and
-`custody`'s close-only form price theirs. It works only while the check runs and is canceled as it ends;
-with no part open none is sent. Either close is never sent while a request that could close the same
+is a DAY limit so marked, `LIMIT_OFFSET` through the latest quote on the part's feed, put on Alpaca's step
+by `close_limit` as `custody`'s close-only form puts theirs (the strategy's own still go through
+`through_the_touch`, in whole cents). It works only while the check runs and is canceled as it ends; with
+no part open none is sent. Either close is never sent while a request that could close the same
 shares is sent and not found, since
 a lookup that finds nothing does not show the order was never placed and Alpaca says not to resend one
 that timed out; such a window is recorded failed, naming the position and the request. What a market
@@ -197,6 +198,7 @@ from datetime import date
 from datetime import datetime
 from datetime import time as dt_time
 from datetime import timedelta
+from decimal import ROUND_CEILING
 from decimal import Decimal
 from decimal import InvalidOperation
 from pathlib import Path
@@ -242,6 +244,7 @@ from canon_alpaca.constants import ENV_SECRET_KEY
 from canon_alpaca.constants import FEED
 from canon_alpaca.constants import VENUE
 from canon_alpaca.execution import DEFINITIVE_SUBMIT_REFUSALS
+from canon_alpaca.execution import INSTRUMENT_REFUSAL
 from canon_alpaca.execution import ORDERS_PAGE_LIMIT
 from canon_alpaca.providers import CONNECT_TIMEOUT_SECS
 from canon_alpaca.providers import READ_TIMEOUT_SECS
@@ -264,6 +267,7 @@ from nautilus_trader.model import Quantity
 from nautilus_trader.model import StrategyId
 from nautilus_trader.model import TimeInForce
 
+from . import price_step
 from .mover import TRAIL_SETTINGS
 from .mover import Mover
 from .mover import MoverConfig
@@ -626,6 +630,10 @@ PAPER_LOCK_WAIT_SECS = 3900
 `STREAM_LOCK_WAIT_SECS`; a window holds account B's, not that one, since 2026-11-11), and how long
 `mise run paper:test` waits for account A's lock (`lockwait` in `mise.toml`); no window takes that lock,
 since windows run on account B under their own (ADR 0069). Tests read both, so the three cannot drift."""
+REFERENCES_BEFORE_NODE_SECS = 120.0
+"""How long a Mover window waits, before its node is built, for the reference read started with the stream
+sample (UNCALIBRATED: the snapshot read measured about 45 s for the whole market on account A on
+2026-11-12, at 1.1 s a request of 400)."""
 START_UP_SECS = 30
 """The process's start before Alpaca's clock is first read (`uv run`, the imports)."""
 LONGEST_WINDOW_SECS = math.floor(
@@ -1196,15 +1204,17 @@ def subscriptions(run: Mapping[str, Any], feed: str, assets: object) -> list[dic
     ]
 
 
-def start_reference_read(trading: TradingClient, notes: list[str]) -> ReferenceReader:
+def start_reference_read(
+    trading: TradingClient, notes: list[str]
+) -> tuple[ReferenceReader, Future[ReferenceRead]]:
     """Start the rank actor's reference read for the whole market before the node exists, so it runs
     during the stream sample and the first generation does not wait for it (the owner's plan of
     2026-11-12, Wave 0 (b); measured at about 90 s for 14,406 symbols on 2026-11-12). The symbols are the
     assets the data client's `load_all` loads (one GET, `assets_request`'s default filter); the key is the
     actor's own (`reference_cutoff`, `trade_date`) for now. The read runs on its own thread with the
-    environment's pair, GET only (`alpaca_reference_reader`)."""
+    environment's pair, GET only (`alpaca_reference_reader`). Returns the actor's reader and the read
+    itself, which `references_before_node` waits for before the node is built."""
     import threading
-    from concurrent.futures import Future
 
     from canon_alpaca.providers import assets_request
 
@@ -1237,7 +1247,43 @@ def start_reference_read(trading: TradingClient, notes: list[str]) -> ReferenceR
 
     future.set_running_or_notify_cancel()
     threading.Thread(target=read, name="reference-pre-read", daemon=True).start()
-    return prefetched_reference_reader(future, symbols, key, notes)
+    return prefetched_reference_reader(future, symbols, key, notes), future
+
+
+def references_before_node(
+    read: Future[ReferenceRead] | None, notes: list[str], bound_secs: float
+) -> dict[str, object]:
+    """Wait at most `bound_secs` for the window's reference read, so the node starts with every reference
+    in (the lead's hold of 2026-11-12, item (i)), and return what the record carries: the read's wall time,
+    the names it asked for, those with a close and those left without one, when it came in and how long
+    the window waited. A read that did not start, failed, is not in within the bound or found no close
+    refuses the window by name before any node exists."""
+    if read is None:
+        raise WindowRefused(f"the reference read did not start ({'; '.join(notes)})")
+    began = time.monotonic()
+    try:  # `exception` raises TimeoutError only for the wait; a read that failed with one returns it
+        error = read.exception(timeout=bound_secs)
+    except TimeoutError:
+        raise WindowRefused(
+            f"the reference read was not in within {bound_secs:g} s of the node's start"
+        ) from None
+    if error is not None:
+        raise WindowRefused(
+            f"the reference read failed: {type(error).__name__}: {error}"
+        ) from error
+    done = read.result()
+    from .movers_rank_actor import reference_problem
+
+    # the actor's own test of a read, so the node never starts on one the actor would refuse and read again
+    # (code review of the snapshot read, finding 3)
+    if (problem := reference_problem(done)) is not None:
+        raise WindowRefused(f"the reference read is not usable: {problem}")
+    return {
+        **done.counts(),
+        "before_node": True,
+        "in_at": datetime.fromtimestamp(done.read_ns / 1e9, UTC).isoformat(timespec="milliseconds"),
+        "waited_secs": round(time.monotonic() - began, 2),
+    }
 
 
 def dollar_basis() -> dict[str, str]:
@@ -1570,6 +1616,14 @@ class WindowReport:
     stream: list[str] = field(default_factory=list)
     """The adapter's own log lines about its stream (`STREAM_LINES`): alpaca-py's warnings and errors,
     the stream's end by itself and a subscription it refused. An error among them fails the window."""
+    instrument_refusals: int = 0
+    """The instrument notifications the node's log shows refused for a full command queue
+    (`canon_alpaca.execution.INSTRUMENT_REFUSAL`): an upstream limit at a whole-market start, one line
+    for each instrument past the 1,024 the execution client's queue holds, counted here so that they are
+    one known number and not read as the window's errors. The instruments themselves are in the cache
+    (the adapter's README, "Instrument load and the command queue"). It is the whole window's count: a
+    notification refused later, while the queue held real commands, is in it too, so compare it with the
+    instruments the data client loaded less 1,024."""
     warm_up_bars: int = 0
     warm_up_dropped: int = 0
     result: str = "running"
@@ -2707,6 +2761,7 @@ def run_window(
     basis: str | None = None
     pick: MoverPick | None = None
     reference_reader: ReferenceReader | None = None
+    reference_read: Future[ReferenceRead] | None = None
     reference_notes: list[str] = []
     entry_contexts: dict[InstrumentId, Day] = {}
     allocation: MoverAllocation | None = None
@@ -2740,8 +2795,8 @@ def run_window(
             allocation = mover_allocation(
                 trading, row.slots if config.slots is None else config.slots
             )
-            try:  # a pre-read that cannot start is named, and the actor reads at its own call
-                reference_reader = start_reference_read(trading, reference_notes)
+            try:  # a pre-read that cannot start is named; `references_before_node` then refuses the window
+                reference_reader, reference_read = start_reference_read(trading, reference_notes)
             except Exception as e:  # noqa: BLE001
                 reference_notes.append(f"not pre-read: {type(e).__name__}: {e}")
         pick = choose_mover(
@@ -2892,6 +2947,10 @@ def run_window(
         overnight = "; ".join(overnight_said)  # re-checked name by name above
     else:
         overnight = "; ".join(overnight_eligibility(trading, symbol) for symbol in window_symbols)
+    if config.strategy == MOVER and config.mover:
+        mover["references"] = references_before_node(
+            reference_read, reference_notes, REFERENCES_BEFORE_NODE_SECS
+        )
 
     now = clock.timestamp.astimezone(NEW_YORK)
     seconds, shortened = window_seconds(config.minutes, (end_of_session - now).total_seconds())
@@ -3359,8 +3418,9 @@ MAX_STREAM_LINES = 20
 def _read_stream_lines(report: WindowReport, log: Path) -> None:
     """Copy the adapter's stream lines from the node's log (`STREAM_LINES`, at most `MAX_STREAM_LINES`,
     then a count) into `report.stream`: the log is where the adapter reports a stream Alpaca refused or
-    that ended, since the subscription has returned by then (ADR 0055). A log that cannot be read is
-    noted in `errors`."""
+    that ended, since the subscription has returned by then (ADR 0055). Count, apart from them, the
+    instrument notifications upstream refused for a full queue (`report.instrument_refusals`). A log
+    that cannot be read is noted in `errors`."""
     # The node's logger writes on its own thread; wait until what it was sent is on disk
     # (`logging_sync_to_disk`, as the adapter's tests do).
     logging_sync_to_disk()
@@ -3369,6 +3429,9 @@ def _read_stream_lines(report: WindowReport, log: Path) -> None:
     except OSError as e:
         _note(report, f"reading the node log for the stream's own lines: {type(e).__name__}: {e}")
         return
+    report.instrument_refusals = sum(
+        all(mark in line for mark in INSTRUMENT_REFUSAL) for line in lines
+    )
     found = [line for line in lines if any(mark in line for mark in STREAM_LINES)]
     report.stream = found[:MAX_STREAM_LINES]
     if len(found) > MAX_STREAM_LINES:
@@ -3878,12 +3941,25 @@ class _AccountCheck:
         self._seen(request, order)
 
 
+class QuoteTooWide(ValueError):
+    """`close_limit`'s refusal of a quote too wide to close on. Its text is the window's own (the bid,
+    the ask, the symbol), never an answer's body, so a report may print it."""
+
+
+PENNY_NAME_ASK = Decimal("0.10")
+"""A sell close under Alpaca's finest step goes at the lowest step only when the ask is also under
+this: a name truly worth pennies. With a higher ask the bid alone pulls the limit far under the
+market, so the close is refused as a quote too wide to close on (the lead, 2026-11-12)."""
+
+
 def close_limit(data: Any, symbol: str, side: str, part: str) -> tuple[Decimal, str]:
     """The limit of a close of `side` in `part` outside the regular session: `LIMIT_OFFSET` through the
-    touch of alpaca-py's latest quote on the part's feed (`get_stock_latest_quote`, `window_feed`), as the
-    strategy prices its own (`through_the_touch`), and the quote it came from, with its time, for the
-    record. `ValueError` with no price on the side the close takes; `window_feed`'s error for a part with
-    no feed. The account check after a stop and `custody`'s close-only form both price this way."""
+    touch of alpaca-py's latest quote on the part's feed (`get_stock_latest_quote`, `window_feed`),
+    put on Alpaca's step by `price_step` (a sell down, a buy up), and the quote it came from, with its
+    time, for the record. A sell under the finest step goes at 0.0001 and the record says so, when the
+    ask is under `PENNY_NAME_ASK`; with a higher ask, or none, it is refused as too wide a quote.
+    `ValueError` with no price on the side the close takes; `window_feed`'s error for a part with no
+    feed. The account check after a stop and `custody`'s close-only form both price this way."""
     feed = window_feed(part)
     found = data.get_stock_latest_quote(
         StockLatestQuoteRequest(symbol_or_symbols=symbol, feed=DataFeed(feed))
@@ -3896,17 +3972,34 @@ def close_limit(data: Any, symbol: str, side: str, part: str) -> tuple[Decimal, 
     touch, name = (bid, "bid") if side == "sell" else (ask, "ask")
     if touch <= 0:
         raise ValueError(f"the latest {feed} quote in {symbol} has no {name} ({touch})")
-    limit = through_the_touch(
-        OrderSide.SELL if side == "sell" else OrderSide.BUY, bid, ask, LIMIT_OFFSET
-    )
-    if limit <= 0:
-        raise ValueError(f"the {name} {touch} less {LIMIT_OFFSET} is not a price")
+    raw = touch - LIMIT_OFFSET if side == "sell" else touch + LIMIT_OFFSET
+    # a sell down and a buy up onto Alpaca's step, above the tick scheme's top too: a close is never
+    # refused there (the lead's ruling (ii), 2026-11-12), where a buy's entry is
+    if side == "buy":
+        # up to the finest step first: `up_on_step`'s nudge would take a finer value to the tick under it
+        limit = price_step.up_on_step(raw.quantize(price_step.SUB_DOLLAR, rounding=ROUND_CEILING))
+    else:
+        limit = price_step.down_on_step(raw) if raw > 0 else Decimal(0)
+    clamp = ""
+    if limit < price_step.SUB_DOLLAR:
+        under = f"the {name} {touch} less {LIMIT_OFFSET} is {raw}, under Alpaca's finest step"
+        if not 0 < ask < PENNY_NAME_ASK:
+            # the bid alone says pennies, the ask does not: refused, and the next poll asks again
+            raise QuoteTooWide(
+                f"{under}, and the ask {ask} is not under {PENNY_NAME_ASK}: a quote too wide to "
+                f"close on ({symbol})"
+            )
+        # a name worth pennies: a close exists to close, so it goes at the lowest step and says so
+        limit = price_step.SUB_DOLLAR
+        clamp = f"; {under}, so the close is sent at the lowest, {limit}"
+    # Already on the step: express that step's decimal places in the close record.
+    limit = limit.quantize(price_step.tick(limit))
     at = getattr(quote, "timestamp", None)
     if isinstance(at, datetime):  # alpaca-py's are aware; a naive one is taken as UTC
         when = f"at {(at.astimezone(UTC) if at.tzinfo else at):%H:%M:%S} UTC"
     else:
         when = "with no time given"
-    return limit, f"{feed} quote {when}, bid {bid}, ask {ask}"
+    return limit, f"{feed} quote {when}, bid {bid}, ask {ask}{clamp}"
 
 
 def _closing_side(held: Decimal) -> str:
@@ -4130,6 +4223,7 @@ def window_signals() -> Generator[None]:
     finally:
         for s, handler in found.items():
             signal.signal(s, signal.SIG_DFL if handler is None else handler)
+        _SIGNALS.__init__()  # nothing of this window's signal reaches a later one in the process (review)
 
 
 def _run_node(node: LiveNode, ends: datetime) -> None:
@@ -4365,11 +4459,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         with window_signals():
             code = _main(args)
-    except (
-        WindowSignalled
-    ) as e:  # a stop: said, and the exit a shell gives for the signal (128 + its number)
+            if (
+                _SIGNALS.first is not None
+            ):  # it came after the node: recorded failed, the wind-down finished
+                code = 128 + signal.Signals[_SIGNALS.first].value
+    except WindowSignalled as e:
+        # a stop: said, and the exit a shell gives for the signal (128 + its number)
         print(f"paper:session: {e}", file=sys.stderr)
-        code = 128 + signal.Signals[_SIGNALS.first].value if _SIGNALS.first else 1
+        named = re.search(r"stopped by (SIG[A-Z]+)", str(e))
+        code = 128 + signal.Signals[named.group(1)].value if named else 1
         if _ABANDONED:
             try:
                 write_heartbeat(args.log_dir, f"failed: {type(e).__name__}: {e}")

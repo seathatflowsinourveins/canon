@@ -1396,19 +1396,23 @@ do_status() {
     fi
     if [ -f "$PAPER_DIR/latest.json" ]; then
       # the window's own record decides; a `running` one past its stale_after, or older than a run that came
-      # after it (which held the paper lock, so the window was no longer running), belongs to a window that died
+      # after it (which held the paper lock, so the window was no longer running), belongs to a window that died;
+      # so does a `stopping` one (a signal came and the wind-down never finished: session_window._shown_record)
       # shellcheck disable=SC2016  # jq program, not shell
       v=$(jq -r --argjson now "$(date -u +%s)" --argjson stale "$PAPER_STALE" --argjson heard "$hb_at" "$PAPER_COMMIT"'
             ((($now - (.started_epoch // 0)) / 60) | floor) as $m
             | (.result // "") as $r
             | ($heard != null and $heard > (.started_epoch // 0)) as $later
-            | (($r | startswith("running")) and (($m * 60) > (.stale_after // $stale) or $later)) as $died
-            | (if $r == "ok" then "ok" elif $died then "DIED" elif ($r | startswith("running")) then "ok"
+            | ($r | startswith("running") or startswith("stopping")) as $open
+            | ($open and (($m * 60) > (.stale_after // $stale) or $later)) as $died
+            | (if $r == "ok" then "ok" elif $died then "DIED" elif $open then "ok"
                elif ($r | startswith("refused")) then "REFUSED" else "FAILED" end) + "\t"
               + "last window " + (.started // "?") + " of " + (.strategy // "SessionMaCross")
               + " (" + ($m | tostring) + " min ago, " + (.session // "?")
               + ", account " + (.account // "not recorded" | tostring) + ", commit " + (.commit | short) + "): "
-              + (if $died and $later then "still running by its record, but a run after it took the paper lock, so it died;"
+              + (if $died and ($r | startswith("stopping")) then $r + ", and it never did: the wind-down was cut short"
+                   + " (a kill after the signal); the account may not be flat, and the next window starts only once it is"
+                 elif $died and $later then "still running by its record, but a run after it took the paper lock, so it died;"
                    + " the account may not be flat, and the next window starts only once it is"
                  elif $died then "still running after " + ($m | tostring)
                    + " min, so it died; the next window starts only once the account is flat" else $r end)

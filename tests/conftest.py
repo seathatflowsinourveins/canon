@@ -39,6 +39,7 @@ from datetime import datetime
 from datetime import timedelta
 from statistics import NormalDist
 from time import monotonic
+from time import time_ns
 from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
@@ -393,3 +394,35 @@ def no_holdout_opened_in_the_main_checkout(
     monkeypatch.setattr(
         early_entry_study, "default_holdout_root", lambda: ledger.parent / "holdouts"
     )
+
+
+@pytest.fixture
+def references_in(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A Mover window's references are in before its node (the lead's hold of 2026-11-12, item (i)); window
+    tests' stub clients list no assets, so the reference read is one already in, of one name."""
+    from concurrent.futures import Future
+
+    from canon_trading import movers_rank_actor
+    from canon_trading import session_window
+
+    def start(trading: object, notes: list[str]):
+        read: Future[movers_rank_actor.ReferenceRead] = Future()
+        read.set_result(
+            movers_rank_actor.ReferenceRead(
+                datetime(2026, 11, 11).date(),
+                {
+                    "AAA": movers_rank_actor.movers_rank.Reference(
+                        close=1.0, session=datetime(2026, 11, 10).date()
+                    )
+                },
+                movers_rank_actor.movers_rank.SplitRead(
+                    datetime(2026, 11, 10).date(), datetime(2026, 11, 11).date(), ()
+                ),
+                time_ns(),
+                asked=1,
+                wall_secs=0.0,
+            )
+        )
+        return (lambda symbols, cutoff, session: read.result()), read
+
+    monkeypatch.setattr(session_window, "start_reference_read", start)

@@ -15,6 +15,14 @@ joined and the task ended in `_disconnect`, each wait bounded by a deadline on t
 task drain at disconnect; a wait that runs out fails the disconnect, logged with its reason. Hooks not overridden here
 raise `NotImplementedError`.
 
+Instruments at connect: the provider's instruments are handed to the node unless its cache already holds
+them, which it does for whatever the data client loaded, since the node connects data clients and fills
+the cache first (`crates/live/src/node/mod.rs:35-48` at `nautilus-trader@d53849b216e2`). Each instrument
+handed over is one notification on this client's command queue of 1,024 (the guide, "Process commands in
+order", `docs/developer_guide/python_adapters.md:168-170`, and `:408`), and upstream refuses those past
+its capacity at a whole-market start whatever this client does; the README states that limit ("Instrument
+load and the command queue") and `tests/test_instrument_load.py` counts it.
+
 Reduce-only follows the send-or-reject contract in `docs/concepts/adapters.md` at
 `nautilus-trader@d53849b216e2`: an equivalent enforcing venue instruction may replace the literal flag.
 `reduce_only_sells` is false by default: every reduce-only order is denied before transport with
@@ -455,6 +463,14 @@ TASK_ABORT_SECS = 2.0
 REASON_MAX_CHARS = 200
 """Venue text in a rejection reason is cut to this length; NautilusTrader's policies ask adapters to "bound
 untrusted venue text before emission"."""
+
+INSTRUMENT_REFUSAL = ("instrument update failed", "command queue is full")
+"""What a line of the node's log holds when NautilusTrader refused an instrument's notification to this
+client because its command queue was full: `Client ALPACA instrument update failed: RuntimeError: Client
+ALPACA command queue is full` (`crates/live/src/python/client/mod.rs:1960-1972` and
+`crates/live/src/python/runtime.rs:187-192` at the pinned `d53849b216e2`). `tests/test_instrument_load.py`
+reads it off a real node's log, so a rewording upstream fails there; a window's record counts by it
+(`canon_trading.session_window`)."""
 
 DEFINITIVE_SUBMIT_REFUSALS = frozenset({403, 422})
 """Statuses "Create an Order" documents for a refused order: 403 "Buying power or shares is not
@@ -1509,8 +1525,15 @@ class AlpacaExecutionClient(ExecutionClient):
         )  # a client passed in too; refused without a session (ADR 0039)
         send_order_commands_once(self._trading)  # refused the same way
         await self._provider.initialize()
+        # Only what the cache does not hold. The node connects its data clients and puts their
+        # instruments into the cache before it connects an execution client ("so that instruments are
+        # in the cache before execution clients read them", `crates/live/src/node/mod.rs:35-48` at the
+        # pin), and every instrument handed to the node is one more notification on this client's
+        # command queue of 1,024, refused past that (the README, "Instrument load and the command queue").
+        held = set(self.cache.instrument_ids(VENUE))
         for instrument in self._provider.list_all():
-            self._handle_instrument(instrument)
+            if instrument.id not in held:
+                self._handle_instrument(instrument)
         await self._report_account()
         self._updates = asyncio.Queue()
         self._idle = asyncio.Event()
