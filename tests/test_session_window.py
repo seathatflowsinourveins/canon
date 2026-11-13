@@ -1715,6 +1715,7 @@ def quiet_window(
     baseline_file=True,
     trail=None,
     trigger="bid_ask",
+    validate_trade_sequence=False,
 ):
     """A window of `strategy` whose node runs at once, its strategy having seen `quotes`, `trades` and
     `live_bars`, and its node log holding the lines `log`; returns the report or the error, and the
@@ -1785,6 +1786,7 @@ def quiet_window(
                 request_limit_per_minute=request_limit_per_minute,
                 **(trail or {}),
                 trigger=trigger,
+                validate_trade_sequence=validate_trade_sequence,
             )
         )
     except RuntimeError as e:
@@ -10504,3 +10506,168 @@ def test_a_refused_windows_record_carries_the_trigger_its_config_had(monkeypatch
     latest = json.loads((tmp_path / "latest.json").read_text())
     assert latest["result"] == "refused: the test refuses here"
     assert latest["trigger"] == "last_price"
+
+
+# -- The adapter's trade-sequence check, chosen per window (ADR 0134) --------------------------------
+
+
+@pytest.mark.parametrize(
+    ("trigger", "sequence"), [("bid_ask", False), ("bid_ask", True), ("last_price", False)]
+)
+def test_a_window_turns_the_data_clients_trade_sequence_check_on_only_when_asked(
+    monkeypatch, tmp_path, trigger: str, sequence: bool
+) -> None:
+    """`--validate-trade-sequence` names ADR 0134's check on the data client's config, and a print
+    trigger the trade-condition filter, and neither changes the other; with neither, the data client's
+    config is the plain one it was. The two together are refused (the case below)."""
+    from canon_alpaca.data import AlpacaDataClientConfig
+    from nautilus_trader.config import DataClientConfig
+
+    configs = data_client_configs(monkeypatch)
+    ends = AT + timedelta(minutes=30)
+    node, _, _ = session_window.window_node(
+        WindowConfig(
+            symbol="LLL",
+            mover=True,
+            strategy="Mover",
+            session="extended",
+            log_dir=tmp_path,
+            trigger=trigger,
+            validate_trade_sequence=sequence,
+        ),
+        wind_down_at=ends - timedelta(seconds=session_window.FLATTEN_SECS),
+        log_name=f"sequence-{trigger}-{sequence}",
+        feed="sip",
+        part="after-hours",
+        pick=mover_pick(),
+        entry_notional=Decimal(500),
+        loss_share=PAPER_LOSS_SHARE,
+        ends=ends,
+    )
+    try:
+        [config] = configs
+        assert config.instrument_provider.load_all is True
+        if trigger == "bid_ask" and not sequence:
+            assert type(config) is DataClientConfig
+        else:
+            assert isinstance(config, AlpacaDataClientConfig)
+            assert config.trade_condition_filter is (trigger == "last_price")
+            assert config.validate_trade_sequence is sequence
+    finally:
+        node.dispose()
+
+
+@pytest.mark.parametrize("sequence", [False, True])
+def test_a_mover_windows_record_says_whether_the_trade_sequence_check_is_on(
+    monkeypatch, tmp_path, sequence: bool
+) -> None:
+    monkeypatch.setattr(session_window, "window_data", lambda: Quoted())
+    monkeypatch.setattr(session_window, "choose_mover", lambda *a, **k: mover_pick())
+    outcome, latest, _ = quiet_window(
+        monkeypatch,
+        tmp_path,
+        quotes=1,
+        trades=0,
+        account=Assets(),
+        mover=True,
+        strategy="Mover",
+        validate_trade_sequence=sequence,
+    )
+    assert not isinstance(outcome, Exception), outcome
+    assert latest["mover"]["validate_trade_sequence"] is sequence
+
+
+def test_the_trade_sequence_flag_is_off_unless_given_and_reaches_the_windows_config() -> None:
+    mover_args = ["--session", "regular", "--strategy", "Mover", "--mover"]
+    assert session_window._args(mover_args).validate_trade_sequence is False
+    args = session_window._args([*mover_args, "--validate-trade-sequence"])
+    assert args.validate_trade_sequence is True
+    assert session_window.window_config(args, "regular").validate_trade_sequence is True
+    assert WindowConfig(symbol="LLL").validate_trade_sequence is False
+
+
+def test_the_trade_sequence_flag_is_movers_and_refused_without_it(capsys) -> None:
+    """The check's tally is in Mover's record, so the flag is Mover's, as `--trigger` is: refused when
+    the arguments are read unless the run can start a Mover window, and by the config for a strategy
+    that is not Mover."""
+    with pytest.raises(SystemExit):
+        session_window._args(["--session", "regular", "--validate-trade-sequence"])
+    assert "--validate-trade-sequence" in capsys.readouterr().err
+    with pytest.raises(ValueError, match="validate_trade_sequence"):
+        WindowConfig(symbol="LLL", validate_trade_sequence=True)
+
+
+def test_the_trade_sequence_check_under_a_print_trigger_is_refused_by_name(capsys) -> None:
+    """Under a print trigger Mover judges a late print itself (it counts one toward a held stop's low),
+    so the data client's check, which sets a late print aside before any strategy sees it, must not
+    stand in front of it there (the lead's ruling, 2026-11-13). The window's config refuses the two
+    together by name, and so do the arguments when they are read."""
+    refusal = "Mover judges a late print itself under a print trigger"
+    with pytest.raises(ValueError, match=refusal):
+        WindowConfig(
+            symbol="LLL",
+            mover=True,
+            strategy="Mover",
+            session="extended",
+            trigger="last_price",
+            validate_trade_sequence=True,
+        )
+    argv = ["--session", "extended", "--mover", "--validate-trade-sequence"]
+    with pytest.raises(SystemExit):
+        session_window._args([*argv, "--trigger", "last_price"])
+    said = capsys.readouterr().err
+    assert "--validate-trade-sequence" in said and "--trigger last_price" in said
+    assert refusal in " ".join(said.split())
+    # the default trigger with the check, and a print trigger without it, both stand
+    assert session_window._args([*argv, "--trigger", "bid_ask"]).validate_trade_sequence is True
+    WindowConfig(
+        symbol="LLL", mover=True, strategy="Mover", session="extended", validate_trade_sequence=True
+    )
+    WindowConfig(
+        symbol="LLL", mover=True, strategy="Mover", session="extended", trigger="last_price"
+    )
+
+
+@pytest.mark.parametrize("sequence", [False, True])
+def test_a_refused_windows_record_says_whether_the_trade_sequence_check_was_asked(
+    monkeypatch, tmp_path, sequence: bool
+) -> None:
+    """The record a refusal leaves carries the flag beside the trigger once the window's config was
+    made, so a reader of a refused window knows what it would have run."""
+
+    def window(config, **_kwargs):
+        raise session_window.WindowRefused("the test refuses here")
+
+    monkeypatch.setattr(session_window, "run_window", window)
+    monkeypatch.setattr(session_window, "paper_account", lambda: "windows")
+    argv = ["--session", "extended", "--mover"] + (
+        ["--validate-trade-sequence"] if sequence else []
+    )
+    assert session_window.main([*argv, "--log-dir", str(tmp_path)]) == 1
+    latest = json.loads((tmp_path / "latest.json").read_text())
+    assert latest["result"] == "refused: the test refuses here"
+    assert latest["validate_trade_sequence"] is sequence
+
+
+def test_a_trade_sequence_flag_a_part_does_not_run_is_said(monkeypatch, tmp_path, capsys) -> None:
+    """`--session auto --mover --validate-trade-sequence` in a regular part that runs another strategy
+    runs no check there; it says so rather than drop the flag unseen (AGENTS.md rule 5)."""
+    seen = []
+
+    class At(Account):
+        def get_clock(self) -> Clock:
+            return clock(datetime(2026, 11, 10, 11, 0, tzinfo=NEW_YORK), is_open=True)
+
+    def window(config, **_kwargs):
+        seen.append((config.strategy, config.validate_trade_sequence))
+        raise session_window.WindowSkipped("the test stops here")
+
+    monkeypatch.setattr(session_window, "EXTENDED_READY", True)
+    monkeypatch.setattr(session_window, "paper_trading", lambda: At())
+    monkeypatch.setattr(session_window, "run_window", window)
+    argv = ["--session", "auto", "--mover", "--log-dir", str(tmp_path), "--validate-trade-sequence"]
+    assert session_window.main(argv) == 0
+    assert seen == [(session_window.DEFAULT_STRATEGY, False)]
+    out = capsys.readouterr().out
+    assert "--validate-trade-sequence not run" in out
+    assert f"runs {session_window.DEFAULT_STRATEGY}" in out

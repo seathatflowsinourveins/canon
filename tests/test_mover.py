@@ -2897,6 +2897,7 @@ class Seam:
     _mark_exit = Mover._mark_exit
     _hold = Mover._hold
     _held_at_l = Mover._held_at_l
+    _record_held_stop = Mover._record_held_stop
     _end_hold = Mover._end_hold
     _held_anchor = Mover._held_anchor
     _last_known = Mover._last_known
