@@ -25,6 +25,8 @@
 # <plugins>/cache/<marketplace>/claude-hud/<version>/hud.mjs (the cache layout
 # https://code.claude.com/docs/en/plugins/security.md gives; <plugins> is CLAUDE_CODE_PLUGIN_CACHE_DIR when set,
 # as the HUD's own launcher reads it), run with node (from PATH, else mise). It reads canon's claude-hud.json beside settings.json.
+# When canon/fleet-rate.sh is installed beside this, the HUD is given it as --extra-cmd, with the opt-in
+# CLAUDE_HUD_ALLOW_EXTRA_CMD=1 its README asks for, and shows its fleet label on the first line.
 # It gets the same input with model.display_name set to model.id, so the model actually in use is shown, and,
 # when a compaction window applies, context_window.context_window_size set to it and used_percentage removed, so
 # the HUD measures its bar against the point where this session compacts (its config sets no autoCompactWindow
@@ -140,6 +142,8 @@ hud_command() {
   node=$(command -v node 2>/dev/null) || node=$(mise which node 2>/dev/null) || node=""
   v="$dir/hud.mjs"
   printf '%s\n%s\n' "${node:-node-not-found}" "$v"
+  # the fleet label (fleet-rate.sh), through the HUD's --extra-cmd, which runs its argument in a shell
+  [ ! -x "$cfg/canon/fleet-rate.sh" ] || printf -- '--extra-cmd\n%q\n' "$cfg/canon/fleet-rate.sh"
 }
 
 # scrub: terminal hyperlinks, e-mail addresses, and the repository owner and the home folder's user name as
@@ -190,7 +194,7 @@ if [ "${#cmd[@]}" -eq 0 ]; then
   canon_line | scrub
 # the HUD reports its own failures (an internal error, a Node too old) as a line that sends the reader to its
 # /hud skill and exits 0; that counts as a failure here, since canon does not run that skill's install
-elif [ -x "${cmd[0]}" ] && shown=$(printf '%s' "$hud_input" | "${cmd[@]}" 2>/dev/null) && [ -n "$shown" ] \
+elif [ -x "${cmd[0]}" ] && shown=$(printf '%s' "$hud_input" | CLAUDE_HUD_ALLOW_EXTRA_CMD=1 "${cmd[@]}" 2>/dev/null) && [ -n "$shown" ] \
      && case "$shown" in *"/hud"*) false ;; *) true ;; esac; then
   printf '%s\n' "$shown" | scrub
 else
