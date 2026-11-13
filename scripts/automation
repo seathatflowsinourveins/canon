@@ -1684,8 +1684,21 @@ do_status() {
   local origin mise_bin mise_err=""
   mise_bin=$(find_mise 2>/dev/null) || { mise_err=$(find_mise 2>&1); mise_bin=""; }
   if origin=$(git -C "$ROOT" remote get-url origin 2>/dev/null); then
+    # scripts/land's spent_budget, read first as land reads it: GET /rate_limit is not counted against the
+    # budget, and a spent one fails gh's own check, which would read as signed out (see scripts/land)
+    local name limit reset when spent=""
+    if [ -n "$mise_bin" ] && read -r name limit reset < <(cd "$ROOT" && "$mise_bin" exec -- gh api rate_limit --jq '.resources | to_entries[]
+          | select((.key == "core" or .key == "graphql") and .value.remaining == 0)
+          | "\(.key) \(.value.limit) \(.value.reset)"' 2>/dev/null) && [ -n "$reset" ]; then
+      when=$(date -r "$reset" '+%Y-%m-%d %H:%M:%S %Z' 2>/dev/null || date -d "@$reset" '+%Y-%m-%d %H:%M:%S %Z' 2>/dev/null) \
+        || when="epoch $reset"
+      [ "$name" = graphql ] && name=GraphQL || name=REST
+      spent="GitHub's $name budget is spent (0 of $limit) until $when"
+    fi
     if [ -z "$mise_bin" ]; then
       check_row "landing" UNKNOWN "cannot ask gh whether it is signed in: $mise_err"
+    elif [ -n "$spent" ]; then
+      check_row "landing" UNKNOWN "$spent, so scripts/land cannot land on $(repo_label "$origin") before then"
     elif (cd "$ROOT" && "$mise_bin" exec -- gh auth status >/dev/null 2>&1); then
       row "landing" ok "scripts/land: pull request, local sign-off, squash merge ($(repo_label "$origin"))"
     else row "landing" OFF "gh is not signed in, so scripts/land cannot reach $(repo_label "$origin"); run: gh auth login"; bad=1; fi

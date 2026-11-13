@@ -37,13 +37,14 @@
 # warning, as does a named test the tree lacks. It never refuses a change for a missing or malformed marker. scripts/fix-index lists them.
 # gh flags used are from gh's own help (gh 2.103.3): auth status, pr create --title/--body-file,
 # pr merge --squash/--auto/--match-head-commit/--subject/--body-file, pr checks --required --json, pr checkout --worktree,
-# pr view --json/--jq (title, body, state), pr list --json/--jq, api (commit statuses).
+# pr view --json/--jq (title, body, state), pr list --json/--jq, api (commit statuses; rate_limit --jq).
 set -uo pipefail
 SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 CHECK_ADDRESSES="$(dirname "$SELF")/check-addresses"
 ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || { echo "land: not inside a git repository" >&2; exit 1; }
 cd "$ROOT" || exit 1
-die()  { echo "land: $*" >&2; exit 1; }
+# die: once gh is in use, a failure also names a spent GitHub budget, whichever gh call met it (spent_budget)
+die()  { local b=""; [ "${GH_IN_USE:-0}" = 1 ] && b=$(spent_budget) && b="; $b"; echo "land: $*$b" >&2; exit 1; }
 note() { echo "land: $*"; }
 USAGE="usage: scripts/land [--body <file>] [--reviewed <note>] [--dry-run] [--pr <number>]"
 
@@ -74,14 +75,35 @@ if command -v mise >/dev/null 2>&1; then MISE=$(command -v mise)
 elif [ -x "$HOME/.local/bin/mise" ]; then MISE="$HOME/.local/bin/mise"
 else die "mise not found. Run scripts/bootstrap --install."; fi
 gh() { "$MISE" exec -- gh "$@"; }
+# spent_budget: when GitHub's REST budget (`core`) or its GraphQL budget (`graphql`, which gh's pr commands
+# spend) has no call left, print "GitHub's REST budget is spent (0 of <limit>) until <date time zone>, in
+# <n> min" and succeed; otherwise, or when it cannot be read, fail. GET /rate_limit "does not count against
+# your REST API rate limit", lists both under `resources`, and gives `reset` in UTC epoch seconds
+# (docs.github.com, rest/rate-limit and rest/using-the-rest-api/rate-limits-for-the-rest-api, read
+# 2026-11-12). A spent budget answers 403 or 429; `gh auth status` GETs the API root and fails on any
+# answer but 200 (gh at its pin, pkg/cmd/auth/shared/oauth_scopes.go:35-60), so it reads as signed out.
+# A secondary rate limit leaves both budgets with calls and is not named here.
+spent_budget() {
+  local name limit reset when
+  read -r name limit reset < <(gh api rate_limit --jq '.resources | to_entries[]
+      | select((.key == "core" or .key == "graphql") and .value.remaining == 0)
+      | "\(.key) \(.value.limit) \(.value.reset)"' 2>/dev/null) && [ -n "$reset" ] || return 1
+  when=$(date -r "$reset" '+%Y-%m-%d %H:%M:%S %Z' 2>/dev/null || date -d "@$reset" '+%Y-%m-%d %H:%M:%S %Z' 2>/dev/null) \
+    || when="epoch $reset"
+  [ "$name" = graphql ] && name=GraphQL || name=REST
+  echo "GitHub's $name budget is spent (0 of $limit) until $when, in $(( (reset - $(date +%s) + 59) / 60 )) min"
+}
 
 # The local path is for a repository with no origin at all. With an origin, landing goes through GitHub
 # or not at all, and a pull request's run never lands locally.
 remote=""
 if git remote get-url origin >/dev/null 2>&1; then
   remote=origin
+  # a spent budget fails gh's own check too, so it is read first and named, never called a sign-out
+  if spent=$(spent_budget); then die "$spent, so nothing was landed; run this again after then"; fi
   gh auth status >/dev/null 2>&1 \
     || die "this repository has an origin remote, but gh is not signed in or cannot reach GitHub, so nothing was landed. Sign in with: mise exec -- gh auth login (check with: mise exec -- gh auth status), then run this again"
+  GH_IN_USE=1
 fi
 [ -n "$remote" ] || [ -z "$INNER_PR" ] || die "pull request $INNER_PR has no origin remote to land through; nothing was landed"
 # What a branch must contain before it lands: GitHub's main where there is a remote, the local one otherwise.
@@ -471,15 +493,18 @@ num=${found%% *}; url=${found#* }
 # Record the review first: `signoff` is the status the ruleset waits for, so nothing can merge before the
 # note is on the commit. (A status description holds 140 characters; the note was cut to that when read.)
 [ -n "$review_note" ] || die "no review note to record on $url"
-gh api -X POST "repos/{owner}/{repo}/statuses/$sha" -f state=success -f context=review \
-   -f description="$review_note" >/dev/null || die "could not record the review on $url"
+# refused <context> <gh's answer>: a status GitHub did not take fails the land, naming it and what GitHub
+# said (and, through die, a spent budget)
+refused() { die "GitHub refused the $1 status on $url, so nothing was merged: ${2:-no answer}"; }
+answer=$(gh api -X POST "repos/{owner}/{repo}/statuses/$sha" -f state=success -f context=review \
+   -f description="$review_note" 2>&1 >/dev/null) || refused review "$answer"
 
 # Local sign-off. scripts/ci has just passed on exactly this commit, so record that on GitHub as the
 # `signoff` commit status, which the ruleset on main requires. A status belongs to one commit, so a later
 # push needs its own sign-off. This is 37signals' local-CI practice (basecamp/gh-signoff) with the same
 # status name, done through GitHub's commit status API.
-gh api -X POST "repos/{owner}/{repo}/statuses/$sha" -f state=success -f context=signoff \
-   -f description="scripts/ci passed locally" >/dev/null || die "could not post the sign-off status for $url"
+answer=$(gh api -X POST "repos/{owner}/{repo}/statuses/$sha" -f state=success -f context=signoff \
+   -f description="scripts/ci passed locally" 2>&1 >/dev/null) || refused signoff "$answer"
 
 # The ruleset also requires the hosted workflow's aggregating job, which runs the same script on GitHub's
 # runners. Both merge calls name the commit that was checked, so GitHub refuses to merge anything else,
