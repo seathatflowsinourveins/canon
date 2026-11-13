@@ -61,7 +61,8 @@ order that replaces another counts only what it filled beyond that one: Alpaca's
 order on", its filled quantity counting the fills before it (ADR 0042, paper, 2026-11-10), so a chain of
 ours is counted once, and the fills of a foreign order in a chain stay foreign whatever replaced it. A
 replacement of ours with fills whose replaced order the listing does not hold (one working since before the
-lookback) carries fills that cannot be told apart, and freezes the symbol; one with no fills, as a resting
+lookback) carries fills that cannot be told apart, and freezes the symbol; so does one whose replaced
+order is listed without a fill count, since what is not shown is not zero; one with no fills, as a resting
 stop tightened days after it was placed, carries none and counts nothing. A long
 is ours to close only when it is exactly that net. On an account held long-only, ours at the lookback's start
 is not negative, so the net over the lookback is never more than what ours holds now, and a match never takes
@@ -290,6 +291,19 @@ def _qty(field: object) -> Decimal:
     return Decimal(str(field)) if field not in (None, "") else Decimal(0)
 
 
+def _shown(field: object) -> Decimal | None:
+    """A quantity as a listing shows it, or None when it shows none or one that is no finite number.
+    alpaca-py's `Order.filled_qty` may be absent (`alpaca/trading/models.py:283` at the pin), and what
+    is not shown is not zero."""
+    if field in (None, ""):
+        return None
+    try:
+        value = Decimal(str(field))
+    except ArithmeticError:
+        return None
+    return value if value.is_finite() else None
+
+
 def describe(order: Order) -> str:
     """An order by name for a report: ours by its client order ID, a foreign one by what it is (never its
     ID, which may be the owner's)."""
@@ -355,7 +369,15 @@ def _opened(trading: TradingClient, symbol: str, now: datetime) -> tuple[Decimal
                     f"{LINEAGE_LOOKBACK} does not hold, whose fills it carries, so the quantity ours "
                     "opened is not established"
                 )
-            filled = max(Decimal(0), filled - _qty(replaced.filled_qty))
+            before = _shown(replaced.filled_qty)
+            if before is None:
+                # read as zero, every fill of the chain would be ours, a hand's among them
+                return None, (
+                    f"an order of ours in {symbol} replaces one whose listing shows no fill count, so "
+                    "what it filled beyond that one, and with it the quantity ours opened, is not "
+                    "established"
+                )
+            filled = max(Decimal(0), filled - before)
         opened += filled if _value(order.side) == "buy" else -filled
     return opened, ""
 

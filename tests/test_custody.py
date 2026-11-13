@@ -257,6 +257,28 @@ def test_a_replacement_whose_replaced_order_is_not_listed_freezes_the_symbol() -
     assert report.frozen["SPY"] == [why]
 
 
+@pytest.mark.parametrize("shown", [None, "", "many"], ids=["absent", "empty", "no number"])
+def test_a_replaced_order_that_shows_no_fill_count_freezes_the_symbol(shown) -> None:
+    """Ours filled nothing, a hand replaced it and 18 filled, and the node replaced that one, which
+    shows the chain's 20. The listing holds the hand's order but not its fill count, which alpaca-py's
+    `Order.filled_qty` allows. Read as zero, all 20 would be ours and the 18 foreign shares held would
+    be sold with them. What the replaced order filled is not known, so nothing is established."""
+    venue = ReplacedNotListedOpen(REGULAR)
+    venue.hold("SPY", 20, client_order_id=None)
+    chain(venue, "0", "18", "20", by_hand=(1,))
+    (at,) = [n for n, order in enumerate(venue.history) if order.filled_qty == "18"]
+    venue.history[at] = venue.history[at].model_copy(update={"filled_qty": shown})
+    quantity, why = opened(venue)
+    assert quantity is None
+    assert why == (
+        "an order of ours in SPY replaces one whose listing shows no fill count, so what it filled "
+        "beyond that one, and with it the quantity ours opened, is not established"
+    )
+    report = close(venue)
+    assert venue.sent == []
+    assert report.frozen["SPY"] == [why]
+
+
 @pytest.mark.parametrize("filled", [("18", "20"), ("16", "18", "20"), ("0", "20")])
 def test_a_chain_of_our_own_replacements_counts_its_fills_once(filled) -> None:
     """Now that the adapter's replacement reads as ours, a partly filled buy and its replacement are
@@ -833,6 +855,17 @@ class Clocks:
 
     def monotonic(self) -> float:
         return self.t
+
+
+class ReplacedNotListedOpen(Venue):
+    """A venue whose listing of open orders does not hold a replaced order, so nothing but the
+    quantity rule stands between a chain and the close."""
+
+    def get_orders(self, filter: Any = None):
+        found = super().get_orders(filter)
+        if filter is not None and filter.status and filter.status.value == "all":
+            return found
+        return [order for order in found if _value(order.status) != "replaced"]
 
 
 def close(venue: Venue, data: Any = None):

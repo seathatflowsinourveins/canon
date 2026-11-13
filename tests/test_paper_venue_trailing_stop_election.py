@@ -110,9 +110,12 @@ class Elected(paper.Trailer):
             # named, not `super()`: the offline cases walk these steps on a stand-in for the strategy
             seam.Adopter._step(self, event)
             return
-        if self._timed_out():
-            return
         order = self.cache.order(self.own[-1])
+        # the order's end is read before the walk's own limit: a fill that reached the node as the
+        # limit ran out is the walk's end, and a walk that timed out past it would leave the verdict
+        # saying the node's order missed a fill it got
+        if not (order is not None and order.is_closed) and self._timed_out():
+            return
         if order is None or not (order.is_open or order.is_closed):
             return
         if self.phase == "waiting for the sell to work":

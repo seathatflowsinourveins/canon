@@ -9,6 +9,7 @@ What these cannot show is what the paper run is for: how Alpaca elects the stop 
 
 from __future__ import annotations
 
+import time
 from datetime import UTC
 from datetime import datetime
 from datetime import timedelta
@@ -159,6 +160,31 @@ def test_a_refused_cancel_ends_the_walk_by_name_instead_of_waiting_out_the_limit
     assert walk.outcome == "the stop's cancel was refused"
     assert walk.cancel_refusals == ["Alpaca refused the cancel (422): 42210000: no"]
     assert walk.modify_refusals == []
+
+
+def test_a_fill_already_at_the_node_when_the_limit_passes_is_the_walks_end_not_a_time_out() -> None:
+    """The fill can reach the node as the walk's own limit runs out. The order's end is read before
+    the limit: a walk that timed out without recording it would have the verdict say the node's order
+    missed a fill it got, which is ADR 0129's condition (b)."""
+    walk = working()
+    end(walk, "FILLED", 1)
+    walk.events = [("OrderFilled", OURS, 0)]
+    assert walk.started_ns is not None
+    walk.started_ns = time.time_ns() - walk.limit_ns - 1
+    assert walk.step() == "done"
+    assert walk.outcome == "done"
+    assert walk.seen["the node's order ended"] == "FILLED"
+    assert election.verdict(walk, [SOLD], Decimal(0), {"orders": 0}) == []
+
+
+def test_a_stop_that_ended_unfilled_as_the_limit_passes_is_named_by_its_end() -> None:
+    walk = working()
+    end(walk, "EXPIRED")
+    assert walk.started_ns is not None
+    walk.started_ns = time.time_ns() - walk.limit_ns - 1
+    assert walk.step() == "done"
+    assert walk.outcome == "the trailing stop ended EXPIRED with no election"
+    assert walk.seen["the node's order ended"] == "EXPIRED"
 
 
 def test_a_wait_past_the_limit_ends_the_walk_by_the_step_it_was_in() -> None:
