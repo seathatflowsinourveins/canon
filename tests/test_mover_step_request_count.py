@@ -196,3 +196,113 @@ def test_a_fill_account_query_reaches_the_soft_line_before_a_buy(
         assert any("140 requests" in why for why in s.dropped)
     finally:
         eng.dispose()
+
+
+def test_the_account_query_inside_a_budget_buy_reaches_the_soft_line_before_its_submit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The xr7 reader's P1 on P1-1: with budget sizing, an unanswered account query whose retry deadline
+    falls between two buys is sent again inside the second `_buy`, after `_refusal` passed it at 139;
+    that query is the step's 140th request, so the second buy is refused at the soft line, not sent as
+    the 141st. The reader's reproducer, kept as it ran."""
+    eng = engine()
+    s = strategy(slots=2, watch=2, soft_line=140, protect=False, size_from_budget=True)
+    account, ask, buy, submit = (
+        s._trading_account,
+        s._ask_for_the_account,
+        s._buy,
+        s.submit_order,
+    )
+    state: dict[str, Any] = {"reported": None, "target": None, "buying": 0, "submits": []}
+
+    def reported(venue: Any) -> Any:
+        real = account(venue)
+        if real is not None and state["reported"] is None:
+            state["reported"] = ReportedAccount(real)
+        return state["reported"]
+
+    def ask_with_expiry() -> None:
+        if state["target"] is None and all(
+            (slot := s.slots.get(i)) is not None and slot.run_ns is not None for i in (AAA, BBB)
+        ):
+            state["target"] = s.clock.timestamp_ns()
+            s.query_venue = VENUE
+            s.query_awaits = reported(VENUE).event_count + 1
+            s.query_sent_ns = state["target"] - mover.QUERY_WAIT_SECS * SECOND + 1
+        ask()
+
+    def buying(*args: Any) -> Any:
+        state["buying"] += 1
+        return buy(*args)
+
+    def submitting(order: Any, position_id=None, client_id=None, params=None) -> None:
+        if order.side == OrderSide.BUY:
+            state["submits"].append((str(order.instrument_id), s.recent))
+        submit(order, position_id, client_id, params)
+
+    monkeypatch.setattr(
+        mover,
+        "requests_sent",
+        lambda: 138 if s.clock.timestamp_ns() >= T0 + 5 * MINUTE - 10 * SECOND else 0,
+    )
+    monkeypatch.setattr(s, "_trading_account", reported)
+    monkeypatch.setattr(s, "_ask_for_the_account", ask_with_expiry)
+    monkeypatch.setattr(s, "_buy", buying)
+    monkeypatch.setattr(
+        s, "_now_ns", lambda: s.clock.timestamp_ns() + (1 if state["buying"] >= 2 else 0)
+    )
+    monkeypatch.setattr(s, "submit_order", submitting)
+    try:
+        run(
+            eng,
+            s,
+            ranker(rank((AAA, "0.4"), (BBB, "0.25"))),
+            tape(AAA, RISING[:6]),
+            tape(BBB, RISING[:6]),
+        )
+        assert state["target"] is not None, "the query's deadline must fall between the buys"
+        assert state["submits"] == [("AAA.ALPACA", 138)], state["submits"]
+        assert any("BBB.ALPACA" in why and "140 requests" in why for why in s.dropped), s.dropped
+    finally:
+        eng.dispose()
+
+
+def test_a_buy_the_risk_engine_denies_keeps_its_reserve_for_the_step(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The xr7 reader's P2 on P1-1, kept as a limit: AAA's buy is denied by the risk engine's per-order
+    notional cap and sent nowhere, but its `OrderDenied` reaches the strategy only after the step's
+    decisions, so BBB is judged at 140 and refused: the conservative side, for one step."""
+    eng = engine(order_cap=Decimal(1))
+    s = strategy(slots=2, watch=2, soft_line=140, protect=False)
+    burst_ns = T0 + 5 * MINUTE - 10 * SECOND
+    seen: list[str] = []
+    refusal, denied = s._refusal, s.on_order_denied
+
+    def judged(slot: Any, *args: Any) -> Any:
+        seen.append(f"judged {slot.instrument_id} at {s.recent}")
+        return refusal(slot, *args)
+
+    def on_denied(event: Any) -> None:
+        seen.append(f"denied {event.instrument_id}")
+        denied(event)
+
+    monkeypatch.setattr(
+        mover, "requests_sent", lambda: 139 if s.clock.timestamp_ns() >= burst_ns else 0
+    )
+    monkeypatch.setattr(s, "_refusal", judged)
+    monkeypatch.setattr(s, "on_order_denied", on_denied)
+    try:
+        orders = run(
+            eng,
+            s,
+            ranker(rank((AAA, "0.4"), (BBB, "0.25"))),
+            tape(AAA, RISING[:6]),
+            tape(BBB, RISING[:6]),
+        )
+        buys = {o.instrument_id: o for o in orders if o.side == OrderSide.BUY}
+        assert buys[AAA].status == mover.OrderStatus.DENIED and BBB not in buys
+        assert seen == ["judged AAA.ALPACA at 139", "judged BBB.ALPACA at 140", "denied AAA.ALPACA"]
+        assert any("BBB.ALPACA" in why and "140 requests" in why for why in s.dropped)
+    finally:
+        eng.dispose()

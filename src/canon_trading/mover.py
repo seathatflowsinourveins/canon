@@ -3809,7 +3809,10 @@ class Mover(Strategy):
     # anew. Never add a second adapter read to these reserves: a command already counted by the
     # transport would be counted twice. Limit: a command still queued in that thread when the next
     # step samples is in neither count until it is sent; the soft line's margin under Alpaca's
-    # limit is what absorbs it.
+    # limit is what absorbs it. Limit, the conservative side: a submit the risk engine denies is
+    # reserved for the rest of the step all the same, since its `OrderDenied` reaches the strategy
+    # only after the step's decisions (the xr7 reader's P2; `on_order_denied` follows them in the
+    # backtest engine too); the next step samples the adapter anew.
     # rc8 Strategy signatures: trading/__init__.pyi:538-544, :571-576, :613-618; routing to the local
     # emulator instead of execution: crates/trading/src/strategy/mod.rs:646-655, :2436-2442.
     def submit_order(
@@ -3949,6 +3952,10 @@ class Mover(Strategy):
             # a buy filled since the last report is not in the reported cash yet, and a sale's
             # proceeds count only once a report has them (the lead's ruling of 2026-11-12)
             self._ask_for_the_account()  # a fill this step, before this buy is sized
+            if self.recent >= settings.soft_line:
+                # the query just sent is a venue request too (`query_account`): `_refusal` passed
+                # this buy before it, so the soft line is read again before the buy adds one
+                return f"{self.recent} requests in the last 60 s, at the soft line of {settings.soft_line}"
             unreported = self._unreported_buys(account) if reported else Decimal(0)
             query_wait = self._query_wait_secs(account) if reported else 0.0
             spendable = free.as_decimal() - unlocked - unreported
