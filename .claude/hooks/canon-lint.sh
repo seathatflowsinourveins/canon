@@ -3,7 +3,8 @@
 # Contract: https://code.claude.com/docs/en/hooks.md
 #   stdin  = JSON with tool_input; ${CLAUDE_PROJECT_DIR} is exported to the hook.
 #   exit 2 = stderr is shown to Claude (the edit has already happened, so this is feedback, not a block).
-# Runs `scripts/canon lint` only when the edited file is under canon/ or docs/adr/.
+# Runs `scripts/canon lint` only when the edited file is under canon/, docs/adr/ or .agents/, or is an
+# AGENTS.md or AGENTS.override.md (the skills' front matter and Codex's project-doc budget).
 input=$(cat)
 if ! command -v jq >/dev/null 2>&1; then
   echo "canon-lint hook: jq not found, so the lint did NOT run." >&2
@@ -36,7 +37,7 @@ case "$file" in
   *) exit 0 ;;
 esac
 case "$rel" in
-  canon/*|docs/adr/*) ;;
+  canon/*|docs/adr/*|.agents/*|AGENTS.md|*/AGENTS.md|AGENTS.override.md|*/AGENTS.override.md) ;;
   *) exit 0 ;;
 esac
 if [ ! -x "$root/scripts/canon" ]; then

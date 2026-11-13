@@ -1,0 +1,326 @@
+#!/bin/bash
+# Tests of ADR 0132 unit 1, written before the build, for the public `scripts/canon lint` contract, without reading its implementation.
+# Contracts: agentskills-spec@83021e2be457 docs/specification.mdx:19-41,58-65,91-95
+# (YAML front matter, required fields, and the name rule); codex-cli@0a94398fa60c
+# codex-rs/config/defaults.toml:9 (32768-byte project document limit) and
+# codex-rs/ext/skills/src/host_roots.rs:27-28 (.agents/skills).
+# Properties P1-P7 are ADR 0132 unit 1's lint terms, written as tests before the unit was built.
+# Temp-tree copying, PATH fakes, case functions and counts follow scripts/test-canon at c3e1a51e.
+# Run: nice -n 20 bash scripts/test-agent-skills-blind
+# Each case, including its fixture and valid control, has a hard 120-second bound.
+set -euo pipefail
+
+SRC=$(cd "$(dirname "$0")/.." && pwd -P)
+SELF="$SRC/scripts/test-agent-skills-blind"
+CASES=(
+  p1_built_tree_lints
+  p1_valid_yaml_lints
+  p2_missing_front_matter
+  p2_front_matter_not_first
+  p2_unterminated_front_matter
+  p3_name_mismatch
+  p3_missing_name
+  p3_empty_name
+  p4_uppercase_name
+  p4_leading_hyphen
+  p4_trailing_hyphen
+  p4_consecutive_hyphens
+  p4_underscore_name
+  p4_name_65_characters
+  p4_valid_name_limits
+  p5_missing_description
+  p5_empty_description
+  p5_empty_double_quoted_description
+  p5_empty_single_quoted_description
+  p5_empty_block_description
+  p5_comment_only_description
+  p6_agents_32769_bytes
+  p6_agents_32768_bytes
+  p6_agents_multibyte_32769_bytes
+  p7_no_skills_folder
+  p7_empty_skills_folder
+)
+
+fail() { printf 'ASSERTION FAILED: %s\n' "$*" >&2; exit 1; }
+harness_error() { printf 'HARNESS ERROR: %s\n' "$*" >&2; exit 2; }
+
+# Only the parent's temporary seed is copied. No git init, hooks, or real service CLI is needed.
+fresh() {
+  mkdir -p "$W"
+  cp -R "$SEED" "$T"
+  : > "$W/forbidden"
+}
+
+write_skill() {
+  local folder=$1 name=$2
+  mkdir -p "$T/.agents/skills/$folder"
+  printf -- '---\nname: %s\ndescription: Exercise the offline blind lint fixture.\n---\n\nFixture body.\n' \
+    "$name" > "$T/.agents/skills/$folder/SKILL.md"
+}
+
+# Mutations have a known-valid sibling, so stopping at the first valid file cannot pass them.
+# The built-tree case retains the real skills and AGENTS.md; all other cases use synthetic ones.
+fixture() {
+  fresh
+  rm -rf "$T/.agents/skills"
+  printf '# Blind fixture\n' > "$T/AGENTS.md"
+  write_skill a-valid a-valid
+}
+
+out=""; rc=0
+run_lint() {
+  [ -f "$T/scripts/canon" ] || fail 'absent R1 command: scripts/canon does not exist'
+  [ -x "$T/scripts/canon" ] || fail 'absent R1 command: scripts/canon is not executable'
+  if out=$(cd "$T" && ./scripts/canon lint 2>&1); then rc=0; else rc=$?; fi
+  if [ -s "$W/forbidden" ]; then
+    cat "$W/forbidden" >&2
+    fail 'lint attempted a forbidden service command; this is not an expected validation failure'
+  fi
+}
+
+show_lint() { printf '  lint exit: %s\n%s\n' "$rc" "$out" >&2; }
+expect_ok() {
+  run_lint
+  if [ "$rc" -ne 0 ]; then show_lint; fail "$1: expected lint to exit 0"; fi
+}
+
+expect_rejected() {
+  local file=$1 reason=$2 label=$3 detail
+  run_lint
+  if [ "$rc" -eq 0 ]; then
+    show_lint
+    fail "absent R1 behavior: $label was accepted (expected non-zero lint exit)"
+  fi
+  case "$out" in
+    *"$file"*) ;;
+    *) show_lint; fail "$label: rejection does not identify $file" ;;
+  esac
+  # Ignore file/directory words when checking that the diagnostic also explains the problem.
+  # No exact message, severity prefix, or particular non-zero status is part of the brief.
+  detail=${out//"$T"/}
+  detail=${detail//"$file"/}
+  if ! printf '%s\n' "$detail" | grep -Ei "$reason" >/dev/null; then
+    show_lint
+    fail "$label: diagnostic names the file but does not explain the field or limit"
+  fi
+}
+
+bad_skill() {
+  local folder=$1 contents=$2 reason=$3 label=$4
+  fixture
+  expect_ok 'valid control before adding one invalid skill'
+  mkdir -p "$T/.agents/skills/$folder"
+  printf '%s\n' "$contents" > "$T/.agents/skills/$folder/SKILL.md"
+  expect_rejected ".agents/skills/$folder/SKILL.md" "$reason" "$label"
+}
+
+bad_name() {
+  local name=$1 label=$2 contents
+  # Match the folder exactly to isolate the name rule from the separate equality rule.
+  printf -v contents -- '---\nname: %s\ndescription: Exercise an invalid name.\n---\n' "$name"
+  bad_skill "$name" "$contents" 'name' "$label"
+}
+
+p1_built_tree_lints() {
+  local skill missing=""
+  fresh
+  for skill in canon-builder canon-reader canon-report; do
+    [ -f "$T/.agents/skills/$skill/SKILL.md" ] || missing="$missing .agents/skills/$skill/SKILL.md"
+  done
+  [ -z "$missing" ] || fail "absent R1 artifacts: built tree lacks$missing"
+  expect_ok 'the built tree with all three required skills'
+}
+
+p1_valid_yaml_lints() {
+  fixture
+  mkdir -p "$T/.agents/skills/quoted" "$T/.agents/skills/folded" "$T/.agents/skills/literal"
+  cat > "$T/.agents/skills/quoted/SKILL.md" <<'EOF'
+---
+name: "quoted"
+description: 'Use this fixture: when checking quoted YAML scalars.'
+metadata:
+  purpose: blind-test
+---
+EOF
+  cat > "$T/.agents/skills/folded/SKILL.md" <<'EOF'
+---
+name: folded
+description: >-
+  Exercise a non-empty folded YAML description
+  when running the blind lint tests.
+---
+EOF
+  cat > "$T/.agents/skills/literal/SKILL.md" <<'EOF'
+---
+name: literal
+description: |
+  Exercise a non-empty literal YAML description.
+---
+EOF
+  expect_ok 'valid plain, quoted, folded and literal YAML front matter'
+}
+
+p2_missing_front_matter() {
+  bad_skill z-probe $'name: z-probe\ndescription: These keys are only body text.' \
+    'front.?matter|yaml|delimiter|header|---' 'a SKILL.md without front matter'
+}
+p2_front_matter_not_first() {
+  bad_skill z-probe $'# Body first\n---\nname: z-probe\ndescription: Not at the start.\n---' \
+    'front.?matter|yaml|delimiter|header|---' 'front matter after a Markdown heading'
+}
+p2_unterminated_front_matter() {
+  bad_skill z-probe $'---\nname: z-probe\ndescription: Missing the closing delimiter.' \
+    'front.?matter|yaml|delimiter|header|---' 'unterminated front matter'
+}
+p3_name_mismatch() {
+  bad_skill z-probe $'---\nname: another-valid-name\ndescription: Both names are otherwise valid.\n---' \
+    'name|folder|directory|match' 'a name different from its folder'
+}
+p3_missing_name() {
+  bad_skill z-probe $'---\ndescription: Required name is missing.\n---\nname: z-probe' \
+    'name' 'a name present only in the Markdown body'
+}
+p3_empty_name() {
+  bad_skill z-probe $'---\nname: ""\ndescription: Empty name scalar.\n---' \
+    'name' 'an empty name'
+}
+p4_uppercase_name()       { bad_name Z-probe 'an uppercase name matching its folder'; }
+p4_leading_hyphen()       { bad_name -z-probe 'a leading hyphen in a matching name'; }
+p4_trailing_hyphen()      { bad_name z-probe- 'a trailing hyphen in a matching name'; }
+p4_consecutive_hyphens()  { bad_name z--probe 'consecutive hyphens in a matching name'; }
+p4_underscore_name()      { bad_name z_probe 'an underscore in a matching name'; }
+p4_name_65_characters() {
+  local name
+  name=$(awk 'BEGIN { for (i = 0; i < 65; i++) printf "z" }')
+  [ "${#name}" -eq 65 ] || harness_error 'failed to make a 65-character name'
+  bad_name "$name" 'a 65-character name matching its folder'
+}
+p4_valid_name_limits() {
+  local name
+  fixture
+  name=$(awk 'BEGIN { for (i = 0; i < 64; i++) printf "z" }')
+  [ "${#name}" -eq 64 ] || harness_error 'failed to make a 64-character name'
+  write_skill z z
+  write_skill "$name" "$name"
+  write_skill z1-probe2 z1-probe2
+  expect_ok 'valid 1- and 64-character names, digits and an internal hyphen'
+}
+p5_missing_description() {
+  bad_skill z-probe $'---\nname: z-probe\n---\ndescription: This is only Markdown body text.' \
+    'description' 'a description present only in the Markdown body'
+}
+p5_empty_description() {
+  bad_skill z-probe $'---\nname: z-probe\ndescription:\n---\nA non-empty body.' \
+    'description' 'an empty description value'
+}
+p5_empty_double_quoted_description() {
+  bad_skill z-probe $'---\nname: z-probe\ndescription: ""\n---' \
+    'description' 'an empty double-quoted description'
+}
+p5_empty_single_quoted_description() {
+  bad_skill z-probe $'---\nname: z-probe\ndescription: \'\'\n---' \
+    'description' 'an empty single-quoted description'
+}
+p5_empty_block_description() {
+  bad_skill z-probe $'---\nname: z-probe\ndescription: |\n---' \
+    'description' 'an empty YAML block description'
+}
+p5_comment_only_description() {
+  bad_skill z-probe $'---\nname: z-probe\ndescription: # A YAML comment is not a value.\n---' \
+    'description' 'a comment-only description value'
+}
+
+agents_bytes() {
+  local count=$1
+  awk -v n="$count" 'BEGIN { for (i = 0; i < n; i++) printf "x" }' > "$T/AGENTS.md"
+  [ "$(wc -c < "$T/AGENTS.md")" -eq "$count" ] || harness_error 'wrong AGENTS.md fixture byte count'
+}
+p6_agents_32769_bytes() {
+  fixture
+  expect_ok 'valid control before enlarging AGENTS.md'
+  agents_bytes 32769
+  expect_rejected AGENTS.md 'byte|32768|32769|32.?768|large|long|size|limit|exceed' \
+    'AGENTS.md at 32769 bytes'
+}
+p6_agents_32768_bytes() {
+  fixture
+  agents_bytes 32768
+  expect_ok 'AGENTS.md at exactly 32768 bytes'
+}
+p6_agents_multibyte_32769_bytes() {
+  fixture
+  expect_ok 'valid control before writing multibyte AGENTS.md'
+  # 16384 UTF-8 e-acute characters (two bytes each), then one ASCII character, with no newline.
+  awk 'BEGIN { for (i = 0; i < 16384; i++) printf "\303\251"; printf "x" }' > "$T/AGENTS.md"
+  [ "$(wc -c < "$T/AGENTS.md")" -eq 32769 ] || harness_error 'wrong multibyte fixture byte count'
+  expect_rejected AGENTS.md 'byte|32768|32769|32.?768|large|long|size|limit|exceed' \
+    'AGENTS.md at 32769 bytes but only 16385 characters'
+}
+p7_no_skills_folder() {
+  fixture
+  rm -rf "$T/.agents"
+  [ ! -e "$T/.agents/skills" ] || harness_error 'skills folder still exists'
+  expect_ok 'a tree with no .agents/skills folder (no literal skip message is required)'
+}
+p7_empty_skills_folder() {
+  fixture
+  rm -rf "$T/.agents/skills"
+  mkdir -p "$T/.agents/skills"
+  expect_ok 'an empty skills folder, with no SKILL.md to check'
+}
+
+if [ "${1:-}" = --case ]; then
+  [ "$#" -eq 3 ] || harness_error 'internal --case requires a case name and a temp root'
+  name=$2; TMP=$3
+  case " ${CASES[*]} " in *" $name "*) ;; *) harness_error "unknown case: $name" ;; esac
+  SEED="$TMP/seed"; W="$TMP/run.$name"; T="$W/canon"
+  export BLIND_FORBIDDEN_LOG="$W/forbidden"
+  "$name"
+  exit 0
+fi
+[ "$#" -eq 0 ] || harness_error 'run this script without arguments'
+for tool in awk bash cat chmod cp dirname grep mkdir mktemp rm timeout wc; do
+  command -v "$tool" >/dev/null || harness_error "required tool is unavailable: $tool"
+done
+
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/canon-agent-skills-blind.XXXXXX")
+TMP=$(cd "$TMP" && pwd -P)
+trap 'rm -rf "$TMP"' EXIT
+SEED="$TMP/seed"
+mkdir -p "$SEED/docs" "$SEED/.claude" "$SEED/.github" "$TMP/bin"
+# This is the established test-canon fresh() fixture, plus R1's two inputs.
+cp -R "$SRC/scripts" "$SRC/canon" "$SRC/home" "$SEED/"
+cp -R "$SRC/docs/adr" "$SEED/docs/"
+cp -R "$SRC/.claude/hooks" "$SEED/.claude/"
+cp -R "$SRC/.github/workflows" "$SEED/.github/"
+cp "$SRC/mise.toml" "$SRC/mise.lock" "$SRC/uv.lock" "$SRC/AGENTS.md" "$SEED/"
+if [ -d "$SRC/.agents/skills" ]; then
+  mkdir -p "$SEED/.agents"
+  cp -R "$SRC/.agents/skills" "$SEED/.agents/"
+fi
+cat > "$TMP/bin/forbidden" <<'EOF'
+#!/bin/bash
+printf 'forbidden command attempted by lint: %s\n' "${0##*/}" >> "$BLIND_FORBIDDEN_LOG"
+exit 97
+EOF
+chmod +x "$TMP/bin/forbidden"
+for tool in curl wget gh orca orca-dev orca-ide security uv mise; do
+  cp "$TMP/bin/forbidden" "$TMP/bin/$tool"
+done
+export PATH="$TMP/bin:$PATH" LC_ALL=C
+
+pass=0; failed=0
+for name in "${CASES[@]}"; do
+  if timeout -s KILL 120 bash "$SELF" --case "$name" "$TMP" > "$TMP/$name.log" 2>&1; then
+    pass=$((pass + 1))
+    printf '  pass  %s\n' "$name"
+  else
+    status=$?
+    failed=$((failed + 1))
+    printf '  FAIL  %s (exit %s)\n' "$name" "$status"
+    cat "$TMP/$name.log"
+    case "$status" in 124|137) printf '  Case exceeded the 120-second bound.\n' ;; esac
+  fi
+done
+printf 'test-agent-skills-blind: %s passed, %s failed, 0 skipped\n' "$pass" "$failed"
+[ "$failed" -eq 0 ]
