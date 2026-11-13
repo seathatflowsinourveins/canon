@@ -281,8 +281,10 @@ In both `fix` runs, both readers mark every defect in the statement removed. Two
   resolved.
 * **What four cases can show.** Four cases from two modules tell only all against none (README, "Reading a
   score").
-* **What came of it.** The lead's ruling on these marks, and the lesson, are in the lessons journal
-  (`docs/handbook/journal.md`).
+* **What came of it.** The lead ruled on these marks on 2026-11-13, at 16:13. DeepSeek workers do not build on the
+  order or stop path. They read, write text and blind tests, and build off the trading path. The order and stop path
+  stays with the builders ADR 0058 names, reproduced by a Claude lane. The lesson goes to the lessons journal
+  (`docs/handbook/journal.md`) in a change of its own.
 
 ## The readers
 

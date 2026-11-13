@@ -134,16 +134,3 @@ ten fields as list lines, in this order, each with a value:
 * status: adopted
 * supersedes: none
 * source: lead
-
-### L0008: A change that passes every named test can still drop a close on the order path
-
-* area: execution
-* session: 2026-11-13
-* result: One graded build-eval run of each of the four ready cases by DeepSeek Harness on DeepSeek Flash (`dsh/deepseek-flash/max/orca-worker`): 4 of 4 resolved by the grader, and two blind readers agreed on every mark, 0 land, 2 fix and 2 no. On the order path (`modify-follows-replace`) the change drops the newest replacement's cancel or expiry, so the node's order stays open after Alpaca has closed it; on the gate it keeps the engine's 10,000-bar cache, so every longer trial is told FAIL. All 373 tool calls were read and no term was broken. Four runs, one wave
-* evidence: evals/build/runs/2026-11-13-dsh-flash/scores.md
-* lesson: A resolved grade is not a landable change: on the two cases where every runtime before it, the reference included, had a run marked no, this worker's changes passed every named test and still carried a blocker that only the blind readings found, each with a probe; one wave sets no level (ADR 0079)
-* change: the lead's ruling of 2026-11-13, 16:13: DeepSeek workers do not build on the order or stop path; they read, write text and blind tests, and build off the trading path, and the order and stop path stays with the builders ADR 0058 names, reproduced by a Claude lane
-* next: A second wave, proposed to the lead with its cost; ADR 0079 leaves open what in the cases or the brief changes before a new trial
-* status: open
-* supersedes: none
-* source: review
