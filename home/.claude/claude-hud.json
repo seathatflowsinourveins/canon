@@ -32,7 +32,7 @@
     "showWeeklyCost": false,
     "showDuration": true,
     "showSpeed": true,
-    "showUsage": true,
+    "showUsage": false,
     "usageValue": "percent",
     "usageBarEnabled": false,
     "usageCompact": true,
