@@ -2069,6 +2069,7 @@ def test_the_close_margin_is_one_sends_bound_not_the_tasks_timeout() -> None:
     assert protect.CLOSE_MARGIN == protect.SEND_MARGIN
 
 
+@EXIT
 def test_a_long_bought_a_minute_before_the_close_gets_its_stop(capsys) -> None:
     """A minute before the close is inside the old 300 s refusal: the stop now goes out."""
     paper = Paper(positions=[_position("AAA", "10")], next_close="2026-11-12T15:01:00Z")
