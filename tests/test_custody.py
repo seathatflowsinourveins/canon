@@ -342,11 +342,14 @@ def test_an_order_of_ours_with_no_fill_count_still_has_our_open_orders_canceled(
     ]
 
 
-@pytest.mark.parametrize("shown", NO_COUNT, ids=[repr(v) for v in NO_COUNT])
+NO_NUMBER = [None, "", "many", "NaN", "Infinity"]
+
+
+@pytest.mark.parametrize("shown", NO_NUMBER, ids=[repr(v) for v in NO_NUMBER])
 def test_a_position_that_shows_no_count_freezes_its_symbol_and_the_rest_goes_on(shown) -> None:
-    """A position's quantity is read as a fill count is: what shows no count is not known, and its
-    symbol freezes by name. It does not end the run: our open order in it is still canceled, and the
-    long ours opened in another symbol is still closed."""
+    """A position's quantity that is no finite number is not known, and its symbol freezes by name.
+    It does not end the run: our open order in it is still canceled, and the long ours opened in
+    another symbol is still closed."""
     venue = PositionShows(REGULAR)
     venue.shown = {"SPY": {"qty": shown}}
     venue.hold("SPY", 1)
@@ -368,10 +371,118 @@ def test_a_position_that_shows_no_count_freezes_its_symbol_and_the_rest_goes_on(
     assert (sent.symbol, sent.qty) == ("AAPL", 1)
 
 
+@pytest.mark.parametrize("shown", NO_NUMBER, ids=[repr(v) for v in NO_NUMBER])
+def test_a_position_of_unknown_quantity_is_not_carried_as_holding_nothing(shown) -> None:
+    """Unknown is not zero: the holding's quantity is None, apart from the zero of a symbol that has
+    only an open order."""
+    venue = PositionShows(REGULAR)
+    venue.shown = {"SPY": {"qty": shown}}
+    venue.hold("SPY", 1)
+    venue.open(client_order_id=OURS[2], symbol="AAPL", side="buy", qty="1")
+    unknown, only_an_order = sorted(
+        custody.read_holdings(cast(Any, venue), venue.now), key=lambda h: h.symbol != "SPY"
+    )
+    assert (unknown.symbol, unknown.held) == ("SPY", None)
+    assert unknown.ours_left() == []
+    assert (only_an_order.symbol, only_an_order.held) == ("AAPL", Decimal(0))
+
+
+def test_a_long_listed_below_zero_is_a_short_and_never_read_as_a_long() -> None:
+    venue = PositionShows(REGULAR)
+    venue.shown = {"SPY": {"qty": "-18"}}
+    venue.hold("SPY", 18)
+    report = close(venue)
+    assert venue.sent == []
+    assert report.frozen["SPY"] == ["a short of 18 SPY: never bought back here"]
+
+
+@pytest.mark.parametrize(
+    ("order", "quantity"),
+    [
+        ({"qty": "-1", "filled_qty": "NaN"}, "a quantity that is no count"),
+        ({"qty": "many"}, "a quantity that is no count"),
+        ({"qty": ""}, "a quantity that is no count"),
+        ({"qty": None, "notional": "100"}, "notional 100"),
+        ({"qty": "2"}, "2"),
+    ],
+    ids=["below zero", "no number", "empty", "by notional", "a count"],
+)
+def test_a_line_about_an_order_names_a_quantity_that_is_no_count(order, quantity) -> None:
+    assert custody.order_line(_order(**order)).startswith(f"SPY buy {quantity} limit ")
+    assert f"(buy {quantity} SPY limit, " in custody.describe(_order(**order))
+
+
+@pytest.mark.parametrize(
+    ("position", "said"),
+    [
+        ({"qty": "many"}, "SPY long a quantity that is no number avg_entry"),
+        ({"qty": "NaN"}, "SPY long a quantity that is no number avg_entry"),
+        ({"qty": "2"}, "SPY long 2 avg_entry"),
+        ({"qty": "-3", "side": "short"}, "SPY short -3 avg_entry"),
+    ],
+    ids=["no number", "not finite", "a count", "a short"],
+)
+def test_a_line_about_a_position_names_a_quantity_that_is_no_number(position, said) -> None:
+    assert custody.position_line(_position(**position)).startswith(said)
+
+
+@pytest.mark.parametrize(
+    ("position", "note"),
+    [
+        ({"qty": "2"}, ""),
+        ({"qty": "-3", "side": "short"}, ""),
+        ({"qty": "-18"}, " (below zero: read as a short)"),
+        (
+            {"qty": "2", "qty_available": "many"},
+            " (the position in SPY lists a quantity no order holds that cannot be counted)",
+        ),
+        (
+            {"qty": "many"},
+            (
+                " (the position in SPY shows no quantity that can be counted, so what is held there "
+                "is not known)"
+            ),
+        ),
+    ],
+    ids=["a long", "a short", "a long below zero", "available unreadable", "no number"],
+)
+def test_the_accounts_line_reads_a_position_as_the_close_form_does(position, note) -> None:
+    line = custody.position_line(_position(**position))
+    assert line.endswith(f"unrealized_pl 0.88{note}")
+
+
+@pytest.mark.parametrize("available", [None, "0", "1"], ids=["not listed", "none free", "one free"])
+def test_the_quantity_no_order_holds_decides_nothing_and_may_be_left_out(available) -> None:
+    """Custody reads a position's `qty_available` for no decision: the long of ours is closed whole
+    whatever it shows, and a listing that leaves it out is read like any other. The day custody decides
+    on it, this case changes and the field becomes required in that same change."""
+    venue = PositionShows(REGULAR)
+    venue.shown = {"SPY": {"qty_available": available}}
+    venue.hold("SPY", 2)
+    (holding,) = custody.read_holdings(cast(Any, venue), venue.now)
+    assert (holding.held, holding.frozen) == (Decimal(2), [])
+    report = close(venue)
+    assert report.frozen == {}
+    (sent,) = venue.sent
+    assert (sent.symbol, sent.qty) == ("SPY", 2)
+
+
+@pytest.mark.parametrize("available", ["", "many", "-1", "NaN", "Infinity"])
+def test_a_listed_quantity_no_order_holds_that_is_no_count_freezes_the_symbol(available) -> None:
+    venue = PositionShows(REGULAR)
+    venue.shown = {"SPY": {"qty_available": available}}
+    venue.hold("SPY", 2)
+    report = close(venue)
+    assert venue.sent == []
+    assert report.frozen["SPY"] == [
+        "the position in SPY lists a quantity no order holds that cannot be counted"
+    ]
+
+
 def test_a_short_listed_with_its_quantity_below_zero_is_still_a_short_never_bought_back() -> None:
     """Alpaca lists a short with its quantity below zero: there, and only there, that is a count."""
     venue = PositionShows(REGULAR)
-    venue.shown = {"SPY": {"qty": "-3", "side": "short"}}
+    venue.shown = {"SPY": {"qty": "-3", "qty_available": "-3", "side": "short"}}
     venue.hold("SPY", -3, client_order_id=None)
     report = close(venue)
     assert venue.sent == []

@@ -62,14 +62,19 @@ order on", its filled quantity counting the fills before it (ADR 0042, paper, 20
 ours is counted once, and the fills of a foreign order in a chain stay foreign whatever replaced it. A
 replacement of ours with fills whose replaced order the listing does not hold (one working since before the
 lookback) carries fills that cannot be told apart, and freezes the symbol; so does one whose replaced order the
-lookback's listing does hold but shows no count. Every quantity Alpaca lists is read one way (`_shown`): a
-count is a finite number not below zero, and what is absent, empty, no number, not finite or below zero is
-not zero but unknown. An order in the symbol's listing, ours or not, whose fill count or quantity is no
-count leaves the quantity ours opened not established (an order placed by notional names no quantity, and
-that is not a missing one); so does an open order, a position whose held or available quantity is no count
-(a short's are below zero, and count there), and a close of ours last shown without a fill count. Each
-freezes its symbol by name, and none ends the run before our open orders are canceled. A replacement with
-no fills, as a resting
+lookback's listing does hold but shows no count. Every count this module reads from an order is read one
+way (`_shown`): a count is a finite number not below zero, and what is absent, empty, no number, not finite
+or below zero is not zero but unknown. An order in the symbol's listing, ours or not, whose fill count or
+quantity is no count leaves the quantity ours opened not established; so does an open order, a close of
+ours last shown without a fill count, and counts too large to sum. An order placed by notional names no
+quantity, which Alpaca lists as null beside a notional above zero, and that alone is not a missing one. A
+position's quantity is signed at Alpaca, so its rule is its own (`_held`): it must be a finite number; one
+below zero is a short, as is any position labelled short whatever it shows; what is no finite number is not
+known, and is carried as unknown, never as zero. What no order holds is read for no decision: left out it
+passes, and listed it must be a count for a long. Each of these freezes its symbol by name, at the run's
+last read as at its first, and none ends the run before our open orders are canceled: when the account
+cannot be read whole, they are canceled from the open orders alone and the run then fails by name. A
+replacement with no fills, as a resting
 stop tightened days after it was placed, carries none and counts nothing. A long
 is ours to close only when it is exactly that net. On an account held long-only, ours at the lookback's start
 is not negative, so the net over the lookback is never more than what ours holds now, and a match never takes
@@ -189,7 +194,7 @@ def _value(field: object) -> str:
 
 def order_line(order: Order) -> str:
     """One open order as `paper:account` names it: symbol, side, quantity, type, limit, status, lineage."""
-    qty = order.qty if order.qty is not None else f"notional {_value(order.notional)}"
+    qty = _quantity_named(order)
     kind = _value(order.type if order.type is not None else order.order_type)
     return (
         f"{order.symbol} {_value(order.side)} {qty} {kind} limit {_value(order.limit_price)} "
@@ -199,9 +204,15 @@ def order_line(order: Order) -> str:
 
 def position_line(position: Position) -> str:
     """One position: symbol, side, quantity, average entry, market value, unrealised result."""
+    listed = _listed(position)
+    qty = NO_NUMBER if listed.held is None else position.qty
+    note = f" ({listed.unknown})" if listed.unknown else ""
+    if listed.short and _value(position.side) != "short":
+        note += " (below zero: read as a short)"
     return (
-        f"{position.symbol} {_value(position.side)} {position.qty} avg_entry {position.avg_entry_price} "
+        f"{position.symbol} {_value(position.side)} {qty} avg_entry {position.avg_entry_price} "
         f"market_value {_value(position.market_value)} unrealized_pl {_value(position.unrealized_pl)}"
+        f"{note}"
     )
 
 
@@ -314,46 +325,103 @@ def _shown(field: object) -> Decimal | None:
     return value if value is not None and value >= 0 else None
 
 
-def _held(trading: TradingClient) -> tuple[dict[str, Decimal], dict[str, str]]:
-    """Alpaca's signed position in each symbol, and, for each symbol whose position shows a quantity
-    that is no count, why what is held there is not known. Both of a position's quantities are read:
-    what is held (`qty`) and what no order holds (`qty_available`). Alpaca lists a short with `side`
-    short and its quantities below zero, so there, and only there, a number below zero is a count."""
-    held: dict[str, Decimal] = {}
-    unknown: dict[str, str] = {}
-    for position in _read("the positions", trading.get_all_positions, list, Position):
-        symbol = str(position.symbol)
-        short = _value(position.side) == "short"
-        counts = []
-        # read by name: a listing may leave either out altogether
-        for shown in (getattr(position, "qty", None), getattr(position, "qty_available", None)):
-            number = _number(shown)
-            counts.append(None if number is None else _shown(abs(number) if short else number))
-        if None in counts:
-            unknown[symbol] = (
+class _Unread(str):
+    """A freeze reason that says a quantity could not be read. It is text like any other reason; the
+    type is what lets a run keep it when a later read of the same symbol is clean (`_CloseOnly._run`):
+    a listing that could not be read once in a run is not trusted in that run."""
+
+    __slots__ = ()
+
+
+NO_COUNT = "a quantity that is no count"
+NO_NUMBER = "a quantity that is no number"
+"""What a line of a report says in place of a quantity that cannot be read (`_shown`, `_number`)."""
+
+
+@dataclass(frozen=True)
+class _Listed:
+    """One position as Alpaca lists it. `held` is its signed quantity, below zero for a short, or None
+    when its quantity is no finite number. `short` says it is a short, by its label or by its sign.
+    `unknown` names what in the listing cannot be read, or is ""."""
+
+    held: Decimal | None
+    short: bool = False
+    unknown: str = ""
+
+
+def _listed(position: Position) -> _Listed:
+    """How this module reads one listed position, for the close form and for the account's lines alike.
+
+    A position's quantity (`qty`) is signed at Alpaca, so the count rule of `_shown` is not its rule: it
+    must be a finite number, read before any sign is taken off. One below zero is a short, and so is any
+    position whose `side` is short, whatever quantity it shows (a short listed with none, or with one
+    above zero, is still never read as a long). What is no finite number is not known.
+
+    What no order holds (`qty_available`) is optional in alpaca-py (`alpaca/trading/models.py:201` at the
+    pin) and is not among the fields Alpaca's reference requires of a position
+    (https://docs.alpaca.markets/us/reference/getallopenpositions.md, read 2026-11-13), and nothing here
+    decides on it: left out it passes; listed, it must be a count for a long and a finite number for a
+    short. The day this module decides on it, it becomes required in that change."""
+    symbol = str(position.symbol)
+    # read by name: a listing may leave either out altogether
+    qty = _number(getattr(position, "qty", None))
+    available = getattr(position, "qty_available", None)
+    short = _value(position.side) == "short" or (qty is not None and qty < 0)
+    if qty is None:
+        return _Listed(
+            None,
+            short,
+            _Unread(
                 f"the position in {symbol} shows no quantity that can be counted, so what is held "
                 "there is not known"
-            )
-            continue
-        count = counts[0]
-        assert count is not None
-        held[symbol] = -count if short else count
-    return held, unknown
+            ),
+        )
+    unknown = ""
+    if available is not None and (_number(available) if short else _shown(available)) is None:
+        unknown = _Unread(
+            f"the position in {symbol} lists a quantity no order holds that cannot be counted"
+        )
+    # `copy_abs` and `copy_negate` take no context, so no quantity is too large for them
+    return _Listed(qty.copy_abs().copy_negate() if short else qty, short, unknown)
+
+
+def _held(trading: TradingClient) -> dict[str, _Listed]:
+    """Each position Alpaca lists, by symbol (`_listed`)."""
+    return {
+        str(position.symbol): _listed(position)
+        for position in _read("the positions", trading.get_all_positions, list, Position)
+    }
+
+
+def _by_notional(order: Order) -> bool:
+    """Whether an order names a dollar amount in place of a share quantity: Alpaca then lists its
+    quantity as null (`Order.qty`, `alpaca/trading/models.py:238-240` at the pin), which is not a
+    missing count. An empty quantity is not that form, and neither is a notional that is no amount
+    above zero."""
+    notional = _shown(order.notional)
+    return order.qty is None and notional is not None and notional > 0
 
 
 def _no_count(order: Order) -> str:
     """ "" when both of an order's quantities are counts (`_shown`), else which is not: its fill count,
-    or its quantity. An order placed by notional names no quantity, and that is not a missing one."""
+    or its quantity. An order placed by notional names no quantity (`_by_notional`)."""
     if _shown(order.filled_qty) is None:
         return "fill count"
-    by_notional = order.qty in (None, "") and (_number(order.notional) or Decimal(0)) > 0
-    return "" if by_notional or _shown(order.qty) is not None else "quantity"
+    return "" if _by_notional(order) or _shown(order.qty) is not None else "quantity"
+
+
+def _quantity_named(order: Order) -> str:
+    """An order's quantity for a line of a report: as listed when it is a count, its notional when it
+    was placed by one, and named as no count otherwise, never printed as if it were one."""
+    if _by_notional(order):
+        return f"notional {_value(order.notional)}"
+    return str(order.qty) if _shown(order.qty) is not None else NO_COUNT
 
 
 def describe(order: Order) -> str:
     """An order by name for a report: ours by its client order ID, a foreign one by what it is (never its
     ID, which may be the owner's)."""
-    qty = order.qty if order.qty is not None else f"notional {_value(order.notional)}"
+    qty = _quantity_named(order)
     what = f"{_value(order.side)} {qty} {order.symbol} {_value(order.type or order.order_type)}"
     if lineage(order.client_order_id) == OURS:
         return f"{order.client_order_id} ({what}, {_value(order.status)})"
@@ -365,7 +433,9 @@ class Holding:
     """One symbol's custody: what Alpaca holds, what our orders opened, and what is open in it."""
 
     symbol: str
-    held: Decimal
+    held: Decimal | None
+    """Alpaca's signed position, zero when it lists none, or None when it lists one whose quantity is
+    not known: never zero in its place."""
     ours_open: list[Order] = field(default_factory=list)
     foreign_open: list[Order] = field(default_factory=list)
     opened: Decimal | None = None
@@ -381,6 +451,13 @@ class Holding:
         if self.held and self.opened and not self.frozen:
             left.append(f"position of {self.held} {self.symbol} (ours opened {self.opened})")
         return left
+
+
+def _not_counted(symbol: str, what: str) -> str:
+    return _Unread(
+        f"an order in {symbol} shows no {what} that can be counted, so the quantity ours opened is "
+        "not established"
+    )
 
 
 def _opened(trading: TradingClient, symbol: str, now: datetime) -> tuple[Decimal | None, str]:
@@ -403,17 +480,27 @@ def _opened(trading: TradingClient, symbol: str, now: datetime) -> tuple[Decimal
         if what := _no_count(order):
             # ours or not: a row that shows no count says nothing sure about the symbol, and read as
             # zero a sale of ours would vanish from the net, or a hand's fills be taken for ours
-            return None, (
-                f"an order in {symbol} shows no {what} that can be counted, so the quantity ours "
-                "opened is not established"
-            )
+            return None, _not_counted(symbol, what)
+    try:
+        return _net_of_ours(symbol, orders)
+    except ArithmeticError:
+        # counts the arithmetic cannot carry (a number too large to sum) are no counts either
+        return None, _Unread(
+            f"the fill counts of the orders in {symbol} cannot be summed, so the quantity ours opened "
+            "is not established"
+        )
+
+
+def _net_of_ours(symbol: str, orders: list[Order]) -> tuple[Decimal | None, str]:
+    """`_opened`'s sum over a listing whose every row shows counts (`_no_count`)."""
     listed = {str(o.id): o for o in orders}
     opened = Decimal(0)
     for order in orders:
         if lineage(order.client_order_id) != OURS:
             continue
         filled = _shown(order.filled_qty)
-        assert filled is not None  # every row was checked above
+        if filled is None:
+            return None, _not_counted(symbol, "fill count")
         if order.replaces is not None and filled > 0:
             # a replacement carries on the fills of the order it replaces, whoever placed that one:
             # only what it filled beyond them is its own (one with no fills carries none)
@@ -425,7 +512,8 @@ def _opened(trading: TradingClient, symbol: str, now: datetime) -> tuple[Decimal
                     "opened is not established"
                 )
             before = _shown(replaced.filled_qty)
-            assert before is not None
+            if before is None:
+                return None, _not_counted(symbol, "fill count")
             filled = max(Decimal(0), filled - before)
         opened += filled if _value(order.side) == "buy" else -filled
     return opened, ""
@@ -434,19 +522,22 @@ def _opened(trading: TradingClient, symbol: str, now: datetime) -> tuple[Decimal
 def read_holdings(trading: TradingClient, now: datetime) -> list[Holding]:
     """Each symbol with a position or an open order, with its custody: a symbol is frozen when a foreign or
     unmarked order is open in it, when what Alpaca holds is short, or when it is not exactly what our orders
-    opened, or when the account is not held long-only, on which the quantity rule rests (module header,
-    "Quantity"). A read that fails raises `ReadFailed`."""
-    held, unknown = _held(trading)
+    opened, or when the account is not held long-only, on which the quantity rule rests, or when a
+    position, an open order or an order in the symbol's listing shows a quantity that cannot be read
+    (module header, "Quantity"). A position whose quantity is not known has `held` None, with why in
+    `frozen`, and nothing is sent for it. A read that fails raises `ReadFailed`."""
+    listed = _held(trading)
     orders = open_orders(trading)
     configuration = _read(
         "the account configuration", trading.get_account_configurations, AccountConfiguration
     )
     found = {
-        symbol: Holding(symbol, held.get(symbol, Decimal(0)))
-        for symbol in sorted({*held, *unknown, *(str(o.symbol) for o in orders if o.symbol)})
+        symbol: Holding(symbol, listed[symbol].held if symbol in listed else Decimal(0))
+        for symbol in sorted({*listed, *(str(o.symbol) for o in orders if o.symbol)})
     }
-    for symbol, why in unknown.items():
-        found[symbol].frozen.append(why)
+    for symbol, position in listed.items():
+        if position.unknown:
+            found[symbol].frozen.append(position.unknown)
     for order in orders:
         if (holding := found.get(order.symbol)) is not None:
             mine = lineage(order.client_order_id) == OURS
@@ -455,16 +546,20 @@ def read_holdings(trading: TradingClient, now: datetime) -> list[Holding]:
     for holding in found.values():
         holding.frozen.extend(f"open {describe(o)}" for o in holding.foreign_open)
         holding.frozen.extend(
-            f"an open order in {holding.symbol} shows no {what} that can be counted"
+            _Unread(f"an open order in {holding.symbol} shows no {what} that can be counted")
             for o in (*holding.ours_open, *holding.foreign_open)
             if (what := _no_count(o))
         )
         if full:
             holding.frozen.append(f"{len(orders)} open orders, the most one listing returns")
-        if holding.held < 0:
-            holding.frozen.append(
-                f"a short of {-holding.held} {holding.symbol}: never bought back here"
+        position = listed.get(holding.symbol)
+        if position is not None and position.short:
+            size = (
+                "a quantity that is not known"
+                if position.held is None
+                else position.held.copy_abs()
             )
+            holding.frozen.append(f"a short of {size} {holding.symbol}: never bought back here")
         elif holding.held and not configuration.no_shorting:
             holding.frozen.append(
                 "the account is not long-only (no_shorting is false), so what our orders opened does "
@@ -475,11 +570,15 @@ def read_holdings(trading: TradingClient, now: datetime) -> list[Holding]:
         holding.opened, why = _opened(trading, holding.symbol, now)
         if holding.opened is None:
             holding.frozen.append(why)
-        elif holding.held > 0 and holding.held != holding.opened:
+        elif holding.held is not None and holding.held > 0 and holding.held != holding.opened:
             holding.frozen.append(
                 f"{holding.held} {holding.symbol} held, but our orders opened {holding.opened} in the "
                 f"last {LINEAGE_LOOKBACK}"
             )
+    for holding in found.values():
+        holding.frozen[:] = dict.fromkeys(
+            holding.frozen
+        )  # two orders alike are one reason, named once
     return list(found.values())
 
 
@@ -580,6 +679,10 @@ class _CloseOnly:
         self.no_part = ""
         self.client: Any = None
         """The market data client, built on the first quote and kept for the run."""
+        self.unread: dict[str, list[str]] = {}
+        """Per symbol, what the run's first read could not count (`_carry`)."""
+        self.closing: set[str] = set()
+        """The symbols whose long the run found ours to close."""
         self.sent: list[str] = []
         self.done: set[str] = set()
         """The closes sent, and those `_work` has seen ended or canceled."""
@@ -592,9 +695,24 @@ class _CloseOnly:
             report.failed = f"{_failure(e)} part way through"
             self._cancel_sent()
         try:
-            report.left = [
-                x for h in read_holdings(self.trading, self.now()) for x in h.ours_left()
-            ]
+            last = read_holdings(self.trading, self.now())
+            carried = self._carry(last)  # before `ours_left`: a frozen position is never ours left
+            report.left = [x for h in last for x in h.ours_left()]
+            for h in last:
+                # a symbol frozen only at this read (a position that cannot be counted now) is named,
+                # beside what `_run` and `_work` recorded: a frozen position is in no `ours_left`
+                known = report.frozen.setdefault(h.symbol, []) if h.frozen else []
+                known.extend(
+                    f"at the end: {why}"
+                    for why in h.frozen
+                    if why not in known and why not in carried
+                )
+                if h.frozen and h.symbol in self.closing and (h.held is None or h.held > 0):
+                    # ours when the run began, and not shown closed: never reported as nothing left
+                    report.left.append(
+                        f"the position in {h.symbol} this run was closing: frozen at the end, so it "
+                        "is not shown closed"
+                    )
         except Exception as e:  # noqa: BLE001 - named; the run is not flat
             report.failed = report.failed or f"the last read: {_failure(e)}"
             report.left = ["unknown: the account could not be read at the end"]
@@ -602,8 +720,24 @@ class _CloseOnly:
 
     def _run(self) -> None:
         report = self.report
-        report.part, self.no_part = _part(self.trading)
-        holdings = read_holdings(self.trading, self.now())
+        try:
+            report.part, self.no_part = _part(self.trading)
+            holdings = read_holdings(self.trading, self.now())
+        except Stopped:
+            raise  # a stop is not a failed read: it starts no cancel, as Ctrl-C starts none
+        except Exception:
+            # what is held could not be read, so nothing is closed; our own open orders need no such
+            # read to be told as ours, and are canceled before the failure ends the run
+            self._cancel_ours_alone()
+            raise
+        # what this read could not count is kept for the run (`_carry`), and what it froze is in the
+        # report from here on, so a run that fails next still names it
+        self.unread = {
+            h.symbol: list(dict.fromkeys(w for w in h.frozen if isinstance(w, _Unread)))
+            for h in holdings
+            if any(isinstance(w, _Unread) for w in h.frozen)
+        }
+        report.frozen = {h.symbol: list(h.frozen) for h in holdings if h.frozen}
         report.found = [x for h in holdings for x in h.ours_left()]
         if any(h.ours_open for h in holdings):
             self._cancel_ours([o for h in holdings for o in h.ours_open])
@@ -611,13 +745,37 @@ class _CloseOnly:
             report.part, self.no_part = _part(
                 self.trading
             )  # the wait may have crossed into another part
-        report.frozen = {h.symbol: list(h.frozen) for h in holdings if h.frozen}
+            self._carry(holdings)
+            listed = {h.symbol for h in holdings}
+            report.frozen = {
+                # a symbol with nothing listed in it any more is still named
+                **{
+                    symbol: [f"at the first read: {w}" for w in reasons]
+                    for symbol, reasons in self.unread.items()
+                    if symbol not in listed
+                },
+                **{h.symbol: list(h.frozen) for h in holdings if h.frozen},
+            }
         closes = [h for h in holdings if self._closable(h)]
+        self.closing = {h.symbol for h in closes}
         for n, h in enumerate(closes, 1):
             if client_order_id := self._close(h, n):
                 self.sent.append(client_order_id)
         if self.sent:
             self._work(list(self.sent))
+
+    def _carry(self, holdings: list[Holding]) -> set[str]:
+        """Freeze, in a later read's holdings, each symbol whose quantity the run's first read could not
+        count, and return the reasons added. That read replaces the first, but not what the first could
+        not read: a listing that could not be read once in a run is not trusted in that run, however it
+        is listed now."""
+        added: set[str] = set()
+        for h in holdings:
+            for why in self.unread.get(h.symbol, ()):
+                if why not in h.frozen:  # still unreadable now: named as it is, once
+                    h.frozen.append(f"at the first read: {why}")
+                    added.add(h.frozen[-1])
+        return added
 
     def _cancel_sent(self) -> None:
         """After a failure part way: cancel each close sent that `_work` has not seen end, so none is left
@@ -640,6 +798,19 @@ class _CloseOnly:
                 log.append("canceled after the failure")
             except Exception as e:  # noqa: BLE001 - named in its log
                 log.append(f"cancel after the failure failed: {_failure(e)}")
+
+    def _cancel_ours_alone(self) -> None:
+        """When the account could not be read whole: cancel our open orders from the open orders alone,
+        by their client order IDs. If that listing cannot be read either, none is canceled and it is
+        said: which orders are ours is never guessed."""
+        try:
+            ours = [o for o in open_orders(self.trading) if lineage(o.client_order_id) == OURS]
+        except Exception as e:  # noqa: BLE001 - named; the first failure is the run's
+            self.report.errors.append(f"our open orders were not canceled: {_failure(e)}")
+            return
+        self.report.found = [f"open order {describe(o)}" for o in ours]
+        if ours:
+            self._cancel_ours(ours)
 
     def _cancel_ours(self, orders: list[Order]) -> None:
         """Cancel each open order of ours, then wait, at most `CANCEL_WAIT_SECS`, for Alpaca to show each
@@ -672,7 +843,7 @@ class _CloseOnly:
     def _closable(self, h: Holding) -> bool:
         """Whether `h` is ours to close now: not frozen, a long ours opened, nothing of ours still open,
         and a session part open."""
-        if h.frozen or h.held <= 0 or h.ours_open:
+        if h.frozen or h.held is None or h.held <= 0 or h.ours_open:
             return False
         if not self.report.part:
             self.report.errors.append(
@@ -684,6 +855,8 @@ class _CloseOnly:
     def _close(self, h: Holding, n: int) -> str:
         """Send the one close for `h` and return its client order ID, or "" when none was sent."""
         client_order_id = f"{self.prefix}{self.stamp}-{n}-{uuid4().hex[:8]}"
+        if h.held is None:  # `_closable` lets none such through: an unknown quantity is never sold
+            return ""
         qty = float(h.held)
         if self.report.part == "regular":
             request: MarketOrderRequest | LimitOrderRequest = MarketOrderRequest(
@@ -830,7 +1003,9 @@ def _stop(signum: int, frame: object) -> None:
 
 def close_task(trading: TradingClient | None = None, data: Any = None, **timing: Any) -> int:
     """`mise run paper:close <tests|windows>`: run `close_ours` and print its report. 0 when nothing of
-    ours is left and nothing is frozen, 1 when something of ours is left, 2 when only frozen symbols are.
+    ours is left and nothing is frozen, 1 when something of ours is left, 2 when only frozen symbols are
+    (a symbol whose close was last shown without a fill count is one, even when nothing is held after;
+    so is one whose quantity the run's first read could not count, however it is listed later).
     SIGTERM, which the task's `timeout` sends before its KILL, and Ctrl-C stop the run as a failure, after
     which each close sent is canceled (Python's `signal.signal`; the default for SIGTERM ends the process
     with no cleanup). `timing` goes to `close_ours` (`sleep`, `monotonic`, `now`), for tests."""
