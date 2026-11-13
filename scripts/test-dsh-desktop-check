@@ -1,0 +1,609 @@
+#!/bin/bash
+# test-dsh-desktop-check — run scripts/dsh-desktop-check against stand-in records, app bundles, profiles and
+# settings files in a temp folder, and check every line it prints and its exit code. The cases cover: one line
+# per item for app version, update channel, bundles, rows and plugins; semver order including prereleases;
+# DIFFERS/AHEAD/MISSING/ok; exit 0/1/2; no other value of a read file reaching the output; no write; the
+# plain-XML plist read with plutil off the PATH; and no network or `dsh` call. No real app, profile, settings
+# file or record is read: every case points all four inputs into the temp folder. Offline; exit 0 if every case
+# behaves, 1 otherwise.
+set -uo pipefail
+ROOT=$(cd "$(dirname "$0")/.." && pwd -P)
+CHECK="$ROOT/scripts/dsh-desktop-check"
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/canon-test-dsh-desktop-check.XXXXXX") \
+  || { printf 'test-dsh-desktop-check: could not create a temp folder under %s; nothing was written\n' "${TMPDIR:-/tmp}" >&2; exit 1; }
+trap 'rm -rf "$TMP"' EXIT
+TMP=$(cd "$TMP" && pwd -P)   # /var is a link to /private/var on macOS; keep the printed paths real
+JQ_REAL=$(command -v jq) || { printf 'test-dsh-desktop-check: jq not found\n' >&2; exit 1; }
+AWK_REAL=$(command -v awk) || { printf 'test-dsh-desktop-check: awk not found\n' >&2; exit 1; }
+
+DEFAULT_BUNDLES='["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app"]'
+DEFAULT_BUNDLES_ABSENT='["@deepseek-ai/dsh-experimental-inspector-profile"]'
+DEFAULT_ROWS_OFF='["session-log-deepseek", "product-analytics"]'
+DEFAULT_DEPS='{"@deepseek-ai/dsh-base": "0.2.2-rc.2", "@deepseek-ai/dsh-web-app": "0.2.2-rc.2", "@deepseek-ai/dsh-message-feedback": "0.2.2-rc.2", "@deepseek-ai/dsh-unused": "0.0.1"}'
+
+# deps_at VERSION — the default dependency set with the three selected plugins at VERSION.
+deps_at() {
+  printf '{"@deepseek-ai/dsh-base": "%s", "@deepseek-ai/dsh-web-app": "%s", "@deepseek-ai/dsh-message-feedback": "%s", "@deepseek-ai/dsh-unused": "0.0.1"}\n' "$1" "$1" "$1"
+}
+
+pass=0
+fail=0
+CASE_OUT=
+CASE_RC=0
+
+ok() { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
+bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
+same() { if [ "$2" = "$3" ]; then ok "$1"; else bad "$1"; printf '  wanted: %s\n  got:    %s\n' "$3" "$2"; fi; }
+wants_rc() { if [ "$2" -eq "$3" ]; then ok "$1"; else bad "$1 (exit $2, wanted $3)"; fi; }
+contains() { case $2 in *"$3"*) ok "$1" ;; *) bad "$1 (no '$3')" ;; esac; }
+rejects() { case $2 in *"$3"*) bad "$1 (found '$3')" ;; *) ok "$1" ;; esac; }
+differences() { printf '%s\n' "$1" | grep -c '^DIFFERS ' || true; }
+
+# run_check DIR [PATH] — run the check with all four inputs pointed into DIR; CASE_OUT and CASE_RC are set.
+run_check() {
+  local d=$1 p=$PATH
+  if [ "${2:-}" != "" ]; then p=$2; fi
+  CASE_OUT=$(env -i HOME="$d/home" PATH="$p" \
+    DSH_HOME="$d/home/.dsh" \
+    DSH_DESKTOP_APP="$d/app" \
+    DSH_DESKTOP_SETTINGS="$d/settings.json" \
+    DSH_DESKTOP_RECORD="$d/record.json" \
+    "$CHECK" 2>&1)
+  CASE_RC=$?
+}
+
+# snapshot DIR — the listing and every file's checksum, so a write by the check shows.
+snapshot() {
+  (
+    cd "$1" || exit 1
+    find . -print | LC_ALL=C sort
+    find . -type f -print | LC_ALL=C sort | while IFS= read -r f; do cksum "$f"; done
+  )
+}
+
+write_plist() { # DIR VERSION
+  mkdir -p "$1/app/Contents"
+  cat > "$1/app/Contents/Info.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+	<key>CFBundleShortVersionString</key>
+	<string>$2</string>
+</dict>
+</plist>
+PLIST
+}
+
+write_record() { # DIR APP_VERSION CHANNEL BUNDLES_ABSENT_JSON ROWS_OFF_JSON
+  cat > "$1/record.json" <<RECORD
+{
+  "about": "What the DeepSeek Harness desktop profile should hold. Read by scripts/dsh-desktop-check.",
+  "app_version": "$2",
+  "update_channel": "$3",
+  "bundles_absent": $4,
+  "rows_off": $5
+}
+RECORD
+}
+
+write_settings() { # DIR CHANNEL
+  cat > "$1/settings.json" <<SETTINGS
+{
+  "updates": {"channel": "$2"},
+  "allowTestAuthPopupWindow": false,
+  "marker": "P4-MARKER-settings"
+}
+SETTINGS
+}
+
+write_profile() { # DIR BUNDLES_JSON DEPS_JSON
+  mkdir -p "$1/home/.dsh/profiles/desktop"
+  cat > "$1/home/.dsh/profiles/desktop/package.json" <<PKG
+{
+  "name": "dsh-profile-desktop",
+  "private": true,
+  "dependencies": $3,
+  "dsh": {"profile": {"bundles": $2}},
+  "marker": "P4-MARKER-package"
+}
+PKG
+}
+
+write_patch() { # DIR
+  cat > "$1/home/.dsh/profiles/desktop/cordis.patch.yml" <<'PATCH'
+# Desktop profile user patch (stand-in).
+- id: session-log-deepseek
+  config:
+    enabled: false
+- id: product-analytics
+  config:
+    enabled: false
+- insert:
+    - id: message-feedback
+      name: '@deepseek-ai/dsh-message-feedback'
+- id: unrelated
+  config:
+    keep: P4-MARKER-patch
+# P4-MARKER-comment
+PATCH
+}
+
+build_fixture() { # DIR — a stand-in on which every line of the check is ok
+  local d=$1
+  mkdir -p "$d"
+  write_plist "$d" 0.2.2-rc.2
+  write_record "$d" 0.2.2-rc.2 nightly "$DEFAULT_BUNDLES_ABSENT" "$DEFAULT_ROWS_OFF"
+  write_settings "$d" nightly
+  write_profile "$d" "$DEFAULT_BUNDLES" "$DEFAULT_DEPS"
+  write_patch "$d"
+}
+
+expected_good() {
+  cat <<'GOOD'
+ok app version
+ok update channel
+ok bundle @deepseek-ai/dsh-experimental-inspector-profile
+ok row session-log-deepseek
+ok row product-analytics
+ok plugin @deepseek-ai/dsh-base
+ok plugin @deepseek-ai/dsh-web-app
+ok plugin @deepseek-ai/dsh-message-feedback
+GOOD
+}
+
+# --- the all-ok stand-in, its exit code, its exact lines, no write and no stray value --------------------
+d=$TMP/case-ok
+build_fixture "$d"
+before=$(snapshot "$d")
+run_check "$d"
+after=$(snapshot "$d")
+wants_rc "good stand-in: exit 0" "$CASE_RC" 0
+same "good stand-in: one line per item, in order" "$CASE_OUT" "$(expected_good)"
+same "P5: the check writes nothing" "$after" "$before"
+rejects "P4: no other settings value is printed" "$CASE_OUT" "P4-MARKER-settings"
+rejects "P4: no other package value is printed" "$CASE_OUT" "P4-MARKER-package"
+rejects "P4: no other patch value is printed" "$CASE_OUT" "P4-MARKER-patch"
+rejects "P4: no other patch comment is printed" "$CASE_OUT" "P4-MARKER-comment"
+
+# --- app version: semver, prerelease order, AHEAD exits 0 ------------------------------------------------
+d=$TMP/case-app-newer
+build_fixture "$d"
+write_plist "$d" 0.2.3
+write_profile "$d" "$DEFAULT_BUNDLES" "$(deps_at 0.2.3)"
+run_check "$d"
+wants_rc "app newer: exit 0 (AHEAD)" "$CASE_RC" 0
+contains "app newer: AHEAD app version" "$CASE_OUT" "AHEAD app version"
+same "app newer: only the app version differs" "$(differences "$CASE_OUT")" 0
+
+d=$TMP/case-app-release
+build_fixture "$d"
+write_plist "$d" 0.2.2
+write_profile "$d" "$DEFAULT_BUNDLES" "$(deps_at 0.2.2)"
+run_check "$d"
+wants_rc "app release over record prerelease: exit 0 (AHEAD)" "$CASE_RC" 0
+contains "app release over prerelease: AHEAD" "$CASE_OUT" "AHEAD app version"
+
+d=$TMP/case-app-rc10
+build_fixture "$d"
+write_plist "$d" 0.2.2-rc.10
+write_profile "$d" "$DEFAULT_BUNDLES" "$(deps_at 0.2.2-rc.10)"
+run_check "$d"
+wants_rc "prerelease rc.10 over rc.2: exit 0 (AHEAD, numeric)" "$CASE_RC" 0
+contains "prerelease rc.10 over rc.2: AHEAD" "$CASE_OUT" "AHEAD app version"
+
+d=$TMP/case-app-older
+build_fixture "$d"
+write_plist "$d" 0.2.2-rc.1
+write_profile "$d" "$DEFAULT_BUNDLES" "$(deps_at 0.2.2-rc.1)"
+run_check "$d"
+wants_rc "app older: exit 1" "$CASE_RC" 1
+contains "app older: DIFFERS app version" "$CASE_OUT" "DIFFERS app version"
+same "app older: only the app version differs" "$(differences "$CASE_OUT")" 1
+
+d=$TMP/case-app-prerelease
+build_fixture "$d"
+write_record "$d" 0.2.2 nightly "$DEFAULT_BUNDLES_ABSENT" "$DEFAULT_ROWS_OFF"
+write_plist "$d" 0.2.2-rc.3
+write_profile "$d" "$DEFAULT_BUNDLES" "$(deps_at 0.2.2-rc.3)"
+run_check "$d"
+wants_rc "prerelease is older than the release: exit 1" "$CASE_RC" 1
+contains "prerelease is older than the release: DIFFERS" "$CASE_OUT" "DIFFERS app version"
+
+d=$TMP/case-app-garbage
+build_fixture "$d"
+write_plist "$d" not-a-version
+run_check "$d"
+wants_rc "unparseable app version: exit 2" "$CASE_RC" 2
+same "unparseable app version: MISSING the plist" "$CASE_OUT" "MISSING $d/app/Contents/Info.plist"
+
+# semver 2.0.0 forbids a leading zero in a numeric part; past nine digits a part is not compared, so refused
+for v in 0.2.99999999999999999999 01.2.3 0.2.2-rc.99999999999999999999 0.2.2-rc.01; do
+  d=$TMP/case-app-bad-$v
+  build_fixture "$d"
+  write_plist "$d" "$v"
+  run_check "$d"
+  wants_rc "app version $v is no version this check compares: exit 2" "$CASE_RC" 2
+  same "app version $v: MISSING the plist" "$CASE_OUT" "MISSING $d/app/Contents/Info.plist"
+done
+
+# --- update channel --------------------------------------------------------------------------------------
+d=$TMP/case-channel-other
+build_fixture "$d"
+write_settings "$d" stable
+run_check "$d"
+wants_rc "channel stable: exit 1" "$CASE_RC" 1
+contains "channel stable: DIFFERS update channel" "$CASE_OUT" "DIFFERS update channel"
+
+d=$TMP/case-channel-absent
+build_fixture "$d"
+printf '%s\n' '{"updates": {}}' > "$d/settings.json"
+run_check "$d"
+wants_rc "channel absent: exit 1" "$CASE_RC" 1
+contains "channel absent: DIFFERS update channel" "$CASE_OUT" "DIFFERS update channel"
+
+d=$TMP/case-channel-type
+build_fixture "$d"
+printf '%s\n' '{"updates": {"channel": 3}}' > "$d/settings.json"
+run_check "$d"
+wants_rc "channel not a string: exit 1" "$CASE_RC" 1
+contains "channel not a string: DIFFERS update channel" "$CASE_OUT" "DIFFERS update channel"
+
+d=$TMP/case-settings-bad
+build_fixture "$d"
+printf '%s\n' '{oops' > "$d/settings.json"
+run_check "$d"
+wants_rc "unparseable settings: exit 2" "$CASE_RC" 2
+same "unparseable settings: MISSING the settings file" "$CASE_OUT" "MISSING $d/settings.json"
+
+# --- bundles ---------------------------------------------------------------------------------------------
+d=$TMP/case-bundle-listed
+build_fixture "$d"
+write_profile "$d" '["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app", "@deepseek-ai/dsh-experimental-inspector-profile"]' "$DEFAULT_DEPS"
+run_check "$d"
+wants_rc "bundle listed: exit 1" "$CASE_RC" 1
+contains "bundle listed: DIFFERS bundle" "$CASE_OUT" "DIFFERS bundle @deepseek-ai/dsh-experimental-inspector-profile"
+
+# --- rows: false, present, absent, commented, quoted, nested, repeated -----------------------------------
+d=$TMP/case-row-true
+build_fixture "$d"
+cat > "$d/home/.dsh/profiles/desktop/cordis.patch.yml" <<'PATCH'
+- id: session-log-deepseek
+  config:
+    enabled: false
+- id: product-analytics
+  config:
+    enabled: true
+PATCH
+run_check "$d"
+wants_rc "row enabled true: exit 1" "$CASE_RC" 1
+contains "row enabled true: DIFFERS row" "$CASE_OUT" "DIFFERS row product-analytics"
+
+d=$TMP/case-row-absent
+build_fixture "$d"
+cat > "$d/home/.dsh/profiles/desktop/cordis.patch.yml" <<'PATCH'
+- id: session-log-deepseek
+  config:
+    enabled: false
+PATCH
+run_check "$d"
+wants_rc "row absent: exit 1" "$CASE_RC" 1
+contains "row absent: DIFFERS row product-analytics" "$CASE_OUT" "DIFFERS row product-analytics"
+
+d=$TMP/case-row-commented
+build_fixture "$d"
+cat > "$d/home/.dsh/profiles/desktop/cordis.patch.yml" <<'PATCH'
+- id: session-log-deepseek
+  config:
+    enabled: false
+# - id: product-analytics
+#   config:
+#     enabled: false
+PATCH
+run_check "$d"
+wants_rc "commented row does not count: exit 1" "$CASE_RC" 1
+contains "commented row does not count: DIFFERS row product-analytics" "$CASE_OUT" "DIFFERS row product-analytics"
+
+d=$TMP/case-row-quoted
+build_fixture "$d"
+cat > "$d/home/.dsh/profiles/desktop/cordis.patch.yml" <<'PATCH'
+- id: session-log-deepseek
+  config:
+    enabled: false
+- id: product-analytics
+  config:
+    enabled: "false"
+PATCH
+run_check "$d"
+wants_rc "quoted enabled value is not boolean false: exit 1" "$CASE_RC" 1
+contains "quoted enabled value: DIFFERS row product-analytics" "$CASE_OUT" "DIFFERS row product-analytics"
+
+d=$TMP/case-row-nested
+build_fixture "$d"
+cat > "$d/home/.dsh/profiles/desktop/cordis.patch.yml" <<'PATCH'
+- id: session-log-deepseek
+  config:
+    enabled: false
+- id: product-analytics
+  config:
+    presets:
+      read-only:
+        enabled: false
+PATCH
+run_check "$d"
+wants_rc "nested enabled false is not the row's config: exit 1" "$CASE_RC" 1
+contains "nested enabled false: DIFFERS row product-analytics" "$CASE_OUT" "DIFFERS row product-analytics"
+
+d=$TMP/case-row-repeated
+build_fixture "$d"
+cat > "$d/home/.dsh/profiles/desktop/cordis.patch.yml" <<'PATCH'
+- id: session-log-deepseek
+  config:
+    enabled: false
+- id: product-analytics
+  config:
+    enabled: false
+- id: product-analytics
+  config:
+    enabled: true
+PATCH
+run_check "$d"
+wants_rc "a later row restates the config: exit 1" "$CASE_RC" 1
+contains "a later row restates the config: DIFFERS row product-analytics" "$CASE_OUT" "DIFFERS row product-analytics"
+
+d=$TMP/case-row-inline
+build_fixture "$d"
+cat > "$d/home/.dsh/profiles/desktop/cordis.patch.yml" <<'PATCH'
+- id: session-log-deepseek
+  config:
+    enabled: false
+- id: product-analytics
+  config: {enabled: false}
+PATCH
+run_check "$d"
+wants_rc "inline config mapping: exit 0" "$CASE_RC" 0
+contains "inline config mapping: row ok" "$CASE_OUT" "ok row product-analytics"
+
+# an inline config is read as off only when it is exactly {enabled: false}
+d=$TMP/case-row-inline-nested
+build_fixture "$d"
+cat > "$d/home/.dsh/profiles/desktop/cordis.patch.yml" <<'PATCH'
+- id: session-log-deepseek
+  config:
+    enabled: false
+- id: product-analytics
+  config: {presets: {read-only: {enabled: false}}}
+PATCH
+run_check "$d"
+wants_rc "an inline config whose only enabled false is nested: exit 1" "$CASE_RC" 1
+contains "an inline config whose only enabled false is nested: DIFFERS row product-analytics" "$CASE_OUT" "DIFFERS row product-analytics"
+
+d=$TMP/case-row-inline-nospace
+build_fixture "$d"
+cat > "$d/home/.dsh/profiles/desktop/cordis.patch.yml" <<'PATCH'
+- id: session-log-deepseek
+  config:
+    enabled: false
+- id: product-analytics
+  config: {enabled:false}
+PATCH
+run_check "$d"
+wants_rc "an inline config written enabled:false, with no space, is not read as off: exit 1" "$CASE_RC" 1
+contains "an inline config written enabled:false: DIFFERS row product-analytics" "$CASE_OUT" "DIFFERS row product-analytics"
+
+# the home-level patch is applied after the profile's, so it outranks it (app-boot README L61)
+d=$TMP/case-row-home-on
+build_fixture "$d"
+cat > "$d/home/.dsh/cordis.patch.yml" <<'PATCH'
+- id: session-log-deepseek
+  config:
+    enabled: true
+PATCH
+run_check "$d"
+wants_rc "a home-level row turning a row back on outranks the profile's: exit 1" "$CASE_RC" 1
+contains "a home-level row turning a row back on: DIFFERS row session-log-deepseek" "$CASE_OUT" "DIFFERS row session-log-deepseek"
+
+d=$TMP/case-row-home-off
+build_fixture "$d"
+cat > "$d/home/.dsh/profiles/desktop/cordis.patch.yml" <<'PATCH'
+- id: session-log-deepseek
+  config:
+    enabled: false
+PATCH
+cat > "$d/home/.dsh/cordis.patch.yml" <<'PATCH'
+- id: product-analytics
+  config:
+    enabled: false
+PATCH
+run_check "$d"
+wants_rc "a home-level row turning a row off, with none in the profile: exit 0" "$CASE_RC" 0
+contains "a home-level row turning a row off: ok row product-analytics" "$CASE_OUT" "ok row product-analytics"
+
+# a later row of the same id in a form the reader does not take: never ok, since dsh may apply it
+d=$TMP/case-row-later-flow
+build_fixture "$d"
+printf '%s\n' '- {id: session-log-deepseek, config: {enabled: true}}' >> "$d/home/.dsh/profiles/desktop/cordis.patch.yml"
+run_check "$d"
+wants_rc "a later flow-style row of the same id: exit 1" "$CASE_RC" 1
+contains "a later flow-style row of the same id: DIFFERS row session-log-deepseek" "$CASE_OUT" "DIFFERS row session-log-deepseek"
+contains "a later flow-style row: the line says the check does not read that form" "$CASE_OUT" \
+  "DIFFERS row session-log-deepseek (written in a form this check does not read)"
+
+d=$TMP/case-row-later-quoted
+build_fixture "$d"
+cat >> "$d/home/.dsh/profiles/desktop/cordis.patch.yml" <<'PATCH'
+- "id": product-analytics
+  config:
+    enabled: true
+PATCH
+run_check "$d"
+wants_rc "a later row of the same id with a quoted key: exit 1" "$CASE_RC" 1
+contains "a later row with a quoted key: DIFFERS row product-analytics" "$CASE_OUT" "DIFFERS row product-analytics"
+
+d=$TMP/case-row-later-id-last
+build_fixture "$d"
+cat >> "$d/home/.dsh/profiles/desktop/cordis.patch.yml" <<'PATCH'
+- config:
+    enabled: true
+  id: product-analytics
+PATCH
+run_check "$d"
+wants_rc "a later row of the same id written after its config: exit 1" "$CASE_RC" 1
+contains "a later row with its id after its config: DIFFERS row product-analytics" "$CASE_OUT" "DIFFERS row product-analytics"
+
+# --- plugins: version equal, stale, and only when a bundle or patch names it ------------------------------
+d=$TMP/case-plugin-stale
+build_fixture "$d"
+write_profile "$d" "$DEFAULT_BUNDLES" '{"@deepseek-ai/dsh-base": "0.2.2-rc.1", "@deepseek-ai/dsh-web-app": "0.2.2-rc.2", "@deepseek-ai/dsh-message-feedback": "0.2.2-rc.2", "@deepseek-ai/dsh-unused": "0.0.1"}'
+run_check "$d"
+wants_rc "stale plugin: exit 1" "$CASE_RC" 1
+contains "stale plugin: both versions named" "$CASE_OUT" "DIFFERS plugin @deepseek-ai/dsh-base 0.2.2-rc.1 (app 0.2.2-rc.2)"
+same "stale plugin: only the plugin differs" "$(differences "$CASE_OUT")" 1
+
+d=$TMP/case-plugin-named
+build_fixture "$d"
+cat > "$d/home/.dsh/profiles/desktop/cordis.patch.yml" <<'PATCH'
+- id: session-log-deepseek
+  config:
+    enabled: false
+- id: product-analytics
+  config:
+    enabled: false
+PATCH
+run_check "$d"
+wants_rc "a patch-named plugin line goes when the patch no longer names it: exit 0" "$CASE_RC" 0
+rejects "a patch-named plugin line goes when the patch no longer names it" "$CASE_OUT" "plugin @deepseek-ai/dsh-message-feedback"
+same "a stale dependency no bundle or patch names is not printed" "$(differences "$CASE_OUT")" 0
+
+d=$TMP/case-ahead-and-stale
+build_fixture "$d"
+write_plist "$d" 0.2.3
+write_profile "$d" "$DEFAULT_BUNDLES" '{"@deepseek-ai/dsh-base": "0.2.2-rc.1", "@deepseek-ai/dsh-web-app": "0.2.3", "@deepseek-ai/dsh-message-feedback": "0.2.3"}'
+run_check "$d"
+wants_rc "AHEAD does not hide a DIFFERS: exit 1" "$CASE_RC" 1
+contains "AHEAD app version alongside a stale plugin" "$CASE_OUT" "AHEAD app version"
+contains "stale plugin alongside AHEAD" "$CASE_OUT" "DIFFERS plugin @deepseek-ai/dsh-base"
+
+# a declared spec is printed as scripts/bootstrap prints a value: ? for each other character, at most 64
+d=$TMP/case-plugin-raw-spec
+build_fixture "$d"
+write_profile "$d" "$DEFAULT_BUNDLES" '{"@deepseek-ai/dsh-base": "0.2.2-rc.1\u001b[31mSPEC-0123456789012345678901234567890123456789012345678901234567890123456789", "@deepseek-ai/dsh-web-app": "0.2.2-rc.2", "@deepseek-ai/dsh-message-feedback": "0.2.2-rc.2"}'
+run_check "$d"
+wants_rc "a spec holding an escape character: exit 1" "$CASE_RC" 1
+rejects "P4: no escape character from a spec reaches the output" "$CASE_OUT" "$(printf '\033')"
+contains "P4: a spec is shown with ? for other characters, cut at 64" "$CASE_OUT" \
+  "DIFFERS plugin @deepseek-ai/dsh-base 0.2.2-rc.1??31mSPEC-01234567890123456789012345678901234567890123 (app 0.2.2-rc.2)"
+
+# --- missing or unparseable inputs: exit 2, one MISSING line, no item lines -------------------------------
+d=$TMP/case-missing-record
+build_fixture "$d"
+rm "$d/record.json"
+run_check "$d"
+wants_rc "missing record: exit 2" "$CASE_RC" 2
+same "missing record: names the record" "$CASE_OUT" "MISSING $d/record.json"
+
+d=$TMP/case-bad-record
+build_fixture "$d"
+printf '%s\n' '{' > "$d/record.json"
+run_check "$d"
+wants_rc "unparseable record: exit 2" "$CASE_RC" 2
+same "unparseable record: names the record" "$CASE_OUT" "MISSING $d/record.json"
+
+d=$TMP/case-record-field
+build_fixture "$d"
+printf '%s\n' '{"app_version": "0.2.2-rc.2", "update_channel": "nightly", "bundles_absent": []}' > "$d/record.json"
+run_check "$d"
+wants_rc "record without rows_off: exit 2" "$CASE_RC" 2
+same "record without rows_off: names the record" "$CASE_OUT" "MISSING $d/record.json"
+
+d=$TMP/case-missing-plist
+build_fixture "$d"
+rm "$d/app/Contents/Info.plist"
+run_check "$d"
+wants_rc "missing Info.plist: exit 2" "$CASE_RC" 2
+same "missing Info.plist: names the plist" "$CASE_OUT" "MISSING $d/app/Contents/Info.plist"
+
+d=$TMP/case-missing-settings
+build_fixture "$d"
+rm "$d/settings.json"
+run_check "$d"
+wants_rc "missing settings: exit 2" "$CASE_RC" 2
+same "missing settings: names the settings file" "$CASE_OUT" "MISSING $d/settings.json"
+
+d=$TMP/case-missing-package
+build_fixture "$d"
+rm "$d/home/.dsh/profiles/desktop/package.json"
+run_check "$d"
+wants_rc "missing profile package.json: exit 2" "$CASE_RC" 2
+same "missing profile package.json: names it" "$CASE_OUT" "MISSING $d/home/.dsh/profiles/desktop/package.json"
+
+d=$TMP/case-bad-package
+build_fixture "$d"
+printf '%s\n' '{' > "$d/home/.dsh/profiles/desktop/package.json"
+run_check "$d"
+wants_rc "unparseable profile package.json: exit 2" "$CASE_RC" 2
+same "unparseable profile package.json: names it" "$CASE_OUT" "MISSING $d/home/.dsh/profiles/desktop/package.json"
+
+d=$TMP/case-missing-patch
+build_fixture "$d"
+rm "$d/home/.dsh/profiles/desktop/cordis.patch.yml"
+run_check "$d"
+wants_rc "missing profile patch: exit 2" "$CASE_RC" 2
+same "missing profile patch: names it" "$CASE_OUT" "MISSING $d/home/.dsh/profiles/desktop/cordis.patch.yml"
+
+# a JSON input holding two values is not one the app reads, so it is unparseable here too
+d=$TMP/case-two-settings
+build_fixture "$d"
+cat "$d/settings.json" "$d/settings.json" > "$d/settings.two"
+mv "$d/settings.two" "$d/settings.json"
+run_check "$d"
+wants_rc "a settings file holding two JSON values: exit 2" "$CASE_RC" 2
+same "a settings file holding two JSON values: names it" "$CASE_OUT" "MISSING $d/settings.json"
+
+d=$TMP/case-two-package
+build_fixture "$d"
+p=$d/home/.dsh/profiles/desktop/package.json
+cat "$p" "$p" > "$p.two"
+mv "$p.two" "$p"
+run_check "$d"
+wants_rc "a profile package.json holding two JSON values: exit 2" "$CASE_RC" 2
+same "a profile package.json holding two JSON values: names it" "$CASE_OUT" "MISSING $p"
+
+# a home-level patch that exists but is no readable file: the check cannot say which rows dsh applies
+d=$TMP/case-home-patch-folder
+build_fixture "$d"
+mkdir -p "$d/home/.dsh/cordis.patch.yml"
+run_check "$d"
+wants_rc "a home-level patch that is a folder: exit 2" "$CASE_RC" 2
+same "a home-level patch that is a folder: names it" "$CASE_OUT" "MISSING $d/home/.dsh/cordis.patch.yml"
+
+# --- plutil off the PATH: the plain-XML read still finds the version -------------------------------------
+d=$TMP/case-no-plutil
+build_fixture "$d"
+mkdir -p "$d/bin"
+ln -s "$JQ_REAL" "$d/bin/jq"
+ln -s "$AWK_REAL" "$d/bin/awk"
+run_check "$d" "$d/bin"
+wants_rc "without plutil on the PATH: exit 0" "$CASE_RC" 0
+contains "without plutil on the PATH: reads the XML Info.plist" "$CASE_OUT" "ok app version"
+same "without plutil on the PATH: every line" "$CASE_OUT" "$(expected_good)"
+
+# --- no network and no dsh -------------------------------------------------------------------------------
+d=$TMP/case-no-network
+build_fixture "$d"
+mkdir -p "$d/netbin"
+for tool in curl wget dsh; do
+  cat > "$d/netbin/$tool" <<FAKE
+#!/bin/bash
+printf '%s\n' "$tool" >> "$d/net.log"
+exit 99
+FAKE
+  chmod +x "$d/netbin/$tool"
+done
+run_check "$d" "$d/netbin:$PATH"
+wants_rc "offline: exit 0" "$CASE_RC" 0
+same "offline: every line" "$CASE_OUT" "$(expected_good)"
+if [ -e "$d/net.log" ]; then bad "P6: no curl, wget or dsh call"; else ok "P6: no curl, wget or dsh call"; fi
+
+# --- result ----------------------------------------------------------------------------------------------
+printf '\n%d passed, %d failed\n' "$pass" "$fail"
+[ "$fail" -eq 0 ]

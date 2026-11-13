@@ -1,0 +1,578 @@
+#!/bin/bash
+# dsh-desktop-check — name where the DeepSeek Harness desktop profile differs from its record.
+#
+# One line per item, starting `ok`, `DIFFERS`, `AHEAD` or `MISSING`, then the item's name:
+#   app version     record app_version against the app's CFBundleShortVersionString, in semver 2.0.0 order
+#                   (prerelease included); a numeric part with a leading zero or of more than nine digits is
+#                   no version this check compares, so it reads MISSING
+#   update channel  updates.channel in the desktop settings file against record update_channel; an absent
+#                   key differs, since the app then takes the channel packaged with it
+#   bundle <name>   each bundles_absent entry must not be in dsh.profile.bundles
+#   row <id>        each rows_off entry: the last row of that id, reading the profile's patch and then the
+#                   home-level $DSH_HOME/cordis.patch.yml, must be a top-level block-style `- id: <id>` row
+#                   whose config sets `enabled: false`, or is exactly `{enabled: false}`. The id written
+#                   anywhere else in either file (a flow-style row, a quoted key, an id after its config)
+#                   reads DIFFERS: this reader takes that one form and reads nothing else as ok
+#   plugin <name>   each @deepseek-ai/* dependency whose bundle is listed, or that either patch names in a
+#                   `name:`, must be declared at exactly the app's version; a DIFFERS line names both. A name
+#                   or spec is shown as scripts/bootstrap shows a value, cut at 64 characters with ? for each
+#                   character but A-Z a-z 0-9 . _ : / - and, for npm's scoped names, @
+# Exit 0 when every line is ok or AHEAD, 1 on any DIFFERS, 2 when an input is missing or unparseable (a JSON
+# input must hold exactly one JSON object), with one `MISSING <path>` line per such input and no item line.
+# The home-level patch is optional; one that exists but cannot be read is MISSING.
+#
+# Inputs, each overridable: DSH_HOME (default ~/.dsh; the profile is $DSH_HOME/profiles/desktop),
+# DSH_DESKTOP_APP (default /Applications/DeepSeek Harness.app), DSH_DESKTOP_SETTINGS (default
+# ~/Library/Application Support/@deepseek-ai/dsh-desktop/desktop/settings.json), and DSH_DESKTOP_RECORD
+# (default home/dsh/desktop.json beside this script's repository; DSH_DESKTOP_RECORD_PATH is accepted too).
+#
+# Reads only those paths. Writes nothing, uses no network and runs no `dsh`. The record is what the desktop
+# profile should hold; changing what it holds is a change to the record, reviewed like any other.
+#
+# The contract, from deepseek-ai/deepseek-harness, read 2026-11-13 at the pin 1f81c047 and, where marked, at
+# dsh-v0.2.2-rc.2, the desktop's own version:
+#   packages/boot/app-boot/README.md L50: a profile lives at $DSH_HOME/profiles/<name> with its own
+#     cordis.patch.yml. L61: the home-level cordis.patch.yml is applied after the profile's, "which therefore
+#     outranks it", and a row replaces one entry's whole config, so the last row of an id decides.
+#   packages/boot/app-boot/src/profile-context.ts readProfilePatches (L76-79 at dsh-v0.2.2-rc.2): the bundle
+#     patches, the profile's patch, the home-level patch, then overlays; apps/desktop-host/src/index.ts
+#     passes none (patchFiles: [], L33 at dsh-v0.2.2-rc.2).
+#   packages/bundle/base/cordis.patch.yml L43 and packages/bundle/web-app/cordis.patch.yml L57-61: the
+#     session-log-deepseek and product-analytics rows, the second `enabled: true` for the desktop profile.
+#   packages/boot/plugin-manager/README.md L52: registry installs save exact versions, so a range, an npm:
+#     alias or a workspace: spec reads DIFFERS.
+#   apps/desktop/src/settings-file.ts (dsh-v0.2.2-rc.2): L74 the file is <userData>/desktop/settings.json,
+#     L106 its channel is updates.channel; apps/desktop/src/update-settings.ts L6: only an absent channel
+#     takes the packaged default.
+# Limits: a `name:` at any depth counts, so a package named inside a row's config is compared too; that can
+# add a line and never hides one. A listed bundle with no dependency in the profile gets no line: it comes
+# from the app's own installation, which this check does not read (UNVERIFIED).
+set -u
+LC_ALL=C
+export LC_ALL
+
+script_dir=.
+case $0 in
+  */*) script_dir=${0%/*} ;;
+esac
+if ! REPO=$(cd "$script_dir/.." 2>/dev/null && pwd -P); then
+  printf 'dsh-desktop-check: cannot locate the repository from %s\n' "$0" >&2
+  exit 2
+fi
+
+home=${HOME:-}
+DSH_HOME=${DSH_HOME:-$home/.dsh}
+DSH_DESKTOP_APP=${DSH_DESKTOP_APP:-/Applications/DeepSeek Harness.app}
+DSH_DESKTOP_SETTINGS=${DSH_DESKTOP_SETTINGS:-$home/Library/Application Support/@deepseek-ai/dsh-desktop/desktop/settings.json}
+DSH_DESKTOP_RECORD=${DSH_DESKTOP_RECORD:-${DSH_DESKTOP_RECORD_PATH:-$REPO/home/dsh/desktop.json}}
+case $DSH_HOME in
+  /) ;;
+  */) DSH_HOME=${DSH_HOME%/} ;;
+esac
+
+PROFILE=$DSH_HOME/profiles/desktop
+PACKAGE=$PROFILE/package.json
+PATCH=$PROFILE/cordis.patch.yml
+HOME_PATCH=$DSH_HOME/cordis.patch.yml
+PLIST=$DSH_DESKTOP_APP/Contents/Info.plist
+SETTINGS=$DSH_DESKTOP_SETTINGS
+RECORD=$DSH_DESKTOP_RECORD
+
+JQ=$(command -v jq 2>/dev/null) || JQ=
+if [ -z "$JQ" ]; then
+  for candidate in /usr/bin/jq /opt/homebrew/bin/jq /usr/local/bin/jq; do
+    if [ -x "$candidate" ]; then
+      JQ=$candidate
+      break
+    fi
+  done
+fi
+if [ -z "$JQ" ]; then
+  printf 'dsh-desktop-check: jq is required\n' >&2
+  exit 2
+fi
+AWK=$(command -v awk 2>/dev/null) || AWK=
+if [ -z "$AWK" ] && [ -x /usr/bin/awk ]; then
+  AWK=/usr/bin/awk
+fi
+if [ -z "$AWK" ]; then
+  printf 'dsh-desktop-check: awk is required\n' >&2
+  exit 2
+fi
+
+# num_ok PART — a numeric part semver 2.0.0 allows (0, or no leading zero) that this check can compare in
+# shell arithmetic: at most nine digits. A version with a longer part is refused as unparseable.
+num_ok() {
+  local re='^(0|[1-9][0-9]{0,8})$'
+  [[ $1 =~ $re ]]
+}
+
+# is_semver VERSION — MAJOR.MINOR.PATCH with an optional -prerelease and +build, every numeric part num_ok.
+is_semver() {
+  local v=$1 meta pre a b c id
+  case $v in
+    '' | *[!0-9A-Za-z.+-]*) return 1 ;;
+  esac
+  v=${v#v}
+  case $v in
+    *+*)
+      meta=${v#*+}
+      v=${v%%+*}
+      case $meta in
+        '' | .* | *. | *..* | *[!0-9A-Za-z.-]*) return 1 ;;
+      esac
+      ;;
+  esac
+  case $v in
+    *-*)
+      pre=${v#*-}
+      v=${v%%-*}
+      case $pre in
+        '' | .* | *. | *..* | *[!0-9A-Za-z.-]*) return 1 ;;
+      esac
+      ;;
+  esac
+  local IFS=.
+  # shellcheck disable=SC2086  # the dotted version is split on purpose
+  set -- $v
+  if [ $# -ne 3 ]; then
+    return 1
+  fi
+  a=$1
+  b=$2
+  c=$3
+  num_ok "$a" && num_ok "$b" && num_ok "$c" || return 1
+  # a numeric prerelease identifier is held to the same rule; one with a letter is compared as text
+  # shellcheck disable=SC2086  # the dotted prerelease is split on purpose
+  set -- ${pre:-}
+  for id in "$@"; do
+    case $id in
+      *[!0-9]*) ;;
+      *) num_ok "$id" || return 1 ;;
+    esac
+  done
+  return 0
+}
+
+# semver_cmp A B — print -1, 0 or 1 as semver 2.0.0 orders them (prerelease identifiers included).
+semver_cmp() {
+  local a=$1 b=$2 acore apre bcore bpre a1 a2 a3 b1 b2 b3
+  a=${a#v}
+  b=${b#v}
+  a=${a%%+*}
+  b=${b%%+*}
+  acore=${a%%-*}
+  apre=
+  if [ "$acore" != "$a" ]; then apre=${a#*-}; fi
+  bcore=${b%%-*}
+  bpre=
+  if [ "$bcore" != "$b" ]; then bpre=${b#*-}; fi
+  local IFS=.
+  # shellcheck disable=SC2086  # the dotted version is split on purpose
+  set -- $acore
+  a1=${1:-0}
+  a2=${2:-0}
+  a3=${3:-0}
+  # shellcheck disable=SC2086  # the dotted version is split on purpose
+  set -- $bcore
+  b1=${1:-0}
+  b2=${2:-0}
+  b3=${3:-0}
+  if [ "$a1" -ne "$b1" ]; then
+    if [ "$a1" -lt "$b1" ]; then printf '%s\n' -1; else printf '%s\n' 1; fi
+    return 0
+  fi
+  if [ "$a2" -ne "$b2" ]; then
+    if [ "$a2" -lt "$b2" ]; then printf '%s\n' -1; else printf '%s\n' 1; fi
+    return 0
+  fi
+  if [ "$a3" -ne "$b3" ]; then
+    if [ "$a3" -lt "$b3" ]; then printf '%s\n' -1; else printf '%s\n' 1; fi
+    return 0
+  fi
+  if [ -z "$apre" ] && [ -z "$bpre" ]; then
+    printf '0\n'
+    return 0
+  fi
+  if [ -z "$apre" ]; then
+    printf '1\n'
+    return 0
+  fi
+  if [ -z "$bpre" ]; then
+    printf '%s\n' -1
+    return 0
+  fi
+  local -a ap bp
+  IFS=. read -r -a ap <<< "$apre"
+  IFS=. read -r -a bp <<< "$bpre"
+  local n=${#ap[@]} m=${#bp[@]} max i x y xn yn
+  max=$n
+  if [ "$m" -gt "$max" ]; then max=$m; fi
+  i=0
+  while [ "$i" -lt "$max" ]; do
+    if [ "$i" -ge "$n" ]; then printf '%s\n' -1; return 0; fi
+    if [ "$i" -ge "$m" ]; then printf '%s\n' 1; return 0; fi
+    x=${ap[$i]}
+    y=${bp[$i]}
+    xn=0
+    yn=0
+    case $x in '' | *[!0-9]*) ;; *) xn=1 ;; esac
+    case $y in '' | *[!0-9]*) ;; *) yn=1 ;; esac
+    if [ "$xn" -eq 1 ] && [ "$yn" -eq 1 ]; then
+      if [ "$((10#$x))" -lt "$((10#$y))" ]; then printf '%s\n' -1; return 0; fi
+      if [ "$((10#$x))" -gt "$((10#$y))" ]; then printf '%s\n' 1; return 0; fi
+    elif [ "$xn" -eq 1 ]; then
+      printf '%s\n' -1
+      return 0
+    elif [ "$yn" -eq 1 ]; then
+      printf '%s\n' 1
+      return 0
+    else
+      if [[ $x < $y ]]; then printf '%s\n' -1; return 0; fi
+      if [[ $y < $x ]]; then printf '%s\n' 1; return 0; fi
+    fi
+    i=$((i + 1))
+  done
+  printf '0\n'
+}
+
+# list_has LIST-TEXT ITEM — whether a newline-separated list holds ITEM exactly.
+list_has() {
+  local item=$2 line
+  while IFS= read -r line; do
+    if [ "$line" = "$item" ]; then
+      return 0
+    fi
+  done <<< "$1"
+  return 1
+}
+
+# patch_row_state ID PATCH... — read the patches in the order dsh applies them and print `false` when the last
+# top-level row with ID has config.enabled false, `notfalse` when it exists without that, `absent` when no
+# top-level row has the id, and `unknown` when the id appears on any other uncommented line of any patch (a
+# flow-style row, a quoted key, an id after its config): dsh may apply a row this reader cannot parse. A
+# commented row, a nested `enabled:` under config, a quoted "false" and a later row restating the config are
+# not `false`.
+patch_row_state() {
+  local want=$1
+  shift
+  # shellcheck disable=SC2016  # the awk program is single-quoted on purpose
+  "$AWK" -v want="$want" '
+    function strip(s) {
+      sub(/[[:blank:]]+#.*$/, "", s)
+      sub(/^[[:blank:]]+/, "", s)
+      sub(/[[:blank:]\r]+$/, "", s)
+      return s
+    }
+    function unquote(s,   n, f, l, q) {
+      n = length(s)
+      if (n < 2) return s
+      f = substr(s, 1, 1)
+      l = substr(s, n, 1)
+      q = sprintf("%c", 39)
+      if ((f == "\"" && l == "\"") || (f == q && l == q)) return substr(s, 2, n - 2)
+      return s
+    }
+    # holds(s): whether s names the wanted id as a whole token, with no id character on either side
+    function holds(s,   p, off, b, a) {
+      off = 0
+      while ((p = index(substr(s, off + 1), want)) > 0) {
+        p += off
+        b = (p > 1) ? substr(s, p - 1, 1) : ""
+        a = substr(s, p + length(want), 1)
+        if (b !~ /[A-Za-z0-9_.@\/-]/ && a !~ /[A-Za-z0-9_.@\/-]/) return 1
+        off = p
+      }
+      return 0
+    }
+    # inline_off(v): whether a config written inline is exactly {enabled: false}
+    function inline_off(v) {
+      return v ~ /^\{[[:blank:]]*enabled[[:blank:]]*:[[:blank:]]+false[[:blank:]]*\}$/
+    }
+    function flush() {
+      if (rowid == want) {
+        seen = 1
+        last = hasfalse
+      }
+      rowid = ""
+      hasfalse = 0
+      incfg = 0
+      cfgind = 0
+      childind = -1
+    }
+    FNR == 1 { flush() }
+    /^[[:blank:]]*$/ { next }
+    /^[[:blank:]]*#/ { next }
+    {
+      match($0, /^[[:blank:]]*/)
+      ind = RLENGTH
+      line = strip($0)
+      if (ind == 0 && substr($0, 1, 1) == "-" && (length($0) == 1 || substr($0, 2, 1) == " " || substr($0, 2, 1) == "\t")) {
+        flush()
+        rest = strip(substr($0, 2))
+        if (rest ~ /^id[[:blank:]]*:([[:blank:]]|$)/) {
+          v = rest
+          sub(/^id[[:blank:]]*:[[:blank:]]*/, "", v)
+          rowid = unquote(v)
+          if (rowid != want && holds(rest)) odd = 1
+        } else {
+          if (holds(rest)) odd = 1
+          if (rest ~ /^config[[:blank:]]*:([[:blank:]]|$)/) {
+            incfg = 1
+            cfgind = 0
+            childind = -1
+            v = rest
+            sub(/^config[[:blank:]]*:[[:blank:]]*/, "", v)
+            if (inline_off(v)) hasfalse = 1
+          }
+        }
+        next
+      }
+      if (holds(line)) odd = 1
+      if (ind == 0) next
+      if (incfg && ind <= cfgind) incfg = 0
+      if (!incfg && line ~ /^config[[:blank:]]*:([[:blank:]]|$)/) {
+        incfg = 1
+        cfgind = ind
+        childind = -1
+        v = line
+        sub(/^config[[:blank:]]*:[[:blank:]]*/, "", v)
+        if (inline_off(v)) hasfalse = 1
+        next
+      }
+      if (incfg) {
+        if (childind < 0) childind = ind
+        if (line ~ /^enabled[[:blank:]]*:([[:blank:]]|$)/ && ind == childind) {
+          v = line
+          sub(/^enabled[[:blank:]]*:[[:blank:]]*/, "", v)
+          hasfalse = (v == "false")
+        }
+      }
+    }
+    END {
+      flush()
+      if (odd) print "unknown"
+      else if (!seen) print "absent"
+      else if (last) print "false"
+      else print "notfalse"
+    }
+  ' "$@"
+}
+
+# patch_names PATCH... — every uncommented `name:` value in the patches, one per line.
+patch_names() {
+  # shellcheck disable=SC2016  # the awk program is single-quoted on purpose
+  "$AWK" '
+    function strip(s) {
+      sub(/[[:blank:]]+#.*$/, "", s)
+      sub(/[[:blank:]]+$/, "", s)
+      sub(/\r$/, "", s)
+      return s
+    }
+    /^[[:blank:]]*#/ { next }
+    {
+      line = $0
+      if (line ~ /^[[:blank:]]*-?[[:blank:]]*name[[:blank:]]*:/) {
+        v = line
+        sub(/^[[:blank:]]*-?[[:blank:]]*name[[:blank:]]*:[[:blank:]]*/, "", v)
+        v = strip(v)
+        n = length(v)
+        q = sprintf("%c", 39)
+        if (n >= 2 && ((substr(v, 1, 1) == "\"" && substr(v, n, 1) == "\"") || (substr(v, 1, 1) == q && substr(v, n, 1) == q))) v = substr(v, 2, n - 2)
+        if (v != "") print v
+      }
+    }
+  ' "$@"
+}
+
+# xml_plist_version PLIST — CFBundleShortVersionString from a plain XML Info.plist, for hosts without plutil.
+xml_plist_version() {
+  # shellcheck disable=SC2016  # the awk program is single-quoted on purpose
+  "$AWK" '
+    /<key>CFBundleShortVersionString<\/key>/ {
+      line = $0
+      sub(/^.*<key>CFBundleShortVersionString<\/key>/, "", line)
+      if (line ~ /<string>/) {
+        sub(/^.*<string>/, "", line)
+        sub(/<\/string>.*$/, "", line)
+        gsub(/^[[:blank:]\r]+|[[:blank:]\r]+$/, "", line)
+        print line
+        exit
+      }
+      want = 1
+      next
+    }
+    want {
+      if ($0 ~ /<string>/) {
+        line = $0
+        sub(/^.*<string>/, "", line)
+        sub(/<\/string>.*$/, "", line)
+        gsub(/^[[:blank:]\r]+|[[:blank:]\r]+$/, "", line)
+        print line
+        exit
+      }
+    }
+  ' "$1"
+}
+
+# --- inputs: every one present and parseable, or MISSING and exit 2 --------------------------------------
+# Every value an item line needs is read here, each read checked, before any item line is printed.
+rec_bad=0
+plist_bad=0
+settings_bad=0
+package_bad=0
+patch_bad=0
+home_patch_bad=0
+
+recver=
+recchannel=
+absent=
+rows=
+if [ ! -f "$RECORD" ]; then
+  rec_bad=1
+elif ! "$JQ" -e -s 'length == 1 and (.[0] | type) == "object" and (.[0]
+  | (.app_version | type) == "string"
+  and (.update_channel | type) == "string"
+  and ((.bundles_absent | type) == "array") and all(.bundles_absent[]; type == "string")
+  and ((.rows_off | type) == "array") and all(.rows_off[]; type == "string"))' "$RECORD" >/dev/null 2>&1; then
+  rec_bad=1
+elif ! recver=$("$JQ" -r '.app_version' "$RECORD" 2>/dev/null) \
+  || ! recchannel=$("$JQ" -r '.update_channel' "$RECORD" 2>/dev/null) \
+  || ! absent=$("$JQ" -r '.bundles_absent[]' "$RECORD" 2>/dev/null) \
+  || ! rows=$("$JQ" -r '.rows_off[]' "$RECORD" 2>/dev/null) \
+  || ! is_semver "$recver"; then
+  rec_bad=1
+fi
+
+appver=
+if [ ! -f "$PLIST" ]; then
+  plist_bad=1
+else
+  if command -v plutil >/dev/null 2>&1; then
+    appver=$(plutil -extract CFBundleShortVersionString raw "$PLIST" 2>/dev/null) || appver=
+  else
+    appver=$(xml_plist_version "$PLIST" 2>/dev/null) || appver=
+  fi
+  if ! is_semver "$appver"; then plist_bad=1; fi
+fi
+
+channel_ok=no
+if [ ! -f "$SETTINGS" ] || ! "$JQ" -e -s 'length == 1 and (.[0] | type) == "object"' "$SETTINGS" >/dev/null 2>&1; then
+  settings_bad=1
+else
+  # shellcheck disable=SC2016  # $c belongs to jq, not to this shell
+  channel_ok=$("$JQ" -r --arg c "$recchannel" \
+    'if (.updates | type) == "object" then (if .updates.channel == $c then "yes" else "no" end) else "no" end' \
+    "$SETTINGS" 2>/dev/null) || settings_bad=1
+fi
+
+# the bundle list, when dsh.profile.bundles is an array; its string entries only
+bundles=
+if [ ! -f "$PACKAGE" ] || ! "$JQ" -e -s 'length == 1 and (.[0] | type) == "object"' "$PACKAGE" >/dev/null 2>&1; then
+  package_bad=1
+else
+  bundles=$("$JQ" -r '((.dsh | objects | .profile | objects | .bundles | arrays) // []) | .[] | strings' \
+    "$PACKAGE" 2>/dev/null) || package_bad=1
+fi
+
+if [ ! -f "$PATCH" ] || [ ! -r "$PATCH" ]; then
+  patch_bad=1
+fi
+# dsh reads the home-level patch when it exists (profile-context.ts L78 at dsh-v0.2.2-rc.2)
+patches=("$PATCH")
+if [ -e "$HOME_PATCH" ]; then
+  if [ -f "$HOME_PATCH" ] && [ -r "$HOME_PATCH" ]; then
+    patches+=("$HOME_PATCH")
+  else
+    home_patch_bad=1
+  fi
+fi
+
+# each rows_off id's line, from the patches in the order dsh applies them
+row_lines=
+if [ "$rec_bad" -eq 0 ] && [ "$patch_bad" -eq 0 ] && [ "$home_patch_bad" -eq 0 ]; then
+  while IFS= read -r id; do
+    if [ -z "$id" ]; then continue; fi
+    if ! state=$(patch_row_state "$id" "${patches[@]}"); then
+      patch_bad=1
+      break
+    fi
+    case $state in
+      false) row_lines="${row_lines}ok row $id"$'\n' ;;
+      unknown) row_lines="${row_lines}DIFFERS row $id (written in a form this check does not read)"$'\n' ;;
+      *) row_lines="${row_lines}DIFFERS row $id"$'\n' ;;
+    esac
+  done <<< "$rows"
+fi
+
+# each @deepseek-ai/* dependency a listed bundle or a patch's `name:` names, compared exactly with the app
+plugin_lines=
+if [ "$plist_bad" -eq 0 ] && [ "$package_bad" -eq 0 ] && [ "$patch_bad" -eq 0 ] && [ "$home_patch_bad" -eq 0 ]; then
+  if ! patchnames=$(patch_names "${patches[@]}"); then
+    patch_bad=1
+  else
+    # shellcheck disable=SC2016  # $app, $named, $listed and $k belong to jq, not to this shell
+    plugin_lines=$("$JQ" -r --arg app "$appver" --arg named "$patchnames" '
+        def show: tostring | .[0:64] | gsub("[^A-Za-z0-9._:/@-]"; "?");
+        ([(.dsh | objects | .profile | objects | .bundles | arrays) // [] | .[] | strings]
+          + ($named | split("\n"))) as $listed
+        | (.dependencies | objects // {})
+        | to_entries[]
+        | select(.key | startswith("@deepseek-ai/"))
+        | select(.key as $k | any($listed[]; . == $k))
+        | if .value == $app then "ok plugin \(.key | show)"
+          else "DIFFERS plugin \(.key | show) \(.value | show) (app \($app))" end
+      ' "$PACKAGE" 2>/dev/null) || package_bad=1
+  fi
+fi
+
+if [ "$rec_bad" -eq 1 ] || [ "$plist_bad" -eq 1 ] || [ "$settings_bad" -eq 1 ] || [ "$package_bad" -eq 1 ] \
+  || [ "$patch_bad" -eq 1 ] || [ "$home_patch_bad" -eq 1 ]; then
+  if [ "$rec_bad" -eq 1 ]; then printf 'MISSING %s\n' "$RECORD"; fi
+  if [ "$plist_bad" -eq 1 ]; then printf 'MISSING %s\n' "$PLIST"; fi
+  if [ "$settings_bad" -eq 1 ]; then printf 'MISSING %s\n' "$SETTINGS"; fi
+  if [ "$package_bad" -eq 1 ]; then printf 'MISSING %s\n' "$PACKAGE"; fi
+  if [ "$patch_bad" -eq 1 ]; then printf 'MISSING %s\n' "$PATCH"; fi
+  if [ "$home_patch_bad" -eq 1 ]; then printf 'MISSING %s\n' "$HOME_PATCH"; fi
+  exit 2
+fi
+
+# --- items -----------------------------------------------------------------------------------------------
+rc=0
+
+case $(semver_cmp "$appver" "$recver") in
+  0) printf 'ok app version\n' ;;
+  1) printf 'AHEAD app version\n' ;;
+  *)
+    printf 'DIFFERS app version\n'
+    rc=1
+    ;;
+esac
+
+if [ "$channel_ok" = yes ]; then
+  printf 'ok update channel\n'
+else
+  printf 'DIFFERS update channel\n'
+  rc=1
+fi
+
+while IFS= read -r name; do
+  if [ -z "$name" ]; then continue; fi
+  if list_has "$bundles" "$name"; then
+    printf 'DIFFERS bundle %s\n' "$name"
+    rc=1
+  else
+    printf 'ok bundle %s\n' "$name"
+  fi
+done <<< "$absent"
+
+# the row and plugin lines were built above; a name or spec in them is already shown safely
+while IFS= read -r line; do
+  if [ -z "$line" ]; then continue; fi
+  printf '%s\n' "$line"
+  case $line in
+    'DIFFERS '*) rc=1 ;;
+  esac
+done <<< "$row_lines$plugin_lines"
+
+exit "$rc"
