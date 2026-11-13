@@ -1672,21 +1672,25 @@ the value of the adapter's `STAMP_AHEAD_MOST_NS` in its late-print setting, whic
 adapter's part and measures against receipt; it is to move to this reference with it, or a host
 clock more than 5 s behind sets every print aside there. "Ahead" is measured on the venue's time as
 the stream shows it (the lead's ruling of 2026-11-13, 08:49): a print's venue time less its receipt
-here, less the same of its name's latest quotes (`Slot.quote_lag`, their median, so one quote
+here, less the same of its name's latest quotes (`Slot.quote_lag`, the highest of them, so a quote
 reported late moves nothing), so this host's clock offset cancels, whatever its size. A print further
 ahead has no usable time: it is neither the newest nor set aside, and `prints_stamped_ahead` counts it.
 With no quote of the name yet, the venue's time cannot be had, and the print is measured against its
-receipt as before; `prints_timed_on_receipt` counts each print so judged. NautilusTrader at the pin corrects no clock
-offset (crates/common, data, live and core read none), so the rule is ours."""
+receipt as before; `prints_timed_on_receipt` counts each print so judged. A name whose every latest
+quote runs more than 5 s behind its prints sets them aside as ahead until a timely quote comes: a
+limit, counted in `prints_stamped_ahead`. NautilusTrader at the pin corrects no clock offset
+(crates/common, data, live and core read none), so the rule is ours."""
 CLOCK_QUOTES = 101
 """The latest quotes, of every name, whose venue time less their receipt on this host (`ts_event` less
 `ts_init`) the run record summarises as `host_clock`: their median, with the least and most of every
 quote. Quotes, not prints: a print reported late, as off-exchange prints are, reads below the clocks'
 difference. A record only; the lead reads it past 2 s (`session_window.CLOCK_NOTE_MOST_MS`)."""
 QUOTE_REFERENCE_QUOTES = 9
-"""The latest quotes of a name whose median venue-time-less-receipt is its reference
-(`Slot.quote_lag`): enough that one quote reported late moves nothing, few enough that a step of
-this host's clock is followed within five quotes. UNCALIBRATED."""
+"""The latest quotes of a name whose highest venue time less receipt is its reference
+(`Slot.quote_lag`). A quote's delay only lowers that difference, so the highest is the least-delayed
+quote's, the clocks' difference less the feed's least latency; one timely quote among them is enough.
+A step of this host's clock behind is followed at once, one ahead within nine quotes, meanwhile
+reading prints as less ahead than they are. UNCALIBRATED."""
 
 
 def print_time(trade: Any, reference: int | None = None) -> int | None:
@@ -1837,9 +1841,6 @@ class Slot:
     quote_lags: deque[int] = field(default_factory=lambda: deque(maxlen=QUOTE_REFERENCE_QUOTES))
     """The name's latest quotes' venue time less their receipt on this host (`on_quote`; the cache's
     quote at the opening first)."""
-    quote_lag: int | None = None
-    """Their median (`QUOTE_REFERENCE_QUOTES`): the reference a print is measured against
-    (`print_time`, `stamp_of`); None before any quote of the name."""
     sized_loss: Decimal | None = None
     """L, the loss per share the entry was sized for (`sizing.plan_for_loss`): the planned entry less its
     stepped stop, on Alpaca's step. The trailing sell holds its trigger L under the fill, then L under the
@@ -1868,6 +1869,12 @@ class Slot:
     an answer after live bars resets the ATR and feeds it again in time order (F-2)."""
     first_live_open: int | None = None
     """The minute open of the slot's first live bar: history from that minute on is the live bars'."""
+
+    @property
+    def quote_lag(self) -> int | None:
+        """The highest of `quote_lags` (`QUOTE_REFERENCE_QUOTES`): the reference a print is measured
+        against (`print_time`, `stamp_of`); None before any quote of the name."""
+        return max(self.quote_lags, default=None)
 
 
 def l_in_force(slot: Slot, bought: Decimal) -> Decimal | None:
@@ -2381,7 +2388,7 @@ class Mover(Strategy):
     def on_quote(self, quote: Any) -> None:
         self.quotes += 1
         # the clocks' difference, in plain attributes: a handler may run while the strategy is borrowed
-        lag = int(quote.ts_event) - int(quote.ts_init)  # `quote_lag`, inline: no call on a borrow
+        lag = int(quote.ts_event) - int(quote.ts_init)  # `quote_lag`, inline
         self.quote_lags.append(lag)
         least, most = self.quote_lag_least, self.quote_lag_most
         self.quote_lag_least = lag if least is None else min(least, lag)
@@ -2389,7 +2396,6 @@ class Mover(Strategy):
         slot = self.slots.get(quote.instrument_id)
         if slot is not None:
             slot.quote_lags.append(lag)
-            slot.quote_lag = median_low(slot.quote_lags)
             bid = quote.bid_price.as_decimal()
             if bid > 0:  # a one-sided quote's zero bid is no price: keep the last real one
                 slot.last_bid = bid
@@ -3096,10 +3102,10 @@ class Mover(Strategy):
             # Cache.trades is in reverse insertion order, not venue-time order
             # (crates/common/src/cache/mod.rs:6218-6228 at the pin).
             newest_print=self._newest_cached(instrument_id, reference),
-            quote_lag=reference,
+            quote_lags=deque(
+                [] if reference is None else [reference], maxlen=QUOTE_REFERENCE_QUOTES
+            ),
         )
-        if reference is not None:
-            self.slots[instrument_id].quote_lags.append(reference)
         if (state := self.reentry_states.get(instrument_id)) is not None:
             state.restart()  # only closes this slot observes count toward a turn or a crossing
         slot = self.slots[instrument_id]
@@ -3135,7 +3141,7 @@ class Mover(Strategy):
         milliseconds rounded to the nearest: their median (`median_of` quotes), with the least and most
         of every quote in the run (`quotes`). It is the clocks' difference less the feed's latency."""
         least, most = self.quote_lag_least, self.quote_lag_most
-        if least is None or most is None:
+        if not self.quote_lags or least is None or most is None:
             return {"venue_minus_receipt_ms": None, "median_of": 0, "quotes": self.quotes}
         return {
             "venue_minus_receipt_ms": {

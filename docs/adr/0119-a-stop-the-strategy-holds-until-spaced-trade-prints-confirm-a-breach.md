@@ -65,7 +65,7 @@ The count, with `breach_count` or `high_count` above one, on trade prints only (
 | A breach | `breach_count` counted prints at or under the level with no print above it between them. The count never expires: a thin name sells at its second print however late it comes. |
 | A new high | `high_count` counted prints above the confirmed high, none at or under it between them; the level rises to the lowest of them less the trail, on Alpaca's price step, never down. |
 | The level's start | The entry's average fill as it stands at the arming step, less the trail; never a cached print. The start is not re-based as a partly filled entry fills further; the trail's distance is, being taken from the current average each step. |
-| A print's time | The earlier of its event time and its receipt, the receipt read on the venue's clock when its name's quotes show this host's clock behind (the median of the name's latest nine quotes' event time less receipt). A print with the last print's time may reset an arm and never counts; an older one, a late report, does neither. |
+| A print's time | The earlier of its event time and its receipt, the receipt read on the venue's clock when its name's quotes show this host's clock behind (the highest of the name's latest nine quotes' event time less receipt, the least-delayed quote's). A print with the last print's time may reset an arm and never counts; an older one, a late report, does neither. |
 | The sale | A DAY limit `exit_ticks` through the bid of the first step after the confirming print, so it never rests above the bid as the emulator's released limit can; then the existing chase. Its floor is `chase_cap` under a first price taken from the lower of the confirming print and the bid at that step. A one-sided quote's zero bid is no price, and neither is no quote: the last trade then stands in for the bid, for the floor and for the sale and each remake of it, so a recovery cannot lift the sale and a fall under the print is followed. The last trade is the one newest by a print's time as the row above reads it, not the one received last. The floor is set once; released after its wait, it stays released. The exit's record is marked at the confirming print's own time and price, as a stop-out. |
 | The rows | `breach_count` 1 and `high_count` 1 (both off), `confirm_gap_ms` 100. The on row is 2, 2 and 100 ms. |
 
@@ -106,7 +106,8 @@ The count, with `breach_count` or `high_count` above one, on trade prints only (
   faster than the name's quotes stamps up to that difference before its venue time. The record
   carries the clocks' difference (`host_clock`), and a window more than 2 s apart goes to the lead.
   The adapter's own 5 s bound, which lands with its part, measures against receipt and is to move to
-  the same reference.
+  the same reference. A name whose nine latest quotes all run more than 5 s behind its prints sets
+  its prints aside as ahead until a timely quote comes; `prints_stamped_ahead` counts them.
 
 ### Consequences
 

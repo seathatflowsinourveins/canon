@@ -228,3 +228,17 @@ def test_with_the_clocks_agreeing_a_late_quote_moves_no_persistence_stamp() -> N
         seam.on_quote(late)
     deliver(seam, last, received("10.1000", filled + 2 * SECOND, 0, slot.instrument_id))
     assert slot.stamp_seen == filled + 2 * SECOND
+
+
+@pytest.mark.parametrize("skew", OFFSETS, ids=OFFSET_IDS)
+def test_after_one_timely_quote_a_late_one_moves_no_print_into_ahead(skew: int) -> None:
+    """A quote reported late only lowers its venue time less receipt, so the reference is the highest
+    of the name's latest quotes: with one timely quote seen, a second reported 6 s late does not class
+    the next print as ahead (code-review-high-host-clock-v5/2)."""
+    seam, slot, filled, last = held(skew)
+    late = quoted(filled + 100 * MS, skew, slot.instrument_id)
+    late.ts_init += 6 * SECOND
+    seam.on_quote(late)
+    deliver(seam, last, received("10.2000", filled + 2 * SECOND, skew, slot.instrument_id))
+    assert slot.newest_print is not None and slot.newest_print.price == D("10.20")
+    assert seam.prints_ahead == {}
