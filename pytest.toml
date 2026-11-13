@@ -5,3 +5,7 @@
 [pytest]
 addopts = ["--import-mode=importlib"]
 testpaths = ["tests", "packages"]
+# Registering a custom mark: https://docs.pytest.org/en/stable/how-to/mark.html ("Registering marks").
+markers = [
+    "no_position_without_its_exit: a case of the rule that every position has its exit, in any session, on any account (the lead's order D, 2026-11-13); `pytest -m no_position_without_its_exit` runs the set",
+]
