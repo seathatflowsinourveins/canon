@@ -122,7 +122,20 @@ ten fields as list lines, in this order, each with a value:
 * supersedes: none
 * source: lead
 
-### L0007: A checker written to a contract before its writer drifted from the writer, and its clock gap was measured, not assumed
+### L0007: A copy bound left a long window's log behind with no word
+
+* area: execution
+* session: 2026-11-13
+* result: The scheduled runner kept each window's records outside the temp folder with a copy bounded at 1 MB, and a window log over that bound was left behind silently; a long window's log is often around 10 MB, so the log of the windows most worth reading was the one lost on a restart
+* evidence: scripts/test-lanes, the cases a log over 1 MB is never dropped silently and the log over 1 MB that cannot be kept is named on stderr with its size
+* lesson: A bound on what is kept says what it left out and where it still is; a silent bound reads later as a record that never existed
+* change: a log over the bound is kept as its first and last 512000 bytes with a line naming what was left out, and one that cannot be kept is named on stderr (mise.toml, kept)
+* next: none
+* status: adopted
+* supersedes: none
+* source: lead
+
+### L0008: A checker written to a contract before its writer drifted from the writer, and its clock gap was measured, not assumed
 
 * area: execution
 * session: 2026-11-13
@@ -135,7 +148,7 @@ ten fields as list lines, in this order, each with a value:
 * supersedes: none
 * source: review
 
-### L0008: A sizing quotient formed in floats can land just past a ceiling that the exact value meets
+### L0009: A sizing quotient formed in floats can land just past a ceiling that the exact value meets
 
 * area: sizing
 * session: 2026-11-13
@@ -148,7 +161,7 @@ ten fields as list lines, in this order, each with a value:
 * supersedes: none
 * source: review
 
-### L0009: A Decimal test passed alone and failed in the full suite, because `localcontext` copies the thread's sticky flags
+### L0010: A Decimal test passed alone and failed in the full suite, because `localcontext` copies the thread's sticky flags
 
 * area: exits
 * session: 2026-11-13
