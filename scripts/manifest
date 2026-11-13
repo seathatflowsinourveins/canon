@@ -226,7 +226,7 @@ def records(key, value, fields):
 def report_rows(key, stop=None):
     rows = []
     # Tokens emitted by bootstrap's row() and automation's row()/paper_rank()/watch status.
-    tokens = r"NOT SET|INCOMPLETE|STALE-LOCK|OUTDATED|UNKNOWN|MISSING|REFUSED|FAILED|OWNER|BEHIND|STALE|DIED|DIFF|OFF|on|ok"
+    tokens = r"NOT SET|INCOMPLETE|STALE-LOCK|OUTDATED|OVERRIDE|MISMATCH|UNKNOWN|MISSING|REFUSED|INVALID|FAILED|PINNED|OWNER|OTHER|BEHIND|STALE|DIED|DIFFERS|DIFF|OFF|absent|on|ok"
     for line in sources[key]["report"].splitlines():
         if stop and line.startswith(stop):
             break

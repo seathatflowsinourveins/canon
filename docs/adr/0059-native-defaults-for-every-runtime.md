@@ -7,6 +7,8 @@ review-by: 2026-12-10
 
 # Native defaults for every runtime: Claude aliases unpinned, the legacy Fable row hidden, each runtime's model set where its docs put it
 
+*Muse Code deferred 2026-11-13 by the owner: no Muse reviewer is started until the owner lifts it. Its row, pin and launch notes are kept as they are, so it can be resumed as written; Codex and Antigravity read in its place, and DeepSeek Harness stays on Flash.*
+
 ## Context and Problem Statement
 
 The `/model` picker on this machine showed a row "Fable · Fable 5.1". The owner asked that every runtime,

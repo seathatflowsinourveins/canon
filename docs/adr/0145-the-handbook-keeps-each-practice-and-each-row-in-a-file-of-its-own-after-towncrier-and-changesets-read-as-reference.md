@@ -67,6 +67,14 @@ Chosen: **option 2**.
 
 Neither is installed or run (`canon/upstreams.json`).
 
+**The journal (2026-11-13, the lead's ruling).** The lessons journal takes the same form. Each entry is
+one file, `docs/handbook/journal/<YYYY-MM-DD>-<slug>.md`, whose name is its id and whose date is its
+session, so two units writing lessons the same day never pick one counter. `L0001` to `L0009` stay on
+`journal.md`, whose append point is closed. Each file adds two fields, `owner` and `closes`: an open
+entry names who closes it and its verifiable end state, as Google SRE's postmortem action items ask; a
+closed one says `none` in both. A correction supersedes an entry of its own date or earlier, never in a
+cycle. Google SRE's workbook is registered as `reference`, read for this practice only.
+
 ### Consequences
 
 * Good: a unit adding a practice or a row merges clean beside another that does the same.
@@ -101,6 +109,10 @@ Read 2026-11-13.
   `resolved` by `scripts/canon resolve`.
 * The 56 practice lines and 77 rows on `main` were compared with the files by a one-off script, and are
   equal and in order. Only two relative links were rewritten, for the deeper folder.
+* https://sre.google/workbook/postmortem-culture/, "Concrete Action Items": "All action items have both
+  an owner and a tracking number" and "The action items have a verifiable end state"; the page is
+  licensed CC BY-NC-ND 4.0. `fetched` 2026-11-13. Its owner and end state are taken; the tracking number
+  is the entry's own id.
 * The `evidence-verifier` pass of 2026-11-13 found every upstream claim held. It found two claims only
   partly held: two units at one place, and the merge check at one place. Both are reworded above, and the
   day's conflicts are marked `UNVERIFIED`.
