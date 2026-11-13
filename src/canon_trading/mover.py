@@ -39,6 +39,14 @@ A composition of upstream parts (ADR 0083, ADR 0088). What each part is, at Naut
   `share_caps` where the window sets them), the free balance
   and `flow_share` of the dollar volume of the last `flow_bars` bars. No entry is sent into a quote whose
   bid is already under that planned sale: the quote is then wider than the plan the size rests on.
+* `adopt_holding` attaches an own cached long without an entry, and arms that same emulated sell
+  reduce-only from a supplied trigger rounded up onto Alpaca's step, logging both prices if it moves.
+  Carry currently requires the BID_ASK quote trigger: LAST_PRICE adoption is refused by name before
+  arming because a late trade seed can bypass held-stop protection.
+  A level already met rests behind the native activation price
+  (`crates/execution/src/order_emulator/emulator.rs:1721-1782`) until a later observation confirms it
+  or the followed price recovers. Timers and repeated event times do not confirm it; a second call
+  leaves the existing stop alone. Persistence arms must be off for this emulated-order contract.
 * **The protection with both persistence arms off** is the engine's order emulator holding a
   `TRAILING_STOP_LIMIT` sell
   (`OrderFactory.trailing_stop_limit`, `common/__init__.pyi:1523-1547`; concepts/orders/emulated and
@@ -1953,6 +1961,11 @@ class Slot:
     entry_cancel_ns: int = 0
     protect_id: ClientOrderId | None = None
     """The one sell of this name: the trailing stop-limit, then the limit it became, or a plain limit."""
+    adopted: bool = False
+    """An own long attached without an entry: all its protective sales are reduce-only."""
+    adoption_guard: tuple[int, int | None] | None = None
+    """The adoption step and first followed observation's venue time (None before a positive price).
+    A later step needs a strictly newer observation; timers and repeats cannot confirm the first."""
     exiting: bool = False
     """The trigger has been met, or the wind-down has begun: from here every sell is a plain limit."""
     floor: Decimal | None = None
@@ -3231,6 +3244,109 @@ class Mover(Strategy):
 
     # --- watch ---------------------------------------------------------------------------------------
 
+    def adopt_holding(self, instrument_id: InstrumentId, level: Price) -> None:
+        """Attach this strategy's cached open long and protect it from the supplied level.
+
+        Cache.positions_open filters by strategy (rc8 common/__init__.pyi:568-576).
+        The existing arming path uses OrderFactory.trailing_stop_limit's trigger_price,
+        activation_price and reduce_only (same file:1523-1547). A breached first quote
+        rests below activation until a fresh observation confirms it, or price recovers
+        above the level (emulator.rs:1721-1782); trailing.rs:58-100 only raises the stop.
+        Persistence must be off: adoption never replaces its configured confirmation counts.
+        Carry runs on the BID_ASK quote trigger for now: LAST_PRICE is refused before
+        arming because a late delivered trade can seed an unsafe trailing sell or leave
+        the held stop unchecked. A positive supplied level goes up onto Alpaca's step
+        through price_step.up_on_step, as fill_trigger does; a move logs both figures.
+        """
+        slot = self.slots.get(instrument_id)
+        if slot is not None and slot.adopted:
+            return
+        if (
+            self.winding_down
+            or self.is_exiting()
+            or (
+                slot is not None
+                and (
+                    slot.exiting
+                    or (slot.protect_id is not None and slot.protect_id.value in self.released)
+                )
+            )
+        ):
+            raise ValueError(f"{instrument_id}: cannot adopt while an exit or wind-down is active")
+        positions = self.cache.positions_open(
+            instrument_id=instrument_id, strategy_id=self.strategy_id
+        )
+        if not positions or any(position.signed_qty <= 0 for position in positions):
+            owners = sorted(
+                {
+                    str(position.strategy_id)
+                    for position in self.cache.positions_open(instrument_id=instrument_id)
+                }
+            )
+            raise ValueError(
+                f"{instrument_id}: cannot adopt: no own open long for {self.strategy_id}; "
+                f"open position strategies: {', '.join(owners) or 'none'}"
+            )
+        value = level.as_decimal()
+        if not value.is_finite() or value <= 0:
+            reason = f"{instrument_id}: invalid adoption level {level}: expected a positive price"
+            self._say(reason)
+            raise ValueError(reason)
+        if self.persistence:
+            raise ValueError(
+                f"{instrument_id}: cannot adopt with persistence: the emulated trailing sell "
+                "requires both persistence arms off"
+            )
+        if self.settings.trigger == TriggerType.LAST_PRICE:
+            reason = (
+                f"{instrument_id}: cannot adopt with LAST_PRICE: carry requires the BID_ASK "
+                "quote trigger; a late trade seed can bypass held-stop protection"
+            )
+            self._say(reason)
+            raise ValueError(reason)
+        if slot is not None and self._working(slot):
+            raise ValueError(f"{instrument_id}: cannot adopt over a working slot order")
+        on_step = up_on_step(value)
+        # Validate on an unpublished slot (or a copy of an existing one). Neither
+        # a refused plan nor a missing anchor may leave subscriptions or half a slot.
+        candidate = self._prepare_slot(instrument_id) if slot is None else replace(slot)
+        held = self._held(candidate)
+        now = self.clock.timestamp_ns()
+        quote = self.cache.quote(instrument_id)
+        anchor = self._trail_anchor(candidate, record=False)
+        if candidate.trail_plan is None:
+            candidate.trail_plan = candidate.initial_trail = self._entry_trail(
+                candidate, anchor, quote, now=now, allow_no_quote=True
+            )
+        observation = self._adoption_observation(candidate)
+        if slot is None:
+            self._publish_slot(candidate)
+            slot = self.slots[instrument_id]
+        else:
+            slot.trail_plan, slot.initial_trail = candidate.trail_plan, candidate.initial_trail
+            slot.holding_average = candidate.holding_average
+        slot.adopted = slot.was_held = True
+        slot.trail_trigger = on_step
+        slot.protect_id = None  # any previous sell is terminal, checked by `_working` above
+        slot.adoption_guard = (now, None if observation is None else observation[0])
+        if on_step != value:
+            self._say(
+                f"{instrument_id}: adoption level {level} rounded up to {on_step} on Alpaca's step"
+            )
+        self._protect(slot, held, now)
+
+    def _adoption_observation(self, slot: Slot) -> tuple[int, Decimal] | None:
+        """The configured trigger's observed price and venue time, never the step's time."""
+        if self.settings.trigger == TriggerType.BID_ASK:
+            quote = self.cache.quote(slot.instrument_id)
+            if quote is not None and quote.bid_price.as_decimal() > 0:
+                return quote.ts_event, quote.bid_price.as_decimal()
+        else:
+            trade = self._holding_trade(slot)
+            if trade is not None and trade.price > 0:
+                return trade.event_ns, trade.price
+        return None
+
     def _watch(self, now: int) -> None:
         ranked = self._ranked(now)
         if self.settings.load_instruments:
@@ -3451,11 +3567,11 @@ class Mover(Strategy):
             self._instrument_drop(instrument_id, load.reason)
         return False
 
-    def _open_slot(self, instrument_id: InstrumentId) -> None:
+    def _prepare_slot(self, instrument_id: InstrumentId) -> Slot:
+        """Build and warm a slot from cache without publishing it or subscribing."""
         bar_type = BarType.from_str(f"{instrument_id}-{self.spec_suffix}")
-        self.opened_slots.add(instrument_id)
         reference = quote_lag(self.cache.quote(instrument_id))
-        self.slots[instrument_id] = Slot(
+        slot = Slot(
             instrument_id=instrument_id,
             bar_type=bar_type,
             closes=deque(maxlen=self.settings.run_bars + 1),
@@ -3471,9 +3587,6 @@ class Mover(Strategy):
                 [] if reference is None else [reference], maxlen=QUOTE_REFERENCE_QUOTES
             ),
         )
-        if (state := self.reentry_states.get(instrument_id)) is not None:
-            state.restart()  # only closes this slot observes count toward a turn or a crossing
-        slot = self.slots[instrument_id]
         if slot.atr is not None:
             # The lead's (a), 2026-11-12: warm from the minute bars this node's cache already holds
             # for the name, the rank actor's EXTERNAL bars, with no request. A slot's own INTERNAL bars
@@ -3481,20 +3594,38 @@ class Mover(Strategy):
             # None for a bar type it holds none of (crates/common/src/python/cache.rs at the pin).
             cached = self.cache.bars(BarType.from_str(f"{instrument_id}-{WARM_BAR_SPEC}"))
             if self._warm_atr(slot, cached or [], slot.subscribed_ns):
-                load = slot.history = HistoryLoad(
+                slot.history = HistoryLoad(
                     instrument_id,
                     slot.subscribed_ns,
                     completed=True,
                     cached=slot.atr_warm_bars,
                     from_cache=True,
                 )
-                self.history_loads.append(load)
+        return slot
+
+    def _open_slot(self, instrument_id: InstrumentId) -> None:
+        self._publish_slot(self._prepare_slot(instrument_id))
+
+    def _publish_slot(self, slot: Slot) -> None:
+        """Install a slot `_prepare_slot` built, then subscribe it; `adopt_holding` publishes the
+        slot it validated, so a subclass's `_open_slot` keeps main's signature."""
+        instrument_id = slot.instrument_id
+        self.slots[instrument_id] = slot
+        self.opened_slots.add(instrument_id)
+        if (state := self.reentry_states.get(instrument_id)) is not None:
+            state.restart()  # only closes this slot observes count toward a turn or a crossing
+        if slot.history is not None:
+            self.history_loads.append(slot.history)
+            self.notes.setdefault(instrument_id, []).append(
+                f"{instrument_id}: ATR warmed from {slot.atr_warm_bars} cached one-minute bars "
+                f"({slot.atr_bars[-1][1].bar_type}), no request"
+            )
         self._sync_opening(slot, slot.subscribed_ns)
         # Quotes and trades first, on the feed: the data engine hands the client only an instrument's
         # first subscription (ADR 0055), and the emulator's own subscription names no feed.
         self.subscribe_quotes(instrument_id, params=self.feed_params)
         self.subscribe_trades(instrument_id, params=self.feed_params)
-        self.subscribe_bars(bar_type)
+        self.subscribe_bars(slot.bar_type)
         slot = self.slots[instrument_id]
         if slot.atr is not None and slot.history is None:  # F-2: only when the cache left it short
             self._request_history(slot)
@@ -3770,10 +3901,6 @@ class Mover(Strategy):
         slot.atr_warm_bars = len(closed)
         if len(closed) < n:
             return False
-        self.notes.setdefault(slot.instrument_id, []).append(
-            f"{slot.instrument_id}: ATR warmed from {len(closed)} cached one-minute bars "
-            f"({closed[0].bar_type}), no request"
-        )
         return slot.atr.initialized
 
     def _close_slot(self, slot: Slot) -> None:
@@ -3837,7 +3964,7 @@ class Mover(Strategy):
         if self.winding_down:
             if self.settings.extended_hours:
                 self._sell_out(slot, held, now)
-        elif (self.settings.protect or slot.exiting) and not self.is_exiting():
+        elif (self.settings.protect or slot.adopted or slot.exiting) and not self.is_exiting():
             # While upstream's market exit runs it alone sells: a sell made here would be denied, being
             # neither reduce-only nor the exit's own (MARKET_EXIT_IN_PROGRESS, pinned
             # crates/trading/src/strategy/mod.rs:2396-2402). Cancels and bookkeeping go on.
@@ -3929,16 +4056,49 @@ class Mover(Strategy):
             slot.holding_from = slot.held_average = None
             slot.floor_since, slot.floor_released = None, False
             slot.trailed, slot.last_sale = False, None
+            slot.adopted, slot.adoption_guard = False, None
 
     def _protect(self, slot: Slot, held: Decimal, now: int) -> None:
         self._ensure_exit(slot, held)
+        order = self._order(slot.protect_id)
+        adoption_ready = False
+        if slot.adoption_guard is not None and not slot.exiting:
+            armed_at, observed_at = slot.adoption_guard
+            observation = self._adoption_observation(slot)
+            # The fill/held anchor or the emulator may have raised the supplied
+            # level. Confirmation belongs to the actual order's trigger.
+            level = slot.trail_trigger
+            if order is not None and order.trigger_price is not None:
+                level = order.trigger_price.as_decimal()
+            if (
+                now > armed_at
+                and observation is not None
+                and (observed_at is None or observation[0] > observed_at)
+            ):
+                if observed_at is None:
+                    slot.adoption_guard = (now, observation[0])
+                elif (level is not None and observation[1] <= level) or (
+                    order is not None and order.is_emulated and order.is_activated
+                ):
+                    # Above the armed level, a dormant order still waits for a price
+                    # that can seed positive offsets. Re-arming it into `_hold` here
+                    # would replace that level with an unrequested stop at the average.
+                    slot.adoption_guard = None
+                    adoption_ready = True
+            if (
+                slot.adoption_guard is not None
+                and order is not None
+                and not order.is_closed
+                and (not order.is_emulated or order.quantity.as_decimal() == held)
+            ):
+                return
         if self.persistence and not slot.exiting:
             self._persistent_trail(slot, now)
             if not slot.exiting:
                 return
         order = self._order(slot.protect_id)
         raised = False
-        if not slot.exiting and slot.sized_loss is not None:
+        if not slot.exiting and slot.adoption_guard is None and slot.sized_loss is not None:
             # H1-H3 apply to the holding, including fills of another entry (lead, 2026-11-13).
             # Read its average before either anchor is refreshed. A cheaper fill cannot lower a
             # reached stop; if a fill brings the average from above the kept stop to at or under
@@ -4046,7 +4206,10 @@ class Mover(Strategy):
             # No order is modified. A trailing sell that no longer covers what is held is canceled,
             # and one for all of it is made from the trigger this one had reached.
             if (
-                order.quantity.as_decimal() != held or tightened or raised
+                order.quantity.as_decimal() != held
+                or tightened
+                or raised
+                or (adoption_ready and not order.is_activated)
             ) and not order.is_pending_cancel:
                 if order.trigger_price is not None:
                     reached = order.trigger_price.as_decimal()
@@ -4172,12 +4335,12 @@ class Mover(Strategy):
         """
         trigger = self.settings.trigger
         at = self._followed(slot)
-        if at is None or at <= 0:
+        if (at is None or at <= 0) and slot.adoption_guard is None:
             # The emulator cannot arm without a market price: hold a stop the strategy checks itself
             # (the lead's decision (b), 2026-11-12), not a sale at once.
             self._hold(slot, held, now)
             return
-        if slot.held_since is not None:
+        if slot.held_since is not None and slot.adoption_guard is None:
             # the held stop at the average as it is now, before any price is compared with it: a fill
             # since the last hold step moves it, as each hold step would (dsh-reader-343, F1;
             # t-heldrefresh, H1 and H2), and the exit record names the refreshed level, measured from
@@ -4185,7 +4348,12 @@ class Mover(Strategy):
             # code review, finding 1)
             self._held_at_l(slot)
             self._record_held_stop(slot)
-        if slot.held_since is not None and slot.held_stop is not None:
+        if (
+            slot.adoption_guard is None
+            and slot.held_since is not None
+            and slot.held_stop is not None
+            and at is not None
+        ):
             # the first followed price meets the held stop before the hold ends, under either trigger
             # (the lead's H1-H3, 2026-11-12; the xr3 fast reader's SF1 and its BID_ASK twin): at or
             # under it, the hold's sale at once, as `_hold` compares, with the hold's low received since
@@ -4225,6 +4393,10 @@ class Mover(Strategy):
             # the hold ends below, so a hold kept for want of room keeps its start
             from_hold = reached is None or held_level >= stop_trigger_price(reached)
             reached = held_level if reached is None else max(reached, held_level)
+        # Every slot's kept trigger floors onto Alpaca's step, as main does. An adopted slot's
+        # supplied level went UP onto the step at adoption (`adopt_holding`), so it floors to
+        # itself; a native trigger the emulator reached off the step is floored, never raised,
+        # since raising it sold a bid that never met it (the lead's ruling, 2026-11-13, 15:48).
         kept = None if reached is None else stop_trigger_price(reached)
         origin = None if reached is None else f"reached {reached}"
         met = "retained trigger"
@@ -4251,7 +4423,7 @@ class Mover(Strategy):
             self._floor_m(),
             basis=entry_basis(self._order(slot.entry_id)),
         )
-        if kept is not None and at <= kept:
+        if kept is not None and at is not None and at <= kept and slot.adoption_guard is None:
             # the market is at the trigger the canceled sell had reached, or the stop held: the sale
             # is due now, whatever room the floor leaves a trailing sell (the landing review, P2)
             if holding:
@@ -4272,7 +4444,8 @@ class Mover(Strategy):
             # price too: a late print must not seed a non-positive trigger or release limit (P1-1).
             trade = self.cache.trade(slot.instrument_id)
             seed = None if trade is None else trade.price.as_decimal()
-        if seed is None or min(at, seed) - max(trailing, limit) <= 0:
+        unsafe_seed = seed is None or at is None or min(at, seed) - max(trailing, limit) <= 0
+        if unsafe_seed and slot.adoption_guard is None:
             # A3+O's floor in price terms can reach the followed price: the emulator would seed the
             # trigger at it less the offset (`crates/execution/src/trailing.rs:61`), at or under zero,
             # and its limit with it. No such sell is sent: the stop is held, and sells through the
@@ -4299,8 +4472,8 @@ class Mover(Strategy):
         # better one (`crates/execution/src/trailing.rs:61-65`); with no price the remade sell's first
         # limit is the bid less its offset, under the one already reached after a pullback.
         # Capped at the kept trigger less this sell's own spread between its offsets, the limit the
-        # emulator would seed beside that trigger: the kept trigger is rounded down to Alpaca's step,
-        # so a sub-cent trail can leave the reached limit above it (the landing review of this fix,
+        # emulator would seed beside that trigger: the kept trigger is on Alpaca's step,
+        # and a sub-cent trail can leave the reached limit above it (the landing review of this fix,
         # finding 1), and a released sale keeps the room its limit offset gives it under the trigger.
         # Without a ratchet over $1 the cap is the lower, by what the trigger lost to the step. The
         # cap is rounded down to Alpaca's step, which a sub-cent offset leaves it off (the review of
@@ -4323,13 +4496,24 @@ class Mover(Strategy):
             limit_offset=limit,
             trailing_offset=trailing,
             trailing_offset_type=TrailingOffsetType.PRICE,
+            # A preset trigger alone matches at submission (emulator.rs:679-699). A stop
+            # already met by adoption's first bid rests until recovery above that level;
+            # a fresh breached quote instead takes the ordinary cancel/remake sale path.
+            activation_price=(
+                instrument.make_price(up_on_step(max(kept, limit, trailing) + SUB_DOLLAR))
+                if slot.adoption_guard is not None and kept is not None
+                else None
+            ),
             trigger_price=None if kept is None else instrument.make_price(kept),
             trigger_type=trigger,
             time_in_force=TimeInForce.DAY,
             emulation_trigger=trigger,
+            reduce_only=slot.adopted,
         )
         slot.protect_id = order.client_order_id
         slot.trailed = True
+        if slot.adoption_guard is not None:
+            slot.trail_trigger = kept
         if kept is not None:
             self.sell_triggers[order.client_order_id.value] = str(kept)
         slot.priced_ns = (
@@ -4588,7 +4772,7 @@ class Mover(Strategy):
             Mover._held(self, slot)
         return slot.holding_average
 
-    def _trail_anchor(self, slot: Slot) -> Decimal:
+    def _trail_anchor(self, slot: Slot, *, record: bool = True) -> Decimal:
         """The cache's quantity-weighted holding average, else the entry fill, else the current bid.
 
         `Cache.positions_open(instrument_id, strategy_id)` and `Position.avg_px_open/signed_qty`
@@ -4615,11 +4799,12 @@ class Mover(Strategy):
             raise RuntimeError(
                 f"{slot.instrument_id}: no entry, position average price or positive current bid to protect held shares"
             )
-        self.protection_fallbacks[source] += 1
-        self._note(
-            slot,
-            f"{slot.instrument_id}: no filled entry price; trailing sell anchored on {source} {anchor}",
-        )
+        if record:
+            self.protection_fallbacks[source] += 1
+            self._note(
+                slot,
+                f"{slot.instrument_id}: no filled entry price; trailing sell anchored on {source} {anchor}",
+            )
         return anchor
 
     def _followed(self, slot: Slot) -> Decimal | None:
@@ -4748,6 +4933,7 @@ class Mover(Strategy):
             instrument.make_qty(held),
             Price.from_str(f"{price:.{instrument.price_precision}f}"),
             time_in_force=TimeInForce.DAY,
+            reduce_only=slot.adopted,
         )
         slot.protect_id = order.client_order_id
         if slot.exit_trigger is not None:
@@ -5504,18 +5690,20 @@ class Mover(Strategy):
         now: int | None = None,
         profile_price: Decimal | None = None,
         found_holding: bool = False,
+        allow_no_quote: bool = False,
     ) -> TrailPlan:
         """Freeze T1 at entry. A spread floor or distance the cap forbids refuses the entry by name
         (`DistanceRefusal`); an unusable spread selects the configured fixed plan, and a cold ATR the
         fixed plan raised to the spread floor at the step (`_cold_plan`), by name. A held profile's
         warm check supplies its completed close as the ATR basis, keeping `price` as its anchor.
         `found_holding` lets protect retain an own-cap holding's distance without choosing an entry
-        size; that caller enforces `sizing.DISTANCE_CEILING` (ADR 0142, 2026-11-13)."""
+        size; that caller enforces `sizing.DISTANCE_CEILING` (ADR 0142, 2026-11-13). Only adoption may
+        take the no-spread plan before a quote; entries still refuse it."""
         settings = self.settings
         if settings.trail_mode == "profile" and self.trail_profile is None:
             raise ValueError("profile document is missing; no profile entry is allowed")
         atr = None if slot.atr is None or not slot.atr.initialized else Decimal(str(slot.atr.value))
-        if quote is None:
+        if quote is None and not allow_no_quote:
             raise ValueError("no quote yet")
         spread = quoted_spread(quote)
         if settings.trail_mode == "fixed":
