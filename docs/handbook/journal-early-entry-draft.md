@@ -1,6 +1,7 @@
 # Early entry on the tape of 2026-11-11: CENN first (draft journal entries)
 
-A draft: these entries move into the lessons journal, with their ids, once the handbook is on `main`.
+A draft: each entry moves into the lessons journal as a file of its own under `docs/handbook/journal/`,
+in the journal's form (its id is the file's name, and it gains `owner` and `closes`).
 Every figure here is a DIAGNOSTIC under ADR 0092: it is counted and labelled, and it changes no row.
 
 **How it was made.** `python -m canon_trading.early_entry_study --catalog <a sip root> --day 2026-11-11

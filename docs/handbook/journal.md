@@ -7,26 +7,31 @@ form and that the entries already on `main` are unchanged.
 
 ## The learn step
 
-A change that taught something lands with its lesson: a new entry here, or a line on a handbook page,
-in the same pull request. A practice that is stopped is deleted where it is stated, not left as a
-fallback, and the entry that stopped it says so. Landing itself is ADR 0014's and its review ADR 0017's.
+A change that taught something lands with its lesson: a new file in `docs/handbook/journal/`, named
+`<YYYY-MM-DD>-<slug>.md`, or a line on a handbook page, in the same pull request. A practice that is
+stopped is deleted where it is stated, not left as a fallback, and the entry that stopped it says so.
+Landing itself is ADR 0014's and its review ADR 0017's.
 
 ## The session-end reflection
 
-Every session ends with a reflection, written as one entry here with the source `reflection`. Its
-`result` gives, for each rule that acted, what it did against holding flat over the session, with the
-count of exits behind it; and the movers missed, from the recorder's ranking against the day's final
-gainers. Each exit's counterfactuals (held to now, matched holding flat, the managed policy, the managed
+Every session ends with a reflection, written as one file in `docs/handbook/journal/`, named
+`<YYYY-MM-DD>-<slug>.md`, with the source `reflection`. Its `result` gives, for each rule that acted,
+what it did against holding flat over the session, with the count of exits behind it; and the movers
+missed, from the recorder's ranking against the day's final gainers. Each exit's counterfactuals (held to now, matched holding flat, the managed policy, the managed
 policy with re-entry, and each shadow arm, with counts and costs at one times and stressed) are its
 `evidence`. The loop that writes it is not yet built (roadmap step 6).
 
 ## An entry's form
 
-A heading `### L<four digits>: <subject>`, the ids in order from `L0001` with none skipped, then these
-ten fields as list lines, in this order, each with a value:
+Add one file under `docs/handbook/journal/`, named `<YYYY-MM-DD>-<slug>.md`: a valid date and a
+lowercase slug of words or numbers joined by hyphens, chosen for the lesson. The file name without
+`.md` is the entry's id, and its heading is `### <id>: <subject>`, matching that name. The name's date
+is the entry's `session`. Read the files in filename order; two entries on the same date need different slugs, never a shared counter.
+Each file holds exactly one entry with these twelve fields as list lines, in this order, each with a
+value:
 
 ```text
-### L0001: <the subject, one line>
+### YYYY-MM-DD-slug: <the subject, one line>
 
 * area: <ranking | entries | exits | sizing | execution | data | risk | strategies>
 * session: <the session's date, YYYY-MM-DD>
@@ -36,13 +41,32 @@ ten fields as list lines, in this order, each with a value:
 * change: <the change it led to and its reference (a record, a pull request), or none>
 * next: <what comes next>
 * status: <open | confirmed | refuted | adopted | superseded>
-* supersedes: <the id of an earlier entry, or none>
+* supersedes: <an existing L.... id or fragment id being corrected, or none; never this entry's own id>
 * source: <reflection | nightly | review | lead | owner>
+* owner: <who closes it: a lane's role, the lead or the owner; none once it is closed>
+* closes: <the verifiable end state: the test or the unit that closes it; none once it is closed>
 ```
+
+An `open` entry names both `owner` and `closes`, and a closed one says `none` in both: an incident's
+action item has an owner and "a verifiable end state" and is tracked to closure, as Google SRE's
+postmortem practice asks (https://sre.google/workbook/postmortem-culture/, "Concrete Action Items").
+It is closed by a later entry that supersedes it. The check refuses an open entry with no owner or end
+state; it does not refuse one left open, so closure is tracked by reading the open entries at each
+reflection. `L0001` through `L0009`, written on this page before the form gained the two fields, keep
+their ten.
+
+An entry already on `main` is never edited, renamed or removed. Correct it in a new file whose
+`supersedes` names it; a fragment may name another fragment of its own date or earlier, even when its
+slug sorts later on the same date, but never one of a later date, and no chain of `supersedes` returns
+to an entry it started from. An `owner` or `closes` that only defers (`TBD`, `later`, `none yet`, `?`)
+names no one. Dotfiles are ignored, and every other file in the folder must have the form above.
 
 ## Entries
 
-<!-- append-only: add new entries below this line; never edit or remove one above it -->
+Closed: `L0001` through `L0009` stay here unchanged. New entries go in `docs/handbook/journal/`;
+do not append an `L0010` or any other entry here.
+
+<!-- append-only: closed; new entries go in docs/handbook/journal/ -->
 
 ### L0001: Five sessions is the least that keeps a best-of-eight false pass under three per cent
 
