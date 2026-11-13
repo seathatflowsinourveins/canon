@@ -45,7 +45,7 @@ on `main`, and open until the record is accepted.
 | `RANK_MAX_AGE_SECS` | 90 seconds; an older ranking means no entry | UNCALIBRATED | `MoverConfig` (ADR 0088) | 2026-11-11 |
 | `RUN_BARS` | 3 strictly rising one-minute closes | UNCALIBRATED | `MoverConfig` (ADR 0088; ADR 0083's row) | 2026-11-11 |
 | `ENTRY_TIMEOUT_SECS` | 30 seconds, then the entry is cancelled | UNCALIBRATED | `MoverConfig` (ADR 0088) | 2026-11-11 |
-| `TRAIL` | 0.02 of the entry price, a fixed offset under the highest bid | UNCALIBRATED | `MoverConfig` (ADR 0088) | 2026-11-11 |
+| `TRAIL` | 0.02 of the entry price, a fixed offset under the highest bid: `MoverConfig`'s default and arm F2's. A Mover window that names no trail flag and no `--arm` runs arm OWN1 instead (row `TRAIL_MODE`) | UNCALIBRATED | `MoverConfig` (ADR 0088); the window's default arm (ADR 0106) | 2026-11-12 |
 | `CHASE_CAP` | 0.02 under the first sale price, the floor of a sale's re-pricing | UNCALIBRATED | `MoverConfig` (ADR 0088) | 2026-11-11 |
 | `CHASE_SECS` | 5 seconds between a sale's re-sends | UNCALIBRATED | `MoverConfig` (ADR 0088) | 2026-11-11 |
 | `COOLDOWN_SECS` | 300 seconds after a sale before the same name is bought again, under the clock re-entry arm only; a state arm (`REENTRY_ARM`) imposes no time delay | UNCALIBRATED | `MoverConfig` (ADR 0088) | 2026-11-11 |
@@ -67,11 +67,13 @@ on `main`, and open until the record is accepted.
 The selectable trail and re-entry rows below are a window's settings, not tuned by the bars study.
 The bars replay accepts only the fixed trail and the existing clock cooldown; another mode is refused
 by its field and value. These window rows are excluded from its trial keys and decode as the fixed
-rows. The defaults remain the fixed trail and the 300-second clock cooldown (the lead, 2026-11-12).
+rows. The defaults remain the fixed trail and the 300-second clock cooldown (the lead, 2026-11-12), in
+`MoverConfig` and `WindowConfig`; a Mover window's command line that names no trail runs arm OWN1
+(ADR 0106, 2026-11-12).
 
 | Row | Value | Status | Source or study | Date |
 |---|---|---|---|---|
-| `TRAIL_MODE` | fixed by default; atr, tier or ratchet by explicit window selection | UNCALIBRATED | Source b01f4c4; lead's ruling, 2026-11-12, preserves main's default | 2026-11-12 |
+| `TRAIL_MODE` | fixed by default; atr, tier or ratchet by explicit window selection. A Mover window that names no trail flag and no `--arm` runs arm OWN1 (atr, k 1, cap arm own), recorded as the default (`session_window.DEFAULT_ARM`) | UNCALIBRATED | Source b01f4c4; lead's ruling, 2026-11-12, preserves main's default; OWN1 as the window's default: the owner's requirement, 2026-11-12 (ADR 0106) | 2026-11-12 |
 | `ATR_K` | 1; alternates 2, 3 | UNCALIBRATED | Source b01f4c4; lead, no primary source | 2026-11-12 |
 | `ATR_N` | 14 complete one-minute bars; alternates 7, 28 | UNCALIBRATED | Source b01f4c4; NautilusTrader AverageTrueRange at d53849b216e2; window selection | 2026-11-12 |
 | `SPREAD_FLOOR_M` | 2 quoted spreads; alternates 1, 3 | UNCALIBRATED | Source b01f4c4; lead, no primary source | 2026-11-12 |

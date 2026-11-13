@@ -535,7 +535,14 @@ TRAIL_ARMS: dict[str, dict[str, Any]] = {
 """The three trail arms a Mover window may name (the lead's rotation of 2026-11-12, registered before any
 result): F2 the fixed 2% trail; OWN1 and OWN3 ATR mode at k 1 and 3 over the spread floor, with the cap
 arm `own`. All sized by `sizing.plan_for_loss` at the same planned loss. UNCALIBRATED; source the lead,
-no primary source. Which arm a window runs is the lead's rotation, not a default."""
+no primary source. A window that names one runs it; one that names no arm and no trail flag runs
+`DEFAULT_ARM`."""
+DEFAULT_ARM = "OWN1"
+"""The arm a Mover window runs when its command line names no arm and no trail flag, marked in the
+record (`arm_default`) and the heartbeat as the default taken: the trailing stop's distance per symbol,
+from its own volatility and spread over a floor the spread sets (the owner's requirement of 2026-11-12;
+ADR 0106's amendment of that date). `MoverConfig`'s and `WindowConfig`'s own defaults stay the fixed
+trail, which the bars replay ranks (`tuning_contract.BARS_REPLAY_FIXED_ROWS`). UNCALIBRATED."""
 SCHEDULED_ENV = "CANON_PAPER_SCHEDULED"
 """`1` only in a run the schedule started: the launchd agent's plist sets it (launchd.plist(5),
 EnvironmentVariables), so a run of the runner or the task by hand does not have it (ADR 0050)."""
@@ -749,6 +756,9 @@ class WindowConfig:
     """A name of `TRAIL_ARMS`, written to the record and the heartbeat; its rows must be the window's."""
     trail_profile_path: Path | None = None
     """T5's strict profile file; None selects catalog/movers-baseline/trail-profile-v1.json."""
+    arm_default: bool = False
+    """True only when `arm` is `DEFAULT_ARM`, taken because the command line named no arm and no trail
+    flag (`_mover_trail`); written to the record and the heartbeat."""
     trail_mode: str = "fixed"
     trail_cap: str = TRAIL_CAP_DEFAULT
     """What `Mover` does with a non-fixed trail over the 0.02 cap (`mover.TRAIL_CAPS`): `clamp`, main's
@@ -846,6 +856,10 @@ class WindowConfig:
                 raise ValueError(
                     f"arm {self.arm} does not match the window's rows: {', '.join(wrong)}"
                 )
+        if self.arm_default and self.arm != DEFAULT_ARM:
+            raise ValueError(
+                f"arm_default marks the default arm {DEFAULT_ARM} taken, not arm {self.arm}"
+            )
         if type(self.spares) is not int or self.spares < 0:
             raise ValueError(f"spares must be a nonnegative whole number, got {self.spares!r}")
         if (
@@ -1748,7 +1762,10 @@ class WindowReport:
     strategy: str = DEFAULT_STRATEGY
     """The strategy the window ran, a name of `WINDOW_STRATEGIES`."""
     arm: str | None = None
-    """The trail arm the window named (`TRAIL_ARMS`), or None."""
+    """The trail arm the window ran (`TRAIL_ARMS`), or None."""
+    arm_default: bool = False
+    """True when `arm` is `DEFAULT_ARM`, taken because the window named no arm and no trail flag; false
+    when the arm was named, or there is none."""
     feed: str = ""
     """The feed the strategy streamed and warmed up on (ADR 0055)."""
     overnight: str = ""
@@ -3138,6 +3155,7 @@ def run_window(
         part=part,
         strategy=config.strategy,
         arm=config.arm,
+        arm_default=config.arm_default,
         feed=feed,
         overnight=overnight,
         no_shorting=no_shorting,
@@ -4683,31 +4701,33 @@ def _parser() -> argparse.ArgumentParser:
         help=f"{MOVER}'s slots; default: seven in every part",
     )
     parser.add_argument("--spares", type=int, default=MOVER_SPARES, help="extra Mover roster names")
+    # the trail flags default to None, so `_args` tells a flag given at its fixed value from one left
+    # out; a Mover window that names none of them and no --arm runs DEFAULT_ARM (`_mover_trail`)
     parser.add_argument(
         "--trail-mode",
         choices=TRAIL_SETTINGS["trail_mode"]["arms"],
-        default=TRAIL_SETTINGS["trail_mode"]["default"],
-        help=f"{MOVER}'s trail: fixed (default), atr over the spread floor, tier, ratchet or profile",
+        help=f"{MOVER}'s trail: fixed, atr over the spread floor, tier, ratchet or profile; fixed "
+        f"when another trail flag or --arm is given, and arm {DEFAULT_ARM}'s rows when none is",
     )
     parser.add_argument(
         "--trail-cap",
         choices=TRAIL_CAPS,
-        default=TRAIL_CAP_DEFAULT,
-        help=f"{MOVER}'s arm for a trail over the 0.02 cap: clamp (default), refuse, or own (the "
-        "name's distance, sized down)",
+        help=f"{MOVER}'s arm for a trail over the 0.02 cap: clamp, refuse, or own (the name's "
+        f"distance, sized down); clamp when another trail flag or --arm is given",
     )
     parser.add_argument(
         "--atr-k",
         type=Decimal,
         choices=(TRAIL_SETTINGS["atr_k"]["default"], *TRAIL_SETTINGS["atr_k"]["alternates"]),
-        default=TRAIL_SETTINGS["atr_k"]["default"],
-        help=f"{MOVER}'s ATR multiple under --trail-mode atr: a registered row, 1 (default), 2 or 3",
+        help=f"{MOVER}'s ATR multiple under --trail-mode atr: a registered row, 1, 2 or 3; 1 when "
+        "another trail flag or --arm is given",
     )
     parser.add_argument(
         "--arm",
         choices=tuple(TRAIL_ARMS),
         help=f"{MOVER}'s trail arm, named in the record and the heartbeat; refused unless the trail "
-        "flags give its rows",
+        f"flags give its rows. With no trail flag and no --arm, a {MOVER} window runs "
+        f"{DEFAULT_ARM}, named as the default",
     )
     parser.add_argument(
         "--baseline-path", type=Path, help="default: catalog/movers-baseline/<feed>.json"
@@ -4718,23 +4738,22 @@ def _parser() -> argparse.ArgumentParser:
         help="default: catalog/movers-baseline/trail-profile-v1.json",
     )
     profile_k = PROFILE_SETTINGS["profile_k"]
+    # the profile flags default to None, as the trail flags do, so a flag given at its row is told
+    # from one left out; `window_config` fills the rows (`_profile_rows`)
     parser.add_argument(
         "--profile-k",
         type=_decimal_argument,
         choices=sorted((profile_k["default"], *profile_k["alternates"])),
-        default=profile_k["default"],
     )
     for name in ("profile_pctl", "profile_floor"):
         parser.add_argument(
             "--" + name.replace("_", "-"),
             choices=PROFILE_SETTINGS[name]["arms"],
-            default=PROFILE_SETTINGS[name]["default"],
         )
     parser.add_argument(
         "--profile-multipliers",
         type=_decimal_argument,
         nargs=3,
-        default=PROFILE_SETTINGS["profile_multipliers"]["default"],
     )
     parser.add_argument("--log-dir", type=Path, help="default: `default_log_dir()`")
     for name in ARM_FLAGS:
@@ -4751,22 +4770,23 @@ ARM_FLAGS = ("reentry_arm", "opening_arm")
 validated as a `MoverConfig` row. The opening is a regular-session arm, so another part keeps it off."""
 
 
+def _profile_rows(args: argparse.Namespace) -> dict[str, Any]:
+    """The profile's rows from the command line: each as given, or its registered row when left out."""
+    return {
+        name: row["default"] if getattr(args, name) is None else getattr(args, name)
+        for name, row in PROFILE_SETTINGS.items()
+    }
+
+
 def window_config(args: argparse.Namespace, session: str) -> WindowConfig:
     """The window's configuration from the parsed arguments and the session resolved for this run. The
     arms reach only a Mover window, as `slots` does; an auto run's part that is not regular keeps the
     opening off and says so on stderr, so the arm asked for is never dropped unsaid."""
     rows: dict[str, Any] = {}
-    trail = {"trail_mode": args.trail_mode} | {
-        name: getattr(args, name) for name in PROFILE_SETTINGS
-    }
+    profile = _profile_rows(args)
     if args.strategy == MOVER:
-        rows.update(
-            trail,
-            trail_profile_path=args.trail_profile_path,
-            trail_cap=args.trail_cap,
-            atr_k=args.atr_k,
-            arm=args.arm,
-        )
+        # the trail rows and arm as named, or `DEFAULT_ARM`'s when none is (`_mover_trail`)
+        rows.update(_mover_trail(args), **profile, trail_profile_path=args.trail_profile_path)
         for name in ARM_FLAGS:
             if (arm := getattr(args, name)) is None:
                 continue
@@ -4778,7 +4798,9 @@ def window_config(args: argparse.Namespace, session: str) -> WindowConfig:
                 )
                 continue
             rows[name] = arm
-    elif any(value != getattr(WindowConfig, name) for name, value in trail.items()):
+    elif args.trail_mode not in (None, WindowConfig.trail_mode) or any(
+        value != getattr(WindowConfig, name) for name, value in profile.items()
+    ):
         print(
             f"paper:session: the trail rows are {MOVER}'s; this {args.strategy} window keeps "
             "the fixed trail",
@@ -4816,9 +4838,10 @@ def _args(argv: Sequence[str] | None) -> argparse.Namespace:
     (an empty `getconf` in the caller's shell leaves only the folder's name)."""
     parser = _parser()
     args = parser.parse_args(argv)
-    args.profile_multipliers = tuple(args.profile_multipliers)
+    if args.profile_multipliers is not None:
+        args.profile_multipliers = tuple(args.profile_multipliers)
     multipliers = PROFILE_SETTINGS["profile_multipliers"]
-    if args.profile_multipliers not in (multipliers["default"], *multipliers["alternates"]):
+    if args.profile_multipliers not in (None, multipliers["default"], *multipliers["alternates"]):
         registered = " or ".join(
             " ".join(str(value) for value in row)
             for row in (multipliers["default"], *multipliers["alternates"])
@@ -4873,18 +4896,55 @@ def _heard_failed(log_dir: Path, error: BaseException) -> None:
     _heard(log_dir, f"failed: {type(error).__name__}: {error}")
 
 
+TRAIL_FLAGS: dict[str, Any] = {
+    "trail_mode": TRAIL_SETTINGS["trail_mode"]["default"],
+    "trail_cap": TRAIL_CAP_DEFAULT,
+    "atr_k": TRAIL_SETTINGS["atr_k"]["default"],
+}
+"""Mover's trail flags, by their `argparse` names, with the fixed rows each takes when it is left out
+and another trail flag or `--arm` is given (main's rows before `DEFAULT_ARM`)."""
+
+
+def _mover_trail(args: argparse.Namespace) -> dict[str, Any]:
+    """A Mover window's trail rows and arm from the command line: as given, the flags left out at the
+    fixed rows (`TRAIL_FLAGS`); or, with no trail flag and no `--arm`, `DEFAULT_ARM`'s rows, marked as
+    the default taken. `_args` leaves a flag not given unset, so the namespace shows only what was
+    named."""
+    if not _trail_flags_given(args):
+        return {**TRAIL_ARMS[DEFAULT_ARM], "arm": DEFAULT_ARM, "arm_default": True}
+    rows = {
+        n: default if getattr(args, n) is None else getattr(args, n)
+        for n, default in TRAIL_FLAGS.items()
+    }
+    return {**rows, "arm": args.arm, "arm_default": False}
+
+
 def _trail_flags_given(args: argparse.Namespace) -> list[str]:
-    """Mover's trail flags given away from their defaults, each as `flag value`."""
-    return [
-        f"{flag} {given}"
-        for flag, given, default in (
-            ("--trail-mode", args.trail_mode, TRAIL_SETTINGS["trail_mode"]["default"]),
-            ("--trail-cap", args.trail_cap, TRAIL_CAP_DEFAULT),
-            ("--atr-k", args.atr_k, TRAIL_SETTINGS["atr_k"]["default"]),
-            ("--arm", args.arm, None),
-        )
-        if given != default
+    """Mover's trail flags and `--arm` given on the command line, each as `flag value`. A flag given at
+    its fixed row counts: it opts a Mover window out of `DEFAULT_ARM`. The profile's flags and
+    `--trail-profile-path` count the same way, by presence: each names a trail the default arm would
+    drop."""
+    given = [
+        f"--{name.replace('_', '-')} {getattr(args, name)}"
+        for name in (*TRAIL_FLAGS, "arm")
+        if getattr(args, name) is not None
     ]
+    for name in PROFILE_SETTINGS:
+        if (value := getattr(args, name)) is not None:
+            shown = " ".join(map(str, value)) if isinstance(value, tuple) else value
+            given.append(f"--{name.replace('_', '-')} {shown}")
+    if args.trail_profile_path is not None:
+        given.append(f"--trail-profile-path {args.trail_profile_path}")
+    return given
+
+
+def _refused_arm(args: argparse.Namespace) -> dict[str, Any]:
+    """The arm a refused window would have run, for its record, as an `ok` record names it: Mover's
+    from the command line (`_mover_trail`), none for another strategy."""
+    if args.strategy != MOVER:
+        return {"arm": None, "arm_default": False}
+    trail = _mover_trail(args)
+    return {"arm": trail["arm"], "arm_default": trail["arm_default"]}
 
 
 def _main(args: argparse.Namespace) -> int:
@@ -4918,6 +4978,7 @@ def _main(args: argparse.Namespace) -> int:
             args.log_dir,
             f"a {session} window of {args.strategy}"
             + ("" if config.arm is None else f", arm {config.arm}")
+            + (" (the default)" if config.arm_default else "")
             + ("" if not unrun else f"; {', '.join(unrun)} not run"),
         )
         report = run_window(config, trading=trading, market=market, market_read_at=market_read_at)
@@ -4941,6 +5002,7 @@ def _main(args: argparse.Namespace) -> int:
                     "commit": running_commit(),
                     "account": paper_account(),
                     "request_budget": request_record(()),
+                    **_refused_arm(args),
                 },
             )
             if unrecorded is not None:

@@ -461,7 +461,9 @@ def test_window_defaults_to_fixed_and_has_the_registered_profile_cli_rows(tmp_pa
     config = WindowConfig()
     assert config.trail_mode == "fixed" and config.trail_profile_path is None
     defaults = session_window._args(["--log-dir", str(tmp_path)])
-    assert defaults.trail_mode == "fixed"
+    # a flag not given stays unset (ADR 0106, 2026-11-12/13); a non-Mover window keeps the fixed trail
+    assert defaults.trail_mode is None
+    assert session_window.window_config(defaults, "regular").trail_mode == "fixed"
     args = session_window._args(
         [
             "--strategy",
@@ -889,7 +891,9 @@ def test_a_profile_flag_that_is_not_a_registered_value_is_a_usage_error(flags, t
 def test_the_profile_k_flag_offers_exactly_the_registered_values(tmp_path):
     row = trail.PROFILE_SETTINGS["profile_k"]
     for value in (row["default"], *row["alternates"]):
-        args = session_window._args(["--profile-k", str(value), "--log-dir", str(tmp_path)])
+        # a profile flag is Mover's, refused on another strategy's window like any trail flag
+        argv = ["--strategy", "Mover", "--mover", "--profile-k", str(value)]
+        args = session_window._args([*argv, "--log-dir", str(tmp_path)])
         assert args.profile_k == value
 
 

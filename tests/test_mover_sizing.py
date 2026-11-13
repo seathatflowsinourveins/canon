@@ -360,13 +360,35 @@ def test_the_window_flags_reach_the_window_config() -> None:
     )
     assert (args.trail_mode, args.trail_cap, args.atr_k) == ("atr", "own", D(3))
     plain = session_window._args(["--mover", "--session", "extended"])
-    assert (plain.trail_mode, plain.trail_cap, plain.atr_k) == ("fixed", "clamp", D(1))
+    assert (plain.trail_mode, plain.trail_cap, plain.atr_k, plain.arm) == (None, None, None, None)
+    assert session_window._mover_trail(plain) == {
+        **session_window.TRAIL_ARMS["OWN1"],
+        "arm": "OWN1",
+        "arm_default": True,
+    }
+
+
+def test_a_bare_window_namespace_does_not_show_the_fixed_rows_it_will_not_run() -> None:
+    """Review finding 3 (/code-review high, F-1): `_args` filled the fixed rows into a bare Mover
+    window's namespace, which then runs OWN1; a flag left out stays unset, resolved by `_mover_trail`."""
+    plain = session_window._args(["--mover", "--session", "extended"])
+    assert (plain.trail_mode, plain.trail_cap, plain.atr_k) == (None, None, None)
 
 
 @pytest.mark.parametrize(
-    "flags", [["--trail-mode", "atr"], ["--trail-cap", "own"], ["--atr-k", "3"]]
+    "flags",
+    [
+        ["--trail-mode", "atr"],
+        ["--trail-cap", "own"],
+        ["--atr-k", "3"],
+        ["--trail-mode", "fixed"],
+        ["--trail-cap", "clamp"],
+        ["--atr-k", "1"],
+    ],
 )
 def test_a_trail_flag_without_mover_is_refused(flags) -> None:
+    """Review finding 2 (/code-review high, F-1): a trail flag given at its fixed row opts a Mover
+    window out of `DEFAULT_ARM`, so it is given like any other value, and refused without Mover."""
     with pytest.raises(SystemExit):
         session_window._args(["--session", "regular", *flags])
 
@@ -461,10 +483,7 @@ def test_each_registered_arm_is_named_with_its_rows(arm, flags, tmp_path) -> Non
         strategy="Mover",
         mover=True,
         log_dir=tmp_path,
-        arm=args.arm,
-        trail_mode=args.trail_mode,
-        trail_cap=args.trail_cap,
-        atr_k=args.atr_k,
+        **session_window._mover_trail(args),
     )
     assert config.arm == arm
     assert session_window.WindowReport("extended", "LLL", started="arm", arm=config.arm).arm == arm

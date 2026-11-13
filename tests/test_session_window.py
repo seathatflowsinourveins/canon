@@ -1712,10 +1712,11 @@ def quiet_window(
     request_limit_per_minute=200,
     check_fills=(),
     baseline_file=True,
+    trail=None,
 ):
     """A window of `strategy` whose node runs at once, its strategy having seen `quotes`, `trades` and
     `live_bars`, and its node log holding the lines `log`; returns the report or the error, and the
-    latest record."""
+    latest record. `trail` holds Mover's trail rows and arm for the window's configuration."""
 
     class Ran:
         cache = SimpleNamespace(orders=lambda **kwargs: [])
@@ -1780,6 +1781,7 @@ def quiet_window(
                 slots=slots,
                 baseline_path=baseline,
                 request_limit_per_minute=request_limit_per_minute,
+                **(trail or {}),
             )
         )
     except RuntimeError as e:
@@ -7219,6 +7221,295 @@ def test_an_auto_part_that_runs_another_strategy_names_the_trail_flags_it_does_n
     out = capsys.readouterr().out
     assert "--trail-mode atr, --trail-cap own, --arm OWN1 not run" in out
     assert f"runs {session_window.DEFAULT_STRATEGY}" in out
+
+
+def test_an_auto_part_names_a_trail_flag_given_at_its_fixed_row_as_not_run(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    """Review finding 2 (/code-review high, F-1): `--trail-mode fixed` opts a Mover window out of
+    `DEFAULT_ARM`, so in a part that runs another strategy it is a flag not run, said by name."""
+
+    class At(Account):
+        def get_clock(self) -> Clock:
+            return clock(datetime(2026, 11, 10, 11, 0, tzinfo=NEW_YORK), is_open=True)
+
+    def window(config, **_kwargs):
+        raise session_window.WindowSkipped("the test stops here")
+
+    monkeypatch.setattr(session_window, "EXTENDED_READY", True)
+    monkeypatch.setattr(session_window, "paper_trading", lambda: At())
+    monkeypatch.setattr(session_window, "run_window", window)
+    argv = ["--session", "auto", "--mover", "--trail-mode", "fixed", "--log-dir", str(tmp_path)]
+    assert session_window.main(argv) == 0
+    assert "--trail-mode fixed not run" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    ("flags", "arm", "arm_default"),
+    [([], "OWN1", True), (["--arm", "F2"], "F2", False)],
+)
+def test_a_refused_mover_window_record_names_its_arm(
+    monkeypatch, tmp_path, flags, arm, arm_default
+) -> None:
+    """Review finding 5 (/code-review high, F-1): a refused Mover window's record said nothing of the
+    arm it would have run, so a refusal under the default could not be told from one under F2."""
+
+    def window(config, **_kwargs):
+        raise session_window.WindowRefused("the test refuses here")
+
+    monkeypatch.setattr(session_window, "EXTENDED_READY", True)
+    monkeypatch.setattr(session_window, "paper_trading", lambda: Account())
+    monkeypatch.setattr(session_window, "run_window", window)
+    argv = ["--session", "extended", "--mover", *flags, "--log-dir", str(tmp_path)]
+    assert session_window.main(argv) == 1
+    latest = json.loads((tmp_path / "latest.json").read_text())
+    assert latest["result"] == "refused: the test refuses here"
+    assert (latest["arm"], latest["arm_default"]) == (arm, arm_default)
+
+
+@pytest.mark.parametrize(
+    ("flags", "named"),
+    [
+        (["--profile-k", "3"], "--profile-k 3"),
+        (["--profile-floor", "off"], "--profile-floor off"),
+        (
+            ["--trail-profile-path", "/profiles/today.json"],
+            "--trail-profile-path /profiles/today.json",
+        ),
+        (["--profile-k", "2"], "--profile-k 2"),
+        (["--profile-pctl", "p75"], "--profile-pctl p75"),
+        (["--profile-floor", "median"], "--profile-floor median"),
+        (["--profile-multipliers", "1", "1", "1"], "--profile-multipliers 1 1 1"),
+    ],
+)
+def test_a_profile_flag_is_a_named_trail_and_not_the_default_arm(flags, named, tmp_path) -> None:
+    """/code-review high on F-1 rebased onto the ported profile, finding 2, and the Codex range-diff
+    reader's P1: a Mover window that named only a profile flag ran OWN1 labelled the default, the
+    named row dropped unsaid, where before it ran the fixed rows. A profile flag given, at its row or
+    away from it, is a named trail: the default arm is not taken, and without Mover the flag is
+    refused like any other trail flag."""
+    args = session_window._args(
+        ["--session", "extended", "--mover", *flags, "--log-dir", str(tmp_path)]
+    )
+    assert named in session_window._trail_flags_given(args)
+    trail = session_window._mover_trail(args)
+    assert (trail["arm"], trail["arm_default"], trail["trail_mode"]) == (None, False, "fixed")
+    with pytest.raises(SystemExit):
+        session_window._args(["--session", "regular", *flags, "--log-dir", str(tmp_path)])
+
+
+TRAIL_FIELDS = ("trail_mode", "trail_cap", "atr_k", "arm", "arm_default")
+"""The configuration fields that say which trail a window's Mover runs, and how its arm was taken."""
+FIXED_ROWS = {"trail_mode": "fixed", "trail_cap": "clamp", "atr_k": Decimal(1)}
+"""The fixed 2% trail's rows, main's before F-1 and `MoverConfig`'s own defaults (F2's rows)."""
+
+
+class RegularOpen(Account):
+    """`Account` with Alpaca's clock open, at 11:00 New York on Tuesday 2026-11-10."""
+
+    def get_clock(self) -> Clock:
+        return clock(datetime(2026, 11, 10, 11, 0, tzinfo=NEW_YORK), is_open=True)
+
+
+def window_up_to_the_node(monkeypatch, tmp_path, argv, account=None):
+    """`main` on `argv`, stopped where `run_window` starts: the configuration it was given, and the
+    heartbeat written just before it. Nothing is sent to Alpaca: `--session auto` reads `account`."""
+    seen: dict = {}
+
+    def window(config, **_kwargs):
+        seen["config"] = config
+        seen["heard"] = json.loads((tmp_path / "last-firing.json").read_text())["outcome"]
+        raise session_window.WindowSkipped("the test stops here")
+
+    monkeypatch.setattr(session_window, "EXTENDED_READY", True)
+    monkeypatch.setattr(session_window, "paper_trading", lambda: account or Account())
+    monkeypatch.setattr(session_window, "run_window", window)
+    assert session_window.main([*argv, "--log-dir", str(tmp_path)]) == 0
+    return seen["config"], seen["heard"]
+
+
+@pytest.mark.parametrize(
+    ("argv", "account"),
+    [
+        (["--session", "extended", "--mover"], None),
+        (["--session", "regular", "--strategy", "Mover", "--mover"], None),
+        (["--session", "auto", "--mover"], Evening(17)),
+        (["--session", "auto", "--mover", "--regular-strategy", "Mover"], RegularOpen()),
+    ],
+)
+def test_a_mover_window_with_no_trail_flag_and_no_arm_runs_own1_by_default(
+    monkeypatch, tmp_path, argv, account
+) -> None:
+    """F-1, the owner's requirement of 2026-11-12 (ADR 0106's amendment of that date): a Mover window
+    started with no trail flag and no `--arm` runs the per-symbol arm OWN1, and its configuration, which
+    the record and the heartbeat are written from, names OWN1 as the default taken."""
+    config, heard = window_up_to_the_node(monkeypatch, tmp_path, argv, account)
+    assert config.strategy == "Mover"
+    assert {n: getattr(config, n) for n in TRAIL_FIELDS} == {
+        **session_window.TRAIL_ARMS["OWN1"],
+        "arm": "OWN1",
+        "arm_default": True,
+    }
+    assert heard.endswith(", arm OWN1 (the default)"), heard
+
+
+def test_the_record_names_the_default_arm_and_that_it_was_the_default(
+    monkeypatch, tmp_path
+) -> None:
+    """F-1: the window's record, read by `scripts/automation status` and the lanes, says `arm: OWN1` and
+    `arm_default: true` for a window that named no arm; one that named F2 says `arm_default: false`."""
+    run_window = session_window.run_window
+    config, _ = window_up_to_the_node(monkeypatch, tmp_path, ["--session", "extended", "--mover"])
+    monkeypatch.setattr(session_window, "run_window", run_window)
+    monkeypatch.setattr(session_window, "choose_mover", lambda *a, **k: a_pick())
+    monkeypatch.setattr(session_window, "window_data", lambda: Quoted())
+    _, report, _ = quiet_window(
+        monkeypatch,
+        tmp_path,
+        quotes=5,
+        trades=5,
+        account=Evening(17),
+        strategy="Mover",
+        session="extended",
+        mover=True,
+        trail={n: getattr(config, n) for n in TRAIL_FIELDS},
+    )
+    assert (report["arm"], report["arm_default"]) == ("OWN1", True)
+    named = tmp_path / "named"
+    named.mkdir()
+    _, report, _ = quiet_window(
+        monkeypatch,
+        named,
+        quotes=5,
+        trades=5,
+        account=Evening(17),
+        strategy="Mover",
+        session="extended",
+        mover=True,
+        trail={"arm": "F2"},
+    )
+    assert (report["arm"], report["arm_default"]) == ("F2", False)
+
+
+@pytest.mark.parametrize(
+    ("flags", "rows", "arm"),
+    [
+        (["--arm", "F2"], FIXED_ROWS, "F2"),
+        (["--trail-mode", "fixed"], FIXED_ROWS, None),
+        (["--trail-cap", "clamp"], FIXED_ROWS, None),
+        (["--atr-k", "1"], FIXED_ROWS, None),
+        (["--trail-mode", "fixed", "--trail-cap", "clamp", "--atr-k", "1"], FIXED_ROWS, None),
+        (["--trail-mode", "atr"], {**FIXED_ROWS, "trail_mode": "atr"}, None),
+        (["--trail-cap", "own"], {**FIXED_ROWS, "trail_cap": "own"}, None),
+        (
+            ["--trail-mode", "atr", "--trail-cap", "own", "--arm", "OWN1"],
+            session_window.TRAIL_ARMS["OWN1"],
+            "OWN1",
+        ),
+        (
+            ["--trail-mode", "atr", "--trail-cap", "own", "--atr-k", "3", "--arm", "OWN3"],
+            session_window.TRAIL_ARMS["OWN3"],
+            "OWN3",
+        ),
+    ],
+)
+def test_a_named_arm_or_a_trail_flag_runs_as_before_and_is_not_the_default(
+    monkeypatch, tmp_path, flags, rows, arm
+) -> None:
+    """F-1 changes only a window that names nothing: `--arm F2` is today's F2 exactly, and each trail
+    flag, even one given at its old default value, gives today's rows, with no arm taken by default."""
+    config, heard = window_up_to_the_node(
+        monkeypatch, tmp_path, ["--session", "extended", "--mover", *flags]
+    )
+    assert {n: getattr(config, n) for n in TRAIL_FIELDS} == {
+        **rows,
+        "arm": arm,
+        "arm_default": False,
+    }
+    assert heard == "a extended window of Mover" + ("" if arm is None else f", arm {arm}")
+
+
+@pytest.mark.parametrize(
+    ("flags", "refused"),
+    [
+        (["--arm", "OWN1"], "arm OWN1 does not match the window's rows: trail_mode fixed not atr"),
+        (["--arm", "OWN3", "--trail-mode", "atr"], "arm OWN3 does not match"),
+        (["--arm", "F2", "--trail-mode", "atr"], "arm F2 does not match"),
+        (
+            ["--arm", "OWN1", "--trail-mode", "atr", "--trail-cap", "clamp"],
+            "arm OWN1 does not match",
+        ),
+    ],
+)
+def test_an_arm_with_contradicting_trail_rows_is_still_refused(
+    monkeypatch, tmp_path, capsys, flags, refused
+) -> None:
+    """F-1 keeps the refusal of an arm whose rows the trail flags contradict: `--arm` names an arm, and
+    the flags left out keep the fixed rows, so `--arm OWN1` alone is refused as before, not filled in."""
+    ran = []
+    monkeypatch.setattr(session_window, "EXTENDED_READY", True)
+    monkeypatch.setattr(session_window, "run_window", lambda config, **_: ran.append(config))
+    argv = ["--session", "extended", "--mover", *flags, "--log-dir", str(tmp_path)]
+    assert session_window.main(argv) == 1
+    assert ran == []
+    assert refused in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("argv", "account", "strategy"),
+    [
+        (["--session", "regular"], None, "SessionMaCross"),
+        (["--session", "extended"], None, "SessionMaCross"),
+        (["--session", "auto"], Evening(17), "SessionMaCross"),
+        (["--session", "auto", "--mover"], RegularOpen(), "SessionMaCross"),
+    ],
+)
+def test_another_strategys_window_takes_no_trail_arm(
+    monkeypatch, tmp_path, capsys, argv, account, strategy
+) -> None:
+    """F-1 is Mover's alone: another strategy's window, an auto schedule's regular part among them, keeps
+    the fixed rows and no arm, and its heartbeat says nothing of a trail."""
+    config, heard = window_up_to_the_node(monkeypatch, tmp_path, argv, account)
+    assert config.strategy == strategy
+    assert {n: getattr(config, n) for n in TRAIL_FIELDS} == {
+        **FIXED_ROWS,
+        "arm": None,
+        "arm_default": False,
+    }
+    assert heard == f"a {config.session} window of {strategy}"
+    assert "not run" not in capsys.readouterr().out
+
+
+def test_mover_configs_own_trail_defaults_stay_fixed() -> None:
+    """F-1 moves the window's command line only. `MoverConfig`'s own defaults keep the fixed trail
+    (mover.py: trail_mode "fixed", trail_cap `TRAIL_CAP_DEFAULT`, atr_k 1), and so does `WindowConfig`'s,
+    because the bars replay ranks fixed rows only (`tuning_contract.BARS_REPLAY_FIXED_ROWS` and
+    `check_bars_replay_modes`): a default moved there would change the ledger's keys, the tuning trials,
+    the replay, and the live and account C constructions, which F-1 leaves alone."""
+    from canon_trading.mover import TRAIL_CAP_DEFAULT
+    from canon_trading.mover import MoverConfig
+    from canon_trading.tuning_contract import BARS_REPLAY_FIXED_ROWS
+
+    plain = MoverConfig(max_notional=Decimal(1), max_move=Decimal(1))
+    assert {n: getattr(plain, n) for n in FIXED_ROWS} == FIXED_ROWS
+    assert TRAIL_CAP_DEFAULT == "clamp"
+    assert {n: BARS_REPLAY_FIXED_ROWS[n] for n in FIXED_ROWS} == FIXED_ROWS
+    window = WindowConfig(strategy="Mover", mover=True, session="extended")
+    assert {n: getattr(window, n) for n in TRAIL_FIELDS} == {
+        **FIXED_ROWS,
+        "arm": None,
+        "arm_default": False,
+    }
+
+
+def test_only_the_default_arm_is_marked_as_the_default() -> None:
+    """`arm_default` says the window took `DEFAULT_ARM` because it named nothing; it cannot mark
+    another arm, or no arm, as a default taken."""
+    with pytest.raises(ValueError, match="arm_default"):
+        WindowConfig(strategy="Mover", mover=True, session="extended", arm_default=True)
+    with pytest.raises(ValueError, match="arm_default"):
+        WindowConfig(strategy="Mover", mover=True, session="extended", arm="F2", arm_default=True)
+    assert session_window.DEFAULT_ARM == "OWN1"
 
 
 def test_the_schedule_fires_the_mover_path() -> None:
