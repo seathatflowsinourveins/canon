@@ -4063,6 +4063,46 @@ def test_the_window_hands_the_nodes_orders_in_doubt_to_the_check(monkeypatch, tm
     assert report.unsettled == {"entry-late": ["buy: sent with no answer"]}
 
 
+def test_a_retained_submit_fails_the_window_and_is_handed_to_the_check(
+    monkeypatch, tmp_path
+) -> None:
+    """The paper nodes retain a submit never answered (`RETAIN_UNRESOLVED`, claim 10): if nothing resolves
+    it, the node's run ends with upstream's error naming it ("Submission recovery at shutdown",
+    concepts/live at the pin). The window is recorded failed with that error, and the order still goes to
+    the account check as one sent with no answer."""
+    retained = node_order("entry-late", OrderInitialized(), OrderSubmitted())
+    error = "Submission recovery incomplete at shutdown: unresolved client order IDs [entry-late]"
+
+    class Ran:
+        cache = SimpleNamespace(orders=lambda **kwargs: [retained])
+
+        def dispose(self) -> None: ...
+
+    def run_node(node, ends) -> None:
+        raise RuntimeError(error)
+
+    s = SimpleNamespace(
+        dropped=[], history_bars=0, history_dropped=0, quotes=1, trades=1, live_bars=0
+    )
+    cap = SimpleNamespace(checks=1, peak=Decimal(0), tripped=None)
+    handed: list = []
+    monkeypatch.setattr(session_window, "_ABANDONED", [])
+    monkeypatch.setattr(session_window, "paper_trading", lambda: Account())
+    monkeypatch.setattr(session_window, "window_node", lambda config, **kw: (Ran(), s, cap))
+    monkeypatch.setattr(session_window, "_run_node", run_node)
+    monkeypatch.setattr(
+        session_window,
+        "_flatten_after_stop",
+        lambda trading, config, report, **kw: handed.append(kw["unsettled"]) or [],
+    )
+    with pytest.raises(RuntimeError, match="Submission recovery incomplete"):
+        session_window.run_window(WindowConfig(log_dir=tmp_path))
+    assert handed == [{"entry-late": "buy"}]
+    latest = json.loads((tmp_path / "latest.json").read_text())
+    assert latest["result"].startswith(f"failed: RuntimeError: {error}"), latest["result"]
+    assert latest["unsettled"] == {"entry-late": ["buy: sent with no answer"]}
+
+
 # An independent review of the in-doubt lookup as landed (2026-11-10): each shown here before its fix.
 
 
@@ -6290,6 +6330,49 @@ def test_the_window_task_names_the_account_whose_pair_it_reads() -> None:
     assert task["env"][session_window.ACCOUNT_ENV] == "windows"
     for item in ("ALPACA_API_KEY", "ALPACA_SECRET_KEY"):
         assert f"-s canon-alpaca-paper-windows -a {item} -w" in task["env"][item]["value"]
+
+
+# The session window's claim 10 (ADR 0044, ADR 0075): a submit never answered that Alpaca fills later.
+
+
+@pytest.mark.parametrize("session", ["regular", "extended"])
+def test_the_window_strategy_leaves_unidentified_orders_external(
+    tmp_path, extended, session
+) -> None:
+    """Ownership follows the retained order's confirmed client ID, never the whole symbol: a claim
+    would also give the strategy foreign activity arriving after the flat startup check."""
+    node, s, _ = session_window.window_node(
+        WindowConfig(session=session, log_dir=tmp_path),
+        wind_down_at=datetime(2026, 11, 10, 21, 30, tzinfo=UTC),
+        log_name="claim",
+        feed="iex",
+    )
+    try:
+        assert isinstance(s, SessionMaCross)
+        assert s.config is not None
+        claims = s.config.external_order_instrument_ids
+    finally:
+        node.dispose()
+        del node  # a failed assertion's traceback must not keep the thread's LiveNode alive
+    assert claims is None
+
+
+@pytest.mark.parametrize("instruments", [SPY, (SPY, InstrumentId.from_str("AAPL.ALPACA"), SPY)])
+def test_the_paper_nodes_retain_a_submit_never_answered(instruments) -> None:
+    """With upstream's default the node rejects such an order itself once its in-flight queries run out
+    (`INFLIGHT_TIMEOUT`), though Alpaca may hold it and fill it, and a strategy that sends nothing while one
+    of its orders works then sends again (the adapter's
+    `test_the_claim_alone_leaves_the_order_closed_while_alpaca_may_still_fill_it`)."""
+    from nautilus_trader.live import SubmissionRecoveryPolicy
+
+    assert (
+        exec_engine_config(instruments).submission_recovery_policy
+        == SubmissionRecoveryPolicy.RETAIN_UNRESOLVED
+    )
+    assert (
+        LiveExecutionEngineConfig().submission_recovery_policy
+        == SubmissionRecoveryPolicy.RESOLVE_LOCALLY
+    )
 
 
 # A window on today's top mover, as a check of the stack on a mover (ADR 0083, its dated line of

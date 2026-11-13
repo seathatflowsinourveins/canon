@@ -1820,6 +1820,10 @@ def window_node(
             warm_up_start=warm_up_start,  # in pre-market, the prior session's (`warm_up_start`)
             strategy_id=STRATEGY_ID,
             order_id_tag="001",
+            # No instrument-wide claim: the pin assigns every unmatched order/fill in a claimed
+            # symbol to the strategy (`crates/execution/src/engine/mod.rs:1418`). The adapter names a
+            # retained submit's fill by confirmed client ID; the engine matches it before considering
+            # external ownership (`:1556`). Foreign activity stays EXTERNAL (ADR 0044, ADR 0075).
             # In the session, `stop()` runs upstream's market exit, with closing orders Alpaca takes.
             manage_stop=not limits,
             market_exit_reduce_only=False,
@@ -1849,7 +1853,11 @@ class WindowReport:
     shortened: str = ""
     """Why the window runs shorter than the minutes asked for, if it does."""
     orders: dict[str, list[str]] = field(default_factory=dict)
+    """Each of the strategy's orders in the node's cache, by client order ID, with its events' names.
+    Reconciled fills of retained submits join their original orders by confirmed client ID; unknown
+    or foreign activity stays EXTERNAL and is not part of the strategy's orders."""
     fills: int = 0
+    """The `OrderFilled` events of those orders, those the node's reconciliation booked included."""
     denials: dict[str, str] = field(default_factory=dict)
     dropped: list[str] = field(default_factory=list)
     cap_checks: int = 0
@@ -4782,9 +4790,12 @@ def _close_runner(runner: asyncio.Runner, task: asyncio.Task | None, calls: Call
 
 
 LOCAL_REJECTIONS = ("INFLIGHT_TIMEOUT", "NOT_FOUND_AT_VENUE")
-"""The reasons the node gives a rejection of its own, for a submit never acknowledged: the two
-`create_reconciliation_rejected` calls in `crates/live/src/execution/manager.rs` at the pin (the in-flight
-check out of retries, an order its queries did not find). Alpaca may still take such an order."""
+"""The reasons the node gives a rejection of its own: the two `create_reconciliation_rejected` calls in
+`crates/live/src/execution/manager.rs` at the pin (the in-flight check out of retries, an order its
+queries did not find). Alpaca may still hold such an order. The paper nodes retain a submit never
+acknowledged (`RETAIN_UNRESOLVED`), which takes `SUBMITTED` orders out of both; an `ACCEPTED` order the
+open-order check does not find is still rejected `NOT_FOUND_AT_VENUE`, and a node built without
+`paper_node.exec_engine_config` keeps upstream's default."""
 
 
 def _event_name(event) -> str:
