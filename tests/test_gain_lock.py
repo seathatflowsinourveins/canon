@@ -713,3 +713,31 @@ def test_measure1_a_sale_the_lock_protected_records_its_result_and_spread() -> N
     assert sales[0]["fill_price"] == "10.03"
     assert sales[0]["result_per_share"] == "0.03"
     assert sales[0]["spread_at_release"] == "0.02"
+
+
+def test_the_lock_never_arms_before_the_plan_so_planning_cannot_lift_it_to_the_bid() -> None:
+    """With the plan refused, the spacing is unknown, and a floor applied at a spacing of 0 is lifted
+    by the later plan to floor plus spacing, at or over the bid: the next quote then sends a trail
+    whose trigger is the bid, which the emulator releases at once. The lock alone must never sell."""
+    strategy = GainHarness()
+    strategy.cached.held[0].avg_px_open = Decimal("10.00")
+    strategy.cached.latest = None
+    strategy.cached.history = minute_bars("0.20")
+    plan = strategy._plan_holding
+    refused = [2]  # a planner refusal on the first two quotes, as a refused row gives
+
+    def refusing(*args: Any, **kwargs: Any) -> bool:
+        if refused[0]:
+            refused[0] -= 1
+            return False
+        return plan(*args, **kwargs)
+
+    strategy._plan_holding = refusing
+    strategy.adopt_holding(AAA, Price.from_str("9.80"))
+    for second in (1, 2, 3, 4):
+        strategy.observe("10.05", T0 + second * SECOND)
+    sent = [order for order in strategy.sent if order.order_type == OrderType.TRAILING_STOP_LIMIT]
+    assert sent, "the trail is placed once planned"
+    assert all(order.trigger_price.as_decimal() < Decimal("10.05") for order in sent), [
+        order.trigger_price for order in sent
+    ]

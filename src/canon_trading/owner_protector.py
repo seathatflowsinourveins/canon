@@ -867,6 +867,10 @@ class OwnerProtector(Strategy):
                 reasons.append("unknown cost basis")
             if quote_problem is not None:
                 reasons.append(quote_problem)
+            if slot.distance is None or slot.limit_offset is None:
+                # The spacing a floor keeps is the plan's; armed at a spacing of 0, the later plan
+                # would lift the trigger to the floor plus spacing, at or over the bid, and sell.
+                reasons.append("trail not planned yet")
             if reasons:
                 said = slot.gain_unarmed_said_at
                 if said is None or now - said >= 1_000_000_000:
@@ -1399,6 +1403,7 @@ class OwnerProtector(Strategy):
             limit,
             time_in_force=TimeInForce.DAY,
             reduce_only=True,
+            client_order_id=self._protect_id(),
         )
         if self.cache.order(order.client_order_id) is not None:
             self._sale_stalled(instrument_id, "generated client order ID already exists")

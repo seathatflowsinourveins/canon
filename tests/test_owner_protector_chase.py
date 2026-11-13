@@ -484,7 +484,7 @@ def test_real_core_chases_a_gapped_release_then_fills_the_external_long() -> Non
                     order,
                     venue_id,
                     None,
-                    TradeId(str(order.client_order_id)),
+                    TradeId(f"T-{len(self.sells)}"),  # a TradeId holds at most 36 characters
                     order.quantity,
                     tick.bid_price,
                     h.USD,
@@ -664,3 +664,18 @@ def test_review10_a_sale_ended_by_the_owner_logs_its_final_record() -> None:
     strategy.observe("9.80", at + 4 * h.SECOND)
     assert h.AAA not in strategy.slots
     assert len(records(strategy)) > before, "the ended sale left no final record"
+
+
+def test_every_chase_leg_carries_the_protect_lineage_never_our_nodes() -> None:
+    """A protective sale of the owner's shares is never one of our nodes' orders (ADR 0148): each
+    re-sent leg is named by `_protect_id`, so `paper:close` freezes it rather than canceling it."""
+    from canon_trading import custody
+
+    strategy, first = released()
+    strategy.observe("9.80", RELEASE + CHASE + h.SECOND)
+    terminal(first, RELEASE + CHASE + h.SECOND)
+    strategy.observe("9.80", RELEASE + CHASE + 2 * h.SECOND)
+    legs = [order for order in strategy.sent if order.order_type == OrderType.LIMIT]
+    assert legs, "the chase must re-send the sale"
+    for leg in [strategy.sent[0], *legs]:
+        assert custody.lineage(str(leg.client_order_id)) == custody.PROTECT, leg.client_order_id
