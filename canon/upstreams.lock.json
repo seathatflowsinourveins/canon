@@ -144,6 +144,15 @@
       "sha": "d1d95c99406709d51722b3af82cd32149402c76a",
       "track": "tag:v20.0.49"
     },
+    "changesets": {
+      "default_branch": "main",
+      "default_sha": "9a035ec36045aeb6141dd0bbac9ab9e3c69ac0bc",
+      "ref": "refs/tags/@changesets/cli@3.0.3",
+      "repo": "changesets/changesets",
+      "resolved_at": "2026-11-13T18:33:15Z",
+      "sha": "c9269c01af5f3f7463adc648890fc3a8a729dd18",
+      "track": "tag:@changesets/cli@3.0.3"
+    },
     "claude-agent-sdk-python": {
       "default_branch": "main",
       "default_sha": "97102885fa5539f3d9459141807117477286dc8b",
@@ -557,6 +566,15 @@
       "resolved_at": "2026-11-10T00:34:46Z",
       "sha": "22f0b463e7a5e579904dd6211a520321035526f7",
       "track": "tag:v7.0.2"
+    },
+    "towncrier": {
+      "default_branch": "trunk",
+      "default_sha": "a87ce96b45a6cbb9158eaa5ef8a3e0e73fd1d25b",
+      "ref": "refs/tags/26.9.0",
+      "repo": "twisted/towncrier",
+      "resolved_at": "2026-11-13T18:33:15Z",
+      "sha": "12e95a9ecf4f6a8091e751238fb81144b37f064c",
+      "track": "tag:26.9.0"
     },
     "ty": {
       "default_branch": "main",
