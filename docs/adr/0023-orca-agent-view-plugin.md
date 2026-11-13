@@ -114,6 +114,24 @@ and `collector.mjs` (git's status read runs with `protocol.allow=never`, every g
 status-line input, so the session's paths and model, on this machine only).
 That the CLI commands above install this tag as written is UNVERIFIED until the first run.
 
+**Exception, 2026-11-12: Claude Code's "You should know" mod.** The owner decided on 2026-11-12 to turn
+on `cc-plugin-you-should-know@builtin`, a mod built into the pinned Claude Code CLI and off by default
+(since v2.1.287). As Claude works, a side agent rereads the conversation and shows a `✦ Heads up · …`
+note above the prompt. The docs say the side agent has no tools and cannot change what Claude does.
+Each check is a background request to the session's model, billed for the mod's instructions and its
+reply. Notes and dismissed topics are kept in `~/.claude/plugins/store/cc-plugin-you-should-know*`.
+It loads only in a direct first-party session that fetches feature flags, and Orca is launched with
+`DO_NOT_TRACK=1`, which every agent it starts inherits and which turns that fetch off ("Features that need
+feature-flag fetching", env-vars.md). So canon's user settings set `DO_NOT_TRACK` to `"0"` in `env`, which
+overrides the inherited value for Claude Code alone (a settings `env` value replaces one exported by the
+shell, env-vars.md). Claude Code then also sends its own analytics to Anthropic again, which the owner
+accepted on 2026-11-12. Orca and the other runtimes keep `DO_NOT_TRACK=1`. The owner turns it on, never a
+session, with `/plugin enable cc-plugin-you-should-know@builtin`, and turns it off with
+`/plugin disable cc-plugin-you-should-know@builtin`. Read 2026-11-12 in
+https://code.claude.com/docs/en/interactive-mode.md ("You should know suggestions") and
+https://code.claude.com/docs/en/plugins/mods/overview.md ("Mods built into Claude Code"). The mod's
+source is not among those the docs publish, so what it sends beyond the documented check is UNVERIFIED.
+
 ## Evidence
 
 Read 2026-11-10. `fetched`: downloaded whole with `curl` and read, not summarised.

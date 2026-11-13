@@ -113,6 +113,7 @@ if [ "$cmd" = gh ]; then
   case "$1 $2" in
     "--version ") echo "gh 1.0 (stub)"; exit 0 ;;
     "auth status") exit "$(cat "$STUB/gh-auth-rc" 2>/dev/null || echo 0)" ;;
+    "api rate_limit") [ -f "$STUB/gh-rate" ] || exit 1; cat "$STUB/gh-rate"; exit 0 ;;   # "<core|graphql> <limit> <reset>", spent only
     "run list")
       expr=""; while [ $# -gt 0 ]; do [ "$1" = "--jq" ] && expr="$2"; [ "$1" = "--json" ] && echo "fields $2" >> "$STUB/gh.log"; shift; done
       jq -r "$expr" "$STUB/gh-runs.json"; exit $? ;;
@@ -632,6 +633,13 @@ git -C "$R" remote set-url origin git@github.com:exampleowner/repo.git; status
 check "an SSH remote's landing row names the host and repository, not the owner" \
       eval 'grep -q "squash merge (github.com, repository repo.git)" "$TMP/status.out" && ! grep -q exampleowner "$TMP/status.out"'
 git -C "$R" remote set-url origin https://github.com/example/repo.git
+echo 1 > "$STUB/gh-auth-rc"; echo "core 5000 1763002800" > "$STUB/gh-rate"; status
+check "gh's check failing on a spent REST budget: the landing row names the budget and its reset, not a sign-out" \
+      eval 'rowis "$TMP/status.out" landing UNKNOWN && grep -q "REST budget is spent (0 of 5000)" "$TMP/status.out" && ! grep -q "not signed in" "$TMP/status.out"'
+rm -f "$STUB/gh-rate"; status
+check "... and with no budget to read, the row still says gh is not signed in" \
+      eval 'rowis "$TMP/status.out" landing OFF && grep -q "gh is not signed in" "$TMP/status.out"'
+rm -f "$STUB/gh-auth-rc"
 printf '\tstate = not running\n\truns = 3\n\tlast exit code = 1\n' > "$STUB/launchctl-print"; status; rc=$?
 check "an ok record, but the last firing exited 1: FAILED" eval 'rowis "$TMP/status.out" "paper session" FAILED && [ "$rc" != 0 ]'
 printf '\tstate = not running\n\truns = 3\n\tlast exit code = 0\n' > "$STUB/launchctl-print"
