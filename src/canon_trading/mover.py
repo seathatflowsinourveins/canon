@@ -804,17 +804,28 @@ def offsets(
 ) -> tuple[Decimal, Decimal]:
     """The trailing offset and the limit offset, as prices. The trailing offset is `distance` when the
     entry was sized for one (S2's L, already on the step), else `trail` of the entry up to the entry's
-    step: it places the trigger, which the emulator keeps to itself. The limit offset
-    is that plus `exit_through` of the entry, up to a whole cent and a cent over the trailing offset at
-    least: it places the released limit, the one price that reaches the venue. This preserves cents
-    when the highest bid is in cents, including across a dollar between steps. A fractional-cent
-    basis retains its residue: the native calculation uses the instrument's fixed 0.0001 increment
-    (`crates/execution/src/trailing.rs:182-220`), not PRICES. That observed invalid release above $1 is
-    handed off to the lead's Claude lane; these offsets do not fix it. The cost under a dollar is a
-    release up to a cent lower than `exit_through` asks, included in `planned_stop` for legacy sizing.
+    step: it places the trigger, which the emulator keeps to itself. The limit offset is on
+    `tick(entry)`, with spacing below the trigger of at least one step and at most the registered
+    CHASE_CAP times `entry - trailing`, rounded down to that step. Keep the old cent-rounded result
+    to the digit wherever it meets both bounds; otherwise round the requested give to the entry's
+    step and bound it there. Where the cap, rounded down, is under one step, the spacing is ONE step
+    (the lead's ruling of 2026-11-13, 17:27): the old cent pair is never kept over the cap, and a
+    trigger or limit at or under zero is left to `_trail`/`_hold`'s no-room guards, which read
+    `max(trailing, limit)`. An off-step `distance` (S2's L) can leave no on-step limit between one
+    step and the cap: the limit is then the largest on-step one within the cap, a positive spacing
+    under one step, a named limit. Legacy sizing's `planned_stop` includes the first-sale price.
+
+    NautilusTrader d53849b216e2 (`crates/execution/src/trailing.rs:104-148,176-221`) applies one
+    offset type to both distances: PRICE keeps S2/ATR distances fixed, whereas BASIS_POINTS would
+    scale both. A fractional-cent basis still retains its residue above $1: the native calculation
+    uses the instrument's fixed increment, not PRICES; the adapter owns that venue-price correction.
     `least`, a price, bounds the trailing offset from below, up to the step: the floor a plan took at
     its own step, which a lower average must not cut (`offsets_in_force`); `distance` is not bounded.
     """
+    # Import after this module is initialized: protect's planner uses MoverConfig's registered
+    # chase_cap default, and protect itself imports mover. No second copy of the row's number.
+    from .protect import PLANNER
+
     step = tick(entry)
     trailing = (
         max((entry * trail).quantize(step, rounding=ROUND_CEILING), step)
@@ -824,7 +835,18 @@ def offsets(
     if distance is None and least is not None:
         trailing = max(trailing, least.quantize(step, rounding=ROUND_CEILING))
     limit = (trailing + entry * exit_through).quantize(CENT, rounding=ROUND_CEILING)
-    return trailing, max(limit, (trailing + SUB_DOLLAR).quantize(CENT, rounding=ROUND_CEILING))
+    limit = max(limit, (trailing + SUB_DOLLAR).quantize(CENT, rounding=ROUND_CEILING))
+    bound = ((entry - trailing) * PLANNER.chase_cap).quantize(step, rounding=ROUND_FLOOR)
+    if limit % step == 0 and step <= limit - trailing <= bound:
+        return trailing, limit
+    lower = (trailing + step).quantize(step, rounding=ROUND_CEILING)
+    upper = (trailing + bound).quantize(step, rounding=ROUND_FLOOR)
+    if bound < step:
+        return trailing, lower
+    if lower > upper:
+        return trailing, upper
+    limit = (trailing + entry * exit_through).quantize(step, rounding=ROUND_CEILING)
+    return trailing, min(max(limit, lower), upper)
 
 
 def fill_trigger(fill: Decimal, distance: Decimal | None) -> Decimal | None:
