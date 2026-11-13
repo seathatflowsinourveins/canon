@@ -24,9 +24,19 @@
 # --scope user; another scope's entry is not read): that marketplace's newest version by number,
 # <plugins>/cache/<marketplace>/claude-hud/<version>/hud.mjs (the cache layout
 # https://code.claude.com/docs/en/plugins/security.md gives; <plugins> is CLAUDE_CODE_PLUGIN_CACHE_DIR when set,
-# as the HUD's own launcher reads it), run with node (from PATH, else mise). It reads canon's claude-hud.json beside settings.json.
+# as the HUD's own launcher reads it), run with node. That is PATH's node, unless PATH has none or its node is a
+# version manager's shim (a node in a folder named shims), which looks the version up on every run (mise's cost
+# about 40 ms of CPU a render, measured 2026-11-13): then it is the Node `mise which node` gives for the home
+# folder (mise -C), looked up at most once an hour and kept in canon/hud-node with the lookup's time (none found is
+# kept too, and then the shim runs), and looked up again at once when the kept Node is no longer executable. That is
+# the HUD's own practice, whose installer puts one absolute Node in the status line command for every project
+# (install.mjs, process.execPath): a project's own Node pin, which the shim follows, is not followed, so a project
+# pinning a Node older than the HUD needs (22.18 at v0.15.0, package.json engines) does not stop it.
+# It reads canon's claude-hud.json beside settings.json.
 # When canon/fleet-rate.sh is installed beside this, the HUD is given it as --extra-cmd, with the opt-in
-# CLAUDE_HUD_ALLOW_EXTRA_CMD=1 its README asks for, and shows its fleet label on the first line.
+# CLAUDE_HUD_ALLOW_EXTRA_CMD=1 its README asks for, followed by the input's cost.total_lines_added and
+# cost.total_lines_removed when both are whole numbers, and shows its label on the first line: the session's
+# lines changed and the fleet's output speed.
 # It gets the same input with model.display_name set to model.id, so the model actually in use is shown, and,
 # when a compaction window applies, context_window.context_window_size set to it and used_percentage removed, so
 # the HUD measures its bar against the point where this session compacts (its config sets no autoCompactWindow
@@ -45,54 +55,68 @@
 # the HUD (or the named renderer) is there but fails, prints nothing, or prints its own failure line (one that
 # names /hud), canon's line is shown with "(hud failed)", never silently.
 # The session id names files, so only a plain one (letters, digits, _ and -) is used for the writes.
+# Every process started is a large part of a render's own cost, so the input is read by four jq runs in all (its
+# fields; the previous snapshot and reading; the new snapshot; the time, the HUD's input and the enabled
+# marketplaces), the clock is jq's, and the HUD's version is chosen by the shell.
 input=$(cat)
 if ! command -v jq >/dev/null 2>&1; then
   echo "status line: jq not found"
   exit 0
 fi
+cfg="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+base="$cfg/canon"
+
+# The input's fields used here, in one read, split on the unit separator (a tab would merge empty fields): id, model,
+# directory, cost (JSON), whether rate_limits is an object, the repository owner to scrub (read apart from the
+# settings, so that nothing about them can stop the scrub), and the session's lines added and removed (whole numbers)
+sid="" now_model="" cwd="" cost="" has_rl="" owner="" added="" removed=""
+IFS=$'\037' read -r sid now_model cwd cost has_rl owner added removed < <(printf '%s' "$input" | jq -r '
+    def str(f): [f?] | map(strings) | first // "";
+    def count(f): [f?] | map(numbers | select(. >= 0 and . < 1e9 and . == floor) | tostring) | first // "";
+    (if type == "object" then . else {} end)
+    | [ str(.session_id), str(.model.id), (str(.workspace.current_dir) | if . == "" then null else . end) // str(.cwd),
+        (.cost.total_cost_usd? // null | tojson), ((.rate_limits | type) == "object"), str(.workspace.repo.owner),
+        count(.cost.total_lines_added), count(.cost.total_lines_removed)
+      ] | map(tostring | gsub("[\u001f\n]"; " ")) | join("\u001f")' 2>/dev/null)
 
 canon_writes() {
-  local base="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/canon" dir sid now_model cwd cost has_rl old_model old_rl usage ufile
-  dir="$base/sessions"
-  # the input's fields used here, in one read, split on the unit separator (a tab would merge empty fields): id, model, directory, cost (JSON), whether rate_limits is an object
-  IFS=$'\037' read -r sid now_model cwd cost has_rl < <(printf '%s' "$input" | jq -r '[
-      (.session_id? | strings // ""), (.model.id? | strings // ""), (.workspace.current_dir? // .cwd? | strings // ""),
-      (.cost.total_cost_usd? // null | tojson), (.rate_limits? | type == "object")
-    ] | map(tostring | gsub("[\u001f\n]"; " ")) | join("\u001f")' 2>/dev/null)
+  local dir="$base/sessions" ufile snap old old_model="" old_rl="" usage=""
   case "$sid" in ''|*[!A-Za-z0-9_-]*) return 0 ;; esac
-  mkdir -p "$dir" "$base/ledger" 2>/dev/null || return 0
-  # the previous snapshot, read once: its model and the cost at the last usage update (JSON)
-  IFS=$'\037' read -r old_model old_rl < <(jq -r '[(.model | strings // ""), (if has("rl_cost") then .rl_cost else "none" end | tojson)]
-      | map(gsub("[\u001f\n]"; " ")) | join("\u001f")' "$dir/$sid.json" 2>/dev/null)
-  # A model change inside one session discards the prompt cache and may be an unintended fallback (ADR 0005).
-  # Detect it here from the documented status-line input and record it in the event ledger.
-  if [ -n "$now_model" ] && [ -n "$old_model" ] && [ "$now_model" != "$old_model" ]; then
-    # the directory is left out when the input has none, so it never blanks the lane name
-    jq -cn --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg sid "$sid" --arg from "$old_model" --arg to "$now_model" \
-       --arg cwd "$cwd" \
-       '{ts:$ts, ev:"PostModelSwitch", sid:$sid, from_model:$from, to_model:$to, via:"statusline"}
-        + (if $cwd == "" then {} else {cwd:$cwd} end)' \
-       >> "$base/ledger/$(date -u +%Y-%m-%d).jsonl" 2>/dev/null
-  fi
-  # usage windows: prints the new file's content, or nothing when the reading stays as it is
+  { [ -d "$dir" ] && [ -d "$base/ledger" ]; } || mkdir -p "$dir" "$base/ledger" 2>/dev/null || return 0
   ufile="$base/rate-limits/$sid.json"
-  usage=$(printf '%s' "$input" | jq -c --arg old "$(head -c 4096 "$ufile" 2>/dev/null)" --arg old_rl "${old_rl:-\"none\"}" '
+  snap="$dir/$sid.json"; { [ -f "$snap" ] && [ -r "$snap" ]; } || snap=/dev/null
+  old="$ufile"; { [ -f "$old" ] && [ -r "$old" ]; } || old=/dev/null
+  # One read of the previous snapshot, the previous reading and the input: the model before this render, the cost
+  # when the reading last came up to date (JSON), and the new usage reading, or nothing when it stays as it is.
+  IFS=$'\037' read -r old_model old_rl usage < <(printf '%s' "$input" | jq -r --rawfile snap "$snap" --rawfile old "$old" '
       (now | floor) as $now
       | def win: if type == "object" and (.used_percentage | type) == "number"
                     and .used_percentage >= 0 and .used_percentage <= 100
                     and (.resets_at | type) == "number" and .resets_at > $now and .resets_at <= $now + 8 * 86400
                  then {used_percentage, resets_at} else empty end;
-      (if type == "object" and (.rate_limits | type) == "object" then .rate_limits else {} end) as $r
+      ((try ($snap | fromjson) catch null) | if type == "object" then . else {} end) as $prev
+      | (if $prev | has("rl_cost") then $prev.rl_cost else "none" end) as $was
+      | (if type == "object" and (.rate_limits | type) == "object" then .rate_limits else {} end) as $r
       | ([("five_hour", "seven_day") as $k | $r[$k] | win | {key: $k, value: .}] | from_entries) as $w
       | ((try ($old | fromjson) catch null) | if type == "object" and (.rate_limits | type) == "object"
                                              then .rate_limits else {} end) as $o
       | (.cost.total_cost_usd? // null) as $cost
-      | (try ($old_rl | fromjson) catch "none") as $was
-      | if ($w | length) == 0 then empty
-        elif ($w | to_entries | any(. as $e | $o[$e.key] != $e.value)) or $cost != $was
-          then {rate_limits: $w, t: $now}
-        else empty end' 2>/dev/null)
-  if [ -n "$usage" ] && mkdir -p "$base/rate-limits" 2>/dev/null; then
+      | [ ($prev.model | strings // ""), ($was | tojson),
+          (if ($w | length) == 0 then ""
+           elif ($w | to_entries | any(. as $e | $o[$e.key] != $e.value)) or $cost != $was
+             then {rate_limits: $w, t: $now} | tojson
+           else "" end)
+        ] | map(gsub("[\u001f\n]"; " ")) | join("\u001f")' 2>/dev/null)
+  # A model change inside one session discards the prompt cache and may be an unintended fallback (ADR 0005).
+  # Detect it here from the documented status-line input and record it in the event ledger.
+  if [ -n "$now_model" ] && [ -n "$old_model" ] && [ "$now_model" != "$old_model" ]; then
+    # the directory is left out when the input has none, so it never blanks the lane name
+    jq -cn --arg sid "$sid" --arg from "$old_model" --arg to "$now_model" --arg cwd "$cwd" \
+       '{ts:(now | floor | todate), ev:"PostModelSwitch", sid:$sid, from_model:$from, to_model:$to, via:"statusline"}
+        + (if $cwd == "" then {} else {cwd:$cwd} end)' \
+       >> "$base/ledger/$(date -u +%Y-%m-%d).jsonl" 2>/dev/null
+  fi
+  if [ -n "$usage" ] && { [ -d "$base/rate-limits" ] || mkdir -p "$base/rate-limits" 2>/dev/null; }; then
     [ -e "$ufile" ] || find "$base/rate-limits" -maxdepth 1 -type f -name '*.json' -mtime +8 -delete 2>/dev/null
     if { printf '%s\n' "$usage" > "$ufile.tmp.$$" && mv -f "$ufile.tmp.$$" "$ufile"; } 2>/dev/null; then
       old_rl="$cost"
@@ -103,8 +127,8 @@ canon_writes() {
     # the reading is up to date for this cost
     old_rl="$cost"
   fi
-  printf '%s' "$input" | jq -c --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg rl "${old_rl:-\"none\"}" '{
-      ts: $ts, sid: .session_id, cwd: .cwd,
+  printf '%s' "$input" | jq -c --arg rl "${old_rl:-\"none\"}" '{
+      ts: (now | floor | todate), sid: .session_id, cwd: .cwd,
       model: (.model.id? // null), effort: (.effort.level? // null),
       cost_usd: (.cost.total_cost_usd? // null),
       ctx_pct: (.context_window.used_percentage? // null),
@@ -122,74 +146,132 @@ canon_line() {
     ] | map(select(. != null and . != "")) | join(" · ")' 2>/dev/null || echo "status line: could not parse input"
 }
 
-# hud_command: prints the renderer's path (and node's before it for the HUD), or nothing when none is installed
-hud_command() {
-  local cfg="${CLAUDE_CONFIG_DIR:-$HOME/.claude}" plugins dir="" node mp v best
-  if [ -n "${CANON_STATUSLINE_RENDERER:-}" ]; then printf '%s\n' "$CANON_STATUSLINE_RENDERER"; return 0; fi
-  plugins="${CLAUDE_CODE_PLUGIN_CACHE_DIR:-$cfg/plugins}"
-  # only while the user settings enable it (an uninstalled plugin's files stay in the cache for 14 days), and
-  # that marketplace's newest version by number, run through its own hud.mjs: the plugin's launcher would run
-  # the newest copy in any marketplace's cache instead
-  while IFS= read -r mp; do
+# hud_version_dir: in the enabled marketplaces, the newest claude-hud version folder by number (x.y.z, each part 1
+# to 9 digits) that holds a hud.mjs, the last marketplace listed with one winning, or nothing. It is run through its
+# own hud.mjs: the plugin's launcher would run the newest copy in any marketplace's cache instead.
+hud_version_dir() {
+  local plugins="${CLAUDE_CODE_PLUGIN_CACHE_DIR:-$cfg/plugins}" mp f v x y z key best bkey
+  hud=""
+  for mp in "${mps[@]}"; do
     case "$mp" in ''|*[!A-Za-z0-9._-]*) continue ;; esac
-    best=$(find "$plugins/cache/$mp/claude-hud" -mindepth 2 -maxdepth 2 -name hud.mjs 2>/dev/null \
-             | sed -n 's#.*/claude-hud/\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)/hud\.mjs$#\1#p' \
-             | sort -t. -k1,1n -k2,2n -k3,3n | tail -n 1)
-    [ -z "$best" ] || dir="$plugins/cache/$mp/claude-hud/$best"
-  done < <(jq -r '.enabledPlugins // {} | objects | to_entries[] | select(.value == true and (.key | startswith("claude-hud@")))
-                   | .key | ltrimstr("claude-hud@")' "$cfg/settings.json" 2>/dev/null)
-  [ -n "$dir" ] || return 0
-  node=$(command -v node 2>/dev/null) || node=$(mise which node 2>/dev/null) || node=""
-  v="$dir/hud.mjs"
-  printf '%s\n%s\n' "${node:-node-not-found}" "$v"
-  # the fleet label (fleet-rate.sh), through the HUD's --extra-cmd, which runs its argument in a shell
-  [ ! -x "$cfg/canon/fleet-rate.sh" ] || printf -- '--extra-cmd\n%q\n' "$cfg/canon/fleet-rate.sh"
+    best="" bkey=""
+    for f in "$plugins/cache/$mp/claude-hud/"*/hud.mjs; do
+      [ -f "$f" ] || continue
+      v=${f%/hud.mjs}; v=${v##*/}
+      x=${v%%.*}; y=${v#*.}; z=${y#*.}; y=${y%%.*}
+      [ "$x.$y.$z" = "$v" ] || continue
+      case "$x" in ''|*[!0-9]*|??????????*) continue ;; esac
+      case "$y" in ''|*[!0-9]*|??????????*) continue ;; esac
+      case "$z" in ''|*[!0-9]*|??????????*) continue ;; esac
+      printf -v key '%09d%09d%09d' "$((10#$x))" "$((10#$y))" "$((10#$z))"
+      if [ -z "$best" ] || [[ "$key" > "$bkey" ]]; then best=${f%/hud.mjs}; bkey=$key; fi
+    done
+    [ -z "$best" ] || hud=$best
+  done
+}
+
+# hud_node: the Node the HUD runs on (above): PATH's node when it is not a shim; else the Node mise gives for the
+# home folder, from canon/hud-node (its path, empty for none, then the lookup's time) when that lookup is less than
+# an hour old by the clock and its Node still executable, else looked up and kept anew; PATH's shim when mise gives
+# none; nothing when there is no node at all
+hud_node() {
+  local rest="$PATH:" d p="" t="" cache="$base/hud-node"
+  node=""
+  while [ -n "$rest" ]; do
+    d=${rest%%:*}; rest=${rest#*:}
+    if [ -n "$d" ] && [ -f "$d/node" ] && [ -x "$d/node" ]; then node="$d/node"; break; fi
+  done
+  case "$node" in ''|*/shims/node) ;; *) return 0 ;; esac
+  case "$clock" in ''|*[!0-9]*|????????????*) clock="" ;; esac
+  if [ -n "$clock" ] && [ -f "$cache" ] && [ -r "$cache" ]; then
+    { IFS= read -r p; IFS= read -r t; } < "$cache"
+    case "$t" in ''|*[!0-9]*|????????????*) t="" ;; esac
+    if [ -n "$t" ] && [ "$t" -le "$clock" ] && [ $((clock - t)) -lt 3600 ]; then
+      [ -n "$p" ] || return 0
+      case "$p" in /*/node) case "$p" in */shims/node) ;; *) if [ -f "$p" ] && [ -x "$p" ]; then node=$p; return 0; fi ;; esac ;; esac
+    fi
+  fi
+  p=$(mise -C "$HOME" which node 2>/dev/null) || p=""
+  case "$p" in */shims/node) p="" ;; /*/node) ;; *) p="" ;; esac
+  if [ -n "$p" ] && [ -f "$p" ] && [ -x "$p" ]; then node=$p; else p=""; fi
+  [ -n "$clock" ] || return 0
+  { printf '%s\n%s\n' "$p" "$clock" > "$cache.$$" && mv -f "$cache.$$" "$cache"; } 2>/dev/null || rm -f "$cache.$$" 2>/dev/null
 }
 
 # scrub: terminal hyperlinks, e-mail addresses, and the repository owner and the home folder's user name as
-# whole words (not inside another word), out of what is shown
+# whole words (not inside another word), out of what is shown. A word starts after a line's start, a character
+# that cannot be in a name, or a colour code (ESC [ ... m), which ends in a letter: the HUD colours the branch.
 scrub() {
   # without perl nothing can be scrubbed, so nothing is shown but this
   command -v perl >/dev/null 2>&1 || { cat >/dev/null; echo "status line: perl not found"; return 0; }
   OWNER="$owner" HUSER="${HOME##*/}" perl -pe '
     s/\e\]8;[^\a\e]*(?:\a|\e\\)//g;
     s/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/<email>/g;
-    for my $w ($ENV{OWNER}, $ENV{HUSER}) { next unless defined $w && length($w) >= 3; s/(?<![A-Za-z0-9_.-])\Q$w\E(?![A-Za-z0-9_])/~/g; }
+    for my $w ($ENV{OWNER}, $ENV{HUSER}) { next unless defined $w && length($w) >= 3; s/(^|[^A-Za-z0-9_.-]|\e\[[0-9;]*m)\Q$w\E(?![A-Za-z0-9_])/$1~/g; }
   ' 2>/dev/null || echo "status line: could not scrub the line"
 }
 
 canon_writes
-# the repository owner, to scrub, read apart from the settings so that nothing about them can stop the scrub
-owner=$(printf '%s' "$input" | jq -r '.workspace.repo.owner? | strings // "" | gsub("\n"; " ")' 2>/dev/null)
-# the HUD's input: the same with model.display_name = model.id and the session's compaction window as the context
-# window's size (above). The model's entry is the one under its canonical name, which Claude Code also matches to
-# the model's [1m], date-suffixed and provider IDs (settings-reference.md, modelSettings); "auto" there means the
-# window tuned for the model, which this does not know, so the input is left as it came.
-hud_input="" user_settings="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json"
-[ -r "$user_settings" ] || user_settings=/dev/null
-hud_input=$(printf '%s' "$input" | jq -c --arg envw "${CLAUDE_CODE_AUTO_COMPACT_WINDOW:-}" --rawfile s "$user_settings" '
+# The time, the HUD's input and the enabled marketplaces, in one read of the input and the user settings. The first
+# line is the time (epoch seconds); the second the input with model.display_name = model.id and the session's
+# compaction window as the context window's size (above), or nothing when the input cannot be read so, and the HUD
+# then gets the input as it came; each line after them names a marketplace whose claude-hud entry the settings'
+# enabledPlugins sets to true (an uninstalled plugin's files stay in the cache for 14 days, so the cache alone is not
+# read). The input is read as text, so that none, however malformed, stops the marketplaces from being read. The
+# model's entry is the one under its canonical name, which Claude Code also matches to the model's [1m],
+# date-suffixed and provider IDs (settings-reference.md, modelSettings); "auto" there means the window tuned for the
+# model, which this does not know, so the input is left as it came.
+hud_input="" clock="" mps=() user_settings="$cfg/settings.json"
+{ [ -f "$user_settings" ] && [ -r "$user_settings" ]; } || user_settings=/dev/null
+{
+  IFS= read -r clock
+  IFS= read -r hud_input
+  while IFS= read -r mp; do mps+=("$mp"); done
+} < <(printf '%s' "$input" | jq -Rrs --arg envw "${CLAUDE_CODE_AUTO_COMPACT_WINDOW:-}" --rawfile s "$user_settings" '
     def usable: if type == "number" and . > 0 then ([[., 100000] | max, 1000000] | min | floor) else null end;
     def envwin: ($envw | capture("^(?<n>[0-9]+)(?<u>[kKmM])?$")?
                  | (.n | tonumber) * ({"k": 1000, "m": 1000000}[.u // "" | ascii_downcase] // 1) | usable) // null;
     def canonical: sub("^.*/"; "") | sub("\\[[^]]*\\]$"; "") | sub("^([a-z]+\\.)?anthropic\\."; "") | sub("-v[0-9]+:[0-9]+$"; "")
                    | sub("[-@][0-9]{8}$"; "");
     ((try ($s | fromjson) catch {}) | if type == "object" then . else {} end) as $set
-    | if type == "object" and (.model | type) == "object" and (.model.id | type) == "string"
-      then .model.display_name = .model.id else . end
-    | (.model.id? | strings // "") as $m
-    | (($set.modelSettings? | objects) // {}) as $ms
-    | (([$ms[$m], $ms[$m | canonical]] | map(objects | .autoCompactWindow | select(. != null)) | first) // null) as $per
-    | envwin as $e
-    | (if $e != null then $e
-       elif $per == "auto" then null
-       else ($per | usable) // ($set.autoCompactWindow | usable) end) as $w
-    | if $w != null and (.context_window | type) == "object" then
-        .context_window |= ((.context_window_size | if type == "number" and . > 0 then [., $w] | min else $w end) as $z
-                           | .context_window_size = $z | del(.used_percentage, .remaining_percentage))
-      else . end' 2>/dev/null)
+    | (now | floor | tostring),
+      (try (fromjson
+        | if type == "object" and (.model | type) == "object" and (.model.id | type) == "string"
+          then .model.display_name = .model.id else . end
+        | (.model.id? | strings // "") as $m
+        | (($set.modelSettings? | objects) // {}) as $ms
+        | (([$ms[$m], $ms[$m | canonical]] | map(objects | .autoCompactWindow | select(. != null)) | first) // null) as $per
+        | envwin as $e
+        | (if $e != null then $e
+           elif $per == "auto" then null
+           else ($per | usable) // ($set.autoCompactWindow | usable) end) as $w
+        | if $w != null and (.context_window | type) == "object" then
+            .context_window |= ((.context_window_size | if type == "number" and . > 0 then [., $w] | min else $w end) as $z
+                               | .context_window_size = $z | del(.used_percentage, .remaining_percentage))
+          else . end
+        | tojson) catch ""),
+      ( ($set.enabledPlugins // {}) | objects | to_entries[]
+        | select(.value == true and (.key | startswith("claude-hud@"))) | .key | ltrimstr("claude-hud@")
+        | select(test("^[A-Za-z0-9._-]+$")) )' 2>/dev/null)
 [ -n "$hud_input" ] || hud_input="$input"
+
 cmd=()
-while IFS= read -r part; do cmd+=("$part"); done < <(hud_command)
+if [ -n "${CANON_STATUSLINE_RENDERER:-}" ]; then
+  cmd=("$CANON_STATUSLINE_RENDERER")
+else
+  hud_version_dir
+  if [ -n "$hud" ]; then
+    hud_node
+    cmd=("${node:-node-not-found}" "$hud/hud.mjs")
+    # the first line's label (fleet-rate.sh), through the HUD's --extra-cmd, which runs its argument in a shell: the
+    # script's quoted path, then the session's lines added and removed, digits only
+    if [ -x "$base/fleet-rate.sh" ]; then
+      printf -v extra '%q' "$base/fleet-rate.sh"
+      case "$added$removed" in *[!0-9]*) ;; *) [ -z "$added" ] || [ -z "$removed" ] || extra="$extra $added $removed" ;; esac
+      cmd+=(--extra-cmd "$extra")
+    fi
+  fi
+fi
 if [ "${#cmd[@]}" -eq 0 ]; then
   canon_line | scrub
 # the HUD reports its own failures (an internal error, a Node too old) as a line that sends the reader to its

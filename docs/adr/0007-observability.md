@@ -259,7 +259,14 @@ decision takes up the SDK source.
 **The display (added 2026-11-11).** Claude HUD renders the status line when the owner has it installed
 (ADR 0023's exception). `statusline.sh` stays the configured command. It does the writes above, then runs
 the newest installed version's `hud.mjs` (by number) in the marketplace that the user `settings.json`'s
-`enabledPlugins` enables, with `node` from PATH, else mise's. It does not use the plugin's launcher, which
+`enabledPlugins` enables, with `node` from PATH. When PATH has none, or its node is a version manager's shim,
+which looks the version up on every run, it runs the Node `mise -C ~ which node` gives instead: looked up at most
+once an hour and kept in `canon/hud-node` with the lookup's time (none found is kept too, and the shim runs), and
+looked up again at once when the kept Node is no longer executable; amended 2026-11-13, when mise's shim cost
+about 40 ms of CPU a render. That follows the HUD's own installer, which puts one absolute Node in the status
+line command for every project (`install.mjs`, `process.execPath`, at v0.15.0). It changes which Node runs in a
+project that pins its own: the shim ran the project's, and the HUD now runs the home folder's, so a project
+pinned below the HUD's floor (Node 22.18, `package.json` `engines`) no longer stops it. It does not use the plugin's launcher, which
 would load the newest copy from any marketplace's cache, a stale one kept 14 days included. Another scope's
 `enabledPlugins` entry is not read, since canon installs it with `--scope user`. The HUD gets the input
 with `model.display_name` set to the documented `model.id`, so the model actually in use is shown. The
@@ -267,7 +274,9 @@ lines it prints, and canon's own line, lose their terminal hyperlinks (the HUD l
 `github.com/<owner>/<repo>` and the project to a `file://` path, with no setting to stop it). They are also
 scrubbed of e-mail addresses, and of the input's `workspace.repo.owner` and the home folder's user name as
 whole words of three characters or more. This repository's branch names begin with the owner's handle,
-which shows as `~`. With the plugin absent, canon's own line is shown. If the HUD fails, prints nothing, or
+which shows as `~`. A word may follow a colour code (`ESC [ … m`, which ends in a letter): until
+2026-11-13 the HUD's coloured branch kept the handle, since the scrub took that letter for part of a longer
+word. With the plugin absent, canon's own line is shown. If the HUD fails, prints nothing, or
 prints its own failure line (an internal error or an old Node, a line naming `/hud`), canon's line is shown
 marked `(hud failed)`. On each render the HUD also writes `~/.claude/plugins/claude-hud/heartbeat.json`
 (mode 600), holding the status-line input, and its own data folder, on this machine only.
@@ -287,8 +296,8 @@ sets the HUD's options at v0.15.0 (`src/config.ts`, `src/schema.ts`). The choice
   line cannot see them: a `--autocompact` flag, the project, local and managed settings scopes, and the
   window tuned for the model when none is set or the model's entry is `"auto"`; there the bar, like
   canon's own line and `ctx_pct`, measures the full window. Amended 2026-11-12: a fixed 300000 pinned a
-  model compacting at 600000 at a red 100% from 300k on. The session cost: `cost.total_cost_usd`. The
-  duration: the elapsed session time. Usage, compact, both windows with countdown and 24-hour reset time,
+  model compacting at 600000 at a red 100% from 300k on. The session cost: `cost.total_cost_usd`, beside
+  the context bar since 2026-11-13 (below, the layout). The duration: the elapsed session time. Usage, compact, both windows with countdown and 24-hour reset time,
   until 2026-11-13 (below). The Claude Code version: the running CLI. A newer installed version
   waiting on a restart is not available, since no documented input field or command gives it.
 * **Off, for identifiers.** `showAuth` and `showAuthUser` (plan and account; v0.15.0 has no other
@@ -333,6 +342,27 @@ sets the HUD's options at v0.15.0 (`src/config.ts`, `src/schema.ts`). The choice
   status line renders, and a summary over ten minutes old or dated ahead of the clock shows nothing.
   "Working" is `lanes`' state of that name; a quiet session is not counted.
   Measured 2026-11-12: a render with the label cached, about 0.3 s.
+* **Shown since 2026-11-13, the owner's decision: the session's lines changed.** The same label begins with
+  them, `+156 -23 │ Fleet 368 tok/s · 9 working`: the input's documented `cost.total_lines_added` and
+  `cost.total_lines_removed` (statusline.md, "Lines of code changed"), which the HUD types but does not show
+  at v0.15.0 (`src/types.ts`). `statusline.sh` appends both to the `--extra-cmd` string as arguments, only
+  when both are whole numbers, and `fleet-rate.sh` shows them when one is above zero and each has at most
+  nine digits, a count of a million or more as the HUD writes token counts (`1.2M`, `src/utils/format.ts`), so
+  the label keeps within the 50 characters the HUD shows (`src/extra-cmd.ts`; nine digits each would reach 53).
+  The ` │ ` between the two parts is the HUD's separator, so a narrow line wraps there. The
+  owner asked for every documented status-line field the HUD cannot show. The others are on screen already
+  or carry nothing here, so they are not duplicated: the open pull request and its review state (Claude
+  Code's footer badge, coloured by review state, interactive-mode.md), fast mode (the `↯` beside the
+  prompt, fast-mode.md), thinking (Opus 5.5, Sonnet 5.5, Haiku 5.5 and the Fable models "always use
+  extended thinking", interactive-mode.md), and `agent.name` (no session here starts with `--agent`).
+* **The layout, since 2026-11-13: fewer rows at the widths in use.** The cost leaves the first line for the
+  context row, and the context bar, cost, cache expiry and cache hit rate share that row (`elementOrder` and
+  `mergeGroups`, `src/render/expanded.ts`); "Last reply" joins the skills and MCP row. A merged row that
+  does not fit the width stacks every member on its own row, so on a narrow pane (below 86 columns for the
+  session measured) the context row takes four. Measured with the pinned HUD run directly on a real
+  session's input with each configuration and the label as `fleet-rate.sh` prints it: from 9 lines to 7 at
+  137 and 149 columns, 10 to 7 at 100, 10 or 11 to 8 from 87 to 93, and 11 to 12 at 85 and below (80 and 60
+  included). Twelve renders sampled from the HUD's heartbeat on 2026-11-13 were 137 to 149 columns wide.
 * **Off, for undocumented sources or identifiers.** The session start, from the same transcript, adds
   nothing a lane acts on. `modelSource` stays `stdin`.
 * **Shown since 2026-11-12: the prompt cache.** One line, `Cache ⏱ until 11:25 │ Cache hit 97.3%`: the clock
@@ -352,14 +382,25 @@ sets the HUD's options at v0.15.0 (`src/config.ts`, `src/schema.ts`). The choice
   `~/.claude/canon/rate-limits/` before the HUD renders, so `scripts/lanes` reports usage as before
   (checked 2026-11-13: the files kept updating after the segment was hidden).
 * **Off, for cost or space.** Memory (it runs `vm_stat`), daily and weekly cost, the token breakdown,
-  config counts, output style, the custom line and jj.
+  config counts, output style, the custom line and jj. Decided 2026-11-13: the session's token totals
+  (`showSessionTokens`, a row of its own from the transcript; the context bar and the cost already say what
+  a lane acts on) and git's file stats (`gitStatus.showFileStats`, a row of changed files; the branch's `*`
+  marks uncommitted work, and the lines changed above show the session's edits).
 
 Checked on 2026-11-11 at 60 and 100 columns, through `statusline.sh` with the pinned HUD placed in a
 temporary config folder's plugin cache: five lines at 60, three at 100, about 0.2 s a render, no hyperlink
 left, the branch's handle shown as `~`, and the bar in the warning colour at 250k of 300k. Re-checked on
 2026-11-12 with the cache line and a session window of 600k: six lines at 60, three at 100, about 0.17 s a
 render. The status line's refresh is event-driven and debounced at 300 ms, and a new
-event cancels a run still going (statusline.md).
+event cancels a run still going (statusline.md). Every open session renders every 5 s, so on 2026-11-13 the
+render's own cost was cut, with the same lines shown: `statusline.sh` reads the input with four `jq` runs
+instead of seven, takes the clock from `jq`, picks the HUD's version in the shell instead of `find`, `sed`,
+`sort` and `tail`, and skips mise's shim (above, which also changes the Node in a project that pins its own);
+`fleet-rate.sh` starts one `jq` a render instead of five processes. The input is read as text in the run that
+also lists the enabled marketplaces, so a malformed one still reaches the HUD as it came, as before. Measured that day against `main`, interleaved, on a real session's input and its 66 MB
+transcript, with the machine's load average between 23 and 54: CPU per render from 303-369 ms to 225-267 ms,
+wall time from 220-281 ms to 184-214 ms, and the wrapper's own CPU, with a renderer that does nothing, from
+56-69 ms to 45-50 ms.
 
 `scripts/test-usage` feeds the status line fake inputs: both windows, an input without `rate_limits`, an
 idle re-render with the same cost and a new response with a higher one, three sessions (an idle one older,
@@ -373,7 +414,17 @@ the home user, and it is given the model ID. One that fails, prints nothing or i
 line marked, and so does one printing a line that names `/hud`. A HUD in the cache that settings do not
 enable is not run. Of an enabled marketplace's 0.9.0 and 0.15.0, 0.15.0 is run with `node`, and a newer copy
 in a marketplace that is not enabled is not; one whose `node` fails shows the marked line. Names are
-scrubbed as whole words only (`dev` leaves `devtools`). In `scripts/lanes` and `scripts/automation status`,
+scrubbed as whole words only (`dev` leaves `devtools`), and right after a colour code. Since 2026-11-13:
+a shim on PATH runs the Node mise gives for the home folder, kept with the lookup's time and reused with no
+lookup within the hour; it is looked up again when no longer executable, over an hour old or dated ahead of
+the clock, so a new Node from mise is followed; none from mise runs the shim and is kept too; a kept path
+that is itself a shim is never used; and no node on PATH runs mise's. An input that is not JSON still runs
+the enabled HUD. The lines changed are passed only as two whole numbers (a fraction, a negative, a string or
+one alone is not), and the label shows them before the fleet figure, alone when that is too old, not at all
+for none changed or a number of ten digits, and a million or more as `1.2M`, within 50 characters. A code
+review that day (`/code-review`, high) found the fraction passed, the kept Node never looked up again, none
+from mise looked up on every render, a malformed input skipping the HUD, and a label over 50 characters;
+each has a test that failed before its fix. In `scripts/lanes` and `scripts/automation status`,
 which the owner pastes, a path under `$HOME` prints as `~` (a sibling such as `$HOME-old` does not), a
 session started in the home folder is lane `~`, and the landing row names the host and repository without
 its owner, for an SSH remote too. Three code reviews and two record checks on 2026-11-11
@@ -513,3 +564,17 @@ Read 2026-11-09 (fetched; fetches are model-summarised).
   https://github.com/ryoppippi/ccusage/releases/tag/v20.0.49 — published 2026-11-10: 1h cache writes in JSON
   model breakdowns, a cline adapter, in-window counting in unified session reports, parser fixes and a
   faster `ccusage claude`; nothing breaking (`gh`). The 2026-11-09 run above used 20.0.48.
+* Read 2026-11-13 for the lines changed, the layout and the render's cost. https://code.claude.com/docs/en/statusline.md
+  (fetched in full, raw): `cost.total_lines_added`, `cost.total_lines_removed`, "Lines of code changed";
+  `pr.number` and `pr.url` "Mirrors the PR badge in the footer". https://code.claude.com/docs/en/interactive-mode.md
+  (raw): the footer's PR link "has a colored underline indicating the review state"; `Option+T` "Has no effect
+  on Opus 5.5, Sonnet 5.5, Haiku 5.5, or the Fable models, which always use extended thinking".
+  https://code.claude.com/docs/en/fast-mode.md (raw): "A small `↯` icon appears next to the prompt while fast
+  mode is active". Claude HUD at v0.15.0, the installed copy: `src/types.ts` types both line counts and no
+  renderer reads them (the one other mention is the preview's sample input in `src/commands.ts`);
+  `src/render/expanded.ts` joins a merge group with ` │ ` when it fits the width and otherwise gives each
+  member its own row; `src/utils/format.ts` writes a count of a million or more as `1.2M`; `src/extra-cmd.ts`
+  cuts the label at `MAX_LABEL_LENGTH = 50`; `install.mjs` writes `process.execPath` into the command;
+  `package.json` `engines` `"node": ">=22.18.0"`. mise 2026.11.6:
+  `mise which --help`, "Prints the real path of the executable mise would run for BIN_NAME in the current
+  directory, bypassing shims"; `mise --help`, `-C, --cd <DIR>` "Run as if mise were started in DIR".
