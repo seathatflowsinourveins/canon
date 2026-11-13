@@ -692,6 +692,7 @@ def test_a_checkout_that_cannot_be_read_is_refused(controls, tmp_path, monkeypat
     module = subject()
     monkeypatch.setattr(module, "parse_args", lambda _argv: config(controls))
     monkeypatch.setattr(module, "run_protector", lambda _config: pytest.fail("started unchecked"))
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
     (tmp_path / "plain").mkdir()
     assert module.main([], checkout=tmp_path / "plain") == 3
 

@@ -65,21 +65,22 @@ holding, with a new row distance, level and first-observation guard. A stopped n
 protection. P1 3 is a named limit: another strategy's sell may cause cancellation of ours; every such
 cancellation attempt names that limit and the other strategy.
 
-Observations (the lead's guard definition V1-V4, 2026-11-13; the table in
-tests/test_owner_protector_stamp_table.py is the specification). The two clocks have separate jobs.
-V1: a quote stamped more than the adapter's `STAMP_AHEAD_MOST_NS` ahead of its own receipt is no
-observation and never a reference, and the wait is named (canon_alpaca/data.py:1044-1062 holds the
-same for prints); that is the only comparison of a venue stamp with a receipt, and no two quotes are
-ever ordered by receipt (the node's clock otherwise only ages a quote and marks the arming). V2: arming takes as its reference
-the sane quote its level is fixed on, aged from the earlier of its stamp and its receipt and no older
-than `protect.QUOTE_MOST`; when a supplied level finds none usable, the first sane quote received
-after the arming becomes the reference and is no observation, so every start of the node with no
-usable quote costs one quote. V3: a quote counts (spends the guard, confirms a breach, or is the quote
-a guarded decision reads) only if its venue stamp is strictly greater than the reference's and the
-last counted one's; receipt order never decides, so the same stamp never counts however late, an
-older one never counts, and a newer one counts however late. The stamps V1 refused are kept per
-instrument, the newest `REFUSED_KEPT` (64), the oldest dropped first when full, and a later quote
-carrying one never counts, even within the bound. V4: every step names a holding with no sell yet.
+Observations (the lead's venue-clock definition, 2026-11-13 17:36, replacing V2/V3; tested in
+tests/test_owner_protector_stamp_table.py). For each instrument the venue clock is the running
+maximum of sane stamps received, including quotes whose spread the planner refuses and quotes
+received with no level armed. V1: a stamp more than `STAMP_AHEAD_MOST_NS` ahead of its own receipt
+is refused and named (canon_alpaca/data.py:1044-1062); the newest `REFUSED_KEPT` (64) refused stamps
+are kept, oldest refusal dropped first, and a stamp still in that record cannot advance the clock.
+A quote counts (spends the guard, confirms, or raises a level) only if it raises the venue clock;
+an equal or older stamp never counts, whatever its receipt. With no maximum at arming, the first
+sane quote establishes it and does not count, even if planning refuses that quote. Planning
+requires a planner-accepted quote at the current maximum, aged from the earlier of stamp and
+receipt and no older than `protect.QUOTE_MOST`. A stale sane quote still moves the clock but cannot
+plan a level. Cache.quote() is the last arrival, not the newest stamp: the pin's cache/mod.rs:2370,
+6207-6216,6343-6349 stores reverse insertion order, and common/__init__.pyi:307 exposes quotes().
+Adoption seeds the clock from that history and tests the last arrival against the maximum before
+planning. If the newest quote cannot be planned from, arming waits and every step names the
+unprotected holding (V4/I2). Receipt order never decides which quote is newer.
 The first observation of a breached or fresh level is guarded; a second confirms (property (b): no
 election on one observation). Its other half (e5): once our sell has gone out, the breach is
 confirmed, so an exit in progress finishes and the rest of the holding goes out at once with no new
@@ -97,7 +98,6 @@ so at every step.
 from __future__ import annotations
 
 from collections import deque
-from collections.abc import Collection
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC
@@ -109,7 +109,6 @@ from time import monotonic
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import Self
-from typing import cast
 from uuid import uuid4
 
 from canon_alpaca.data import STAMP_AHEAD_MOST_NS
@@ -274,21 +273,9 @@ def _sane(tick: QuoteTick) -> bool:
 
 
 def _usable(tick: QuoteTick, now: int) -> bool:
-    """V2: a quote arming may take as its reference: sane, and no older than the bound
-    paper:protect plans on, aged from the earlier of its stamp and its receipt."""
+    """A sane, fresh arming snapshot; planning also requires the current venue maximum."""
     age = now - min(tick.ts_event, tick.ts_init)
     return _sane(tick) and age <= int(protect.QUOTE_MOST.total_seconds()) * 1_000_000_000
-
-
-def _counts(slot: Holding, tick: QuoteTick, refused: Collection[int]) -> bool:
-    """V3: a sane quote counts only if its venue stamp is strictly greater than the reference's and
-    the last counted one's, and is no stamp V1 refused. There is no receipt order: the same stamp
-    again never counts, an older one never counts, and a newer one counts however late it
-    arrives."""
-    if not _sane(tick) or tick.ts_event in refused:
-        return False
-    floor = [s for s in (slot.armed_event, slot.last_observation) if s is not None]
-    return not floor or tick.ts_event > max(floor)
 
 
 def _ahead(tick: QuoteTick) -> str:
@@ -311,13 +298,10 @@ class Holding:
     limit_offset: Decimal | None = None
     fresh: bool = False
     ended: bool = False
-    # The clock when the level was fixed. With no usable reference, only a quote received after it
-    # becomes the reference (V2; the lead's ruling, 2026-11-13, 15:55: no election on one
-    # observation).
+    # The host clock when the level was fixed; it never orders venue observations.
     armed_at: int | None = None
-    # The reference (V2): the venue stamp of the sane quote the level was fixed on, or, when arming
-    # found none usable, of the first sane quote received after it. Only a quote stamped after it
-    # counts (V3), so a re-delivered or older quote never does.
+    # The usable maximum at arming, or the first sane maximum received afterwards. Diagnostic
+    # only: the instrument's running venue clock, not this snapshot, decides whether a quote counts.
     armed_event: int | None = None
     # Set at our first send for this holding: its breach was confirmed, or its level placed, on new
     # observations. Re-placing coverage after that needs none: after our own cancel for a grown
@@ -349,14 +333,42 @@ class OwnerProtector(Strategy):
         # Per instrument, the stamps V1 refused, newest last (REFUSED_KEPT): a quote with one of
         # them is the same observation and never counts, however it comes again.
         self.refused_stamps: dict[InstrumentId, deque[int]] = {}
+        # One quote at the running maximum per instrument, independent of levels and planning.
+        self.venue_quotes: dict[InstrumentId, QuoteTick] = {}
 
-    def _note(self, tick: QuoteTick | None) -> None:
-        """Keep the stamp of a quote V1 refuses."""
-        if tick is None or _sane(tick):
-            return
-        kept = self.refused_stamps.setdefault(tick.instrument_id, deque(maxlen=REFUSED_KEPT))
-        if tick.ts_event not in kept:
-            kept.append(tick.ts_event)
+    def _note(self, tick: QuoteTick | None) -> bool:
+        """Record every quote; return whether it raises an already established venue clock.
+
+        This runs before management can return for coverage or a planner refusal. The first
+        sane quote establishes a clock and cannot count; repeating a cached quote cannot count.
+        """
+        if tick is None:
+            return False
+        if not _sane(tick):
+            kept = self.refused_stamps.setdefault(tick.instrument_id, deque(maxlen=REFUSED_KEPT))
+            if tick.ts_event not in kept:
+                kept.append(tick.ts_event)
+            return False
+        if tick.ts_event in self.refused_stamps.get(tick.instrument_id, ()):
+            return False
+        previous = self.venue_quotes.get(tick.instrument_id)
+        if previous is not None and tick.ts_event <= previous.ts_event:
+            return False
+        self.venue_quotes[tick.instrument_id] = tick
+        slot = self.slots.get(tick.instrument_id)
+        if (
+            slot is not None
+            and slot.armed_event is None
+            and slot.armed_at is not None
+            and tick.ts_init > slot.armed_at
+        ):
+            slot.armed_event = tick.ts_event
+        return previous is not None
+
+    def _seed_clock(self, instrument_id: InstrumentId) -> None:
+        """Cache.quotes is reverse arrival order at the pin, not venue-stamp order."""
+        for tick in reversed(self.cache.quotes(instrument_id) or []):
+            self._note(tick)
 
     def set_external_order_instrument_ids(self, instrument_ids: Sequence[InstrumentId]) -> None:
         if instrument_ids:
@@ -511,15 +523,15 @@ class OwnerProtector(Strategy):
             )
             return
         self.levels[instrument_id] = level
-        cached = self.cache.quote(instrument_id)
-        self._note(cached)
+        self._seed_clock(instrument_id)
+        newest = self.venue_quotes.get(instrument_id)
         now = self.clock.timestamp_ns()
         self.slots[instrument_id] = Holding(
             level,
             position.ts_opened,
             position.ts_init,
             armed_at=now,
-            armed_event=None if cached is None or not _usable(cached, now) else cached.ts_event,
+            armed_event=None if newest is None or not _usable(newest, now) else newest.ts_event,
         )
         self._subscribe_holding(instrument_id)
         self._manage(instrument_id)
@@ -561,6 +573,7 @@ class OwnerProtector(Strategy):
                 self._name_refused(instrument_id, "its supplied level was refused")
                 continue
             self.refused.pop(instrument_id, None)
+            self._seed_clock(instrument_id)
             self.slots[instrument_id] = Holding(
                 None, position.ts_opened, position.ts_init, fresh=True
             )
@@ -575,9 +588,11 @@ class OwnerProtector(Strategy):
         self.clock.set_timer(STEP_TIMER, timedelta(seconds=1), callback=self._on_step)
 
     def on_quote(self, quote: QuoteTick) -> None:
-        if not self.stopping and quote.instrument_id in self.slots:
-            self._note(quote)
-            self._manage(quote.instrument_id, quote)
+        if self.stopping or quote.instrument_id in self.stopped_instruments:
+            return
+        advanced = self._note(quote)
+        if quote.instrument_id in self.slots:
+            self._manage(quote.instrument_id, quote, advanced=advanced)
 
     def on_order_cancel_rejected(self, event: OrderCancelRejected) -> None:
         if event.strategy_id != self.strategy_id or event.client_order_id not in self.sent_ids:
@@ -634,6 +649,13 @@ class OwnerProtector(Strategy):
                     f"old, over the {protect.QUOTE_MOST.total_seconds():.0f} s a level is "
                     "planned on"
                 )
+            newest = self.venue_quotes.get(instrument_id)
+            if (
+                newest is None
+                or tick.ts_event != newest.ts_event
+                or tick.ts_event in self.refused_stamps.get(instrument_id, ())
+            ):
+                raise ValueError("waiting for a planable quote at the current venue maximum")
             atr = AverageTrueRange(protect.PLANNER.atr_n)
             bar_type = BarType.from_str(f"{instrument_id}-1-MINUTE-LAST-EXTERNAL")
             earliest = now - int(protect.ATR_LOOKBACK.total_seconds()) * 1_000_000_000
@@ -670,7 +692,12 @@ class OwnerProtector(Strategy):
             return False
         return True
 
-    def _manage(self, instrument_id: InstrumentId, quote: QuoteTick | None = None) -> None:
+    def _manage(
+        self, instrument_id: InstrumentId, quote: QuoteTick | None = None, *, advanced: bool = False
+    ) -> None:
+        tick = quote if quote is not None else self.cache.quote(instrument_id)
+        if quote is None:
+            advanced = self._note(tick)
         slot = self.slots[instrument_id]
         order = None if slot.protect_id is None else self.cache.order(slot.protect_id)
         if slot.protect_id is not None and order is None:
@@ -729,7 +756,6 @@ class OwnerProtector(Strategy):
             return
         if uncovered <= 0:
             return
-        tick = quote if quote is not None else self.cache.quote(instrument_id)
         if tick is None:
             self._record_unprotected(instrument_id, "no quote to plan protection")
             return
@@ -753,28 +779,23 @@ class OwnerProtector(Strategy):
             self._note(tick)
             self._wait(instrument_id, _ahead(tick))
             return
+        unarmed = slot.level is None
         if slot.distance is None and not self._plan_holding(instrument_id, slot, tick):
             return
+        if unarmed:
+            advanced = False  # Planning this level is not an observation after its arming.
         assert (
             slot.level is not None and slot.distance is not None and slot.limit_offset is not None
         )
-        refused = self.refused_stamps.get(instrument_id, ())
         if not slot.placed:
             if not _sane(tick):
                 self._note(tick)
                 self._wait(instrument_id, _ahead(tick))
                 return
-            if slot.armed_event is None:
-                # V2: arming found no usable reference, so the first sane quote received after it
-                # becomes the reference. It is no observation: nothing orders it against the arming.
-                if tick.ts_event not in refused and tick.ts_init > cast(int, slot.armed_at):
-                    slot.armed_event = tick.ts_event
-                self._wait(instrument_id, "a quote stamped after the reference")
-                return
-            if not _counts(slot, tick, refused):
+            if not advanced:
                 self._wait(
                     instrument_id,
-                    "a quote stamped after the reference"
+                    "a quote stamped after the venue maximum"
                     if slot.last_observation is None
                     else "a second observation newer than the one guarded",
                 )
@@ -786,7 +807,7 @@ class OwnerProtector(Strategy):
                 )
                 self._wait(instrument_id, "a second observation to confirm")
                 return
-        if _counts(slot, tick, refused):
+        if advanced:
             slot.last_observation = tick.ts_event
         trailing, limit = slot.distance.distance, slot.limit_offset
         if bid - limit <= 0:
@@ -859,6 +880,7 @@ class OwnerProtector(Strategy):
         """Stop this instrument by canceling only the sell this instance sent, with no liquidation."""
         self.stopped_instruments.add(instrument_id)
         self.refused_stamps.pop(instrument_id, None)
+        self.venue_quotes.pop(instrument_id, None)
         slot = self.slots.pop(instrument_id, None)
         self.levels.pop(instrument_id, None)
         if self.frozen.get(instrument_id, "").startswith(WAITING):

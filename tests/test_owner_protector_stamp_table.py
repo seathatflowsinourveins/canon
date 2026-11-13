@@ -4,12 +4,13 @@ The specification is the lead's guard definition, V1 to V4 (2026-11-13, after th
 second P1). Every cell's expected result is derived from it in `expect`, and from nothing else:
 - V1: a quote stamped more than the adapter's `STAMP_AHEAD_MOST_NS` (canon_alpaca/data.py:1044)
   ahead of its own receipt is not an observation and is never a reference. It is named.
-- V2: arming fixes its level on a sane quote no older than `protect.QUOTE_MOST`, aged from the
-  earlier of its stamp and its receipt, and that quote is the reference. With none, it waits named.
-- V3: a quote counts only if its venue stamp is strictly greater than the reference's and the last
-  counted one's. Receipt order never decides: the same stamp never counts, however late; an older
-  stamp never counts; a newer one counts, however late. A stamp V1 refused is the same observation
-  when it comes again within the bound, so it never counts either.
+- V2 (replaced by the lead at 17:36): the venue clock is the running maximum of all sane stamps
+  received for the instrument, whether a level exists or the planner accepts the spread. A level
+  can be planned only on the current maximum, no older than `protect.QUOTE_MOST` when aged from
+  the earlier of stamp and receipt. With none planable, it waits named.
+- V3: counting requires raising that maximum. The first sane quote when no maximum existed at
+  arming establishes the clock and does not count. Equal/older stamps never count, regardless of
+  receipt order; a stamp V1 refused remains refused while kept in the bounded record.
 - V4: every step names a holding that has no sell yet.
 
 Axes:
@@ -28,15 +29,19 @@ Axes:
   sell), a self-armed level (the reference is the quote it was planned on; guarded, as for every
   fresh level), or the confirmation (the reference is the guarded observation; the delivery
   confirms the breach).
+- In the two-quote table: the newest quote's planner verdict (accepted or spread refused), and
+  both arrival orders of two distinct venue stamps before the delivery. Each crosses warm/cold
+  adoption, supplied breached/clear/self-armed levels and equal/older/newer deliveries. r1/r1b's
+  sale traces and r2's stale stamp with recent receipt are also named in test_owner_protector_venue_clock.
 
 Invariants, in every cell:
-- I1: no sell on one observation, and the guard is spent exactly as V1-V3 say. A same stamp never
-  counts; a stamp older than the reference never places a clear level or spends the guard.
+- I1: no sell on one observation, and the guard is spent exactly as V1-V3 say. A stamp at or below
+  the venue clock never places a clear level or spends the guard.
 - I2: once newer quotes arrive, one a second at the host's skew, the sell goes out by the later of
   the reference's receipt plus the bound (plus the host's lead over the venue, since V1 measures a
   reference against its own receipt) and the delivery's receipt, plus one second for each counting
-  quote still owed: the observations, and a reference when none is usable yet (V2's cold case: an
-  absent, stale or refused reference). Every step before it, from the arming on, names the holding
+  quote still owed: the observations, plus the first maximum when none exists, or a quote to
+  self-arm an unplanned level. Every step before it, from the arming on, names the holding
   unprotected. A stopped instrument keeps no wait record (e6).
 
 Named cells: F1 (the arming quote re-delivered late after the guard), F2 (a quote older than the
@@ -100,11 +105,11 @@ def alpaca_stream_lock() -> None:
     """No credential-environment reader for these offline simulations."""
 
 
-def tick(bid: str, ts_event: int, ts_init: int) -> QuoteTick:
+def tick(bid: str, ts_event: int, ts_init: int, spread: str = "0.02") -> QuoteTick:
     return QuoteTick(
         AAA,
         Price.from_str(bid),
-        Price.from_str(str(Decimal(bid) + Decimal("0.02"))),
+        Price.from_str(str(Decimal(bid) + Decimal(spread))),
         Quantity.from_int(100),
         Quantity.from_int(100),
         ts_event,
@@ -232,52 +237,76 @@ def delivery(kind: str, late: str, skew: int, ref: dict[str, Any]) -> tuple[int,
     return stamp, max(receipt, base + SECOND)
 
 
-def expect(phase: str, ref: dict[str, Any], d: tuple[int, int]) -> dict[str, Any]:
-    """V1-V3, and V2's cold case, applied to this cell, in the order the quotes arrive."""
+def history_expect(
+    phase: str, history: list[tuple[int, int, bool]], cached_count: int
+) -> dict[str, Any]:
+    """An oracle over input facts: (stamp, receipt, spread accepted), never protector state.
+
+    For each prefix, take the set of sane, not previously refused stamps. Its maximum is the
+    venue clock, independently of planning. Counting indices must be strict records over a
+    nonempty earlier prefix, after arming and with a plan. The first planable current maximum
+    fixes a self-armed level; supplied levels are armed after the initial cache snapshot.
+    """
     most = int(protect.QUOTE_MOST.total_seconds()) * SECOND
-    refused: set[int] = set()
-    reference: int | None = None
-    last: int | None = None
-
-    def usable(stamp: int, receipt: int, now: int) -> bool:  # V1 and V2
-        return sane(stamp, receipt) and stamp not in refused and now - min(stamp, receipt) <= most
-
-    def see(stamp: int, receipt: int) -> None:
-        if not sane(stamp, receipt):
-            refused.add(stamp)
-
-    stamp_ref, receipt_ref = ref["S"], ref["R"]
-    if phase == "confirming":
-        see(ref["Q0"], T0)
-        if usable(ref["Q0"], T0, T0):
-            reference = ref["Q0"]
-        see(stamp_ref, receipt_ref)
-        if sane(stamp_ref, receipt_ref):
-            if reference is None:
-                reference = stamp_ref  # V2: the first sane quote after the arming
-            elif stamp_ref > reference:
-                last = stamp_ref  # the guarded observation
-    elif stamp_ref is not None:
-        see(stamp_ref, receipt_ref)
-        if usable(stamp_ref, receipt_ref, ref["B"]):
-            reference = stamp_ref
-    planned = phase != "self-armed" or reference is not None
-    stamp, receipt = d
-    counted = became = False
-    see(stamp, receipt)
-    if reference is None:
-        if usable(stamp, receipt, receipt):
-            reference, became = stamp, True  # V2: arms a self-armed level, or is the reference
-    elif sane(stamp, receipt) and stamp not in refused:
-        counted = stamp > max(reference, last if last is not None else reference)
-    observations = (1 if phase == "supplied-clear" else 2) - (last is not None) - counted
+    valid = [
+        sane(stamp, receipt) and stamp not in {s for s, r, _ in history[:i] if not sane(s, r)}
+        for i, (stamp, receipt, _) in enumerate(history)
+    ]
+    maxima = [
+        max((s for j, (s, _, _) in enumerate(history[: i + 1]) if valid[j]), default=None)
+        for i in range(len(history))
+    ]
+    plans = [
+        i
+        for i, (stamp, receipt, accepted) in enumerate(history)
+        if i >= cached_count - 1
+        and valid[i]
+        and accepted
+        and stamp == maxima[i]
+        and max(T0, receipt) - min(stamp, receipt) <= most
+    ]
+    plan = min(plans, default=None)
+    arming = plan if phase == "self-armed" else cached_count - 1
+    counted = [
+        i
+        for i, (stamp, _, _) in enumerate(history)
+        if plan is not None
+        and arming is not None
+        and i >= plan
+        and i > arming
+        and i > 0
+        and valid[i]
+        and maxima[i - 1] is not None
+        and stamp > cast(int, maxima[i - 1])
+    ]
+    required = 1 if phase == "supplied-clear" else 2
+    needed = max(0, required - len(counted))
+    clock = maxima[-1] if maxima else None
+    if clock is None or (phase == "self-armed" and plan is None):
+        needed += 1
     return {
-        "planned": planned,
-        "counted": counted,
-        "became": became,
-        "sent": counted and observations == 0,
-        "needed": observations + (reference is None),
+        "planned": plan is not None,
+        "counted": len(history) - 1 in counted,
+        "last": history[counted[-1]][0] if counted else None,
+        "sent": len(counted) >= required,
+        "needed": needed,
     }
+
+
+def expect(phase: str, ref: dict[str, Any], d: tuple[int, int]) -> dict[str, Any]:
+    """Translate the original axes to quote history, then use the definition's prefix maxima."""
+    history = []
+    if phase == "confirming":
+        history.append((ref["Q0"], T0, True))
+    if ref["S"] is not None:
+        history.append((ref["S"], ref["R"], True))
+    cached_count = int(phase != "self-armed" or ref["R"] < T0)
+    if ref["S"] is None:
+        cached_count = 0
+    prior = history_expect(phase, history, cached_count)
+    want = history_expect(phase, [*history, (*d, True)], cached_count)
+    want["planned"] = prior["planned"]
+    return want
 
 
 @pytest.mark.parametrize(("skew", "phase", "reference", "kind", "late"), cases())
@@ -307,9 +336,6 @@ def test_the_guard_over_the_table(
         "I1: the guard's spending"
     )
     assert bool(strategy.sent) == want["sent"], "I1: the sell"
-    if want["became"]:
-        assert slot.armed_event == stamp, "V2: the first sane quote is the reference"
-
     # I2: newer quotes at the host's skew; every step before the sell is named.
     step_named(strategy, receipt + SECOND // 4)
     start = (receipt - ref["B"]) // SECOND + 1
@@ -338,3 +364,61 @@ def test_the_guard_over_the_table(
         )
     strategy.stop_instrument(AAA)
     assert not strategy.frozen.get(AAA, "").startswith(WAITING), "e6: a stopped wait record"
+
+
+@pytest.mark.parametrize("phase", PHASES[:3])
+@pytest.mark.parametrize("warm", [False, True], ids=["cold", "warm"])
+@pytest.mark.parametrize("accepted", [True, False], ids=["accepted", "spread-refused"])
+@pytest.mark.parametrize("order", [(0.2, 1), (1, 0.2)], ids=["older-newer", "newer-older"])
+@pytest.mark.parametrize("kind", KINDS)
+def test_the_venue_clock_over_two_quote_orders(
+    phase: str, warm: bool, accepted: bool, order: tuple[float, float], kind: str
+) -> None:
+    """Two-quote orders and planner verdicts: every prefix is checked, including waiting steps."""
+    strategy = Harness()
+    strategy.cached.latest = None
+    history: list[tuple[int, int, bool]] = []
+    cached_count = 2 if warm else 0
+
+    def arm_level() -> None:
+        if phase == "self-armed":
+            strategy.on_start()
+        else:
+            strategy.adopt_holding(
+                AAA, Price.from_str("9.90" if phase == "supplied-clear" else "10.00")
+            )
+
+    def check() -> None:
+        want = history_expect(phase, history, cached_count)
+        slot = strategy.slots[AAA]
+        assert (slot.distance is not None) == want["planned"], "plan needs the current maximum"
+        assert bool(strategy.sent) == want["sent"], "I1: only strict records can elect"
+        if not strategy.sent:
+            assert slot.last_observation == want["last"], "only strict records spend the guard"
+        step_named(strategy, strategy.clock.timestamp_ns() + SECOND // 100)
+
+    if not warm:
+        arm_level()
+    for i, offset in enumerate(order):
+        stamp = T0 + int(offset * SECOND)
+        receipt = T0 + SECOND + i * SECOND // 2
+        spread_ok = accepted or offset != 1
+        history.append((stamp, receipt, spread_ok))
+        deliver(strategy, tick(BID[phase], stamp, receipt, "0.02" if spread_ok else "1.50"))
+        if not warm:
+            check()
+    if warm:
+        arm_level()
+        check()
+    offset = {"same": SECOND, "older": SECOND // 2, "newer": 2 * SECOND}[kind]
+    for stamp, receipt in [
+        (T0 + offset, T0 + 2 * SECOND),
+        (T0 + 3 * SECOND, T0 + 3 * SECOND),
+        (T0 + 4 * SECOND, T0 + 4 * SECOND),
+        (T0 + 5 * SECOND, T0 + 5 * SECOND),
+    ]:
+        spread_ok = accepted or stamp != T0 + SECOND
+        history.append((stamp, receipt, spread_ok))
+        deliver(strategy, tick(BID[phase], stamp, receipt, "0.02" if spread_ok else "1.50"))
+        check()
+    assert len(strategy.sent) == 1, "I2: new planable maxima eventually protect the holding"

@@ -160,6 +160,7 @@ class Cache:
         self.held: list[Any] = [position()]
         self.working: list[Any] = []
         self.latest: QuoteTick | None = quote()
+        self.earlier_quotes: list[QuoteTick] = []
         self.history: list[Bar] = []
 
     def bars(self, bar_type):
@@ -184,6 +185,11 @@ class Cache:
 
     def quote(self, iid):
         return self.latest if self.latest is not None and self.latest.instrument_id == iid else None
+
+    def quotes(self, iid):
+        """The pin's cache is newest arrival first, without sorting by venue stamp."""
+        latest = [] if self.latest is None else [self.latest]
+        return [q for q in [*latest, *self.earlier_quotes] if q.instrument_id == iid]
 
     def instrument(self, iid):
         return equity(iid)
