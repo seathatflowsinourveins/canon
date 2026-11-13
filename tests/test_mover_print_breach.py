@@ -166,13 +166,31 @@ def stamped(price: str, event: int, received: int) -> SimpleNamespace:
 
 
 def test_under_the_bid_the_held_stop_reads_the_last_trade_as_on_main() -> None:
-    """A `bid_ask` window is as on main (#320): its held stop reads the cache's last trade, whatever its
-    stamp, and a trade at 9.70 under the held stop sells at once (code-review-high-trig-win/1)."""
+    """A `bid_ask` window with no print kept is as on main (#320): its held stop reads the cache's last
+    trade, whatever its stamp against the entry, and a trade at 9.70 under the held stop sells at once
+    (code-review-high-trig-win/1)."""
     seam, slot, filled, last = holding(TriggerType.BID_ASK)
     last.append(stamped("9.7000", filled - SECOND, filled - SECOND))
     seam._protect(slot, Decimal(3), filled + SECOND)
     assert [o.kind for o in seam.sent] == ["LIMIT"] and slot.exiting
     assert slot.exit_record.trigger_reason == "held stop (last trade)"
+
+
+def test_under_the_bid_a_print_set_aside_as_late_moves_no_held_stop() -> None:
+    """Late prints apply under `bid_ask` too (P1, P2): with no bid, the held stop reads the newest print
+    by the venue's time. A print of 9.70 older at the venue than the kept 10.00, received after it, is
+    set aside, so the held stop reads 10.00 and sells nothing, where main read the cache's last trade
+    and sold (the DeepSeek reader of the late-print fold, its third item)."""
+    seam, slot, filled, last = holding(TriggerType.BID_ASK)
+    seam.slots, seam.trades = {slot.instrument_id: slot}, 0
+    for price, at in (("10.0000", filled - SECOND), ("9.7000", filled - 2 * SECOND)):
+        trade = stamped(price, at, at)
+        trade.instrument_id = slot.instrument_id
+        last.append(trade)
+        seam.on_trade(trade)
+    assert seam._last_known(slot) == (Decimal("10.00"), "last trade")
+    seam._protect(slot, Decimal(3), filled + SECOND)
+    assert not seam.sent and not slot.exiting
 
 
 def test_under_a_print_trigger_a_close_older_than_a_stale_print_is_no_price_either() -> None:
