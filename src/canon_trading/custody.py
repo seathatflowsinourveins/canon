@@ -460,9 +460,11 @@ def _quantity_named(order: Order) -> str:
     return str(order.qty) if _shown(order.qty) is not None else NO_COUNT
 
 
-def describe(order: Order) -> str:
+def describe(order: Order, *, never_canceled: bool = True) -> str:
     """An order by name for a report: ours by its client order ID, a foreign one by what it is (never its
-    ID, which may be the owner's)."""
+    ID, which may be the owner's). A protect stop's name ends with the words of the account read and
+    the close-only form, which never cancel one; the protect task's own cancel asks for it without
+    them (`never_canceled=False`)."""
     qty = _quantity_named(order)
     what = f"{_value(order.side)} {qty} {order.symbol or NO_SYMBOL} {_value(order.type or order.order_type)}"
     found = lineage(order.client_order_id)
@@ -470,8 +472,8 @@ def describe(order: Order) -> str:
         return f"{order.client_order_id} ({what}, {_value(order.status)})"
     if found == PROTECT:
         return (
-            f"a protect stop of ours, {order.client_order_id} ({what}, {_value(order.status)}), which "
-            "this form never cancels"
+            f"a protect stop of ours, {order.client_order_id} ({what}, {_value(order.status)})"
+            + (", which this form never cancels" if never_canceled else "")
         )
     return f"a {found} order: {what}, {_value(order.status)}"
 

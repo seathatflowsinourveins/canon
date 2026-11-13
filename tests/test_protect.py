@@ -21,6 +21,7 @@ from typing import Any
 from typing import cast
 from uuid import uuid4
 
+import canon_alpaca.execution
 import pytest
 import requests
 from alpaca.common.exceptions import APIError
@@ -741,7 +742,9 @@ def test_the_tasks_flags_send_only_on_an_exact_false_and_a_registered_row(
     """`paper:protect` hands its two flags over as text. Anything but an exact `true` or `false` for
     plan-only is refused, so a value this code does not know can never become a send."""
     paper = Paper(positions=[_position("AAA", "10")])
-    got = protect.task_from_flags(plan_only, row, cast(Any, paper), Data({"AAA": AAA_BOOK}))
+    got = protect.task_from_flags(
+        plan_only, row, trading=cast(Any, paper), data=Data({"AAA": AAA_BOOK})
+    )
     assert got == code and len(paper.submitted) == sends
     if code == 3:
         assert paper.calls == []
@@ -1099,12 +1102,6 @@ def test_the_task_reads_account_as_pair_under_its_lock_without_waiting() -> None
     assert "protect) svc=canon-alpaca-paper-protect; lock=canon-paper-protect.lock ;;" in run
     assert 'flag "--plan-only"' in task["usage"]
     assert re.search(r'flag "--row <row>"[^\n]*\{\s*choices "F2" "OWN1" "OWN3"\s*\}', task["usage"])
-    assert re.search(
-        r"task_from_flags\(sys\.argv\[1\], sys\.argv\[2\]\)\)' "
-        r'"\$\{usage_plan_only:-false\}" "\$\{usage_row:-\}"$',
-        run,
-        re.MULTILINE,
-    )
     assert re.search(r'^exec 9>>"\$\{tmp\}\$\{lock\}"$', run, re.MULTILINE)
     assert re.search(
         r"^/usr/bin/lockf -t 0 9 2>/dev/null; held=\$\?$", run, re.MULTILINE
@@ -1139,3 +1136,688 @@ def test_the_task_refuses_windows_and_any_other_name_before_the_keychain(
     done, asked = _run_task(tmp_path, account)
     assert done.returncode == 3 and asked == ""
     assert said in done.stderr and "nothing was read" in done.stderr
+
+
+# -- The cancel of protect stops, by name (`paper:protect <account> --cancel`) ------------------------
+
+
+def test_a_keyboard_interrupt_during_the_send_names_the_stop_that_may_be_at_alpaca(capsys) -> None:
+    """Ctrl-C while the submit waits for its answer: the stop may rest at Alpaca, so its line is
+    printed before the interrupt ends the run (the second reader's drop-in)."""
+    paper = Paper(positions=[_position("AAA", "10"), _position("BBB", "5")])
+    original = paper.submit_order
+
+    def interrupted(order_data):
+        original(order_data)
+        raise KeyboardInterrupt
+
+    paper.submit_order = interrupted  # type: ignore[method-assign]
+    with pytest.raises(KeyboardInterrupt):
+        protect.protect_task(cast(Any, paper), Data({"AAA": AAA_BOOK, "BBB": BBB_BOOK}), row="OWN1")
+    out = capsys.readouterr().out.splitlines()
+    assert len(paper.submitted) == 1
+    (line,) = [x for x in out if x.startswith("failed AAA:")]
+    assert "stopped during the send" in line and "may yet show it working" in line
+
+
+def test_a_submit_answered_with_what_is_no_order_is_a_failure_and_not_a_stop(capsys) -> None:
+    """The second reader's drop-in: an answer alpaca-py did not read into its `Order` shows no stop."""
+    paper = Paper(positions=[_position("AAA", "10")])
+
+    def raw_answer(order_data):
+        paper.submitted.append(order_data)
+        return {"id": "raw-id", "status": "rejected"}
+
+    paper.submit_order = raw_answer  # type: ignore[method-assign]
+    code, lines = _run(paper, Data({"AAA": AAA_BOOK}), capsys)
+    assert len(paper.submitted) == 1
+    assert code == 1, lines
+    assert not [x for x in lines if x.startswith("sent AAA:")], lines
+    (line,) = [x for x in lines if x.startswith("failed AAA:")]
+    assert "not an Order" in line and "may yet show it working" in line
+
+
+@pytest.mark.parametrize(
+    "status", ["suspended", "stopped", "done_for_day", "replaced", "calculated"]
+)
+def test_a_submit_answered_with_a_status_no_resting_stop_has_is_a_failure(capsys, status) -> None:
+    """A stop counts as sent only when the answer shows it resting. One Alpaca answers as suspended,
+    say, is open and is no protection: named, never sent again, and the run fails."""
+    paper = Paper(positions=[_position("AAA", "10")])
+    original = paper.submit_order
+    paper.submit_order = lambda order_data: original(order_data).model_copy(  # type: ignore[method-assign]
+        update={"status": status}
+    )
+    code, lines = _run(paper, Data({"AAA": AAA_BOOK}), capsys)
+    assert code == 1 and len(paper.submitted) == 1, lines
+    (line,) = [x for x in lines if x.startswith("failed AAA:")]
+    assert f"answered {status}" in line and "paper:account" in line
+    assert not [x for x in lines if x.startswith("sent AAA:")]
+
+
+def test_the_quote_age_a_line_prints_counts_the_reads_since_the_quote(capsys, monkeypatch) -> None:
+    """The second reader's drop-in: the clock reads 15:00:00, the quote takes five seconds to come
+    and is stamped 15:00:04, and the send step's read takes twenty more: the quote is 21 s old at
+    the send, and the line says so, not the age against the clock's first read."""
+    passed = [0.0]
+    monkeypatch.setattr(protect, "monotonic", lambda: passed[0])
+    paper = Paper(positions=[_position("AAA", "10")])
+    data = Data({"AAA": AAA_BOOK}, quoted="2026-11-12T15:00:04Z")
+    original_quote = data.get_stock_latest_quote
+    original_pos = paper.get_open_position
+
+    def slow_quote(request):
+        passed[0] += 5.0
+        return original_quote(request)
+
+    def slow_pos(symbol):
+        passed[0] += 20.0
+        return original_pos(symbol)
+
+    data.get_stock_latest_quote = slow_quote  # type: ignore[method-assign]
+    paper.get_open_position = slow_pos  # type: ignore[method-assign]
+    code, lines = _run(paper, data, capsys)
+    assert code == 0, lines
+    (line,) = [x for x in lines if x.startswith("sent AAA:")]
+    assert "quote 21 s old" in line, line
+
+
+def test_the_tasks_file_names_the_protect_task_among_those_that_reach_account_c() -> None:
+    header = "\n".join((ROOT / "mise.toml").read_text().splitlines()[:52])
+    assert "no task trades on it yet" not in header
+    assert "paper:protect" in header and "canon-paper-protect.lock" in header
+
+
+def test_the_paper_tests_cleanup_names_a_short_listed_with_a_positive_count(monkeypatch) -> None:
+    """The second reader's drop-in: alpaca-py's `Position` carries the side apart from the count, so a
+    short may list a positive quantity. The cleanup names it and never sells against it."""
+    paper_test = _paper_test()
+    monkeypatch.setattr(paper_test, "SYMBOL", "SPY")
+    monkeypatch.setattr(paper_test.time, "sleep", lambda _: None)
+    paper = Paper(positions=[_position("SPY", "1", "short")], no_shorting=True)
+    problems: list[str] = []
+    paper_test._clean(paper, problems)
+    assert paper.submitted == []
+    assert any("SHORT" in problem for problem in problems), problems
+
+
+@pytest.mark.parametrize("ends", ["accepted", "filled"])
+def test_the_paper_tests_cleanup_reads_each_order_it_sent_by_its_own_id(monkeypatch, ends) -> None:
+    """An interrupt during the test's buy leaves the order's ID only in the list kept before the
+    submit. The cleanup reads each such ID itself, since the open listing and the positions can lag
+    by a second: a buy still working is canceled, and one that filled with no position shown yet is
+    a problem by name, never a silent end (the second reader's P1)."""
+    paper_test = _paper_test()
+    monkeypatch.setattr(paper_test, "SYMBOL", "SPY")
+    monkeypatch.setattr(paper_test.time, "sleep", lambda _: None)
+    paper = Cancelable(positions=[], orders=[], no_shorting=True)
+    sent_id = f"{paper_test.PREFIX}0123456789abcdef0123-buy"
+    buy = _order("SPY", "1", sent_id, side="buy", type="market", order_type="market").model_copy(
+        update={"status": ends, "filled_qty": "1" if ends == "filled" else "0", "limit_price": None}
+    )
+    paper.found[sent_id] = buy
+    paper.unlisted = [buy]
+    monkeypatch.setattr(paper_test, "SENT", [sent_id])
+    problems: list[str] = []
+    paper_test._clean(paper, problems)
+    if ends == "accepted":
+        assert paper.canceled == [str(buy.id)], (paper.calls, problems)
+    else:
+        assert any("filled" in p and "no position" in p for p in problems), problems
+
+
+PROTECT_STOP = "canon-protect-20261112T150000Z-1-6168c4fe"
+OTHER_STOP = "canon-protect-20261112T150000Z-2-0a1b2c3d"
+
+
+class Cancelable(Paper):
+    """`Paper` with the two calls a cancel makes: the cancel by the order's ID and the order's own read.
+    A canceled order still shows in the open listing (Alpaca's listing lags a cancel by seconds), and
+    reads as canceled by its own ID after `lag` reads."""
+
+    def __init__(self, *, lag: int = 0, **kw: Any) -> None:
+        super().__init__(**kw)
+        self.lag = lag
+        self.canceled: list[str] = []
+        self.cancel_fails: BaseException | None = None
+        self.reads: dict[str, int] = {}
+        self.ends_as = "canceled"
+        self.filled: str | None = "0"
+        self.lands = True
+        """Whether a cancel that raises was taken by Alpaca all the same."""
+        self.unlisted: list[Order] = []
+        """Orders Alpaca holds that its open listing does not show yet."""
+        self.read_fails: BaseException | None = None
+
+    def cancel_order_by_id(self, order_id):
+        self.calls.append(("cancel_order_by_id", str(order_id)))
+        if self.cancel_fails is not None:
+            raise self.cancel_fails
+        self.canceled.append(str(order_id))
+
+    def get_order_by_id(self, order_id):
+        self.calls.append(("get_order_by_id", str(order_id)))
+        if self.read_fails is not None:
+            raise self.read_fails
+        order = next(o for o in (*self.orders, *self.unlisted) if str(o.id) == str(order_id))
+        seen = self.reads[str(order_id)] = self.reads.get(str(order_id), 0) + 1
+        gone = str(order_id) in self.canceled or (self.cancel_fails is not None and self.lands)
+        if gone and seen > self.lag:
+            return order.model_copy(update={"status": self.ends_as, "filled_qty": self.filled})
+        return order
+
+
+def _stop(symbol: str, qty: str, client_order_id: str) -> Order:
+    return _order(
+        symbol,
+        qty,
+        client_order_id,
+        type="trailing_stop",
+        order_type="trailing_stop",
+        limit_price=None,
+        time_in_force="gtc",
+    )
+
+
+def _cancel(paper: Paper, capsys, **kw: Any) -> tuple[int, list[str]]:
+    code = protect.cancel_task(cast(Any, paper), pause=lambda _seconds: None, **kw)
+    out = capsys.readouterr()
+    return code, (out.out + out.err).splitlines()
+
+
+def test_the_cancel_takes_every_open_protect_stop_and_nothing_else(capsys) -> None:
+    """One cancel for each open order of the protect lineage, read by its own ID until it has ended;
+    an order of our nodes, a foreign one and one with no ID are named and left; nothing is sent."""
+    ours, foreign = _order("CCC", "3", OUR_SELL, side="sell"), _order("DDD", "2", FOREIGN_SELL)
+    unnamed = _order("EEE", "1", "unused").model_copy(update={"client_order_id": None})
+    stops = [_stop("AAA", "10", PROTECT_STOP), _stop("BBB", "5", OTHER_STOP)]
+    paper = Cancelable(orders=[*stops, ours, foreign, unnamed], lag=2)
+    code, lines = _cancel(paper, capsys)
+    assert code == 0, lines
+    assert paper.canceled == [str(o.id) for o in stops] and paper.submitted == []
+    assert {name for name, _ in paper.calls} == {
+        "get_orders",
+        "cancel_order_by_id",
+        "get_order_by_id",
+    }
+    for symbol in ("AAA", "BBB"):
+        (line,) = [x for x in lines if x.startswith(f"canceled {symbol}:")]
+        assert "a protect stop of ours" in line and "canceled" in line
+        assert "never cancels" not in line
+    assert len([x for x in lines if x.startswith("left alone")]) == 3
+    assert not any(
+        str(o.id) in " ".join(lines) for o in (*stops, ours, foreign)
+    )  # no venue order ID
+
+
+def test_the_cancel_takes_one_symbols_stops_when_a_symbol_is_named(capsys) -> None:
+    stops = [_stop("AAA", "10", PROTECT_STOP), _stop("BBB", "5", OTHER_STOP)]
+    paper = Cancelable(orders=stops)
+    code, lines = _cancel(paper, capsys, symbol="BBB")
+    assert code == 0 and paper.canceled == [str(stops[1].id)]
+    assert [x for x in lines if x.startswith("left alone AAA:")]
+
+
+def test_plan_only_names_what_the_cancel_would_take_and_cancels_nothing(capsys) -> None:
+    paper = Cancelable(orders=[_stop("AAA", "10", PROTECT_STOP)])
+    code, lines = _cancel(paper, capsys, plan_only=True)
+    assert code == 0 and paper.canceled == []
+    assert "cancel_order_by_id" not in {name for name, _ in paper.calls}
+    assert [x for x in lines if x.startswith("would cancel AAA:")]
+    assert lines[-1] == "plan only: nothing was canceled"
+
+
+def test_no_protect_stop_open_is_said_and_is_no_failure(capsys) -> None:
+    paper = Cancelable(orders=[_order("DDD", "2", FOREIGN_SELL)])
+    code, lines = _cancel(paper, capsys)
+    assert code == 0 and paper.canceled == []
+    assert "the open listing showed no protect stop (2 reads)" in lines
+    assert len([c for c in paper.calls if c[0] == "get_orders"]) == 2  # one listing is no "none"
+
+
+@pytest.mark.parametrize(
+    ("change", "said", "code"),
+    [
+        (lambda p: setattr(p, "lag", 10_000), "still new after", 1),
+        (lambda p: setattr(p, "ends_as", "filled"), "ended filled", 1),
+        (
+            lambda p: (
+                setattr(p, "cancel_fails", requests.ConnectionError("down")),
+                setattr(p, "lands", False),
+            ),
+            "the cancel",
+            1,
+        ),
+    ],
+    ids=["never-ends", "elected-first", "cancel-fails"],
+)
+def test_a_cancel_that_does_not_end_the_stop_canceled_is_a_failure_by_name(
+    capsys, change, said, code
+) -> None:
+    """A stop still working after the wait, one that elected and filled before the cancel reached it,
+    and a cancel that could not be sent are each named; none is reported as canceled."""
+    paper = Cancelable(orders=[_stop("AAA", "10", PROTECT_STOP)])
+    change(paper)
+    got, lines = _cancel(paper, capsys)
+    assert got == code
+    (line,) = [x for x in lines if x.startswith("failed AAA:")]
+    assert said in line and not [x for x in lines if x.startswith("canceled AAA:")]
+    assert (
+        len([c for c in paper.calls if c[0] == "cancel_order_by_id"]) == 1
+    )  # one attempt, never again
+
+
+def test_a_stop_canceled_after_part_of_it_filled_is_a_failure_that_names_the_shares(capsys) -> None:
+    """A stop can elect and sell part of its shares before the cancel lands: Alpaca then shows it
+    canceled with a fill. That is no clean cancel; the shares sold are named and the run fails."""
+    paper = Cancelable(orders=[_stop("AAA", "10", PROTECT_STOP)])
+    paper.filled = "4"
+    code, lines = _cancel(paper, capsys)
+    assert code == 1
+    (line,) = [x for x in lines if x.startswith("failed AAA:")]
+    assert "4 of its 10 shares filled" in line and "before the cancel" in line
+    assert not [x for x in lines if x.startswith("canceled AAA:")]
+
+
+@pytest.mark.parametrize("status", [404, 422])
+def test_a_cancel_alpaca_refuses_lets_the_stops_own_read_decide(capsys, status) -> None:
+    """A stop already canceled, as when a second run follows the first inside the listing's lag,
+    answers the cancel with a refusal (422, "The order status is not cancelable"): the order's own
+    read decides, and one that shows it canceled unfilled is a cancel, not a failure. One the read
+    shows still working is a failure that names the answer."""
+    paper = Cancelable(orders=[_stop("AAA", "10", PROTECT_STOP)])
+    paper.cancel_fails = APIError('{"code": 42210000, "message": "stand-in"}', _status(status))
+    code, lines = _cancel(paper, capsys)
+    assert code == 0, lines
+    (line,) = [x for x in lines if x.startswith("canceled AAA:")]
+    assert f"the cancel was answered {status}" in line
+    paper = Cancelable(orders=[_stop("AAA", "10", PROTECT_STOP)], lag=10_000)
+    paper.cancel_fails = APIError('{"code": 42210000, "message": "stand-in"}', _status(status))
+    code, lines = _cancel(paper, capsys)
+    assert code == 1
+    (line,) = [x for x in lines if x.startswith("failed AAA:")]
+    assert f"answered {status}" in line and "still new" in line
+
+
+@pytest.mark.parametrize("stopped", [False, True], ids=["read-fails", "stop-signal"])
+def test_a_run_that_ends_inside_a_stops_cancel_names_that_stop_and_those_not_reached(
+    capsys, stopped
+) -> None:
+    """A read that fails after the cancel went out, or the task's stop signal there, ends the run:
+    the stop whose cancel is at Alpaca is named with its symbol, and so is each protect stop the
+    run did not reach."""
+    paper = Cancelable(orders=[_stop("AAA", "10", PROTECT_STOP), _stop("BBB", "5", OTHER_STOP)])
+    paper.read_fails = protect.Stopped() if stopped else requests.ConnectionError("down")
+    code, lines = _cancel(paper, capsys)
+    assert code == 1 and len(paper.canceled) == 1
+    (line,) = [x for x in lines if x.startswith("failed AAA:")]
+    assert "its cancel was sent" in line and "may yet show" in line
+    assert ("the task was stopped" in line) is stopped  # a signal during the read is still a stop
+    (rest,) = [x for x in lines if x.startswith("not reached BBB:")]
+    assert "a protect stop" in rest
+
+
+def test_a_stop_signal_during_a_cancel_names_the_stop_whose_cancel_may_be_at_alpaca(capsys) -> None:
+    paper = Cancelable(orders=[_stop("AAA", "10", PROTECT_STOP), _stop("BBB", "5", OTHER_STOP)])
+    paper.cancel_fails = protect.Stopped()
+    code, lines = _cancel(paper, capsys)
+    assert code == 1
+    (line,) = [x for x in lines if x.startswith("failed AAA:")]
+    assert "its cancel may be at Alpaca" in line and "may yet show" in line
+    assert [x for x in lines if x.startswith("not reached BBB:")]
+    assert len([c for c in paper.calls if c[0] == "cancel_order_by_id"]) == 1
+
+
+def test_a_cancel_whose_answer_was_lost_is_decided_by_the_stops_own_read(capsys) -> None:
+    """A read timeout on the cancel says nothing of whether Alpaca took it: the stop's own read
+    decides, as a lost answer to a send is looked up, and one that shows it canceled is a cancel."""
+    paper = Cancelable(orders=[_stop("AAA", "10", PROTECT_STOP)], lag=3)
+    paper.cancel_fails = requests.ReadTimeout("no answer")
+    code, lines = _cancel(paper, capsys)
+    assert code == 0, lines
+    (line,) = [x for x in lines if x.startswith("canceled AAA:")]
+    assert "the cancel's answer was lost (ReadTimeout)" in line
+
+
+def test_a_refused_cancel_of_a_stop_about_to_end_is_read_until_it_ends(capsys) -> None:
+    """A stop a broken-off run left pending its cancel refuses a second cancel and ends canceled a
+    read or two later: it is read as long as an accepted cancel's stop, not once."""
+    paper = Cancelable(orders=[_stop("AAA", "10", PROTECT_STOP)], lag=3)
+    paper.cancel_fails = APIError('{"code": 42210000, "message": "stand-in"}', _status(422))
+    code, lines = _cancel(paper, capsys)
+    assert code == 0, lines
+    assert [x for x in lines if x.startswith("canceled AAA:")]
+
+
+def test_a_failure_of_another_kind_inside_a_cancel_still_names_its_stop(capsys) -> None:
+    paper = Cancelable(orders=[_stop("AAA", "10", PROTECT_STOP), _stop("BBB", "5", OTHER_STOP)])
+    paper.cancel_fails = RuntimeError("not one of alpaca-py's")
+    code, lines = _cancel(paper, capsys)
+    assert code == 1
+    (line,) = [x for x in lines if x.startswith("failed AAA:")]
+    assert "its cancel may be at Alpaca" in line and "RuntimeError" in line
+    assert [x for x in lines if x.startswith("not reached BBB:")]
+
+
+@pytest.mark.parametrize("where", ["cancel", "read"])
+def test_a_keyboard_interrupt_inside_a_cancel_names_the_stop_first(capsys, where) -> None:
+    paper = Cancelable(orders=[_stop("AAA", "10", PROTECT_STOP), _stop("BBB", "5", OTHER_STOP)])
+    if where == "cancel":
+        paper.cancel_fails = KeyboardInterrupt()
+    else:
+        paper.read_fails = KeyboardInterrupt()
+    with pytest.raises(KeyboardInterrupt):
+        _cancel(paper, capsys)
+    out = capsys.readouterr()
+    said = (out.out + out.err).splitlines()
+    (line,) = [x for x in said if x.startswith("failed AAA:")]
+    assert "may yet show working" in line
+    assert [x for x in said if x.startswith("not reached BBB:")]
+
+
+@pytest.mark.parametrize("plan_only", [False, True])
+def test_a_named_symbol_with_no_protect_stop_is_said_and_is_not_a_success(
+    capsys, plan_only
+) -> None:
+    """A symbol typed wrong must not read as done: the line names it and the exit is 2."""
+    paper = Cancelable(orders=[_stop("AAA", "10", PROTECT_STOP)])
+    code, lines = _cancel(paper, capsys, symbol="ZZZ", plan_only=plan_only)
+    assert code == 2 and paper.canceled == []
+    assert "the open listing showed no protect stop in ZZZ (2 reads)" in lines
+
+
+def test_a_foreign_trailing_stop_sell_is_named_as_a_possible_replacement(capsys) -> None:
+    """A protect stop replaced outside this task carries an ID Alpaca or its maker chose and reads
+    as foreign: it is left alone, and its line says it may be such a replacement, which still
+    holds its shares. A foreign order of another kind gets no such line."""
+    replaced, other = _stop("AAA", "10", FOREIGN_SELL), _order("DDD", "2", str(uuid4()))
+    paper = Cancelable(orders=[replaced, other])
+    _code, lines = _cancel(paper, capsys)
+    assert paper.canceled == []
+    (line,) = [x for x in lines if x.startswith("left alone AAA:")]
+    assert "may be a protect stop replaced outside this task" in line
+    (line,) = [x for x in lines if x.startswith("left alone DDD:")]
+    assert "replaced" not in line
+
+
+def test_a_canceled_stop_whose_fill_count_is_not_shown_is_no_clean_cancel(capsys) -> None:
+    """What Alpaca does not show is not zero: a canceled stop with no filled quantity is a failure."""
+    paper = Cancelable(orders=[_stop("AAA", "10", PROTECT_STOP)])
+    paper.filled = None
+    code, lines = _cancel(paper, capsys)
+    assert code == 1
+    (line,) = [x for x in lines if x.startswith("failed AAA:")]
+    assert "no count of what filled" in line
+
+
+def test_a_full_page_of_open_orders_refuses_the_cancel(capsys) -> None:
+    paper = Cancelable(
+        orders=[_stop("AAA", "1", PROTECT_STOP)] * canon_alpaca.execution.ORDERS_PAGE_LIMIT
+    )
+    code, lines = _cancel(paper, capsys)
+    assert code == 3 and paper.canceled == []
+    assert "a protect stop may be missing from it" in " ".join(lines)
+
+
+@pytest.mark.parametrize(
+    ("flags", "code", "canceled", "sent"),
+    [
+        (("false", "", "true", ""), 0, 1, 0),
+        (("true", "", "true", ""), 0, 0, 0),
+        (("false", "F2", "true", ""), 3, 0, 0),
+        (("false", "", "maybe", ""), 3, 0, 0),
+        (("false", "", "true", "aaa"), 3, 0, 0),
+        (("false", "F2", "false", "AAA"), 3, 0, 0),
+    ],
+    ids=[
+        "cancel",
+        "cancel-plan-only",
+        "cancel-with-a-row",
+        "not-a-switch",
+        "bad-symbol",
+        "symbol-on-a-send",
+    ],
+)
+def test_the_tasks_flags_cancel_only_on_an_exact_true_and_never_with_a_row(
+    capsys, flags, code, canceled, sent
+) -> None:
+    paper = Cancelable(
+        positions=[_position("AAA", "10")], orders=[_stop("AAA", "10", PROTECT_STOP)]
+    )
+    got = protect.task_from_flags(
+        *flags, trading=cast(Any, paper), data=Data({"AAA": AAA_BOOK}), pause=lambda _s: None
+    )
+    assert got == code and len(paper.canceled) == canceled and len(paper.submitted) == sent
+    if code == 3:
+        assert paper.calls == []
+
+
+def test_the_task_hands_the_cancel_and_the_symbol_over() -> None:
+    task = _task()
+    assert 'flag "--cancel"' in task["usage"] and 'flag "--symbol <symbol>"' in task["usage"]
+    assert re.search(
+        r"task_from_flags\(\*sys\.argv\[1:5\]\)\)' "
+        r'"\$\{usage_plan_only:-false\}" "\$\{usage_row:-\}" "\$\{usage_cancel:-false\}" '
+        r'"\$\{usage_symbol:-\}"$',
+        task["run"],
+        re.MULTILINE,
+    )
+
+
+# The cancel unit's outside reader's three cases (its drop-ins, as written).
+
+
+@pytest.mark.parametrize(
+    "interrupted_type", [protect.Stopped, KeyboardInterrupt], ids=["sigterm", "ctrl-c"]
+)
+def test_a_lost_submit_answer_interrupted_during_lookup_names_the_stop(
+    capsys, monkeypatch, interrupted_type
+) -> None:
+    paper = Paper(positions=[_position("AAA", "10")])
+    original_submit = paper.submit_order
+    resting: list[Order] = []
+
+    def accepted_but_answer_lost(order_data):
+        order = original_submit(order_data)
+        resting.append(order)
+        paper.found[order_data.client_order_id] = order
+        raise requests.ReadTimeout("the accepted submit's answer was lost")
+
+    def interrupted_lookup(client_order_id):
+        paper.calls.append(("get_order_by_client_id", client_order_id))
+        assert client_order_id == resting[0].client_order_id
+        raise interrupted_type()
+
+    monkeypatch.setattr(paper, "submit_order", accepted_but_answer_lost)
+    monkeypatch.setattr(paper, "get_order_by_client_id", interrupted_lookup)
+    if interrupted_type is KeyboardInterrupt:
+        with pytest.raises(KeyboardInterrupt):
+            protect.protect_task(cast(Any, paper), Data({"AAA": AAA_BOOK}), row="OWN1")
+    else:
+        assert protect.protect_task(cast(Any, paper), Data({"AAA": AAA_BOOK}), row="OWN1") == 1
+
+    out = capsys.readouterr()
+    said = out.out + out.err
+    assert len(paper.submitted) == len(resting) == 1
+    assert custody._value(resting[0].status) == "new"
+    assert resting[0].client_order_id in said, said
+    assert "failed AAA:" in said and "may yet show" in said, said
+
+
+def test_cleanup_still_cancels_a_saved_buy_when_the_open_listing_fails(
+    monkeypatch,
+) -> None:
+    paper_test = _paper_test()
+    monkeypatch.setattr(paper_test, "SYMBOL", "SPY")
+    monkeypatch.setattr(paper_test.time, "sleep", lambda _seconds: None)
+    client_id = f"{paper_test.PREFIX}0123456789abcdef0123-buy"
+    buy = _order(
+        "SPY",
+        "1",
+        client_id,
+        side="buy",
+        type="market",
+        order_type="market",
+        limit_price=None,
+        status="accepted",
+        filled_qty="0",
+    )
+    paper = Cancelable(positions=[], orders=[], no_shorting=True)
+    paper.found[client_id] = buy
+    paper.unlisted = [buy]
+    monkeypatch.setattr(paper_test, "SENT", [client_id])
+    original_listing = paper.get_orders
+    listings = 0
+
+    def first_listing_fails(filter=None):
+        nonlocal listings
+        listings += 1
+        if listings == 1:
+            raise APIError('{"code": 50300000, "message": "temporary outage"}', _status(503))
+        return original_listing(filter)
+
+    monkeypatch.setattr(paper, "get_orders", first_listing_fails)
+    problems: list[str] = []
+    paper_test._clean(paper, problems)
+
+    assert ("get_order_by_client_id", client_id) in paper.calls
+    assert paper.canceled == [str(buy.id)], (paper.calls, problems)
+    assert paper.submitted == []
+
+
+@pytest.mark.parametrize("read_fails", [False, True], ids=["still-working", "read-fails"])
+def test_an_unresolved_cancel_keeps_the_partial_fill_it_already_read(
+    capsys, monkeypatch, read_fails
+) -> None:
+    stop = _stop("AAA", "10", PROTECT_STOP)
+    partial = stop.model_copy(update={"status": "partially_filled", "filled_qty": "4"})
+    paper = Cancelable(orders=[stop])
+    reads = 0
+    monkeypatch.setattr(protect, "CANCEL_READS", 2)
+
+    def read_after_cancel(order_id):
+        nonlocal reads
+        reads += 1
+        assert str(order_id) == str(stop.id)
+        if read_fails and reads == 2:
+            raise requests.ReadTimeout("the next order read had no answer")
+        return partial
+
+    monkeypatch.setattr(paper, "get_order_by_id", read_after_cancel)
+    code, lines = _cancel(paper, capsys)
+    said = "\n".join(lines)
+    assert code == 1 and paper.canceled == [str(stop.id)]
+    assert not any(line.startswith("canceled AAA:") for line in lines)
+    assert PROTECT_STOP in said
+    assert "4 of its 10 shares filled" in said, said
+
+
+# The cancel unit's second outside reader's case (its drop-in, as written).
+
+
+class Lagging(Cancelable):
+    """Alpaca's open listing has not shown a just-sent stop on its first read (the unit's own note:
+    the listing can lag an order by a second), and shows it on the next."""
+
+    def __init__(self, stop: Order) -> None:
+        super().__init__(orders=[])
+        self.stop = stop
+        self.unlisted = [stop]
+        self.listings = 0
+
+    def get_orders(self, filter: Any = None):
+        self.calls.append(("get_orders", filter))
+        self.listings += 1
+        return [] if self.listings == 1 else [self.stop]
+
+
+def test_a_stop_the_listing_has_not_shown_yet_is_not_reported_as_none(capsys) -> None:
+    stop = _stop("AAA", "10", PROTECT_STOP)
+    paper = Lagging(stop)
+    code, lines = _cancel(paper, capsys)
+    assert paper.canceled == [str(stop.id)], lines
+    assert code == 0 and [x for x in lines if x.startswith("canceled AAA:")], lines
+    assert not [x for x in lines if x.startswith("no protect stop open")], lines
+
+
+# The cancel unit's third outside reader's three cases on the send (its drop-ins, as written but for
+# one parameter's name, marked).
+
+
+@pytest.mark.parametrize("lookup", ["ctrl-c", "sigterm", "raw-dict", "submit-bug"])
+def test_a_broken_submit_or_lookup_after_a_send_still_names_the_stop_and_its_id(
+    capsys, lookup
+) -> None:
+    """Once `submit_order` is entered, an unexpected exception in `submit_order` or a
+    `KeyboardInterrupt`, `Stopped`, or `custody.ReadFailed` (non-`Order` answer) during `_look_up`
+    must still print `failed AAA:` with the stop's `client_order_id` and resting warning."""
+    paper = Paper(positions=[_position("AAA", "10"), _position("BBB", "5")])
+    if lookup == "submit-bug":
+        paper.submit_fails = RuntimeError("unexpected transport failure after send")
+    else:
+        paper.submit_fails = requests.ReadTimeout("read timed out")
+
+    def broken_lookup(client_id):  # the reader wrote `_client_id`; renamed for the type check
+        if lookup == "ctrl-c":
+            raise KeyboardInterrupt
+        if lookup == "sigterm":
+            raise protect.Stopped
+        return {"id": "raw-id", "status": "new"}
+
+    paper.get_order_by_client_id = broken_lookup  # type: ignore[method-assign]
+    if lookup == "ctrl-c":
+        with pytest.raises(KeyboardInterrupt):
+            protect.protect_task(
+                cast(Any, paper), Data({"AAA": AAA_BOOK, "BBB": BBB_BOOK}), row="OWN1"
+            )
+        lines = capsys.readouterr().out.splitlines()
+    else:
+        code, lines = _run(paper, Data({"AAA": AAA_BOOK, "BBB": BBB_BOOK}), capsys)
+        assert code == 1
+    sent_id = paper.submitted[0].client_order_id
+    (line,) = [x for x in lines if x.startswith("failed AAA:")]
+    assert sent_id in line and "may yet show it working" in line
+
+
+@pytest.mark.parametrize(
+    "status", ["suspended", "stopped", "done_for_day", "replaced", "calculated"]
+)
+def test_a_non_resting_open_sell_is_never_counted_as_working_cover(capsys, status) -> None:
+    """`RESTING` excludes open statuses that do not protect a long (`protect.py:199-203`), so
+    `_uncovered` must not count them as working cover: neither leaving a 10-share long 'left alone'
+    with exit 0 nor sending a 6-share stop that leaves 4 shares unprotected."""
+    full = Paper(
+        positions=[_position("AAA", "10")],
+        orders=[_stop("AAA", "10", PROTECT_STOP).model_copy(update={"status": status})],
+    )
+    code, lines = _run(full, Data({"AAA": AAA_BOOK}), capsys)
+    assert code == 2 and full.submitted == [], lines
+    assert [x for x in lines if x.startswith("unprotected AAA:")], lines
+    assert not [x for x in lines if x.startswith("left alone AAA:")], lines
+
+    partial = Paper(
+        positions=[_position("AAA", "10", available="10")],
+        orders=[_stop("AAA", "4", PROTECT_STOP).model_copy(update={"status": status})],
+    )
+    code, lines = _run(partial, Data({"AAA": AAA_BOOK}), capsys)
+    assert code == 2 and partial.submitted == [], (code, partial.submitted, lines)
+
+
+def test_an_open_sell_whose_fill_count_is_not_shown_is_not_counted_as_unfilled_cover(
+    capsys,
+) -> None:
+    """`Order.filled_qty` is optional (`alpaca/trading/models.py:283`), and what is not shown is
+    not zero (`custody._shown`). On a 12-share long where a 10-share sell already filled 4 shares
+    (`available='6'`) and lists `filled_qty=None`, `_remaining` must not assume 0 filled and send a
+    2-share stop that leaves 4 shares unprotected."""
+    paper = Paper(
+        positions=[_position("AAA", "12", available="6")],
+        orders=[
+            _order("AAA", "10", OUR_SELL, status="partially_filled").model_copy(
+                update={"filled_qty": None}
+            )
+        ],
+    )
+    code, lines = _run(paper, Data({"AAA": AAA_BOOK}), capsys)
+    assert code == 2 and paper.submitted == [], (code, paper.submitted, lines)
+    assert [x for x in lines if x.startswith("unprotected AAA:")], lines

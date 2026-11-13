@@ -2,7 +2,8 @@
 covers, on one paper account, then exit (`mise run paper:protect tests`, or `protect` for account C,
 ADR 0142). A run that sends names the registered row its distance is planned on (`--row`, `ROWS`); there
 is no default. `--plan-only` makes every read, names what each stop would be under every row, and sends
-nothing.
+nothing. `--cancel` cancels the open stops of the protect lineage, every one or one symbol's, and nothing
+else (`cancel_stops`): the way a stop that holds a long's shares is taken off before that long is sold.
 
 Contracts, read 2026-11-12:
 
@@ -75,7 +76,9 @@ ends it as a failure by name (`custody._stop`). Exit 0 when each long is covered
 failed or the run was stopped, 2 when a long is left uncovered by name, 3 when the run was refused by name.
 
 A stop that rests holds its shares: Alpaca refuses another sell of them until the stop is canceled, the
-holder's own included, and nothing here cancels a stop.
+holder's own included. `--cancel` (`cancel_stops`) cancels the open stops of the protect lineage, every one
+or one symbol's, once each, and nothing else: no order is sent, and every other open order is named and left.
+Only a stop that ended canceled with nothing filled counts as canceled; its exits are `cancel_task`'s.
 
 Not checked against Alpaca, so UNVERIFIED until a paper run: that Alpaca takes a `trail_price` with
 four decimals on a name under $1; how a GTC trailing stop elects at a later open (ADR 0129's gap); which
@@ -97,6 +100,7 @@ from decimal import ROUND_CEILING
 from decimal import ROUND_FLOOR
 from decimal import Decimal
 from time import monotonic
+from time import sleep
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from typing import Any
@@ -138,6 +142,7 @@ from .custody import _failure
 from .custody import _look_up
 from .custody import _read
 from .custody import _sending_once
+from .custody import _shown
 from .custody import _stop
 from .custody import _value
 from .custody import describe
@@ -149,7 +154,14 @@ from .price_step import tick
 if TYPE_CHECKING:
     from alpaca.trading.client import TradingClient
 
-__all__ = ["PROTECT_PREFIX", "ProtectReport", "protect_longs", "protect_task"]
+__all__ = [
+    "PROTECT_PREFIX",
+    "ProtectReport",
+    "cancel_stops",
+    "cancel_task",
+    "protect_longs",
+    "protect_task",
+]
 
 FEED = DataFeed.SIP
 """The quote and bars the distance is planned on: sip, the consolidated NBBO the spread floor is measured
@@ -191,6 +203,13 @@ SUMMABLE_CLASSES = ("simple", "")
 `oto`) shares them with its sibling, so the legs cannot be added up from a flat listing."""
 PENDING_OUT = ("pending_cancel", "pending_replace")
 """Statuses in which what a sell covers is about to change."""
+RESTING = frozenset({"new", "accepted", "pending_new", "accepted_for_bidding", "partially_filled"})
+"""The statuses in which a stop just sent counts as resting, of those Alpaca's order lifecycle lists
+(orders-at-alpaca, "Order Lifecycle"): received or routed and not yet ended. Any other answer is
+not shown to protect the long, a failure by name, never sent again: `suspended`, `stopped`,
+`done_for_day` and a pending cancel or replace are open and do not rest as a stop; `replaced` and
+`calculated` are not this stop working; and `held`, which alpaca-py's `OrderStatus` lists and Alpaca's
+page does not describe, is undecided until a paper answer shows it, so it fails rather than counts."""
 REFUSED = 3
 
 
@@ -233,11 +252,13 @@ class ProtectReport:
 
 
 def _remaining(order: Order) -> Decimal | None:
-    """What a working order has left to fill, or None when it names no share quantity."""
-    if order.qty in (None, ""):
+    """What a working order has left to fill, or None when it shows no share quantity or no count of
+    what filled: `Order.filled_qty` is optional (`alpaca/trading/models.py:283` at the pin), and what
+    is not shown is not zero (`custody._shown`)."""
+    qty, filled = _shown(order.qty), _shown(order.filled_qty)
+    if qty is None or filled is None:
         return None
-    filled = Decimal(str(order.filled_qty)) if order.filled_qty not in (None, "") else Decimal(0)
-    return Decimal(str(order.qty)) - filled
+    return qty - filled
 
 
 @dataclass
@@ -321,17 +342,18 @@ class Book:
 def read_book(data: Any, symbol: str, now: datetime) -> Book:
     """`symbol`'s latest quote and its ATR warmed on the complete minute bars of the last `ATR_LOOKBACK`:
     `ValueError` or `TypeError` naming why there is none."""
-    read_at = monotonic()
+    asked = monotonic()
     found = data.get_stock_latest_quote(
         StockLatestQuoteRequest(symbol_or_symbols=symbol, feed=FEED)
     )
+    read_at = monotonic()
     quote = found.get(symbol) if isinstance(found, dict) else None
     if quote is None:
         raise ValueError(f"no latest {FEED.value} quote")
     stamped = getattr(quote, "timestamp", None)
     if not isinstance(stamped, datetime):
         raise ValueError(f"the latest {FEED.value} quote carries no time")  # noqa: TRY004 - named
-    age = now - stamped.astimezone(UTC)
+    age = now + timedelta(seconds=read_at - asked) - stamped.astimezone(UTC)
     if age > QUOTE_MOST:
         raise ValueError(
             f"the latest {FEED.value} quote is {age.total_seconds():.0f} s old, over the "
@@ -517,7 +539,7 @@ class _Protect:
             left = _remaining(order)
             why = ""
             if left is None:
-                why = "names no share quantity, so what it covers is not known"
+                why = "shows no share quantity or no fill count, so what it covers is not known"
             elif (_value(order.order_class) or "") not in SUMMABLE_CLASSES:
                 why = (
                     f"is part of a {_value(order.order_class)} order, whose legs hold the same shares "
@@ -525,6 +547,11 @@ class _Protect:
                 )
             elif _value(order.status) in PENDING_OUT:
                 why = f"is {_value(order.status)}, so what it covers is about to change; run again"
+            elif _value(order.status) not in RESTING:
+                why = (
+                    f"is {_value(order.status)}, which is not a sell that rests, so what it covers "
+                    "is not established"
+                )
             if why:
                 report.note(
                     report.unprotected,
@@ -656,6 +683,10 @@ class _Protect:
                 f"{QUOTE_MOST.total_seconds():.0f} s a spread floor is taken from; run again",
             )
             return
+        for _request, _distance, plan in planned.values():
+            plan.quote_age = (
+                aged  # the age a line prints is the one just checked, not the first read's
+            )
 
         def what(distance: Decimal, plan: Distance) -> str:
             return (
@@ -680,26 +711,34 @@ class _Protect:
         try:
             with _sending_once(self.trading):
                 order = counted(self.trading.submit_order)(request)
-        except Stopped:
+        except Stopped, KeyboardInterrupt:
             report.note(
                 report.failed,
                 f"failed {symbol}: {said}: the run was stopped during the send; Alpaca may yet show "
                 "it working (mise run paper:account)",
             )
             raise
-        except session_window.FAILED as e:
+        except Exception as e:  # noqa: BLE001 - every kind ends in the look-up by the stop's own ID
+            # alpaca-py's own failures (`session_window.FAILED`) and any other kind alike: unless
+            # Alpaca refused it or nothing was sent, the stop may rest, so it is looked up and named
             is_refusal = isinstance(e, APIError) and e.status_code in DEFINITIVE_SUBMIT_REFUSALS
             if is_refusal or not_sent(e):
                 report.note(report.failed, f"failed {symbol}: {said}: not placed: {_failure(e)}")
                 return
             try:
                 found = _look_up(self.trading, client_order_id)
-            except session_window.FAILED as looked:
+            except (Exception, KeyboardInterrupt) as looked:
+                # whatever ends the look-up, the task's stop signal and Ctrl-C included, the stop
+                # that may rest at Alpaca is named first
+                stopped = isinstance(looked, (Stopped, KeyboardInterrupt))
+                how = "was stopped" if stopped else f"failed ({_failure(looked)})"
                 report.note(
                     report.failed,
                     f"failed {symbol}: {said}: no answer ({_failure(e)}), and the look-up by its ID "
-                    f"failed ({_failure(looked)}); Alpaca may yet show it working",
+                    f"{how}; Alpaca may yet show it working (mise run paper:account)",
                 )
+                if stopped:
+                    raise
                 return
             if found is None:
                 report.note(
@@ -715,17 +754,39 @@ class _Protect:
                     f"{_value(found.status)}; the long has no stop",
                 )
                 return
+            if _value(found.status) not in RESTING:
+                report.note(
+                    report.failed,
+                    f"failed {symbol}: {said}: no answer ({_failure(e)}), found by its ID as "
+                    f"{_value(found.status)}, which is not a stop that rests; it is not sent again "
+                    "(mise run paper:account)",
+                )
+                return
             report.note(
                 report.sent,
                 f"sent {symbol}: {said}: no answer ({_failure(e)}), found by its ID: "
                 f"{_value(found.status)}",
             )
             return
-        answered = _value(getattr(order, "status", None))
+        if not isinstance(order, Order):
+            report.note(
+                report.failed,
+                f"failed {symbol}: {said}: the submit answered a {type(order).__name__}, not an Order, "
+                "so no stop is shown; Alpaca may yet show it working (mise run paper:account)",
+            )
+            return
+        answered = _value(order.status)
         if answered in session_window.TERMINAL:
             report.note(
                 report.failed,
                 f"failed {symbol}: {said}: answered {answered}; the long has no stop",
+            )
+            return
+        if answered not in RESTING:
+            report.note(
+                report.failed,
+                f"failed {symbol}: {said}: answered {answered}, which is not a stop that rests; it "
+                "is not sent again (mise run paper:account)",
             )
             return
         report.note(report.sent, f"sent {symbol}: {said}: answered {answered}")
@@ -754,20 +815,271 @@ def _say(line: str) -> None:
     print(line, flush=True)
 
 
-def task_from_flags(
-    plan_only: str, row: str, trading: TradingClient | None = None, data: Any = None
-) -> int:
-    """`paper:protect`'s two flags as the task hands them over, as text: plan-only is exactly `true` or
-    `false` (mise gives a passed switch `true`, and the task gives `false` for one not passed), and
-    anything else is refused by name with nothing read, so a value not known here never becomes a send.
-    The row is a registered name, or empty for none."""
-    if plan_only not in ("true", "false"):
-        print(
-            f"refused: plan-only reads {plan_only!r}, which is neither true nor false; nothing was "
-            "read or sent",
-            file=sys.stderr,
+NO_SUCH_STOP = 2
+"""The cancel's exit when a symbol was named and no protect stop is open in it: not a success, since a
+symbol typed wrong would otherwise read as done."""
+LISTINGS = 2
+"""How often the cancel reads the open listing, a second apart, before it says the listing showed no
+protect stop: a stop sent a moment before may not be listed on the first read. One the listing shows on
+neither read is not canceled, and the line says what the listing showed, not that none is open."""
+CANCEL_READS = 20
+"""The most reads, one a second, of a stop after its cancel until it has ended: Alpaca's open-orders
+listing lags a cancel by seconds (seen on paper, 2026-11-13), so each stop is read by its own ID."""
+
+
+class _Ended(Exception):
+    """The run ended inside one stop's cancel, and that stop's line is already said."""
+
+
+def _named(order: Order) -> str:
+    """An order by name for a line of the cancel: a protect stop without the close-only form's words,
+    since this form does cancel one."""
+    return describe(order, never_canceled=False)
+
+
+def _part_filled(order: Order) -> str:
+    """What the last read of a stop showed filled, for a line that cannot say how it ended: a fill
+    already seen is said, never dropped."""
+    filled = _shown(order.filled_qty)
+    return f"; {filled} of its {order.qty} shares filled at its last read" if filled else ""
+
+
+def _cancel_one(
+    trading: TradingClient, order: Order, report: ProtectReport, pause: Callable[[float], None]
+) -> None:
+    """One protect stop's cancel and its end, by name. The cancel goes out once. Alpaca answers 204
+    when it takes it and 422 when "the order status is not cancelable" (Delete Order by ID). Whatever
+    the answer, a refusal or a lost one included, the stop's own read decides, until it has ended and
+    `CANCEL_READS` at most; only a connect timeout, which proves nothing was sent (`not_sent`), is a
+    failure with no read. A stop that ended canceled with nothing filled is canceled; one that ended
+    canceled with shares filled, or ended another way, or is still working after the reads, is a
+    failure that says so. Whatever ends the run inside this cancel (a failure of any kind, a failed
+    read, the task's stop signal, Ctrl-C) is raised with the stop named first (`_Ended`; Ctrl-C as
+    itself)."""
+    named = order.symbol or "?"
+    answered = ""
+    try:
+        with _sending_once(trading):
+            counted(trading.cancel_order_by_id)(order.id)
+    except APIError as e:
+        answered = f"the cancel was answered {e.status_code}"
+    except (Exception, KeyboardInterrupt) as e:
+        stopped = isinstance(e, (Stopped, KeyboardInterrupt))
+        if not stopped and isinstance(e, session_window.FAILED):
+            if not_sent(e):
+                report.note(
+                    report.failed,
+                    f"failed {named}: the cancel of {_named(order)} was not sent: {_failure(e)}; "
+                    "it is still working (mise run paper:account)",
+                )
+                return
+            answered = f"the cancel's answer was lost ({_failure(e)})"
+        else:
+            why = "the run was stopped during" if stopped else f"{_failure(e)} inside"
+            report.note(
+                report.failed,
+                f"failed {named}: {why} the cancel of {_named(order)}; its cancel may be at "
+                "Alpaca, and it may yet show working (mise run paper:account)",
+            )
+            if isinstance(e, KeyboardInterrupt):
+                raise
+            raise _Ended from e
+    said = f" ({answered})" if answered else ""
+    found = order
+    try:
+        for read in range(CANCEL_READS):
+            found = _read(
+                "the stop's own read",
+                lambda order_id=order.id: trading.get_order_by_id(order_id),
+                Order,
+            )
+            if _value(found.status) in session_window.TERMINAL:
+                break
+            if read < CANCEL_READS - 1:
+                pause(1)
+    except (Exception, KeyboardInterrupt) as e:  # the stop in flight is named before the run ends
+        # `_read` wraps what its call raised, the task's stop signal among them
+        stopped = isinstance(e, (Stopped, KeyboardInterrupt)) or isinstance(e.__cause__, Stopped)
+        why = "the task was stopped" if stopped else _failure(e)
+        report.note(
+            report.failed,
+            f"failed {named}: {_named(order)}: its cancel was sent{said} and its end was not "
+            f"read: {why}{_part_filled(found)}; it may yet show working (mise run paper:account)",
         )
-        return REFUSED
+        if isinstance(e, KeyboardInterrupt):
+            raise
+        raise _Ended from e
+    status = _value(found.status)
+    filled = _shown(found.filled_qty)
+    if status == "canceled" and filled == 0:
+        report.note(report.sent, f"canceled {named}: {_named(found)}{said}")
+    elif status == "canceled" and filled is None:
+        report.note(
+            report.failed,
+            f"failed {named}: {_named(found)}{said}: Alpaca shows no count of what filled before "
+            "the cancel ended it, so a clean cancel is not established (mise run paper:account)",
+        )
+    elif status == "canceled":
+        report.note(
+            report.failed,
+            f"failed {named}: {_named(found)}: {filled} of its {found.qty} shares filled before the "
+            f"cancel ended it{said}; the holding changed (mise run paper:account)",
+        )
+    elif status in session_window.TERMINAL:
+        report.note(
+            report.failed,
+            f"failed {named}: {_named(order)} ended {status} before the cancel reached "
+            f"it{said}; nothing was canceled, and the holding may have changed "
+            "(mise run paper:account)",
+        )
+    else:
+        report.note(
+            report.failed,
+            f"failed {named}: {_named(order)} is still {status} after {CANCEL_READS} reads{said}"
+            f"{_part_filled(found)}; the cancel was sent once and is not sent again "
+            "(mise run paper:account)",
+        )
+
+
+def cancel_stops(
+    trading: TradingClient,
+    say: Callable[[str], None] | None = None,
+    symbol: str | None = None,
+    plan_only: bool = False,
+    pause: Callable[[float], None] = sleep,
+) -> ProtectReport:
+    """Cancel every open order of the protect lineage (`custody.PROTECT`), in `symbol` alone when one is
+    named, and nothing else: one cancel each with alpaca-py's retries off (`cancel_order_by_id`,
+    `alpaca/trading/client.py:217` at the pin), then the order's own read (`_cancel_one`). A stop that
+    ended canceled unfilled is `sent`'s counterpart here, `left_alone` holds every order that is not a
+    protect stop or not in the symbol, and `failed` every other end, each by name. A run that ends
+    inside one stop's cancel, Ctrl-C included, names that stop and each protect stop it did not reach.
+    A foreign trailing-stop sell is left alone like any foreign order, and its line says it may be a
+    protect stop replaced outside this task (that a replacement carries an ID this task did not
+    write is UNVERIFIED: no replace was run). It
+    sends no order of any kind and asks for no session; that Alpaca takes a trailing stop's cancel
+    outside the regular session is not shown, UNVERIFIED. `plan_only` names what it would cancel and
+    cancels nothing."""
+    report = ProtectReport(say=say)
+    stops: list[Order] = []
+    try:
+        orders: list[Order] = []
+        for listing in range(LISTINGS):
+            orders = open_orders(trading)
+            if len(orders) >= ORDERS_PAGE_LIMIT:
+                report.refused = (
+                    f"{len(orders)} open orders, the most one listing returns, so a protect stop "
+                    "may be missing from it; nothing was canceled"
+                )
+                return report
+            stops = [
+                order
+                for order in orders
+                if lineage(order.client_order_id) == PROTECT
+                and (not symbol or order.symbol == symbol)
+            ]
+            if stops or listing == LISTINGS - 1:
+                break
+            pause(1)  # a stop sent a moment ago may not be listed yet: one listing is no "none"
+        for order in orders:
+            named = order.symbol or "?"
+            found = lineage(order.client_order_id)
+            if found == PROTECT and (not symbol or order.symbol == symbol):
+                continue
+            line = f"left alone {named}: {_named(order)}"
+            kind = _value(order.type or order.order_type)
+            outside = found not in (OURS, PROTECT)
+            if outside and kind == "trailing_stop" and _value(order.side) == "sell":
+                line += (
+                    "; it may be a protect stop replaced outside this task, which still holds "
+                    "its shares and is its maker's to cancel"
+                )
+            report.note(report.left_alone, line)
+        while stops:
+            order = stops.pop(0)
+            if plan_only:
+                report.note(report.planned, f"would cancel {order.symbol or '?'}: {_named(order)}")
+            else:
+                _cancel_one(trading, order, report, pause)
+    except (Exception, KeyboardInterrupt) as e:  # named, with what was canceled before it
+        if not isinstance(e, (_Ended, KeyboardInterrupt)):
+            report.note(report.failed, f"failed part way: {_failure(e)}; nothing more was canceled")
+        for order in stops:
+            report.note(
+                report.failed,
+                f"not reached {order.symbol or '?'}: {_named(order)}; no cancel was sent for it",
+            )
+        if isinstance(e, KeyboardInterrupt):
+            raise
+    return report
+
+
+def cancel_task(
+    trading: TradingClient | None = None,
+    symbol: str | None = None,
+    plan_only: bool = False,
+    pause: Callable[[float], None] = sleep,
+) -> int:
+    """`mise run paper:protect <account> --cancel`: run `cancel_stops`, printing each line as it
+    happens. Exit 0 when every protect stop named ended canceled with nothing filled (or none was open
+    and no symbol was named), 1 when a cancel or a read failed or a stop did not end so, 2 when a symbol
+    was named and no protect stop is open in it (`NO_SUCH_STOP`), 3 when the run was refused by name."""
+    before = signal.signal(signal.SIGTERM, _stop)
+    try:
+        try:
+            trading = trading or session_window.paper_trading()
+        except Exception as e:  # noqa: BLE001 - named, and nothing was read or canceled
+            print(
+                f"paper:protect: no paper client: {_failure(e)}; nothing was canceled",
+                file=sys.stderr,
+            )
+            return 1
+        report = cancel_stops(trading, _say, symbol, plan_only, pause)
+    finally:
+        signal.signal(signal.SIGTERM, before)
+    if report.refused:
+        print(f"refused: {report.refused}", file=sys.stderr)
+        return report.exit_code
+    nothing = not (report.sent or report.planned or report.failed)
+    if nothing and symbol:
+        _say(f"the open listing showed no protect stop in {symbol} ({LISTINGS} reads)")
+    elif nothing:
+        _say(f"the open listing showed no protect stop ({LISTINGS} reads)")
+    if plan_only:
+        _say("plan only: nothing was canceled")
+    return NO_SUCH_STOP if nothing and symbol else report.exit_code
+
+
+def _refuse(why: str) -> int:
+    print(f"refused: {why}; nothing was read or sent", file=sys.stderr)
+    return REFUSED
+
+
+def task_from_flags(
+    plan_only: str,
+    row: str,
+    cancel: str = "false",
+    symbol: str = "",
+    trading: TradingClient | None = None,
+    data: Any = None,
+    pause: Callable[[float], None] = sleep,
+) -> int:
+    """`paper:protect`'s flags as the task hands them over, as text: plan-only and cancel are each
+    exactly `true` or `false` (mise gives a passed switch `true`, and the task gives `false` for one not
+    passed), and anything else is refused by name with nothing read, so a value not known here never
+    becomes a send or a cancel. The row is a registered name, or empty for none. A cancel takes no row,
+    and only a cancel takes a symbol, which is plain capital letters."""
+    for name, value in (("plan-only", plan_only), ("cancel", cancel)):
+        if value not in ("true", "false"):
+            return _refuse(f"{name} reads {value!r}, which is neither true nor false")
+    if symbol and not (symbol.isascii() and symbol.isalpha() and symbol.isupper()):
+        return _refuse(f"the symbol {symbol!r} is not plain capital letters")
+    if cancel == "true":
+        if row:
+            return _refuse(f"a cancel takes no row, and {row!r} was named")
+        return cancel_task(trading, symbol or None, plan_only == "true", pause)
+    if symbol:
+        return _refuse("a symbol is named only with --cancel; a send covers every long it finds")
     return protect_task(trading, data, plan_only == "true", row or None)
 
 
@@ -780,7 +1092,8 @@ def protect_task(
     """`mise run paper:protect tests`: run `protect_longs`, printing each line as it happens; the exit
     code is the report's (module header): a read that fails, or anything else part way, is named and
     exits 1. SIGTERM, which the task's `timeout` sends before its KILL, ends the run the same way, as
-    `custody.close_task` handles it; Ctrl-C ends it at once, with every line so far already printed."""
+    `custody.close_task` handles it; Ctrl-C ends it at once, with every line so far already printed,
+    a stop whose send it broke off among them."""
     before = signal.signal(signal.SIGTERM, _stop)
     try:
         try:

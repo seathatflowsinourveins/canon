@@ -39,9 +39,10 @@ pair's storage, checks and GET-only read stand as that record has them.
 | The task | `mise run paper:protect protect` reads C's pair under C's own lock (`canon-paper-protect.lock`); `tests` is account A; `windows` is refused by name. |
 | What it sends | For each long no working sell covers, one trailing stop Alpaca holds: `GTC`, whole shares, marked `sell_to_close`, under a client order ID of the protect lineage. Nothing else: no other sell, no buy, no cancel, no replace. |
 | The distance | One of the Mover's registered trail rows, by name (`--row`; `session_window.TRAIL_ARMS`: F2, OWN1, OWN3), never under the spread floor or Alpaca's smallest trail. A send that names no row is refused: there is no default. |
+| The cancel | `--cancel` cancels each open order of the protect lineage, in one symbol with `--symbol`, once, and reads it by its own ID until it has ended, twenty reads a second apart at most, whatever the cancel's answer: a refusal or a lost answer is decided by those reads, and only a connect timeout, which proves nothing was sent, is a failure with no read. It asks for no session. It sends no order, takes no row, and leaves every other order named and untouched. Only a stop that ended canceled with nothing filled counts as canceled: one that elected first, one canceled after part of it filled, and one still working after the reads are each a failure by name. A run that ends inside one stop's cancel, Ctrl-C included, names that stop and each it did not reach. The stops it cancels are those Alpaca's open-orders listing shows; when a listing shows none it is read once more a second later, and the line then says what the listing showed, not that none is open: a stop the listing shows on neither read is not canceled. A symbol named with no protect stop in the listing exits 2. A foreign trailing-stop sell is left alone, and its line says it may be a protect stop replaced outside the task. |
 | Plan-only | `--plan-only` makes every read of a sending run and prints, for each long, what the stop would be under every row: the distance as a share of the price, about where it would open, and what bound it. It sends nothing. |
 | What is left alone | A short; a long any working sell covers in full; a long covered in part by an order that is not ours; a sell whose cover cannot be summed. Each is named. |
-| Procedure, not code | An account's first run is plan-only and its lines are read before the run that sends. A run on C is from `main` only and needs the lead's go, naming the account and the row, read in the step that starts it. |
+| Procedure, not code | An account's first run is plan-only and its lines are read before the run that sends. A run on C is from `main` only and needs the lead's go, read in the step that starts it: naming the account and the row for a run that sends, and the account for one that cancels, which takes no row. |
 
 The task does not rest on the account's long-only setting; it reads it and says it. That a stop never
 opens or adds to a short rests on the holding and Alpaca's count of the shares no order holds
@@ -54,15 +55,18 @@ for and is not what this rests on.
 * Good: the owner sees every row's distance on the holding before anything rests on it.
 * Good: nothing of C's configuration is read as a guarantee or changed.
 * Bad: a stop that rests holds its shares, so Alpaca refuses the holder's own sell of that long until the
-  stop is canceled, and no task here cancels one yet: the owner does, in Alpaca's own screen. The stop is
-  `GTC`, so it stays after the day and can elect in a later regular session.
+  stop is canceled: `paper:protect <account> --cancel` cancels the open stops of the protect lineage,
+  every one or one symbol's, and nothing else, and the owner can cancel one in Alpaca's own screen. The
+  stop is `GTC`, so it stays after the day and can elect in a later regular session.
 * Bad: a trailing stop elects on a trade print at or under its level and then sells at the market.
 * Open: the ATR rows (OWN1, OWN3) were built for a fresh momentum entry and are one and three ATRs of
   one-minute bars; F2 is a fixed 2%. No registered row is calibrated for a standing holding; every one is
   UNCALIBRATED. A row for a holding of days closes this, with its evidence.
 * Not shown, each UNVERIFIED: what Alpaca does with a marked trailing stop for more shares than are held
   where shorting is allowed; how a `GTC` trailing stop elects at a later open, and that it still holds
-  its shares then (ADR 0129's gap); which price Alpaca measures its smallest trail against.
+  its shares then (ADR 0129's gap); which price Alpaca measures its smallest trail against; that Alpaca
+  takes a trailing stop's cancel outside the regular session, and what it answers to a second cancel of
+  a stop pending its first.
 * The ATR rows carry the cap arm `own`, which the Mover lets stand only for an entry it sizes. This task
   sizes nothing, so a distance over the 2% cap under those rows is refused by name and the long gets no
   stop under that row.
@@ -103,6 +107,9 @@ Read 2026-11-13.
 * https://docs.alpaca.markets/us/reference/getallopenpositions.md — `qty_available`: "Total number of
   shares available minus open orders / locked for options covered call" — fetched (a copy saved this
   day, and the page again by this record's second reader, with the same words).
+* https://docs.alpaca.markets/us/reference/deleteorderbyorderid-1.md — "Attempts to cancel an Open Order.
+  If the order is no longer cancelable, the request will be rejected with status 422; otherwise accepted
+  with return status 204"; the page lists those two answers and no other — fetched.
 * alpaca-py at `c42add7c0a7026e2ead3ed64e76f4def2b99fda4` — `OrderRequest.position_intent`
   (`alpaca/trading/requests.py:388`), inherited by `TrailingStopOrderRequest` (`:624`);
   `PositionIntent.SELL_TO_CLOSE` (`alpaca/trading/enums.py:590-598`) — resolved.
