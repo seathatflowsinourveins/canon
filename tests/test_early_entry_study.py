@@ -942,3 +942,23 @@ def test_the_later_read_verifies_the_freezes_hashes_and_refuses_a_mismatch(
     git(repo, "add", "canon/freeze1.json")
     git(repo, "commit", "-q", "-m", "a file the glob would match")
     assert study.verify_freeze(globbed)
+
+
+def test_a_trail_over_the_whole_price_leaves_no_planned_stop_above_nothing() -> None:
+    # own-3 at 1.22 of ATR on a 2.02 close is a 1.81 fraction: both factors of the plan go
+    # negative, and their product must not come back as a stop above the entry
+    assert study.planned_stop(2.02, trail=1.8119, exit_through=1.8119 / 4, chase_cap=1.8119) == 0.0
+
+
+def test_a_gap_under_a_trail_over_the_whole_price_sells_at_the_open() -> None:
+    # a 1.20 trail with a 0.30 limit give and a 1.20 chase: the trigger reaches 0.10, and the next
+    # bar opens under it at 0.09, so the floor is nothing and the gap sells at the open bid
+    walk = (
+        study.Minute(571, 2.00, 2.50, 2.00, 2.40, 100),
+        study.Minute(572, 0.09, 0.09, 0.08, 0.08, 100),
+    )
+    sold = study.protect(
+        walk, 2.00, 2.00, study.GROSS, trail=1.20, exit_through=0.30, chase_cap=1.20
+    )
+    assert sold is not None
+    assert (sold.why, sold.price) == ("gap", 0.09)
