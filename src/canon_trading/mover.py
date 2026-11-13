@@ -3805,16 +3805,23 @@ class Mover(Strategy):
         return total - self.sent[0][1]
 
     # The adapter increments its count in a worker thread (execution.py:_call, providers.py:sent).
-    # Reserve each venue command here until the next step samples it. Never add a second adapter
-    # read to these reserves: a command already counted by the transport would be counted twice.
+    # Reserve each venue command here for the rest of the step; the next step samples the adapter
+    # anew. Never add a second adapter read to these reserves: a command already counted by the
+    # transport would be counted twice. Limit: a command still queued in that thread when the next
+    # step samples is in neither count until it is sent; the soft line's margin under Alpaca's
+    # limit is what absorbs it.
     # rc8 Strategy signatures: trading/__init__.pyi:538-544, :571-576, :613-618; routing to the local
     # emulator instead of execution: crates/trading/src/strategy/mod.rs:646-655, :2436-2442.
     def submit_order(
         self, order: Any, position_id: Any = None, client_id: Any = None, params: dict | None = None
     ) -> None:
-        if order.emulation_trigger is None:
-            self.recent += 1
+        emulated = order.emulation_trigger is not None
         super().submit_order(order, position_id, client_id, params)
+        # An emulated order the bid or print is already through is matched as it is submitted and
+        # released to the venue at once (emulator.rs:679-699 at the pin): a venue request too.
+        released = self._order(order.client_order_id) if emulated else None
+        if not emulated or (released is not None and not released.is_emulated):
+            self.recent += 1
 
     def cancel_order(
         self, client_order_id: ClientOrderId, client_id: Any = None, params: dict | None = None

@@ -9,6 +9,7 @@ from typing import Any
 
 import pytest
 from nautilus_trader.model import OrderSide
+from nautilus_trader.model import TriggerType
 
 from canon_trading import mover
 from tests.test_mover import AAA
@@ -65,7 +66,7 @@ def test_each_buy_counts_before_the_next_candidate_without_double_counting(
         eng.dispose()
 
 
-@pytest.mark.parametrize("exit_command", ["limit sell", "chase cancel"])
+@pytest.mark.parametrize("exit_command", ["limit sell", "chase cancel", "released stop"])
 def test_manage_exit_traffic_reaches_the_soft_line_before_a_buy(
     monkeypatch: pytest.MonkeyPatch, exit_command: str
 ) -> None:
@@ -90,17 +91,37 @@ def test_manage_exit_traffic_reaches_the_soft_line_before_a_buy(
             candidate = s.slots.get(BBB)
             if candidate is not None and candidate.run_ns is not None and target_ns is None:
                 target_ns = now
-                slot.exiting = True
-                slot.floor_released = True  # the sale is free to chase the current bid
+                if exit_command == "released stop":
+                    # An emulated stop whose trigger the bid is already through: the emulator
+                    # matches it as it is submitted and releases it to the venue at once
+                    # (emulator.rs:679-699 at the pin), so the submit is a venue request.
+                    instrument = s.cache.instrument(AAA)
+                    quote = s.cache.quote(AAA)
+                    assert instrument is not None and quote is not None
+                    above = quote.bid_price.as_decimal() + Decimal("0.5")
+                    stop = s.order_factory.stop_limit(
+                        AAA,
+                        OrderSide.SELL,
+                        instrument.make_qty(s._held(slot)),
+                        instrument.make_price(above - Decimal(1)),
+                        instrument.make_price(above),
+                        trigger_type=TriggerType.BID_ASK,
+                        emulation_trigger=TriggerType.BID_ASK,
+                    )
+                    s.submit_order(stop)
+                    released = s.cache.order(stop.client_order_id)
+                    assert released is not None and not released.is_emulated
+                else:
+                    slot.exiting = True
+                    slot.floor_released = True  # the sale is free to chase the current bid
             elif exit_command == "chase cancel" and slot.protect_id is None:
                 # Leave a real limit resting well above the quote, ready for _manage to chase.
                 s._limit_sell(slot, s._held(slot), now, Decimal(20))
         manage(slot, now)
 
     def submitted(order: Any, position_id=None, client_id=None, params=None) -> None:
-        sent.append(
-            ("buy" if order.side == OrderSide.BUY else "limit sell", s.clock.timestamp_ns())
-        )
+        kind = "released stop" if order.emulation_trigger is not None else "limit sell"
+        sent.append(("buy" if order.side == OrderSide.BUY else kind, s.clock.timestamp_ns()))
         submit(order, position_id, client_id, params)
 
     def canceled(client_order_id, client_id=None, params=None) -> None:

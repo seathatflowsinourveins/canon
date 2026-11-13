@@ -1,21 +1,14 @@
-"""Blind reproductions of Antigravity #337 claims 1 and 2 at edec08cd.
+"""Blind reproduction of Antigravity #337 claim 1 (P1-1) at edec08cd.
 
-C1 uses test_mover's offline BacktestEngine and its requests_sent monkeypatch seam.
-C2 delivers complete bars to Mover.on_bar and checks the public ReentryState;
-the trade-date contract is trail.profile_session_date (20:00 New York).
+It uses test_mover's offline BacktestEngine and its requests_sent monkeypatch seam. Claim 2's
+cases go with its own fix (P1-2).
 """
 
-from collections import deque
-from datetime import datetime
-from decimal import Decimal
 from typing import Any
 
 import pytest
-from nautilus_trader.model import Bar
 from nautilus_trader.model import InstrumentId
 from nautilus_trader.model import OrderSide
-from nautilus_trader.model import Price
-from nautilus_trader.model import Quantity
 
 from canon_trading import mover
 from tests.test_mover import AAA
@@ -24,8 +17,6 @@ from tests.test_mover import MINUTE
 from tests.test_mover import RISING
 from tests.test_mover import SECOND
 from tests.test_mover import T0
-from tests.test_mover import Recording
-from tests.test_mover import bar_type
 from tests.test_mover import engine
 from tests.test_mover import rank
 from tests.test_mover import ranker
@@ -84,32 +75,3 @@ def test_entries_stop_when_this_steps_first_buy_reaches_the_soft_line(
         assert all(recent < s.settings.soft_line for _, _, recent in buys), buys
     finally:
         eng.dispose()
-
-
-def _ny_ns(hour: int, minute: int) -> int:
-    return int(datetime(2026, 11, 12, hour, minute, tzinfo=mover.NEW_YORK).timestamp()) * SECOND
-
-
-def _minute(closed_ns: int, close: str) -> Bar:
-    price = Price.from_str(close)
-    return Bar(
-        bar_type(AAA),
-        price,
-        price,
-        price,
-        price,
-        Quantity.from_int(100_000),
-        closed_ns - MINUTE,
-        closed_ns,
-    )
-
-
-def _sold_strategy(arm: str) -> Recording:
-    """Seed a completed sale, as the existing test_mover_trail state cases do."""
-    s = strategy(reentry_arm=arm, turn_k=2, turn_d=Decimal(1))
-    s.slots[AAA] = mover.Slot(AAA, bar_type(AAA), deque(maxlen=4), deque(maxlen=5))
-    sale_ns = _ny_ns(19, 50)
-    s.sold[AAA] = (sale_ns, Decimal("10.00"))
-    s.sold_fill_ns[AAA] = sale_ns
-    s.reentry_states[AAA] = mover.ReentryState(sale_ns, Decimal("10.00"), Decimal("0.20"))
-    return s
