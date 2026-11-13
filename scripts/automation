@@ -5,7 +5,7 @@
 #   commit gate            on every `git commit`             .githooks/pre-commit via core.hooksPath (githooks(5))
 #   landscape watch        once a day, at session start      .claude/hooks/canon-watch.sh, async SessionStart hook
 #   lane watchdog          every 10 minutes, Mac awake       launchd user agent (launchd.plist(5), launchctl(1))
-#   paper session          10 min after each firing, awake   launchd user agent running one window, if Alpaca's
+#   paper session          70 s after each firing, awake     launchd user agent running one window, if Alpaca's
 #                                                            clock says a session is open and main's
 #                                                            canon/paper-schedule says to (ADR 0050)
 #   movers recorder        weekdays 04:00-20:00 New York     launchd user agent: back-to-back data-only
@@ -68,9 +68,10 @@ PAPER_LABEL="local.canon.paper-session"
 PAPER_PLIST="$AGENTS_DIR/$PAPER_LABEL.plist"
 # launchd counts StartInterval from the end of the last firing, not its start (observed on macOS 27.2: a 20 s
 # interval and a 15 s job started every 35 s, with ProcessType Background and Standard alike), so the interval
-# is the pause after each firing: above the 60 s gap (session_window.GAP_SECS), and with a 25-minute window
-# and its start-up, stop and account check, a window about every 35 minutes (ADR 0050, 2026-11-11)
-PAPER_INTERVAL=600
+# is the pause after each firing: above the 60 s gap (session_window.GAP_SECS), so the firing after a window
+# is not skipped, and short, so account B is idle about a minute and a firing's start-up between two windows
+# while a session is open (ADR 0050, 2026-11-13; 600 s from 2026-11-11)
+PAPER_INTERVAL=70
 PAPER_MINUTES=25
 PAPER_REGULAR_STRATEGY=Mover                          # the regular session's strategy (ADR 0091); no other part names one
 PAPER_STALE=4200                                      # a record `running` after 70 minutes, if it gives none
@@ -1049,7 +1050,7 @@ do_install() {
           if [ "${AUTOMATION_SKIP_LAUNCHD:-0}" = "1" ]; then
             note "  not loaded (AUTOMATION_SKIP_LAUNCHD=1)"
           else
-            boot "$PAPER_LABEL" "$PAPER_PLIST" "($((PAPER_INTERVAL / 60)) minutes after each firing ends; a window only when a session is open)" || ok=1
+            boot "$PAPER_LABEL" "$PAPER_PLIST" "($PAPER_INTERVAL s after each firing ends; a window only when a session is open)" || ok=1
           fi
         fi
       fi
@@ -1448,7 +1449,7 @@ do_status() {
     fi
     fired=$(jq -r --argjson now "$(date -u +%s)" '($now - .at_epoch) | floor' "$PAPER_DIR/scheduled-firing.json" 2>/dev/null)
     if [ ! -f "$PAPER_DIR/scheduled-firing.json" ]; then
-      paper_worse UNKNOWN; txt="$txt | no scheduled firing recorded yet (the first comes $((PAPER_INTERVAL / 60)) min after install)"
+      paper_worse UNKNOWN; txt="$txt | no scheduled firing recorded yet (the first comes $PAPER_INTERVAL s after install)"
     elif ! [[ "$fired" =~ ^-?[0-9]+$ ]]; then
       paper_worse UNKNOWN; txt="$txt | $PAPER_DIR/scheduled-firing.json is unreadable, so whether the schedule fires is not known"
     elif [ "$fired" -gt "$PAPER_SILENT" ]; then
@@ -1472,7 +1473,7 @@ do_status() {
         if [ "$pend" -gt 0 ]; then
           pend=$(( $(date +%s) - pend ))
           if [ "$pend" -gt $((2 * PAPER_INTERVAL + 300)) ]; then
-            paper_worse STALE; txt="$txt | overdue: nothing from a scheduled firing for $((pend / 60)) min, while launchd starts one $((PAPER_INTERVAL / 60)) min after the last ends (the Mac asleep, or the schedule stopped)"
+            paper_worse STALE; txt="$txt | overdue: nothing from a scheduled firing for $((pend / 60)) min, while launchd starts one $PAPER_INTERVAL s after the last ends (the Mac asleep, or the schedule stopped)"
           fi
         fi
       fi

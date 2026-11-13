@@ -354,6 +354,8 @@ run = '''
 deadline=6240
 sync=600
 lockwait=900
+# gap: session_window.GAP_SECS, the least time between a window's end and the next one's start (ADR 0044)
+gap=60
 # grace: how long a stop gives the window's wind-down before its group is killed (session_window.STOP_GRACE_SECS)
 grace=785
 start=$(/bin/date +%s)
@@ -421,6 +423,22 @@ lock_wait() {
     [ "$(/bin/date +%s)" -lt "$lw_end" ] || return 1
     sleep 1
   done
+}
+# gapwait: what is left of `gap` since the last window's end, from the marker session_window writes in its log
+# folder (last-window-end), slept out of what is left of `lockwait`; the window's own check still decides. So a
+# run that waited for account B's lock as the window before it ended takes its turn rather than reaching that
+# check and skipping (ADR 0050, 2026-11-13). File time: GNU stat -c %Y, else BSD stat -f %m (stat(1) on each)
+gapwait() {
+  m="${tmp}canon-paper-session/last-window-end"
+  [ -f "$m" ] || return 0
+  e=$(/usr/bin/stat -c %Y "$m" 2>/dev/null || /usr/bin/stat -f %m "$m" 2>/dev/null) || return 0
+  case "$e" in ''|*[!0-9]*) return 0 ;; esac
+  g=$((gap - ($(/bin/date +%s) - e) + 1)); s=$((lockwait - waited))
+  [ "$g" -le "$s" ] || g=$s
+  [ "$g" -gt 0 ] || return 0
+  echo "paper:session: waiting $g s for the gap after the last window's end"
+  sleep "$g"
+  waited=$(( $(/bin/date +%s) - start ))
 }
 # stream: account B's market-data stream lock (ADR 0069), on descriptor 7 (the runner's checkout lock is 8),
 # for what is left of `lockwait`, by lock_wait; taken after uv's sync, so a window holds it only while its
@@ -491,6 +509,7 @@ window() {
   exec 9>>"${tmp}canon-paper-windows.lock"
   lock_wait 9 "$lockwait" || { echo "paper:session: account B's lock stayed held for $lockwait s; nothing was placed" >&2; exit 1; }
   waited=$(( $(/bin/date +%s) - start ))
+  gapwait
   left=$((deadline - ($(/bin/date +%s) - start)))
   [ "$left" -gt 0 ] || { echo "paper:session: no time left before the deadline" >&2; exit 1; }
   # from a terminal, too, uv's sync runs before the stream lock is taken, so the lock is held only while the
