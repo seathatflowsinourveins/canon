@@ -1,0 +1,253 @@
+"""Second reader's probes for run r56d4, case modify-follows-replace: sequences the case's tests leave out.
+
+Copy this file beside `packages/canon-alpaca/tests/test_execution_client.py` in a tree and run it from the
+tree's root; it reuses that module's node, strategy and stand-in helpers. Each probe asserts what the node
+should end with, so it passes where the tree behaves and fails where it does not.
+"""
+
+import asyncio
+import importlib.util
+import sys
+import time
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+from nautilus_trader.model import Price
+
+_PATH = Path(__file__).with_name("test_execution_client.py")
+_SPEC = importlib.util.spec_from_file_location("_tec_second_reader", _PATH)
+assert _SPEC is not None and _SPEC.loader is not None
+tec = importlib.util.module_from_spec(_SPEC)
+sys.modules[_SPEC.name] = tec
+_SPEC.loader.exec_module(tec)
+
+venue = tec.venue  # the fixture that hands the node the stand-ins
+dispose_nodes = tec.dispose_nodes  # autouse there: one LiveNode per thread
+
+
+def wait_in_thread(done, seconds: float = 5.0) -> None:
+    """From the stand-in's worker thread: wait until `done()` or `seconds` pass, then let the loop settle."""
+    deadline = time.monotonic() + seconds
+    while not done() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    time.sleep(0.2)
+
+
+@pytest.mark.parametrize("event", ["canceled", "expired"])
+@pytest.mark.parametrize("replaced_later", [False, True], ids=["replaced-missed", "replaced-late"])
+def test_probe_newer_replacement_ended_before_its_replaced_ends_the_order(
+    venue, event, replaced_later
+) -> None:
+    # Modify 1 (150.50) is replaced and applied (`replaced` sent at once). Modify 2 (151.00), sent on its
+    # `OrderUpdated`, is answered but its `replaced` is held back. The live order, modify 2's replacement,
+    # is then canceled or expires at Alpaca, and its update arrives before modify 2's `replaced` (which is
+    # either never sent or sent afterwards). The node's order must end too.
+    venue.trading.script = "accept"
+    strategy = tec.modifier(prices=["150.50", "151.00"])
+    original = venue.trading.replace_order_by_id
+
+    def replace(order_id, order_data=None):
+        if venue.trading.replace_requests:  # the second replace: no `replaced` yet
+            venue.trading.replace_script = "silent"
+        return original(order_id, order_data)
+
+    venue.trading.replace_order_by_id = replace
+
+    async def end(client) -> None:
+        b, c = tec.placed_order(venue, 1), tec.placed_order(venue, 2)
+        venue.trading.update(c["id"], event, status=event)
+        await tec.until_idle(client, venue)
+        if replaced_later:
+            venue.trading.confirm_replace(b["id"])
+
+    tec.run_modify(venue, strategy, lambda: len(venue.trading.replace_requests) == 2, end)
+
+    final = "OrderCanceled" if event == "canceled" else "OrderExpired"
+    print(f"\nPROBE-A {event} {replaced_later}: {strategy.names()}")
+    assert final in strategy.names(), strategy.names()
+
+
+def test_probe_node_cancel_after_two_modifies_ends_the_order(venue, alpaca) -> None:
+    # As above, but the node cancels: its cancel names modify 1's replacement, which Alpaca has replaced
+    # and refuses to cancel (422), so the client cancels the live order, modify 2's replacement, whose
+    # `canceled` arrives before modify 2's `replaced`. The node's order must end canceled.
+    venue.trading.script = "accept"
+    strategy = tec.modifier(prices=["150.50", "151.00"])
+    original = venue.trading.replace_order_by_id
+
+    def replace(order_id, order_data=None):
+        if venue.trading.replace_requests:  # the second replace: no `replaced` yet
+            venue.trading.replace_script = "silent"
+        return original(order_id, order_data)
+
+    venue.trading.replace_order_by_id = replace
+    venue.trading.refuse_cancel = lambda placed: (
+        alpaca.api_error(422, 42210000, "order is not cancelable (probe)")
+        if placed["status"] == "replaced"
+        else None
+    )
+
+    async def cancel(client) -> None:
+        cached = client.cache.order(strategy.client_order_id)
+        command = SimpleNamespace(
+            client_order_id=strategy.client_order_id, venue_order_id=cached.venue_order_id
+        )
+        await client._cancel_order(command)
+
+    tec.run_modify(venue, strategy, lambda: len(venue.trading.replace_requests) == 2, cancel)
+
+    print(f"\nPROBE-A2 cancels sent {len(venue.trading.cancels)}: {strategy.names()}")
+    assert venue.trading.cancels == [
+        tec.placed_order(venue, 1)["id"],
+        tec.placed_order(venue, 2)["id"],
+    ]
+    assert "OrderCanceled" in strategy.names(), strategy.names()
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "second"),
+    [
+        ("quantity", "5", "150.00"),  # the terms of the statement's defect 8 and its named test
+        ("price", "150.50", "151.00"),  # a second price the first replacement does not hold
+    ],
+    ids=["case-terms", "other-price"],
+)
+def test_probe_second_modify_refused_while_the_first_replaced_lands_is_rejected(
+    venue, field, value, second
+) -> None:
+    # Modify 1 is answered; its `replaced` has not arrived. Modify 2 goes to the old order. While modify 2
+    # is in flight, Alpaca's `replaced` for modify 1 arrives and is applied; then modify 2 is refused 422
+    # "order already replaced". Modify 2 asked for terms the replacement does not hold, so it must get
+    # `OrderModifyRejected`.
+    venue.trading.script = "accept"
+    venue.trading.replace_script = "silent"
+    strategy = tec.modifier(field=field, prices=[value])
+    original = venue.trading.replace_order_by_id
+
+    def replace(order_id, order_data=None):
+        if venue.trading.replace_requests:  # modify 2: modify 1's `replaced` lands first
+            venue.trading.confirm_replace(tec.placed_order(venue, 0)["id"])
+            wait_in_thread(lambda: "OrderUpdated" in strategy.names())
+        return original(order_id, order_data)
+
+    venue.trading.replace_order_by_id = replace
+
+    async def second_modify(client) -> None:
+        cached = client.cache.order(strategy.client_order_id)
+        command = SimpleNamespace(
+            client_order_id=strategy.client_order_id,
+            venue_order_id=cached.venue_order_id,
+            quantity=None,
+            price=Price.from_str(second),
+            trigger_price=None,
+        )
+        await client._modify_order(command)
+
+    tec.run_modify(venue, strategy, lambda: bool(venue.trading.replace_requests), second_modify)
+
+    print(f"\nPROBE-B {field}: {strategy.names()}")
+    assert [old for old, _ in venue.trading.replace_requests] == [
+        tec.placed_order(venue, 0)["id"]
+    ] * 2
+    assert "OrderUpdated" in strategy.names(), strategy.names()
+    assert "OrderModifyRejected" in strategy.names(), strategy.names()
+
+
+def test_probe_filled_replacement_whose_old_order_cannot_be_read(venue, alpaca, capfd) -> None:
+    # The statement's defect 1, with the old order outside what the orders query returned and its read
+    # failing (HTTP 500). The node's filled order is either reported or the failed read is logged.
+    venue.trading.script = "accept"
+    venue.trading.replace_script = "silent"
+    strategy = tec.modifier()
+    reports: list = []
+
+    async def reconcile(client) -> None:
+        old, new = tec.placed_order(venue, 0), tec.placed_order(venue, 1)
+        new.update(status="filled", filled_qty="2", filled_avg_price="150.5")
+        venue.trading.orders = [new]
+        original = venue.trading.get_order_by_id
+
+        def get_order_by_id(order_id):
+            if str(order_id) == old["id"]:
+                raise alpaca.api_error(500, 50010000, "probe read failure")
+            return original(order_id)
+
+        venue.trading.get_order_by_id = get_order_by_id
+        window = SimpleNamespace(open_only=False, instrument_id=None, start=None, end=None)
+        reports.extend(await client._generate_order_status_reports(window))
+
+    tec.run_modify(venue, strategy, lambda: bool(venue.trading.replace_requests), reconcile)
+
+    mine = [
+        (r.venue_order_id.value, r.order_status)
+        for r in reports
+        if r.client_order_id == strategy.client_order_id
+    ]
+    text = tec.logged(capfd)
+    print(
+        f"\nPROBE-C reports for the node's order: {mine}; failure logged: {'probe read failure' in text}"
+    )
+    assert mine or "probe read failure" in text
+
+
+def test_probe_bookkeeping_left_after_the_order_ends(venue) -> None:
+    # Four price modifies in a row, each replaced, then the live order fills. What the client still keeps.
+    venue.trading.script = "accept"
+    strategy = tec.modifier(prices=["150.50", "151.00", "151.50", "152.00"])
+    kept: dict = {}
+
+    async def fill(client) -> None:
+        live = tec.placed_order(venue, 4)
+        venue.trading.update(live["id"], "fill", 2, status="filled", filled_qty="2")
+        async with asyncio.timeout(10):
+            while "OrderFilled" not in strategy.names():
+                await asyncio.sleep(0.01)
+        await tec.until_idle(client, venue)
+        for name in (
+            "_answers",
+            "_adopted",
+            "_handled_replacements",
+            "_settled_modifies",
+            "_modifying",
+        ):
+            if hasattr(client, name):
+                kept[name] = len(getattr(client, name))
+
+    tec.run_modify(venue, strategy, lambda: strategy.names().count("OrderUpdated") == 4, fill)
+
+    print(f"\nPROBE-D kept after the order filled: {kept}")
+    assert "OrderFilled" in strategy.names()
+
+
+@pytest.mark.parametrize("first", ["rejected", "order_replace_rejected"])
+def test_probe_replacement_rejected_and_replace_rejected_is_one_modify_rejection(
+    venue, first
+) -> None:
+    # One modify is answered (replacement B) and never replaced: Alpaca sends the replacement's
+    # `rejected` and the old order's `order_replace_rejected`, in either order. The change's module
+    # header says a replacement's `rejected` and `order_replace_rejected` are `OrderModifyRejected`
+    # "once per modify however many of Alpaca's answers report it".
+    venue.trading.script = "accept"
+    venue.trading.replace_script = "silent"
+    strategy = tec.modifier()
+
+    async def refuse(client) -> None:
+        old, new = tec.placed_order(venue, 0), tec.placed_order(venue, 1)
+        updates = [
+            (new["id"], "rejected", {"status": "rejected"}),
+            (old["id"], "order_replace_rejected", {}),
+        ]
+        if first == "order_replace_rejected":
+            updates.reverse()
+        for order_id, event, status in updates:
+            venue.trading.update(order_id, event, **status)
+        async with asyncio.timeout(10):
+            while "OrderModifyRejected" not in strategy.names():
+                await asyncio.sleep(0.01)
+        await tec.until_idle(client, venue)
+
+    tec.run_modify(venue, strategy, lambda: bool(venue.trading.replace_requests), refuse)
+
+    print(f"\nPROBE-E {first} first: {strategy.names()}")
+    assert strategy.names().count("OrderModifyRejected") == 1, strategy.names()
