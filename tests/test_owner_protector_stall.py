@@ -1,12 +1,15 @@
 """No quote stamped far ahead of its receipt stalls protection, and every wait is said at every step.
 
-The lead's ruling on unit 10 (2026-11-13, 16:3x, on the round-2 review's P2-1):
+The lead's ruling on unit 10 (2026-11-13, 16:3x, on the round-2 review's P2-1), as the lead's guard
+definition V1-V4 (2026-11-13, 17:0x) now states it:
 - The stall: a quote whose venue stamp runs ahead of the stream, taken as the arming quote (or as the
   last observation), made every later quote fail the "stamped after" rule, so the protector sent
-  nothing and named nothing. That is a missed sale under the defaults. A reference quote stamped more
-  than the adapter's `STAMP_AHEAD_MOST_NS` ahead of its receipt has no usable time
-  (canon_alpaca/data.py:1044, `trade_stamp` for prints), so its receipt orders it; its own stamp,
-  re-delivered, is still the same observation (the (e) review's P1-1).
+  nothing and named nothing. Under V1 a quote stamped more than the adapter's `STAMP_AHEAD_MOST_NS`
+  ahead of its own receipt (canon_alpaca/data.py:1044, `trade_stamp` for prints) is no observation
+  and never a reference, so it cannot stall; its stamp, delivered again within the bound, is still
+  the same observation and never counts (V3 and the refused-stamp record).
+- A host clock more than the bound behind the venue's is the named limit (1): nothing is placed, and
+  it is said at every step.
 - The general property: a protector that cannot act on its quotes says so at every step, never in
   silence.
 """
@@ -78,27 +81,35 @@ def test_an_arming_quote_stamped_an_hour_ahead_does_not_stall_protection() -> No
 
 
 def test_a_self_arming_quote_stamped_ahead_does_not_stall_protection() -> None:
+    """V1: a quote stamped an hour ahead plans no level and is named; the next sane quote is the
+    reference (V2), the one after it the guarded observation, and the third sells."""
     strategy = Harness()
     strategy.cached.latest = None
     strategy.on_start()
-    deliver(strategy, tick("10.00", T0 + HOUR, T0 + SECOND))  # the level is planned on this
+    deliver(strategy, tick("10.00", T0 + HOUR, T0 + SECOND))  # refused: no level on this
+    assert strategy.slots[AAA].level is None and not strategy.sent
+    assert "ahead of its receipt" in strategy.frozen[AAA]
+    deliver(strategy, tick("10.00", T0 + 2 * SECOND, T0 + 2 * SECOND))  # the reference
     assert strategy.slots[AAA].level is not None and not strategy.sent
-    for n in (2, 3):
-        deliver(strategy, tick("10.00", T0 + n * SECOND, T0 + n * SECOND))
+    deliver(strategy, tick("10.00", T0 + 3 * SECOND, T0 + 3 * SECOND))  # guarded
+    assert not strategy.sent
+    deliver(strategy, tick("10.00", T0 + 4 * SECOND, T0 + 4 * SECOND))
     assert len(strategy.sent) == 1, "a self-arming quote stamped ahead stalled the protection"
 
 
 def test_a_guarded_quote_stamped_ahead_does_not_stall_the_confirmation() -> None:
-    """At or under the level: the guarded observation is stamped an hour ahead of its receipt; the
-    next distinct quote, ordered after its receipt, confirms."""
+    """At or under the level: a quote stamped an hour ahead of its receipt is no observation (V1),
+    so it neither spends the guard nor holds back the two sane quotes that follow."""
     strategy = Harness()
     strategy.cached.latest = tick("10.00", T0, T0)
     strategy.adopt_holding(AAA, Price.from_str("10.00"))
-    deliver(strategy, tick("9.99", T0 + HOUR, T0 + SECOND))  # guarded
-    assert not strategy.sent
-    deliver(strategy, tick("9.99", T0 + HOUR, T0 + 2 * SECOND))  # the same observation again
-    assert not strategy.sent, "a re-delivered observation confirmed the breach"
-    deliver(strategy, tick("9.97", T0 + 3 * SECOND, T0 + 3 * SECOND))
+    deliver(strategy, tick("9.99", T0 + HOUR, T0 + SECOND))  # V1: no observation
+    assert not strategy.sent and strategy.slots[AAA].last_observation is None
+    deliver(strategy, tick("9.99", T0 + HOUR, T0 + 2 * SECOND))  # the same refused quote again
+    assert not strategy.sent, "a re-delivered quote confirmed the breach"
+    deliver(strategy, tick("9.97", T0 + 3 * SECOND, T0 + 3 * SECOND))  # the guarded observation
+    assert not strategy.sent, "sold on one observation"
+    deliver(strategy, tick("9.96", T0 + 4 * SECOND, T0 + 4 * SECOND))
     assert len(strategy.sent) == 1, "a quote stamped ahead held back the confirmation"
 
 
@@ -139,42 +150,57 @@ def test_waiting_for_a_confirming_observation_is_said_at_every_step() -> None:
 
 
 @pytest.mark.parametrize("behind", [6 * SECOND, HOUR], ids=["6s", "1h"])
-def test_a_node_clock_behind_alpacas_stamps_still_places_protection(behind) -> None:
-    """The (e) review's e1: every quote is stamped `behind` ahead of its receipt (the node's clock
-    runs behind Alpaca's). Protection is still placed, on the second distinct quote."""
+def test_a_node_clock_behind_alpacas_stamps_is_the_named_limit(behind) -> None:
+    """The (e) review's e1, now the named limit (1): every quote is stamped `behind` ahead of its
+    receipt (the node's clock runs behind Alpaca's by more than the bound). V1 refuses each, so
+    nothing is placed, and every step names the holding and why."""
     strategy = Harness()
     strategy.cached.latest = tick("10.00", T0 + behind, T0)
     strategy.adopt_holding(AAA, Price.from_str("9.90"))
-    for n in (1, 2):
+    for n in range(1, 6):
         deliver(strategy, tick("10.00", T0 + behind + n * SECOND, T0 + n * SECOND))
+        before = len(strategy.said)
         step(strategy, T0 + n * SECOND + SECOND // 4)
-    assert len(strategy.sent) == 1, "a node clock behind Alpaca's stamps never placed protection"
+        said = strategy.said[before:]
+        assert any(
+            line.startswith("AAA.ALPACA: unprotected: waiting") and "ahead of its receipt" in line
+            for line in said
+        ), f"step {n} did not name the limit"
+    assert not strategy.sent, "placed on quotes V1 refuses"
 
 
 def test_a_redelivered_cached_quote_stamped_ahead_does_not_spend_the_guard() -> None:
-    """The (e) review's P1-1 (e3): the cached quote is stamped 6 s ahead of its receipt, so its
-    receipt orders it; re-delivered 2 s later it is the same observation and spends nothing, and
-    one new quote under the level then does not sell."""
+    """The (e) review's P1-1 (e3): the cached quote is stamped 6 s ahead of its receipt, so V1
+    refuses it and there is no reference. Re-delivered 2 s later, now within the bound, it carries
+    a refused stamp and never counts; the first new quote is the reference (V2), the second the
+    guarded observation, and the third sells."""
     strategy = Harness()
     strategy.cached.latest = tick("9.80", T0 + 6 * SECOND, T0)
     strategy.adopt_holding(AAA, Price.from_str("9.90"))  # breached: guard applies
     deliver(strategy, tick("9.80", T0 + 6 * SECOND, T0 + 2 * SECOND))  # the cached quote again
-    deliver(strategy, tick("9.79", T0 + 7 * SECOND, T0 + 7 * SECOND))  # one new observation
+    deliver(strategy, tick("9.79", T0 + 7 * SECOND, T0 + 7 * SECOND))  # one new quote
     assert not strategy.sent, "sold on the cached quote's re-delivery plus one new quote"
     deliver(strategy, tick("9.78", T0 + 8 * SECOND, T0 + 8 * SECOND))
+    assert not strategy.sent, "sold on one observation"
+    deliver(strategy, tick("9.77", T0 + 9 * SECOND, T0 + 9 * SECOND))
     assert len(strategy.sent) == 1
 
 
 def test_a_self_arming_quote_redelivered_does_not_spend_the_guard() -> None:
+    """A quote stamped 6 s ahead plans no level (V1). Re-delivered within the bound it carries a
+    refused stamp, so it plans none either (V3 and the record); the next quote is the reference."""
     strategy = Harness()
     strategy.cached.latest = None
     strategy.on_start()
-    deliver(strategy, tick("10.00", T0 + 7 * SECOND, T0 + SECOND))  # the level is planned on this
-    assert strategy.slots[AAA].level is not None and not strategy.sent
+    deliver(strategy, tick("10.00", T0 + 7 * SECOND, T0 + SECOND))  # refused
+    assert strategy.slots[AAA].level is None and not strategy.sent
     deliver(strategy, tick("10.00", T0 + 7 * SECOND, T0 + 3 * SECOND))  # the same, re-delivered
-    deliver(strategy, tick("10.00", T0 + 8 * SECOND, T0 + 8 * SECOND))  # guarded: fresh level
+    assert strategy.slots[AAA].level is None, "a level planned on a refused stamp"
+    deliver(strategy, tick("10.00", T0 + 8 * SECOND, T0 + 8 * SECOND))  # the reference
+    assert strategy.slots[AAA].level is not None
+    deliver(strategy, tick("10.00", T0 + 9 * SECOND, T0 + 9 * SECOND))  # guarded: fresh level
     assert not strategy.sent, "a re-delivered arming quote spent the self-arm guard"
-    deliver(strategy, tick("10.00", T0 + 9 * SECOND, T0 + 9 * SECOND))
+    deliver(strategy, tick("10.00", T0 + 10 * SECOND, T0 + 10 * SECOND))
     assert len(strategy.sent) == 1
 
 

@@ -390,9 +390,11 @@ def test_first_quote_after_adoption_without_a_quote_does_not_elect() -> None:
     strategy = Harness()
     strategy.cached.latest = None
     strategy.adopt_holding(AAA, Price.from_str("10.00"))
-    strategy.observe("9.99", T0 + SECOND)
+    strategy.observe("9.99", T0 + SECOND)  # V2: with no cached quote, this is the reference
     assert not strategy.sent
-    strategy.observe("9.98", T0 + 2 * SECOND)
+    strategy.observe("9.98", T0 + 2 * SECOND)  # the guarded first observation
+    assert not strategy.sent
+    strategy.observe("9.97", T0 + 3 * SECOND)
     assert len(strategy.sent) == 1
 
 
