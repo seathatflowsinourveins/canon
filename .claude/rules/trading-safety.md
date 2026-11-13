@@ -30,8 +30,22 @@ paths:
   or from the scheduled agent (ADR 0044, ADR 0050, ADR 0069), `mise run paper:long-only windows`,
   `mise run paper:account windows` and `mise run paper:close windows`;
   account C's, stored with `paper:store protect`, reaches only `mise run paper:account protect` and
-  `mise run paper:protect protect`, the one task that sends on C: a trailing stop for a long it finds,
-  or with `--cancel` the cancel of such a stop, never anything else (ADR 0114, ADR 0142).
+  `mise run paper:protect protect`, which sends on C a trailing stop for a long it finds, or with
+  `--cancel` the cancel of such a stop, never anything else (ADR 0114, ADR 0142), and
+  `mise run paper:protector protect`, the standing protector's task (the lead's 24/5 plan of 2026-11-13,
+  Decision D and unit 10; ADR 0146 for protection around the clock), not yet on `main`, admitted on the
+  owner's requirement of 2026-11-13, as the lead restates it, that C's holding has its exit in every
+  session, and on custody's line that the owner's fill is recognised at once and protected
+  (`docs/handbook/philosophy.md`, What never changes). It sells only to protect a long it finds,
+  reduce-only and for the uncovered quantity only; it never opens or adds to a position, never cancels,
+  resizes or adopts an order it did not send, and freezes a symbol with a foreign quantity. It takes
+  `--row OWN1|OWN3` and refuses F2 and IEX by name. On C it runs only after its proof on account A and
+  only with the lead's go by name (`--lead-go "protect <row>"`), and it and `paper:protect protect`
+  never send on C at once (one writer per account). These terms are `UNVERIFIED` until the task lands
+  with its tests. A standing runner (the plan's unit U-g, not yet on `main`) may start it back to back
+  across the session parts: each start reads the level book, its hold file and its inbox in that step;
+  on C it starts nothing without the lead's standing go, by name, in a file it reads at every start; it
+  stops at the first start that finds a hold; the owner's word outranks both.
   `mise run paper:history <tests|windows>` reads either one, GET only in data-only mode, a historical
   load that neither trades nor streams (ADR 0093).
   No task reads both pairs. `paper:long-only <account> <check|on|off>` reads, or sets, Alpaca's long-only
