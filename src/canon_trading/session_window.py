@@ -778,7 +778,13 @@ class WindowConfig:
     spares: int = MOVER_SPARES
     """Additional qualified startup names watched by Mover, beyond its held slots."""
     baseline_path: Path | None = None
-    """ADR 0087's baseline file; None selects catalog/movers-baseline/<feed>.json for the part."""
+    """ADR 0087's baseline file; None selects catalog/movers-baseline/<feed>.json for the part, or the
+    trade date's file in `baseline_dir`."""
+    baseline_dir: Path | None = None
+    """A directory of dated baselines, `<trade date>/<feed>.json` (`dated_baseline_path`), relative to
+    the checkout like `baseline_path`, which it excludes; the scheduled runner names one, since its
+    clone is made anew at every firing. A Mover window reads the trade date's file there and refuses
+    one that is missing, outside overnight's dollar tier."""
     arm: str | None = None
     """A name of `TRAIL_ARMS`, written to the record and the heartbeat; its rows must be the window's."""
     trail_profile_path: Path | None = None
@@ -823,6 +829,8 @@ class WindowConfig:
             raise ValueError(
                 f"trigger must be one of {tuple(WINDOW_TRIGGERS)}, got {self.trigger!r}"
             )
+        if self.baseline_path is not None and self.baseline_dir is not None:
+            raise ValueError("a window takes a baseline_path or a baseline_dir, not both")
         MoverConfig(
             max_notional=Decimal(1),
             max_move=Decimal(1),
@@ -1501,6 +1509,35 @@ def mover_baseline_path(config: WindowConfig, feed: str) -> Path:
     """Keep the actor's input relative to the checkout, regardless of the caller's directory."""
     path = config.baseline_path or Path("catalog/movers-baseline") / f"{feed}.json"
     return (SOURCE_ROOT / path).resolve()
+
+
+def dated_baseline_path(root: Path, session: date, feed: str) -> Path:
+    """The file for `session` in a directory of dated baselines: `<session>/<feed>.json`, as
+    `paper:history <account> baseline --session <session> --baseline-dir <root>/<session>` writes it
+    (mise.toml's `paper:history`)."""
+    return root / session.isoformat() / f"{feed}.json"
+
+
+def missing_dated_baseline(root: Path, session: date, feed: str) -> str:
+    """Why a window refuses with no file for its trade date in `root`, naming the newest earlier day's
+    file the directory holds, so an old baseline is told from none. Only a folder named exactly as an
+    ISO date is a day (Python 3.11 on also reads `20261110` as one), and a later day's file says
+    nothing of this one (code-review-high-rb/3, /4)."""
+    days = []
+    with contextlib.suppress(OSError):
+        for entry in root.iterdir():
+            try:
+                day = date.fromisoformat(entry.name)
+            except ValueError:
+                continue
+            if (
+                entry.name == day.isoformat()
+                and day < session
+                and (entry / f"{feed}.json").is_file()
+            ):
+                days.append(day)
+    held = f"the newest before it is {max(days)}" if days else "it holds none before it"
+    return f"no {feed} baseline for {session} at {dated_baseline_path(root, session, feed)}; {held}"
 
 
 def mover_trail_profile_path(config: WindowConfig) -> Path:
@@ -3066,15 +3103,28 @@ def run_window(
                 profile_document, profile_details = read_window_trail_profile(
                     config, as_of=trade_date
                 )
+            dated_root: Path | None = None
+            if config.baseline_dir is not None:
+                # the trade date's file, once, resolved as `mover_baseline_path` resolves a path, so the
+                # actor, the record and a refusal all name the same file (code-review-high-rb/2)
+                dated_root = (SOURCE_ROOT / config.baseline_dir).resolve()
+                config = replace(
+                    config,
+                    baseline_dir=None,
+                    baseline_path=dated_baseline_path(dated_root, trade_date, feed),
+                )
             baseline = mover_baseline_path(config, feed)
             read = read_baselines(baseline, trade_date)
             if read.absent and part == "overnight":
                 # overnight ranks in the dollar tier with no file, until Wave 2's overnight baseline
                 # exists; a file that cannot be used still refuses (the lead's ruling, 2026-11-12)
                 basis = NO_BASELINE
+            elif read.absent and dated_root is not None:
+                raise WindowRefused(missing_dated_baseline(dated_root, trade_date, feed))
             elif read.problem:
+                dated = "" if dated_root is None else f" (the dated file for {trade_date})"
                 raise WindowRefused(
-                    f"the rank actor baseline {baseline} is unusable: {read.problem}"
+                    f"the rank actor baseline {baseline}{dated} is unusable: {read.problem}"
                 )
             allocation = mover_allocation(
                 trading, row.slots if config.slots is None else config.slots
@@ -4865,8 +4915,15 @@ def _parser() -> argparse.ArgumentParser:
         f"check, ADR 0134); off unless given, and {MOVER}'s, whose record carries its tally; refused "
         f"with --trigger last_price, under which {MOVER} judges a late print itself",
     )
-    parser.add_argument(
+    baseline = parser.add_mutually_exclusive_group()
+    baseline.add_argument(
         "--baseline-path", type=Path, help="default: catalog/movers-baseline/<feed>.json"
+    )
+    baseline.add_argument(
+        "--baseline-dir",
+        type=Path,
+        help="read the trade date's <date>/<feed>.json in this directory, and refuse the window "
+        "when it is missing (overnight ranks on dollars without one)",
     )
     parser.add_argument(
         "--trail-profile-path",
@@ -4958,6 +5015,7 @@ def window_config(args: argparse.Namespace, session: str) -> WindowConfig:
         slots=args.slots if args.strategy == MOVER else None,
         spares=args.spares,
         baseline_path=args.baseline_path,
+        baseline_dir=args.baseline_dir,
         **rows,
     )
 

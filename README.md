@@ -194,7 +194,7 @@ by hand holds the port, so stop it first.
 | Hosted watch (`canon check` on GitHub) | Once a day; keeps one locked `canon-drift` issue in step with what has drifted (ADR 0064) | No |
 | Landscape watch | Once a day, at session start | No |
 | Lane watchdog | Every 10 minutes while the Mac is awake | No |
-| Paper session | About two minutes after the last window ends while the Mac is awake (launchd fires it 70 s after each firing ends); a window only when Alpaca's clock says a session is open, on the `main` GitHub has then (ADR 0050) | No |
+| Paper session | 70 s after each firing ends while the Mac is awake, a Mover window starting after its stream sample, some minutes in all; a window only when Alpaca's clock says a session is open, on the `main` GitHub has then (ADR 0050) | No |
 | Movers recorder | Weekdays 04:00–20:00 New York while the Mac is awake; back-to-back data-only screener batches, at most 80 polls each, on its own clone of `main`; a failed batch ends its firing and the next one starts fresh (ADR 0070) | No |
 | Maintenance | Every 30 minutes while the Mac is awake, unless the paper lock is held. It fast-forwards the main checkout and reinstalls whatever differs from `main`. Once a day it runs `claude update` and `agy update` (ADR 0065) | No |
 | OmniRoute gateway | Always, once OmniRoute is installed: `omniroute:serve` on 127.0.0.1 (ADR 0056) | No |

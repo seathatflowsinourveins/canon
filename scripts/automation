@@ -311,9 +311,13 @@ EOF
 # instead (ADR 0083, ADR 0091). --regular-strategy names the regular part; --mover selects the others:
 # the task reads the paper pair from the login keychain, takes the paper lock and runs one window, or prints
 # "nothing to run" when Alpaca's clock says no session is open (weekends and holidays included). Not run at
-# load. No checkout a person uses is read or written (ADR 0050). CANON_PAPER_SCHEDULED=1 (launchd.plist(5),
-# EnvironmentVariables) tells the runner and the window that the schedule started them: only they stamp the
-# firing and write the records status reads.
+# load. No checkout a person uses is read or written (ADR 0050): the clone is made anew at every firing, so a
+# Mover window reads its ranking baseline from $CANON_HOME/movers-baseline/<trade date>/<feed>.json
+# (--baseline-dir) and refuses by name when it is missing, but overnight, which ranks on dollars without one.
+# Nothing here writes that folder: an evening baseline job is its own unit, and until it is installed a
+# Mover firing outside overnight is refused by name.
+# CANON_PAPER_SCHEDULED=1 (launchd.plist(5), EnvironmentVariables) tells the runner and the window that the
+# schedule started them: only they stamp the firing and write the records status reads.
 # write_paper_plist <mise> <origin url> [file, else PAPER_PLIST]
 write_paper_plist() {
   local c; c=$(xml "$CANON_HOME")
@@ -338,6 +342,8 @@ write_paper_plist() {
     <string>--mover</string>
     <string>--regular-strategy</string>
     <string>$PAPER_REGULAR_STRATEGY</string>
+    <string>--baseline-dir</string>
+    <string>$c/movers-baseline</string>
   </array>
   <key>EnvironmentVariables</key>
   <dict>
