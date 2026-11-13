@@ -188,6 +188,29 @@ Known limits:
   (`providers.with_http_timeout`, ADR 0039); a stalled request fails with a timeout. A request whose first
   byte takes longer than 27 s fails too, and alpaca-py does not repeat it.
 * A trade tick already emitted cannot be withdrawn or corrected: a cancel or correction is only logged.
+* A streamed trade tick goes out in the order Alpaca's stream delivered it, whatever its own time.
+  NautilusTrader's data engine caches and publishes every trade as it arrives (`handle_trade`,
+  `crates/data/src/engine/dispatch.rs:117-128` at `d53849b2`); its `validate_data_sequence`
+  (`crates/data/src/engine/config.rs:59-61`) is honoured for bars only (`dispatch.rs:444-446`,
+  `validate_bar_sequence` at `:471-496`); the cache's `trade` is the one added last
+  (`crates/common/src/cache/mod.rs:2418-2422`); and the order emulator acts on each trade as delivered
+  (`crates/execution/src/order_emulator/emulator.rs:1093-1105`). With `validate_trade_sequence` on
+  (ADR 0134), the client applies that bar check's first comparison to streamed prints before the engine
+  sees them: a print whose own time (`ts_event`) is before the newest one passed on for its symbol is
+  set aside and is no tick; one with the newest's own time passes. The check's second comparison, of
+  receipt times, is left out: the client stamps a print's receipt itself, in arrival order. A print
+  stamped more than `STAMP_AHEAD_MOST_NS` ahead of its receipt has no usable time: it is passed on as
+  with the setting off and never becomes the newest (`trade_stamp`). Nothing is silent: lines that begin
+  `Alpaca trade sequence on feed ` name the first of each kind per symbol, then the count at each power
+  of ten and at unsubscribe or disconnect; and `late_prints_set_aside` gives, for the process and per
+  symbol, the count, the most any was behind, their shares and the prints passed on unordered, which a
+  window's record takes at its end as it takes `condition_counts`. The newest time is kept for the
+  client's life, so a print from before an unsubscribe is still late after the next subscribe. Limits:
+  a tick set aside is in no bar built from ticks, so such a bar can lack its shares and, if it was the
+  minute's high or low, that price (Alpaca's own bars are not affected); prints of one symbol with the
+  same time pass in arrival order; a request's trades are not checked, since Alpaca answers them in
+  ascending time as one response; and how often the tape delivers prints out of time order is not
+  measured (UNVERIFIED), which the count is there to show. Off by default.
 * A trade or bar price finer than the instrument's precision (four decimals) is rounded half to even,
   as upstream rounds a venue's value: `Instrument.make_price` (`try_make_price`, `MidpointNearestEven`)
   and the Deribit and Bybit parsers (`Price::from_decimal_dp`) at NautilusTrader `d53849b2`. The
@@ -724,6 +747,12 @@ class AlpacaDataClientConfig(DataClientConfig):
       table does not know. It is measured on SIP prints only, so a trade subscription or request on any
       other feed is refused, as is a trade request with `update_catalog`, whose ticks would go under the
       unfiltered key. For a strategy that elects on prints.
+    * `validate_trade_sequence` (default False): when True, a streamed trade print whose own time is
+      before the newest one passed on for its symbol is set aside, counted and named, and is no tick
+      (`TradeSequence`, `trade_stamp`, `late_prints_set_aside`; ADR 0134): the first comparison of the bar
+      check NautilusTrader's `validate_data_sequence` turns on, which the data engine has for bars only.
+      For a strategy, or an emulated order, that acts on the newest print. A bar built from ticks does
+      not hold a print set aside. A request's trades are not checked.
 
     Any other keyword is refused, since NautilusTrader's native `DataClientConfig` drops an unknown one
     without a word (as `AlpacaExecutionClientConfig` does). A plain `DataClientConfig` gets the defaults.
@@ -739,14 +768,15 @@ class AlpacaDataClientConfig(DataClientConfig):
         stream_data_timeout_secs: float | None = STREAM_DATA_TIMEOUT_SECS,
         stream_mute_limit_secs: float | None = STREAM_MUTE_LIMIT_SECS,
         trade_condition_filter: bool = False,
+        validate_trade_sequence: bool = False,
         **kwargs: object,
     ) -> None:
         for key in kwargs:
             if key not in self.COMMON_FIELDS:
                 raise TypeError(
                     f"AlpacaDataClientConfig has no setting {key!r}: it takes "
-                    "stream_data_timeout_secs, stream_mute_limit_secs, trade_condition_filter and "
-                    f"{sorted(self.COMMON_FIELDS)}, "
+                    "stream_data_timeout_secs, stream_mute_limit_secs, trade_condition_filter, "
+                    f"validate_trade_sequence and {sorted(self.COMMON_FIELDS)}, "
                     "and NautilusTrader would drop an unknown one silently"
                 )
         timeout = bound_secs("stream_data_timeout_secs", stream_data_timeout_secs)
@@ -760,9 +790,14 @@ class AlpacaDataClientConfig(DataClientConfig):
             raise TypeError(
                 f"trade_condition_filter must be True or False, not {trade_condition_filter!r}"
             )
+        if not isinstance(validate_trade_sequence, bool):
+            raise TypeError(
+                f"validate_trade_sequence must be True or False, not {validate_trade_sequence!r}"
+            )
         self.stream_data_timeout_secs = timeout
         self.stream_mute_limit_secs = limit
         self.trade_condition_filter = trade_condition_filter
+        self.validate_trade_sequence = validate_trade_sequence
 
 
 def check_condition_map(historical: object) -> None:
@@ -1004,6 +1039,94 @@ def is_power_of_ten(n: int) -> bool:
     while n >= 10 and n % 10 == 0:
         n //= 10
     return n == 1
+
+
+STAMP_AHEAD_MOST_NS = 5_000_000_000
+"""How far ahead of its receipt a streamed print's own time may be and still order it: five seconds,
+far above the feed's delay and the clock error of a node that can trade at all. UNCALIBRATED."""
+
+
+SEQUENCE_LINE = "Alpaca trade sequence on feed "
+"""How the client begins each line it logs about `validate_trade_sequence`."""
+
+
+def trade_stamp(tick: TradeTick) -> int | None:
+    """The time a streamed print is ordered by: its own (`ts_event`, Alpaca's), as NautilusTrader's bar
+    check orders bars by theirs. Not the earlier of that and its receipt: a node clock that runs behind
+    Alpaca's stamps puts every print's own time ahead of its receipt, and prints ordered by receipt,
+    which only rises, are never late. None for a print stamped more than `STAMP_AHEAD_MOST_NS` ahead of
+    its receipt (`ts_init`, the node clock's): that is no time to order by, and as the newest it would
+    hold back every print until the clock passed it."""
+    if int(tick.ts_event) - int(tick.ts_init) > STAMP_AHEAD_MOST_NS:
+        return None
+    return int(tick.ts_event)
+
+
+def late_ms(late_ns: int) -> int:
+    """A lateness in whole milliseconds, rounded up, so one under a millisecond does not read as none."""
+    return -(-late_ns // 1_000_000)
+
+
+class TradeSequence:
+    """Per symbol, the newest stamp (`trade_stamp`) among the streamed prints passed on.
+
+    The shape of NautilusTrader's `validate_bar_sequence` (`crates/data/src/engine/dispatch.rs:471-496`
+    at the pin), which refuses a bar prior to the last one cached. That check is the whole of the data
+    engine's `validate_data_sequence`; a trade it takes as it arrives (`:117-128`)."""
+
+    def __init__(self) -> None:
+        self._newest: dict[str, int] = {}
+
+    def late_by(self, symbol: str, stamp: int) -> int | None:
+        """None for a print to pass on, whose stamp becomes the symbol's newest unless it is the newest's
+        own; else how many nanoseconds below the newest it is, and the newest stays."""
+        newest = self._newest.get(symbol)
+        if newest is None or stamp >= newest:
+            self._newest[symbol] = stamp
+            return None
+        return newest - stamp
+
+
+_LATE_LOCK = threading.Lock()
+_LATE_PRINTS: dict[str, list[int]] = {}
+"""Per symbol, in this process: how many streamed prints were set aside, the most nanoseconds any was
+behind the newest passed on, their shares, and how many were passed on unordered for a stamp far ahead
+of the clock."""
+
+
+def count_late_print(symbol: str, late_ns: int, shares: int) -> None:
+    """Add one print set aside to the process's tally (`late_prints_set_aside`)."""
+    with _LATE_LOCK:
+        tally = _LATE_PRINTS.setdefault(symbol, [0, 0, 0, 0])
+        tally[0] += 1
+        tally[1] = max(tally[1], late_ns)
+        tally[2] += shares
+
+
+def count_ahead_print(symbol: str) -> None:
+    """Add one print passed on unordered, stamped far ahead of the clock, to the process's tally."""
+    with _LATE_LOCK:
+        _LATE_PRINTS.setdefault(symbol, [0, 0, 0, 0])[3] += 1
+
+
+def late_prints_set_aside() -> dict[str, dict[str, int]]:
+    """What every client's `validate_trade_sequence` did in this process, per symbol: the streamed
+    prints set aside (`count`), the most any was behind the newest passed on (`most_late_ms`,
+    `late_ms`), their shares (`shares`, which a bar built from ticks does not hold), and the prints
+    passed on unordered because their own time was far ahead of the clock (`stamped_ahead`). Empty while
+    there was none of either. As `canon_alpaca.trade_conditions.condition_counts` is, it is the
+    process's, for a window's record to take at its end: a process that runs a second window shows the
+    first one's too."""
+    with _LATE_LOCK:
+        return {
+            symbol: {
+                "count": count,
+                "most_late_ms": late_ms(most),
+                "shares": shares,
+                "stamped_ahead": ahead,
+            }
+            for symbol, (count, most, shares, ahead) in sorted(_LATE_PRINTS.items())
+        }
 
 
 def start_of_day(moment: datetime) -> datetime:
@@ -1322,6 +1445,15 @@ class AlpacaDataClient(MarketDataClient):
         self._condition_filter = isinstance(config, AlpacaDataClientConfig) and bool(
             config.trade_condition_filter
         )
+        # The order of streamed prints (`AlpacaDataClientConfig.validate_trade_sequence`): None when
+        # off. Kept for the client's life, as the cache it guards is; the counts are per subscription.
+        self._trade_sequence = (
+            TradeSequence()
+            if isinstance(config, AlpacaDataClientConfig) and config.validate_trade_sequence
+            else None
+        )
+        self._late_trades: dict[str, tuple[int, int]] = {}  # per symbol: count, most ns behind
+        self._ahead_trades: dict[str, int] = {}  # per symbol: passed on unordered
         self._last_heard = 0.0  # the loop time of this run's start or its last message
         self._mute_timer: asyncio.TimerHandle | None = None
         self._stream_failure: str | None = None  # why the client stopped this run (`_check_mute`)
@@ -1437,6 +1569,58 @@ class AlpacaDataClient(MarketDataClient):
         if self._condition_filter:
             count_print(source, [])
 
+    def _late(self, symbol: str, tick: TradeTick) -> bool:
+        """With `validate_trade_sequence` on, whether this streamed tick is stamped below the newest
+        passed on for its symbol and so is set aside: counted for the process
+        (`late_prints_set_aside`) and for this subscription, and named in the log the first time, with
+        how far behind it was, and at each power of ten. A tick with no usable stamp (`trade_stamp`) is
+        not late and not the newest: it is passed on, counted and named the same way. The lines begin
+        `SEQUENCE_LINE`, not as the stream's own do: a session window keeps a bounded number of those
+        and looks for the stream's errors among them."""
+        if self._trade_sequence is None:
+            return False
+        stamp = trade_stamp(tick)
+        if stamp is None:
+            count_ahead_print(symbol)
+            ahead = self._ahead_trades[symbol] = self._ahead_trades.get(symbol, 0) + 1
+            if ahead == 1 or is_power_of_ten(ahead):
+                self._log.warning(
+                    f"{SEQUENCE_LINE}{self._feed_name()}: a {symbol} print is stamped "
+                    f"{late_ms(int(tick.ts_event) - int(tick.ts_init))} ms ahead of its receipt, which "
+                    f"is no time to order it by: passed on unordered, {ahead} so far for this symbol"
+                )
+            return False
+        late_ns = self._trade_sequence.late_by(symbol, stamp)
+        if late_ns is None:
+            return False
+        count_late_print(symbol, late_ns, int(tick.size.as_decimal()))
+        count, most = self._late_trades.get(symbol, (0, 0))
+        count, most = count + 1, max(most, late_ns)
+        self._late_trades[symbol] = (count, most)
+        if count == 1:
+            self._log.warning(
+                f"{SEQUENCE_LINE}{self._feed_name()}: set aside a late {symbol} print, stamped "
+                f"{late_ms(late_ns)} ms before the newest passed on (validate_trade_sequence); later "
+                "ones for this symbol are counted"
+            )
+        elif is_power_of_ten(count):
+            self._log_late_trades(self._feed_name(), symbol)
+        return True
+
+    def _log_late_trades(self, feed: str, symbol: str) -> None:
+        """Log what the sequence check did with `symbol`'s prints under this subscription: how many it
+        set aside and the most any was behind, and how many it passed on unordered. A warning, which
+        never fails a session window."""
+        count, most = self._late_trades.get(symbol, (0, 0))
+        ahead = self._ahead_trades.get(symbol, 0)
+        if not count and not ahead:
+            return
+        self._log.warning(
+            f"{SEQUENCE_LINE}{feed}: {count} late {symbol} prints set aside since subscribing, at "
+            f"most {late_ms(most)} ms before the newest passed on; {ahead} stamped ahead of the clock "
+            "passed on unordered"
+        )
+
     def _sip_only(self, feed: DataFeed, what: str) -> None:
         """The filter's table is measured on SIP prints only: refuse it on any other feed."""
         if self._condition_filter and feed != DataFeed.SIP:
@@ -1506,6 +1690,10 @@ class AlpacaDataClient(MarketDataClient):
             for symbol in sorted(self._price_counts(kind)):
                 self._log_price_count(feed, kind, symbol)
             self._price_counts(kind).clear()
+        for symbol in sorted({*self._late_trades, *self._ahead_trades}):
+            self._log_late_trades(feed, symbol)
+        self._late_trades.clear()
+        self._ahead_trades.clear()
 
     def _price_counts(self, kind: type) -> dict[str, int]:
         """Per symbol since subscribing: quotes dropped, or trade or bar prices rounded, for their
@@ -1863,6 +2051,10 @@ class AlpacaDataClient(MarketDataClient):
         self._price_counts(channel.kind).pop(symbol, None)
         if channel.kind is Quote:
             self._one_sided_quotes.pop(symbol, None)
+        if channel.kind is Trade:
+            self._log_late_trades(self._feed_name(), symbol)
+            self._late_trades.pop(symbol, None)
+            self._ahead_trades.pop(symbol, None)
 
     # -- historical requests -----------------------------------------------------------------------
 
@@ -2476,7 +2668,9 @@ class AlpacaDataClient(MarketDataClient):
         except (ValueError, TypeError) as e:
             self._log.error(f"Dropped Alpaca trade: {e}")
             return
-        self._kept("stream")
+        if self._late(trade.symbol, tick):
+            return
+        self._kept("stream")  # after the sequence check: kept counts the prints that became ticks
         if was_rounded(tick.price, trade.price):
             # The consolidated tape carries prices finer than the instrument's: rounded as upstream
             # rounds (`rounded_price`), and named.
