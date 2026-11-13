@@ -1736,6 +1736,10 @@ class Slot:
     bids under `BID_ASK`; under a print trigger `on_trade`'s prints of the holding, a late one too):
     the hold's end reads it beside the price the cache has at that step, so a price through the held
     stop and back before the step is not forgotten (the xr4 reader's F2)."""
+    holding_from: int | None = None
+    """While the stop is held, the venue time from which a print is of this holding, as the step last
+    read it (`_holding_since`, in `_hold`), so the trade handler reads no engine attribute; None with
+    no entry fill on record."""
     held_at_l: Decimal | None = None
     """The highest level L under the average fill this hold has held (`_held_at_l`): a cheaper fill
     that lowers the average never lowers the held stop (the xr4 reader's F1; the lead's H3)."""
@@ -2370,7 +2374,7 @@ class Mover(Strategy):
             # ruling of 2026-11-13, F1 (b)); one with no usable time has no place in that order. With
             # no entry fill on record when the holding began cannot be read: a late print, which may
             # be from before it, counts toward nothing, and the newest counts, as on main
-            since = self._holding_since(slot)
+            since = slot.holding_from
             if (since is None and not late_print) or (since is not None and event >= since):
                 slot.held_low = price if slot.held_low is None else min(slot.held_low, price)
 
@@ -3459,7 +3463,7 @@ class Mover(Strategy):
             slot.profile_evaluated_ns = None
             slot.exit_record = None
             slot.protection_anchor = slot.held_stop = slot.held_since = None
-            slot.held_low = slot.held_at_l = slot.entry_received_ns = None
+            slot.held_low = slot.held_at_l = slot.entry_received_ns = slot.holding_from = None
             slot.floor_since, slot.floor_released = None, False
             slot.trailed, slot.last_sale = False, None
 
@@ -3841,6 +3845,7 @@ class Mover(Strategy):
             )
         self._ensure_exit(slot, held)
         self._held_at_l(slot)
+        slot.holding_from = self._holding_since(slot)
         last, source = self._last_known(slot)
         met, by = last, source
         low = slot.held_low
@@ -3924,6 +3929,7 @@ class Mover(Strategy):
             slot.entry_record["held_stop_secs"] = (now - slot.held_since) / SECOND_NS
         self.protect_paths[path] += 1
         slot.held_stop = slot.held_since = slot.held_low = slot.held_at_l = None
+        slot.holding_from = None
 
     def _held_anchor(self, slot: Slot) -> Decimal | None:
         """The average fill (the entry's, else the cache's position average), else the entry's limit."""
@@ -4056,8 +4062,8 @@ class Mover(Strategy):
     def _holding_since(self, slot: Slot) -> int | None:
         """The venue time from which a print is of this holding: the earlier of Alpaca's acceptance of
         the entry (`ts_accepted`) and its first fill on record, or None with no entry fill on record.
-        `_holding_trade` and the held stop's low (`on_trade`) both read it, so a print one follows the
-        other counts."""
+        `_holding_trade` and the held stop's low (`on_trade`, through `Slot.holding_from`) both read
+        it, so a print one follows the other counts."""
         filled = self._entry_filled_ns(slot)
         if filled is None:
             return None

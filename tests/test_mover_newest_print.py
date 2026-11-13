@@ -447,6 +447,31 @@ def test_with_no_entry_fill_on_record_a_late_print_counts_toward_no_low() -> Non
     assert slot.held_low == D("9.9000")
 
 
+def test_the_trade_handler_reads_no_order_from_the_engine() -> None:
+    """The module's handler contract: the trade handler reads no engine attribute. While a stop is held
+    it compares a print with the holding's start as the step last read it (`Slot.holding_from`), not
+    with the cached entry order (w3-d-lpm2/3)."""
+    seam, slot, filled, last = holding(TriggerType.LAST_PRICE, bid="9.89", ask="9.91")
+    seam.slots, seam.trades = {slot.instrument_id: slot}, 0
+    last.append(stamped("10.0000", filled - SECOND, filled - SECOND))
+    seam._protect(slot, D(3), filled + SECOND)
+    assert slot.held_stop is not None
+
+    def engine(_cid: Any) -> Any:
+        raise RuntimeError("Already mutably borrowed")
+
+    seam._order = engine
+    trade = SimpleNamespace(
+        instrument_id=slot.instrument_id,
+        price=Price.from_str("9.7000"),
+        ts_event=filled + 2 * SECOND,
+        ts_init=filled + 2 * SECOND,
+    )
+    last.append(trade)
+    seam.on_trade(trade)
+    assert slot.held_low == D("9.7000")
+
+
 @pytest.mark.parametrize(
     ("trigger", "anchor"), [(TriggerType.LAST_PRICE, None), (TriggerType.BID_ASK, D("9.50"))]
 )

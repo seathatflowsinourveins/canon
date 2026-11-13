@@ -165,19 +165,25 @@ def test_p1_venue_order_does_not_use_the_earlier_of_event_and_receipt(
     assert read(seam, slot, reader) == Decimal(10)
 
 
-@pytest.mark.parametrize("arms", ARMS, ids=ARM_NAMES)
-def test_p2_late_print_does_not_cross_a_held_stop(arms: tuple[int, int]) -> None:
-    # The lead's ruling of 2026-11-13 (09:27, F1 (b)) replaced P2: a late print of the holding counts
-    # toward the hold's low, which the hold's end reads (`_protect`; tests/test_mover_newest_print.py).
-    # `_hold` reads the last price, which a late print never becomes, so this case holds as it reads.
-    seam = PrintSeam(arms=arms, bid="0")
+def test_p2_a_late_print_still_counts_toward_a_held_stop() -> None:
+    """The lead's ruling of 2026-11-13 (09:27, F1 (b)) replaced P2: a print of the holding set aside as
+    late counts toward the hold's low, so the hold's end sells through the stop; it still never becomes
+    the newest price (P1). Persistence is off here: with an arm on, `_protect` runs the print count
+    first and the held-stop path is not reached in the same step. Replaces the tester's case, which
+    asserted the replaced line through `_hold`, a path this state does not reach (w3-d-lpm2/2, its
+    drop-in)."""
+    seam = PrintSeam(bid="9.89")
     slot = seam.open_slot()
     slot.held_since, slot.held_stop = T0, Decimal("9.80")
+    slot.holding_from = seam._holding_since(slot)  # as `_hold` sets it beside `held_since`
+    assert slot.holding_from is not None
     seam.deliver(trade("10", 5 * SECOND, 5 * SECOND))
     seam.deliver(trade("9", SECOND, 6 * SECOND))
-    seam._hold(slot, Decimal(5), T0 + 6 * SECOND)
-    assert seam.sent == [], "a late print went through the held stop"
-    assert not slot.exiting and slot.held_stop == Decimal("9.80")
+    assert slot.newest_print is not None and slot.newest_print.price == Decimal(10)
+    seam._protect(slot, Decimal(5), T0 + 6 * SECOND)
+    assert [o.kind for o in seam.sent] == ["LIMIT"] and slot.exiting
+    assert slot.exit_record is not None
+    assert slot.exit_record.trigger_reason == "held stop (followed price)"
 
 
 def test_p2_late_print_does_not_meet_the_kept_trigger() -> None:
