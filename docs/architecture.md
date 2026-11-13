@@ -163,9 +163,9 @@ locally on the data client's live data; nothing in `src/` builds one yet (ADR 00
   `scripts/canon resolve` writes the commits to the lock (ADR 0001).
 * **Records.** Decisions are MADR 4.0.0 with an Evidence section and a `review-by` date, re-verified
   after it (ADR 0002); `scripts/canon lint` checks them.
-* **One check.** `scripts/ci` runs every check at landing and on GitHub; on every commit, through
-  `.githooks/pre-commit`, it runs the checks that take seconds and leaves the rest to the landing (ADR 0013,
-  ADR 0138).
+* **One check.** `scripts/ci` runs every check on GitHub; on every commit, through `.githooks/pre-commit`,
+  and at landing, before the push, it runs the checks that take seconds (at landing with a secret scan of
+  the whole history) and leaves the rest to GitHub's required check (ADR 0013, ADR 0138, ADR 0144).
 * **Landing.** `scripts/land` runs the check and squash-merges the branch; a change outside a named few
   needs a review note, recorded as the `review` status (ADR 0014, ADR 0017, ADR 0019).
   A trading path leaves the review loop after two rounds with no finding that changes behaviour (ADR 0073;

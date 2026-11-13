@@ -48,7 +48,8 @@ Rules:
    and `scripts/land` runs `scripts/ci --landing`, which takes the last of several CI slots first, so a
    landing starts ahead of waiting hooks (2026-11-11). Since 2026-11-13 `--staged` is a commit's scope:
    the checks that take seconds, each other check a skip line that the landing and the hosted run take
-   up (ADR 0138, proposed).
+   up (ADR 0138, proposed). Amended 2026-11-13 by ADR 0144: `--landing` is that same quick set with the
+   secret scan over the whole history and the working tree, and only the hosted run runs every check.
 2. **A missing tool is a failure**, never a skipped check.
 3. **Ruff:** its default rules plus import sorting. Line length 100 and single-line imports follow
    NautilusTrader's own config, so adapter code reads like upstream. (NautilusTrader itself selects every

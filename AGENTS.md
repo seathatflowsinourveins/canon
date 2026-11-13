@@ -48,7 +48,7 @@ dependency, pattern and practice traces to a pinned upstream or a dated source. 
 | `scripts/canon list` | Show every upstream, its role and pinned commit |
 | `scripts/canon lint` | Check registry, lock and ADRs for required evidence (offline) |
 | `scripts/ci` | Run every check: registry, shell, self-tests and `scripts/test-*`, lockfile, ruff, ty, pytest, workflow, secrets; and for a project kept apart (a `uv.lock` below the root), its own lockfile, ty and pytest in its own environment |
-| `scripts/land` | Land the current branch on `main` once every check passes; no manual merge step. `--pr <n>` lands a pull request the dependency bot opened |
+| `scripts/land` | Land the current branch on `main` once its checks pass here and GitHub's required check passes; no manual merge step. `--pr <n>` lands a pull request the dependency bot opened |
 | `scripts/canon src [id]` | Fetch one pin's repository (every git pin without an id) at its locked commit into `~/.cache/canon/upstream-src/<id>@<commit>`, read-only, and print the path; a folder already there is checked against the lock |
 | `scripts/canon check` | Compare pins with live upstream; exit 3 if a pinned release tag was re-pointed, 4 if the lock is stale against the registry |
 | `scripts/canon outdated` | Show upstreams that have a newer release tag than the one pinned |
@@ -87,7 +87,7 @@ shape the system.
 ## Automation
 
 These run without being asked (ADR 0011, ADR 0013, ADR 0026). Every commit runs `scripts/ci --staged` through
-`.githooks/pre-commit`: the checks that take seconds, with the rest left to the landing and GitHub (ADR 0138). Every push runs `scripts/check-addresses` through `.githooks/pre-push`, which
+`.githooks/pre-commit`: the checks that take seconds, with the rest left to GitHub's required check (ADR 0138, ADR 0144). Every push runs `scripts/check-addresses` through `.githooks/pre-push`, which
 refuses an email address that is not a known service or example address in what the push would publish.
 Every edit to a Python file runs ruff on it, and every edit under `canon/`,
 `docs/adr/` or `.agents/`, or to an `AGENTS.md`, runs the canon lint. Once a day a session-start hook compares the canon with upstream and the
@@ -180,11 +180,14 @@ The owner's standing instruction (2026-11-09): work lands automatically once its
 
 1. One branch per change. A session that runs in parallel with another works in its own git worktree;
    two sessions never write in one checkout.
-2. Commit, then run `scripts/land`. It runs `scripts/ci` on what is committed, on a branch that contains
-   the current `main`, and lands the branch. A branch behind `main` is rebased if it was never pushed;
+2. Commit, then run `scripts/land`. It runs the landing checks (`scripts/ci --landing`: the quick set and a
+   secret scan of the whole history, and on macOS `scripts/test-lanes` and `scripts/test-maintenance`) on
+   what is committed, on a branch that contains the current `main`,
+   and lands the branch once GitHub's required check, the full suite, passes; with no `origin` remote it
+   runs every check here (ADR 0144). A branch behind `main` is rebased if it was never pushed;
    once pushed, `origin/main` is merged into it instead, since a rebase could only be pushed with force. With an `origin` remote, `gh` must be signed in, or it stops
    and lands nothing; it checks every address it would publish, pushes, opens a pull request, posts the
-   `review` and `signoff` statuses, and waits up to nine minutes (`LAND_WAIT_SECONDS`, default 540) for
+   `review` and `signoff` statuses, and waits up to 45 minutes (`LAND_WAIT_SECONDS`, default 2700) for
    GitHub to squash-merge exactly the checked commit with the checked subject and message. If the wait
    runs out first, it stops and says what it last read; with auto-merge requested, GitHub may still merge
    once the checks pass, so look at the pull request. With no `origin` remote

@@ -7,6 +7,8 @@ review-by: 2027-02-11
 
 # A commit runs only the checks that take seconds, and a landing and GitHub run the whole suite (proposed: open until a timed run of each form is in the record)
 
+Superseded in part 2026-11-13 by [ADR 0144](0144-a-landing-runs-the-quick-checks-here-and-the-full-suite-once-on-github.md): its commit scope stands; a landing now runs the quick set with a secret scan of the whole history, and only the hosted run runs every check. The missing timing comparison remains UNVERIFIED.
+
 ## Context and Problem Statement
 
 Every `git commit` runs the whole of `scripts/ci` (`.githooks/pre-commit`, ADR 0011's commit gate). The hook

@@ -95,14 +95,19 @@ FAKE
 chmod +x "$TMP/bin/mise"
 
 # One template, copied for every case: work (on main, with the scripts under test and a scripts/ci stub
-# that records that it ran) and its bare origin.
+# that records its arguments and checked commit) and its bare origin.
 T="$TMP/template"
 mkdir -p "$T/work/scripts" "$T/work/docs/adr" "$T/work/src"
 { git init -q -b main "$T/work" && git init -q --bare "$T/origin.git"; } || { echo "test-land: git init failed"; exit 1; }
 cp "$ROOT/scripts/land" "$ROOT/scripts/check-addresses" "$T/work/scripts/"
 [ ! -f "$ROOT/scripts/fix-index" ] || cp "$ROOT/scripts/fix-index" "$T/work/scripts/"
-# shellcheck disable=SC2016  # expanded by the stub, not here
-printf '%s\n' '#!/bin/bash' 'echo ran >> "$FAKE/ci"' > "$T/work/scripts/ci"; chmod +x "$T/work/scripts/ci"
+cat > "$T/work/scripts/ci" <<'CI'
+#!/bin/bash
+printf '%s\n' "$*" >> "$FAKE/ci"
+git rev-parse HEAD > "$FAKE/ci_head"
+[ ! -f "$FAKE/ci_rc" ] || exit "$(cat "$FAKE/ci_rc")"
+CI
+chmod +x "$T/work/scripts/ci"
 echo "readme" > "$T/work/README.md"; echo "# 0001 First" > "$T/work/docs/adr/0001-first.md"
 echo "lock" > "$T/work/uv.lock"; echo "x = 1" > "$T/work/src/a.py"
 # A gate module on the trading path, and a test file for Fails-before to name.
@@ -130,6 +135,12 @@ land() { out=$(cd "$W" && scripts/land "$@" 2>&1); rc=$?; }
 has()     { case "$out" in *"$1"*) return 0 ;; *) return 1 ;; esac; }
 logged()  { grep -cF -- "$1" "$FAKE/log" >/dev/null; }
 ci_ran()  { [ -f "$FAKE/ci" ]; }
+quick_ci_ran() {          # quick_ci_ran [noremote]: one scripts/ci --landing, or one full run with no origin
+  local want=--landing; [ "${1:-}" != noremote ] || want=""
+  ci_ran || { why="the local checks did not run"; return 1; }
+  [ "$(cat "$FAKE/ci")" = "$want" ] \
+    || { why="expected one scripts/ci ${want:-(no arguments)}; got $(cat "$FAKE/ci")"; return 1; }
+}
 pushed()  { git -C "$C/origin.git" rev-parse --verify -q "refs/heads/$1" >/dev/null; }
 
 # case_ <label> <function> [args]: the function returns 0 when the case behaves as expected. Cases run in
@@ -159,6 +170,43 @@ case_() {
 }
 
 # --- gh and the local path ---
+t_quick_checks() {        # t_quick_checks [noremote]: a clean, multi-commit branch gets the landing set once, or every check with no origin
+  new_repo "${1:-}"; change src/a.py; change README.md
+  local sha; sha=$(git -C "$W" rev-parse topic)
+  land --reviewed "code-review ran, nothing found"
+  quick_ci_ran "${1:-}" || return 1
+  why="the checks did not check and land the committed branch"
+  [ "$rc" -eq 0 ] && has "landed" \
+    && [ "$(cat "$FAKE/ci_head")" = "$sha" ] || return 1
+  if [ "${1:-}" = noremote ]; then
+    [ "$(git -C "$W" rev-parse main)" = "$sha" ] && ! logged "statuses"
+  else
+    logged "statuses/$sha -f state=success -f context=review" \
+      && logged "statuses/$sha -f state=success -f context=signoff" \
+      && logged "pr merge 7 --squash --match-head-commit $sha"
+  fi
+}
+t_quick_signoff() {
+  new_repo; change src/a.py
+  local sha; sha=$(git -C "$W" rev-parse topic)
+  land --reviewed "code-review ran, nothing found"
+  why="the review or signoff status does not truthfully name what ran locally"
+  [ "$rc" -eq 0 ] \
+    && logged "statuses/$sha -f state=success -f context=review -f description=code-review ran, nothing found" \
+    && logged "statuses/$sha -f state=success -f context=signoff -f description=scripts/ci --landing (quick checks, history secret scan, macOS self-tests on macOS) passed locally"
+}
+t_quick_failure() {
+  new_repo; change src/a.py; echo 1 > "$FAKE/ci_rc"
+  land --reviewed "code-review ran, nothing found"
+  quick_ci_ran || return 1
+  why="failed local quick checks did not stop before push, statuses and merge"
+  [ "$rc" -ne 0 ] && has "checks failed; nothing landed" && ! pushed topic \
+    && ! logged "statuses" && ! logged "pr merge"
+}
+case_ "a landing runs the landing set once on the committed branch" t_quick_checks
+case_ "a landing with no origin runs every check once on the committed branch" t_quick_checks noremote
+case_ "both statuses name the checked commit and signoff names the quick checks" t_quick_signoff
+case_ "failed quick checks stop before push, statuses and merge" t_quick_failure
 t_signed_out() {
   new_repo; change README.md; echo 1 > "$FAKE/auth_rc"
   local before; before=$(git -C "$W" rev-parse main)
@@ -350,7 +398,8 @@ t_lands_without_note() {   # t_lands_without_note <path>
 }
 t_needs_note() {           # t_needs_note <path>...
   new_repo; local p; for p in "$@"; do change "$p"; done
-  land; [ "$rc" -ne 0 ] && has "needs an independent review" && ! pushed topic && ! ci_ran
+  land; [ "$rc" -ne 0 ] && has "needs an independent review" && ! pushed topic && ! ci_ran \
+    && ! logged "statuses" && ! logged "pr merge"
 }
 t_new_adr()    { new_repo; echo "# 0002" > "$W/docs/adr/0002-new.md"; git -C "$W" add -A; git -C "$W" commit -q -m "Add"
                  land; [ "$rc" -ne 0 ] && has "docs/adr/0002-new.md"; }
@@ -616,7 +665,8 @@ bot_pr() {   # fails, naming why, if a git step fails; every caller stops then (
 main_moves() { why="moving main failed"; git -C "$W" switch -q -c side main && change README.md "Move main" && git -C "$W" push -q origin side:main \
                  && git -C "$W" switch -q topic && why=""; }
 gone() { [ ! -e "$C/canon-worktrees/pr-5" ] && ! git -C "$W" show-ref --verify -q refs/heads/bot; }
-t_pr_lands() { bot_pr uv.lock || return 1; land --pr 5; [ "$rc" -eq 0 ] && logged "pr merge 5 --squash" && gone; }
+t_pr_lands() { bot_pr uv.lock || return 1; land --pr 5
+              quick_ci_ran && [ "$rc" -eq 0 ] && logged "pr merge 5 --squash" && gone; }
 t_pr_message() {
   bot_pr src/a.py || return 1; land --pr 5
   [ "$rc" -ne 0 ] && has 'scripts/land --pr 5 --reviewed "' && gone
@@ -714,7 +764,8 @@ case_ "an interrupted --pr run stops the run inside it"     t_pr_inner_stopped
 # --- dry run ---
 t_dry_missing_note() {
   new_repo; change src/a.py; land --dry-run
-  [ "$rc" -ne 0 ] && ci_ran && has "would push" && has "needs an independent review" && ! pushed topic
+  quick_ci_ran && [ "$rc" -ne 0 ] && has "would push" && has "needs an independent review" \
+    && ! pushed topic && ! logged "statuses" && ! logged "pr merge"
 }
 case_ "--dry-run without a needed note still runs the checks, then fails" t_dry_missing_note
 

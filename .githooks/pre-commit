@@ -4,8 +4,8 @@
 #
 # Runs scripts/ci --staged, the same script CI runs, in a commit's scope (ADR 0138): the canon lint, the lock
 # check, ruff, its format, ty, pytest's collection, the shell checks and a secret scan of what is staged.
-# The self-tests, the full pytest and actionlint are left to scripts/land and GitHub, which run every check.
-# `git commit --no-verify` would skip it here; GitHub runs the same script before anything merges, so a
+# The self-tests, the full pytest and actionlint are left to GitHub's required check, which runs every check
+# (ADR 0144). `git commit --no-verify` would skip it here; GitHub runs the same script before anything merges, so a
 # skipped commit still cannot land (ADR 0020).
 #
 # A commit in the primary checkout is refused: the maintenance agent keeps that checkout on main and
