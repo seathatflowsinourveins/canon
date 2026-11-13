@@ -21,7 +21,7 @@
   "statusLine": {
     "type": "command",
     "command": "~/.claude/canon/statusline.sh",
-    "refreshInterval": 5
+    "refreshInterval": 30
   },
   "hooks": {
     "SessionStart":       [{ "hooks": [{ "type": "command", "command": "\"$HOME\"/.claude/canon/ledger.sh", "async": true }] }],

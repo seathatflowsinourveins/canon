@@ -2580,21 +2580,32 @@ check "check: telemetry settings and codex telemetry ok" \
 check "a new settings.json's status line refreshes on canon's interval" \
       eval 'jqt "$C/settings.json" ".statusLine.refreshInterval == $(jq .statusLine.refreshInterval "$ROOT/home/.claude/settings.json")"'
 C4="$TMP/cfg4"; mkdir -p "$C4"
-for case_ in canon mine owner30; do
+check "canon's interval is 30 s, the HUD's floor for several sessions (ADR 0007)" \
+      jqt "$ROOT/home/.claude/settings.json" '.statusLine.refreshInterval == 30'
+for case_ in canon mine owner15 earlier5 owner5 text; do
   rm -f "$C4"/settings.json*
   case "$case_" in
-    canon)   sl='{"type":"command","command":"\"'"$C4"'\"/canon/statusline.sh"}' ;;
-    mine)    sl='{"type":"command","command":"/x/mine.sh"}' ;;
-    owner30) sl='{"type":"command","command":"\"'"$C4"'\"/canon/statusline.sh","refreshInterval":30}' ;;
+    canon)    sl='{"type":"command","command":"\"'"$C4"'\"/canon/statusline.sh"}' ;;
+    mine)     sl='{"type":"command","command":"/x/mine.sh"}' ;;
+    owner15)  sl='{"type":"command","command":"\"'"$C4"'\"/canon/statusline.sh","refreshInterval":15}' ;;
+    earlier5) sl='{"type":"command","command":"\"'"$C4"'\"/canon/statusline.sh","refreshInterval":5}' ;;
+    owner5)   sl='{"type":"command","command":"/x/mine.sh","refreshInterval":5}' ;;
+    text)     sl='"~/x/mine.sh"' ;;
   esac
   printf '{"statusLine":%s}\n' "$sl" > "$C4/settings.json"
-  CLAUDE_CONFIG_DIR="$C4" bs --user-config
+  CLAUDE_CONFIG_DIR="$C4" bs --user-config; rc=$?
   case "$case_" in
-    mine)    check "a status line of the owner's own gets no refreshInterval" jqt "$C4/settings.json" '.statusLine | has("refreshInterval") | not' ;;
-    owner30) check "an owner's refreshInterval on canon's command is kept, and not named as a gap" \
-                   eval 'jqt "$C4/settings.json" ".statusLine.refreshInterval == 30" && ! grep -q "statusLine.refreshInterval" "$TMP/bs.out"' ;;
-    canon)   check "canon's command with no refreshInterval gets the template's, named under ADR 0007" \
-                   eval 'jqt "$C4/settings.json" ".statusLine.refreshInterval == $(jq .statusLine.refreshInterval "$ROOT/home/.claude/settings.json")" && grep -q "added      statusLine.refreshInterval to .*(ADR 0007)" "$TMP/bs.out"' ;;
+    mine)     check "a status line of the owner's own gets no refreshInterval" jqt "$C4/settings.json" '.statusLine | has("refreshInterval") | not' ;;
+    owner15)  check "an owner's refreshInterval on canon's command is kept, and not named as a gap" \
+                    eval 'jqt "$C4/settings.json" ".statusLine.refreshInterval == 15" && ! grep -q "statusLine.refreshInterval" "$TMP/bs.out"' ;;
+    canon)    check "canon's command with no refreshInterval gets the template's, named under ADR 0007" \
+                    eval 'jqt "$C4/settings.json" ".statusLine.refreshInterval == $(jq .statusLine.refreshInterval "$ROOT/home/.claude/settings.json")" && grep -q "added      statusLine.refreshInterval to .*(ADR 0007)" "$TMP/bs.out"' ;;
+    earlier5) check "the 5 s an earlier template set on canon's command is retired for the template's, both named" \
+                    eval 'jqt "$C4/settings.json" ".statusLine.refreshInterval == $(jq .statusLine.refreshInterval "$ROOT/home/.claude/settings.json")" && grep -q "retired    statusLine.refreshInterval in .*(ADR 0007" "$TMP/bs.out" && grep -q "added      statusLine.refreshInterval to .*(ADR 0007)" "$TMP/bs.out"' ;;
+    owner5)   check "a 5 s interval on a status line of the owner's own is left as set" \
+                    eval 'jqt "$C4/settings.json" ".statusLine.refreshInterval == 5" && ! grep -q "statusLine.refreshInterval" "$TMP/bs.out"' ;;
+    text)     check "a status line that is not an object is left as set, and the rest still installs" \
+                    eval '[ "$rc" = 0 ] && jqt "$C4/settings.json" ".statusLine == \"~/x/mine.sh\" and .env.CLAUDE_CODE_ENABLE_TELEMETRY == \"1\""' ;;
   esac
 done
 # a history for the bootstrap copy: an earlier claude-hud.json, then the template's

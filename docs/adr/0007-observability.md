@@ -312,11 +312,12 @@ sets the HUD's options at v0.15.0 (`src/config.ts`, `src/schema.ts`). The choice
   v0.15.0), shown only, never recorded. These come from the session transcript, whose format the docs
   call internal, so the HUD's own parser carries them (it followed a format change in v0.12.1) and a
   change in Claude Code can blank or misread them until the HUD follows; nothing else rests on them.
-  The line runs again every 5 s (`statusLine.refreshInterval`, statusline.md: "Set this when your status
+  The line runs again every 30 s (`statusLine.refreshInterval`, statusline.md: "Set this when your status
   line shows time-based data ... or when background subagents change git state while the main session
-  is idle"), so a coordinator waiting on its agents sees them progress, at the cost of one render of
-  about 0.24 s per open session every 5 s; `scripts/bootstrap --user-config` adds the interval only to
-  canon's own status line that sets none, and an interval the owner set is left and not called a gap.
+  is idle"), so a coordinator waiting on its agents sees them progress within half a minute; it ran every
+  5 s until 2026-11-13 (the interval's cost, below). `scripts/bootstrap --user-config` adds the interval
+  only to canon's own status line that sets none, and an interval the owner set is left and not called a
+  gap, except the 5 s an earlier template set on canon's command, which it replaces with the template's.
   It also replaces an installed `claude-hud.json` that is byte for byte a version committed in canon's
   history, keeping the previous copy, so a display change reaches the machine without a hand merge; one
   the owner edited still gets a `.canon-proposed` copy beside it. Measured 2026-11-12 against a real
@@ -392,7 +393,7 @@ temporary config folder's plugin cache: five lines at 60, three at 100, about 0.
 left, the branch's handle shown as `~`, and the bar in the warning colour at 250k of 300k. Re-checked on
 2026-11-12 with the cache line and a session window of 600k: six lines at 60, three at 100, about 0.17 s a
 render. The status line's refresh is event-driven and debounced at 300 ms, and a new
-event cancels a run still going (statusline.md). Every open session renders every 5 s, so on 2026-11-13 the
+event cancels a run still going (statusline.md). Every open session rendered every 5 s then, so on 2026-11-13 the
 render's own cost was cut, with the same lines shown: `statusline.sh` reads the input with four `jq` runs
 instead of seven, takes the clock from `jq`, picks the HUD's version in the shell instead of `find`, `sed`,
 `sort` and `tail`, and skips mise's shim (above, which also changes the Node in a project that pins its own);
@@ -401,6 +402,20 @@ also lists the enabled marketplaces, so a malformed one still reaches the HUD as
 transcript, with the machine's load average between 23 and 54: CPU per render from 303-369 ms to 225-267 ms,
 wall time from 220-281 ms to 184-214 ms, and the wrapper's own CPU, with a renderer that does nothing, from
 56-69 ms to 45-50 ms.
+
+The interval went from 5 s to 30 s the same day, on the owner's requirement of 2026-11-13 that the status
+line not overload the machine. An interval render costs what an event's does, so the idle load grows with the
+open sessions: counted that day over one minute (each `statusline.sh` a `claude` process started, sampled
+every 0.1 s), 240 renders from 18 sessions, about four a second, so about one of the machine's 18 cores at
+0.25 s of CPU each; 216 a minute of them are what 18 intervals of 5 s give. Every render a change needs still
+runs on its event: a new message, `/compact`, a mode change, and a rate-limit reset or a warm cache's expiry
+in the data last received (statusline.md, "How status lines work"); the interval only redraws a session no
+event reaches. What such a session shows that moves with time, the session's duration (to the minute), the
+fleet label (cached for a minute) and a waiting coordinator's subagents, is at most 30 s behind. The HUD's
+own note sets 30 s as the least for several sessions on Windows Git Bash, where shorter intervals fail
+(`src/schema.ts` at v0.15.0); nothing upstream sets one for macOS, so 30 s is canon's choice of load against
+freshness, taking the HUD's figure. Expected at 30 s: 36 interval renders a minute for 18 sessions, plus the
+events' (not yet counted after the change: UNVERIFIED).
 
 `scripts/test-usage` feeds the status line fake inputs: both windows, an input without `rate_limits`, an
 idle re-render with the same cost and a new response with a higher one, three sessions (an idle one older,
@@ -578,3 +593,14 @@ Read 2026-11-09 (fetched; fetches are model-summarised).
   `package.json` `engines` `"node": ">=22.18.0"`. mise 2026.11.6:
   `mise which --help`, "Prints the real path of the executable mise would run for BIN_NAME in the current
   directory, bypassing shims"; `mise --help`, `-C, --cd <DIR>` "Run as if mise were started in DIR".
+* Read 2026-11-13 for the refresh interval. https://code.claude.com/docs/en/statusline.md (fetched in full,
+  raw): `refreshInterval` "re-runs your command every N seconds in addition to the event-driven updates. The
+  minimum is `1`. Set this when your status line shows time-based data such as a clock, or when background
+  subagents change git state while the main session is idle. Leave it unset to run only on events"; the
+  events that run it again (a new assistant message, `/compact`, the permission mode, vim mode, a change of
+  `command`, the timer, a rate-limit window's `resets_at`, a warm prompt cache's `expires_at`), the 300 ms
+  debounce, and "The event-driven triggers can go quiet when the main session is idle, for example while a
+  coordinator waits on background subagents". Claude HUD at v0.15.0, the installed copy, `src/schema.ts`
+  (the refresh entry): "To keep countdowns ticking while idle, add refreshInterval (seconds) to statusLine in
+  settings.json. On Windows Git Bash, short intervals with several sessions can fail with `add_item ...
+  failed, errno 1`: use 30 s or more."

@@ -34,10 +34,10 @@
 # https://code.claude.com/docs/en/monitoring-usage.md), and the keys it lacks of CANON_KEYS (model,
 # availableModels and modelPicker, ADR 0059; autoUpdatesChannel, ADR 0065; autoCompactWindow, ADR 0059;
 # syncClaudeAiSkills, syncClaudeAiPlugins and disableClaudeAiConnectors, ADR 0139), with a NOTE line for
-# each of ADR 0139's four that says what it changes. It replaces two values an
+# each of ADR 0139's four that says what it changes. It replaces three values an
 # earlier template set (RETIRED: autoUpdatesChannel "stable", ADR 0065; env.ANTHROPIC_DEFAULT_FABLE_MODEL
-# "claude-fable-5-2", ADR 0059), keeping a copy of the previous file; a value the owner set otherwise is
-# left alone and named. It
+# "claude-fable-5-2", ADR 0059; statusLine.refreshInterval 5 on canon's own status line command, ADR 0007),
+# keeping a copy of the previous file; a value the owner set otherwise is left alone and named. It
 # appends home/.codex/otel.toml to ${CODEX_HOME:-~/.codex}/config.toml when that file has no otel table of its
 # own and its folder exists, and writes home/.codex/defaults.toml's settings (model, model_reasoning_effort;
 # service_tier and notice.hide_rate_limit_model_nudge, ADR 0005; approval_policy, default_permissions and the
@@ -79,15 +79,17 @@ TELEMETRY_RE='^(CLAUDE_CODE_ENABLE_TELEMETRY$|OTEL_|DO_NOT_TRACK$)'
 # it lacks them (the model keys, ADR 0059; the update channel, ADR 0065; syncClaudeAiSkills and
 # syncClaudeAiPlugins, which only user, local or managed settings can set, and disableClaudeAiConnectors,
 # ADR 0139), and the values an earlier template
-# set that those records retire: --user-config removes one only while it still holds exactly that value, and
-# a key of CANON_KEYS removed so is then added from the template. The earlier template's "model": "fable" is
+# set that those records retire: --user-config removes one only while it still holds exactly that value and,
+# for an entry with "when", while the file holds the template's value at that path too (the status line's
+# interval only on canon's own command), and a key of CANON_KEYS or the status line's interval removed so is
+# then added from the template. The earlier template's "model": "fable" is
 # not among them: it is also the orchestrator lane's alias, which an owner may choose, so --check names it
 CANON_KEYS='["model", "availableModels", "modelPicker", "autoUpdatesChannel", "autoCompactWindow", "syncClaudeAiSkills", "syncClaudeAiPlugins", "disableClaudeAiConnectors"]'
 # the jq lookup of one top-level key, named by --arg k, as JSON text, or nothing when the key is absent
 # (`.[$k] // empty` would read a false as absent)
 # shellcheck disable=SC2016  # a jq program, not shell
 JQ_TOP='if type == "object" and has($k) then .[$k] | tojson else empty end'
-RETIRED='[{"path": ["autoUpdatesChannel"], "value": "stable"}, {"path": ["env", "ANTHROPIC_DEFAULT_FABLE_MODEL"], "value": "claude-fable-5-2"}]'
+RETIRED='[{"path": ["autoUpdatesChannel"], "value": "stable"}, {"path": ["env", "ANTHROPIC_DEFAULT_FABLE_MODEL"], "value": "claude-fable-5-2"}, {"path": ["statusLine", "refreshInterval"], "value": 5, "when": ["statusLine", "command"]}]'
 # the variables that turn Claude Code's background updates off (https://code.claude.com/docs/en/env-vars.md)
 UPDATE_OFF_VARS="DISABLE_AUTOUPDATER DISABLE_UPDATES CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"
 CODEX_DEFAULTS_SRC="$ROOT/home/.codex/defaults.toml"
@@ -1101,7 +1103,8 @@ keep_copy() {
 # A value the owner set otherwise, and an otel setting of Codex's that is not canon's, are left alone and
 # named, as the owner's choice. The template's statusLine.refreshInterval is added the same way, only to a status
 # line that runs canon's command, spelled as the template spells it, and sets no interval (ADR 0007); an interval
-# already there is the owner's and is neither changed nor named as a gap. Codex's config is written only when its folder
+# already there is the owner's and is neither changed nor named as a gap, except the 5 s an earlier template set
+# on that command, which RETIRED replaces. Codex's config is written only when its folder
 # exists (Codex installed).
 # Returns 1 only when settings.json cannot be read as settings.
 install_telemetry() {
@@ -1114,9 +1117,11 @@ install_telemetry() {
     # shellcheck disable=SC2016  # jq program, not shell
     plan=$(jq -c --slurpfile w "$1" --arg re "$TELEMETRY_RE" --argjson mk "$CANON_KEYS" --argjson ret "$RETIRED" '
       def telemetry: with_entries(select(.key | test($re)));
+      def at($p): try getpath($p) catch null;   # a path through a value that is not an object reads as absent
       . as $in | $w[0] as $t
       | ($t.env // {} | telemetry | with_entries(select(($in.env // {})[.key] == null))) as $env
-      | [$ret[] | select(. as $r | $in | getpath($r.path) == $r.value)] as $gone
+      | [$ret[] | select(. as $r | ($in | at($r.path)) == $r.value
+                         and ($r.when == null or (($in | at($r.when)) == ($t | at($r.when)))))] as $gone
       | (reduce $gone[] as $r ($in; delpaths([$r.path]))) as $kept
       | [$mk[] | select($kept[.] == null and $t[.] != null)] as $top
       | ($t.statusLine.refreshInterval? // null) as $ri
@@ -1140,7 +1145,7 @@ install_telemetry() {
       [ "$(jq '.env | length' <<<"$plan")" = 0 ] || note "  added      $(jq -r '.env | join(", ")' <<<"$plan") to the env of $s"
       [ "$(jq '.top | length' <<<"$plan")" = 0 ] || note "  added      $(jq -r '.top | join(", ")' <<<"$plan") to $s (ADR 0059, ADR 0065, ADR 0139)"
       [ "$(jq '.sl | length' <<<"$plan")" = 0 ] || note "  added      statusLine.refreshInterval to $s (ADR 0007)"
-      [ "$(jq '.gone | length' <<<"$plan")" = 0 ] || note "  retired    $(jq -r '.gone | join(", ")' <<<"$plan") in $s, values an earlier canon template set (ADR 0059, ADR 0065); a key retired here is then added from the template"
+      [ "$(jq '.gone | length' <<<"$plan")" = 0 ] || note "  retired    $(jq -r '.gone | join(", ")' <<<"$plan") in $s, values an earlier canon template set (ADR 0007, ADR 0059, ADR 0065); a key retired here is then added from the template"
       claudeai_notes "$s" "$(jq -r '(.env + .top) | join(" ")' <<<"$plan")"
     else
       note "  unchanged  telemetry and model settings in $s"
