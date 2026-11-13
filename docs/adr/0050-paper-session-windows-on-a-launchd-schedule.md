@@ -260,11 +260,14 @@ UNVERIFIED until the first one. Limits:
 
 * **Account B is idle between windows** for the interval and a firing's start-up, about two minutes. That
   is UNVERIFIED until the first firings at 70 s have run.
-* **A proof waits at most 900 s.** A run by hand waits for account B's lock as a firing does, at most
-  `lockwait` (900 s), and a scheduled window holds it for about 27 minutes. A run started early in a scheduled
-  window therefore fails by name with nothing placed, and is started again after that window's end;
-  `paper:session` skips a window that would start within 60 s of the last one's end. A firing that waits out
-  900 s behind a longer run by hand fails the same way, and the next firing comes 600 s later.
+* **How a proof takes its turn.** A run by hand waits for account B's lock as a firing does, at most
+  `lockwait` (900 s), and a scheduled window holds it for about 27 minutes. A proof started in a scheduled
+  window's last 14 minutes or so takes account B when that window ends, ahead of the next firing, which comes
+  an interval later and then waits behind it. Started earlier, it fails by name with nothing placed and is
+  started again. A run that takes the lock under the 60 s gap after the last window's end now waits out the
+  rest of the gap, from what is left of its lock wait (`paper:session`'s `gapwait`), where before it reached
+  the window's own check and was skipped. A firing that waits out 900 s behind a run by hand longer than
+  about 14 minutes fails by name the same way, and the next firing comes 70 s later.
 * **The history load moves to account A.** ADR 0093's history load takes no account lock; with the schedule
   on, it runs on account A, not B. Nothing enforces this; it is a rule for the lane that runs a load.
 
