@@ -371,6 +371,7 @@ from decimal import ROUND_CEILING
 from decimal import ROUND_FLOOR
 from decimal import Decimal
 from enum import Enum
+from time import monotonic
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import ClassVar
@@ -498,6 +499,24 @@ after the first attempt); 3 reads in all keeps a start-up that fails within 6 s 
 FILL_READ_RETRY_SECS = 3.0
 """The wait between those reads, alpaca-py's `DEFAULT_RETRY_WAIT_SECONDS`."""
 
+HELD_REPORT_TIMEOUT_SECS = 0.5
+"""Wall-time bound for an entire report hold, including its REST reads and queued engine events.
+A targeted report must not become a successful empty answer
+(`targeted_report_response`, nautilus-trader@d53849b216e2 reconciliation.rs:549-556). The half second is
+an adapter choice, not an upstream guarantee; targeted failure preserves incomplete coverage."""
+
+HELD_REPORT_RETRY_SECS = 5.0
+"""Minimum spacing after a timed-out hold before retrying an unchanged closed order, and between
+named omissions of an order whose cache stays open. An adapter choice; cache progress can unblock
+a request sooner. Disconnect discards the retry state, which is this client's own."""
+
+HELD_REPORT_REREADS = 3
+"""How often the client reads a finished order again by itself, `HELD_REPORT_RETRY_SECS` apart, after
+a stream update's hold on it failed: no further update comes for an ended order, and the engine's
+open-order check reads open orders only by default (`open_check_open_only`), so nothing else would. An
+adapter choice, the count of `FILL_READ_TRIES`. Past the last the order is left, with an error, to the
+next start-up; whether start-up reconciliation then brings its fills is UNVERIFIED."""
+
 ORDERS_PAGE_LIMIT = 500
 """The most orders one `get_orders` call returns: `GetOrdersRequest.limit` "Defaults to 50 and max is 500"."""
 
@@ -603,6 +622,20 @@ FILL_EVENTS = frozenset({"fill", "partial_fill"})
 
 class PaperOnlyError(ValueError):
     """A setting that would point the execution client anywhere but Alpaca's paper Trading API."""
+
+
+class HeldReportError(RuntimeError):
+    """A report hold ended with an error already logged against its order, never a missing answer."""
+
+
+@dataclasses.dataclass
+class ReportHoldFailure:
+    """Bounded retry and log spacing for the targeted-report incomplete-coverage contract above."""
+
+    state: tuple[bool, Decimal]
+    retry_at: float
+    log_after: float
+    message: str
 
 
 class AlpacaExecutionClientConfig(ExecutionClientConfig):
@@ -1611,10 +1644,14 @@ class AlpacaExecutionClient(ExecutionClient):
         self._last_replacement_stamp = 0
         # One alpaca-py call at a time on its one requests.Session (see data.py); rebuilt in `_connect`.
         self._rest_lock = asyncio.Lock()
-        # Orders this client has seen Alpaca acknowledge, and orders it has seen reach a final state, so
-        # an acknowledgement is generated once and nothing is generated after the end.
+        # Orders this client has seen Alpaca acknowledge, and orders it has stopped tracking. The
+        # latter's snapshots wait for cache closure before additional fills can be reconciled.
         self._accepted: set[ClientOrderId] = set()
         self._finished: set[ClientOrderId] = set()
+        # Closed orders retry after a spacing, even with unchanged fills. An open cache must first
+        # close. Replace this dictionary on disconnect so old holds cannot write into a new session.
+        self._report_hold_failures: dict[ClientOrderId, ReportHoldFailure] = {}
+        self._report_rereads: dict[ClientOrderId, asyncio.Task[None]] = {}
         # One record per node order with a replace chain or fills to count (`OrderRecord`), built from
         # the node's cache when first needed: the cache takes a generated event later, not when it is
         # generated (observed), so an order's terms and end are judged on the record.
@@ -1743,6 +1780,7 @@ class AlpacaExecutionClient(ExecutionClient):
         self._trading = None
         self._accepted.clear()
         self._finished.clear()
+        self._report_hold_failures = {}
         self._waiting_ends = {
             cid: record.end for cid, record in self._records.items() if record.end is not None
         }
@@ -1755,9 +1793,10 @@ class AlpacaExecutionClient(ExecutionClient):
         self._acknowledged.clear()
         catching_up, self._catching_up = list(self._catching_up.values()), {}
         self._catch_up_targets.clear()
-        for task in catching_up:
+        rereads, self._report_rereads = list(self._report_rereads.values()), {}
+        for task in (*catching_up, *rereads):
             task.cancel()
-        await asyncio.gather(*catching_up, return_exceptions=True)
+        await asyncio.gather(*catching_up, *rereads, return_exceptions=True)
         if thread is not None and thread.is_alive():
             raise RuntimeError(
                 f"Alpaca trade updates thread did not stop within {STREAM_JOIN_TIMEOUT_SECS} s",
@@ -1973,7 +2012,15 @@ class AlpacaExecutionClient(ExecutionClient):
             if not is_open_order(held):
                 # Closed already, so its update may never come: Alpaca's read goes to the engine as a
                 # report, as a `QueryOrder` answer does (`_query_order`).
-                await self._send_report(held)
+                try:
+                    await self._send_report(held)
+                except HeldReportError:
+                    pass  # the hold already logged the omitted report
+                except APIError as e:
+                    self._log.warning(
+                        f"Alpaca report for refused submit {client_order_id} omitted "
+                        f"({failure_cause(e)})"
+                    )
             return
         self._reject(
             order,
@@ -2698,6 +2745,8 @@ class AlpacaExecutionClient(ExecutionClient):
             return
         try:
             await self._apply(update)
+        except HeldReportError:
+            return  # the hold logged its order and why it ended
         except (ValueError, TypeError, RuntimeError, APIError, OSError) as e:
             # Nothing else reports it: name the update and keep the stream.
             self._log.error(
@@ -2774,7 +2823,9 @@ class AlpacaExecutionClient(ExecutionClient):
         walked twice. A client order ID NautilusTrader cannot hold (empty or not ASCII, as an order made
         outside the node can carry) ends the chain: the trace stops at the order before it.
         """
+        failures = self._report_hold_failures
         order_id = str(alpaca_order.id)
+        self._check_report_session(holdable_id(alpaca_order.client_order_id), failures)
         if order_id in self._index:
             return self._index[order_id]
         held = self._held_by_venue_id(order_id)
@@ -2814,6 +2865,7 @@ class AlpacaExecutionClient(ExecutionClient):
             if self.cache.order(root) is not None:
                 break
             replaces = prior.replaces
+        self._check_report_session(root, failures)
         self._index[order_id] = root
         return root
 
@@ -3007,6 +3059,17 @@ class AlpacaExecutionClient(ExecutionClient):
                     f"Alpaca rejected the replacement {leg_id} of {client_order_id}, which had filled "
                     "first; the fill is the outcome",
                 )
+                return
+            # A snapshot can outlive the client's tracking. Wait for the queued end to reach the
+            # cache, then reconcile any additional real fills instead of discarding the snapshot.
+            try:
+                await self._send_report(alpaca_order)
+            except HeldReportError, APIError, OSError:
+                # A hold that ended unsettled, or a read of the snapshot's own mapping that failed
+                # before it. Nothing else reads an ended order again: Alpaca sends it no further
+                # update, and the engine's open-order check reads open orders only by default.
+                self._reread_report_later(client_order_id, venue_order_id)
+                raise
             return
         if order.is_closed:
             # Ended by the engine: from a report, which reaches it only once the node's order holds every
@@ -3162,13 +3225,22 @@ class AlpacaExecutionClient(ExecutionClient):
     def _finish(self, client_order_id: ClientOrderId) -> None:
         """Mark the node's order ended and drop its record, as Binance spot's `cleanup_terminal` does; the
         index entries of its Alpaca orders go too: a late update of one is still known as the ended
-        order's, through the node's cache, which holds every venue order ID the order has had."""
+        order's, through the node's cache, which holds every venue order ID the order has had. Retire
+        its later-read target; an already outstanding read exits on return and stays cancellable at
+        disconnect. Only the retry that itself ended the order may log that it caught up."""
         self._finished.add(client_order_id)
         record = self._records.pop(client_order_id, None)
         for leg_id in record.legs if record is not None else ():
             if self._index.get(leg_id) == client_order_id:
                 del self._index[leg_id]
         self._acknowledged.pop(client_order_id, None)
+
+        self._catch_up_targets.pop(client_order_id, None)
+        if self._catching_up.get(client_order_id) is asyncio.current_task():
+            # This read brought the ending fill and may log that fact. Another task's outstanding
+            # read stays tracked for disconnect; after it returns (or its retry wait ends), it exits
+            # without another read or crediting itself for a fill the stream brought.
+            self._catching_up.pop(client_order_id, None)
 
     async def _replaced(
         self, order: Any, record: OrderRecord, old: AlpacaOrder, ts_event: int
@@ -3717,6 +3789,8 @@ class AlpacaExecutionClient(ExecutionClient):
         own read does not. An update showing more while the reads wait, or during one, widens them and
         gives them their reads again. Past the last read the order is left with an error, as Alpaca shows
         it, to the next start-up."""
+        if self._ended(client_order_id):
+            return
         waiting = self._catch_up_targets.get(client_order_id)
         self._catch_up_targets[client_order_id] = max(shown, waiting or Decimal(0))
         if client_order_id in self._catching_up:
@@ -3735,6 +3809,11 @@ class AlpacaExecutionClient(ExecutionClient):
                     caught = self._held(order, record) >= target or await self._catch_up(
                         order, record, target, venue_order_id, logged=False
                     )
+                    if (
+                        self._ended(client_order_id)
+                        and self._catching_up.get(client_order_id) is asyncio.current_task()
+                    ):
+                        return  # the stream or engine ended it while this read was out
                     widened, tries = self._widened(client_order_id, target, tries + 1)
                     if caught and widened == target:
                         self._caught_up(
@@ -3822,17 +3901,27 @@ class AlpacaExecutionClient(ExecutionClient):
     async def _generate_order_status_report(
         self, command: live.GenerateOrderStatusReport
     ) -> OrderStatusReport | None:
-        return await logged_failure(
-            self._log, "order status report failed", self._order_status_report(command)
+        return await self._report_result(
+            "order status report failed", self._order_status_report(command)
         )
 
     @override
     async def _generate_order_status_reports(
         self, command: live.GenerateOrderStatusReports
     ) -> list[OrderStatusReport]:
-        return await logged_failure(
-            self._log, "order status reports failed", self._order_status_reports(command)
+        return await self._report_result(
+            "order status reports failed", self._order_status_reports(command)
         )
+
+    async def _report_result[R](self, what: str, step: Awaitable[R]) -> R:
+        """The report-hook error contract of `logged_failure`, without logging a hold's end twice."""
+        try:
+            return await step
+        except HeldReportError:
+            raise
+        except Exception as e:
+            self._log.error(f"Alpaca {what}: {e}")
+            raise
 
     @override
     async def _generate_fill_reports(self, command: live.GenerateFillReports) -> list[FillReport]:
@@ -3875,7 +3964,17 @@ class AlpacaExecutionClient(ExecutionClient):
                 f"query of {command.client_order_id}; no report sent"
             )
             return
-        report = await self._settled_report(report)
+        try:
+            if report.client_order_id in self._finished:
+                assert report.client_order_id is not None
+                await self._hold_report(
+                    report.client_order_id,
+                    lambda report=report: self._finished_report(report, deliver=True),
+                )
+                return
+            report = await self._settled_report(report)
+        except HeldReportError:
+            return  # the hold logged its end; the command worker must not log it a second time
         if report is not None:
             self._handle_report(report)
 
@@ -3883,6 +3982,23 @@ class AlpacaExecutionClient(ExecutionClient):
         self, held: AlpacaOrder, fills: list[FillReport] | None = None
     ) -> OrderStatusReport | None:
         """Send a mapped report, with complete companion fills kept in the same engine delivery."""
+        # Identify an already known finished order without REST. Mapping may itself walk the root
+        # or sum earlier fills, so it belongs inside the same deadline as settlement on the stream.
+        candidates = (
+            holdable_id(held.client_order_id),
+            self._index.get(str(held.id)),
+            self._held_by_venue_id(str(held.id)),
+        )
+        finished_id = next((cid for cid in candidates if cid in self._finished), None)
+        if finished_id is not None:
+
+            async def finished_snapshot() -> OrderStatusReport | None:
+                report = await self._order_report(held)
+                if report is None:
+                    return None
+                return await self._finished_report(report, fills, deliver=True)
+
+            return await self._hold_report(finished_id, finished_snapshot)
         try:
             report = await self._order_report(held)
         except (APIError, OSError, ValueError, TypeError, RuntimeError) as e:
@@ -3898,6 +4014,14 @@ class AlpacaExecutionClient(ExecutionClient):
             else:
                 self._log.warning(f"{order_description(held)} could not be reported ({reason})")
             return None
+        # Mapping can yield while the order ends. Settlement owns the one delivery, including
+        # checking whether these companion fills have overtaken the mapped snapshot.
+        if report is not None and report.client_order_id in self._finished:
+            assert report.client_order_id is not None
+            return await self._hold_report(
+                report.client_order_id,
+                lambda report=report: self._finished_report(report, fills, deliver=True),
+            )
         if report is not None and fills is not None:
             fills = [moved_report(fill, report.venue_order_id) for fill in fills]
             if fills_count(fills) != report.filled_qty.as_decimal():
@@ -3906,14 +4030,284 @@ class AlpacaExecutionClient(ExecutionClient):
                     f"shows {report.filled_qty} filled, stream trade IDs account for {fills_count(fills)}",
                 )
                 return None
-            # The pinned engine handles both held and new orders in reconcile_order_with_fills,
-            # applying real trade IDs before the snapshot. Keep the bundle even if mapping yielded
-            # while another report materialized the order; _settled_report would fetch them twice.
             self._handle_report(report, fills or None)
             return report
         report = await self._settled_report(report) if report is not None else None
         if report is not None:
             self._handle_report(report)
+        return report
+
+    async def _hold_report[R](
+        self, client_order_id: ClientOrderId, request: Callable[[], Awaitable[R]]
+    ) -> R:
+        """One deadline for mapping, REST and cache waits, with spaced retries after a timeout.
+
+        Targeted errors mark coverage incomplete (execution/reconciliation.rs:530-556); a successful
+        None would let the manager resolve a real order as missing. The worker call can outlive its
+        canceled await, retaining the REST lock until it returns (_call), but not this stream hold.
+        """
+
+        def cache_state() -> tuple[bool, Decimal]:
+            order = self.cache.order(client_order_id)
+            return (
+                (order.is_closed, order.filled_qty.as_decimal())
+                if order is not None
+                else (False, Decimal(0))
+            )
+
+        failures = self._report_hold_failures
+        initial_state = cache_state()
+        failed = failures.get(client_order_id)
+        now = monotonic()
+        if failed is not None:
+            progressed = initial_state[0] and initial_state != failed.state
+            if not progressed and (not initial_state[0] or now < failed.retry_at):
+                if now >= failed.log_after:
+                    self._log.warning(
+                        f"Alpaca held report for {client_order_id} omitted: a previous hold timed "
+                        "out; waiting for cache closure or the retry spacing "
+                        f"HELD_REPORT_RETRY_SECS={HELD_REPORT_RETRY_SECS} s"
+                    )
+                    failed.log_after = now + HELD_REPORT_RETRY_SECS
+                raise HeldReportError(failed.message)
+            # Reserve the retry before yielding, so another request cannot retry alongside it.
+            failed.state = initial_state
+            failed.retry_at = now + HELD_REPORT_RETRY_SECS
+        try:
+            async with asyncio.timeout(HELD_REPORT_TIMEOUT_SECS):
+                result = await request()
+        except TimeoutError:
+            if self._stopping or failures is not self._report_hold_failures:
+                message = (
+                    f"Alpaca held report for {client_order_id} ended after disconnect; omitted"
+                )
+                self._log.warning(message)
+                raise HeldReportError(message) from None
+            message = (
+                f"Alpaca held report for {client_order_id} timed out after "
+                f"{HELD_REPORT_TIMEOUT_SECS} s: mapping, REST and cache settlement exceeded the "
+                "whole hold bound; report omitted; retries after cache closure are spaced by "
+                f"HELD_REPORT_RETRY_SECS={HELD_REPORT_RETRY_SECS} s"
+            )
+            next_attempt = monotonic() + HELD_REPORT_RETRY_SECS
+            failures[client_order_id] = ReportHoldFailure(
+                initial_state, next_attempt, next_attempt, message
+            )
+            self._log.error(message)
+            raise HeldReportError(message) from None
+        except asyncio.CancelledError:
+            self._log.warning(
+                f"Alpaca held report for {client_order_id} ended: request canceled during settlement"
+            )
+            raise
+        self._check_report_session(client_order_id, failures)
+        if failures.get(client_order_id) is failed:
+            failures.pop(client_order_id, None)
+        return result
+
+    def _reread_report_later(
+        self, client_order_id: ClientOrderId, venue_order_id: VenueOrderId
+    ) -> None:
+        """Read a finished order again, `HELD_REPORT_REREADS` times at most and
+        `HELD_REPORT_RETRY_SECS` apart, after a stream update's hold on it failed: by a timeout, whose
+        retry would otherwise wait for a request that never comes, because Alpaca's activities did
+        not list the fills the update showed yet, or because a read for the snapshot's mapping
+        failed. Each read is the order's own, fresh, and goes through the same hold and the same
+        delivery as the update's; fills reach the engine only by their trade IDs, never inferred. A
+        re-read and a later update can each queue the same fills before the cache shows them: the
+        engine's bundle path drops a fill whose trade ID the order holds (`reconcile_fill_report`,
+        nautilus-trader@d53849b216e2 `crates/execution/src/reconciliation/orders.rs:785-791`, called
+        per fill at `engine/mod.rs:1769`). One task per order; an update that fails while it waits
+        adds none. Canceled at disconnect. Past the last read the order is left, by name, to the
+        next start-up."""
+        if (
+            self._stopping
+            or client_order_id not in self._finished
+            or client_order_id in self._report_rereads
+        ):
+            return
+        failures = self._report_hold_failures
+
+        async def later() -> None:
+            try:
+                for _ in range(HELD_REPORT_REREADS):
+                    failed = failures.get(client_order_id)
+                    spaced = 0.0 if failed is None else failed.retry_at - monotonic()
+                    await asyncio.sleep(max(HELD_REPORT_RETRY_SECS, spaced))
+                    if self._stopping or failures is not self._report_hold_failures:
+                        return
+                    try:
+                        report = await self._order_status_report_by(venue_order_id, client_order_id)
+                        if report is None or report.client_order_id != client_order_id:
+                            self._log.warning(
+                                f"Alpaca held report for {client_order_id}: a timed re-read did "
+                                "not find the order as the node's"
+                            )
+                            continue
+                        await self._hold_report(
+                            client_order_id,
+                            lambda report=report: self._finished_report(report, deliver=True),
+                        )
+                    except HeldReportError:
+                        continue  # the hold logged its order and why it ended
+                    except (APIError, OSError, ValueError, TypeError, RuntimeError) as e:
+                        # Transport and SDK errors can carry order IDs: name the class only.
+                        reason = str(e) if type(e) is ValueError else failure_cause(e)
+                        self._log.warning(
+                            f"Alpaca held report for {client_order_id}: a timed re-read failed "
+                            f"({reason})"
+                        )
+                        continue
+                    return
+                self._log.error(
+                    f"Alpaca held report for {client_order_id}: {HELD_REPORT_REREADS} timed re-reads, "
+                    f"{HELD_REPORT_RETRY_SECS} s apart, did not settle it; any fill Alpaca shows "
+                    "beyond the node's is left to the next start-up"
+                )
+            finally:
+                if self._report_rereads.get(client_order_id) is asyncio.current_task():
+                    self._report_rereads.pop(client_order_id, None)
+
+        self._report_rereads[client_order_id] = asyncio.ensure_future(later())
+
+    def _check_report_session(
+        self,
+        client_order_id: ClientOrderId | None,
+        failures: dict[ClientOrderId, ReportHoldFailure],
+    ) -> None:
+        if self._stopping or failures is not self._report_hold_failures:
+            message = f"Alpaca held report for {client_order_id} ended after disconnect; omitted"
+            self._log.warning(message)
+            raise HeldReportError(message)
+
+    async def _wait_report_cache(
+        self, client_order_id: ClientOrderId, ready: Callable[[Any], bool]
+    ) -> Any:
+        """Wait for actual engine state inside _hold_report's single deadline.
+
+        The pinned node polls report futures before queued events (node/mod.rs:1653-1877), so neither
+        `_finished` nor one event-loop turn proves that the engine applied the generated end.
+        """
+        order = self.cache.order(client_order_id)
+        waited = order is None or not ready(order)
+        if waited:
+            self._log.info(
+                f"Alpaca report for {client_order_id} held: waiting for the cache to close the ended "
+                "order and apply its reported fills"
+            )
+        while order is None or not ready(order):
+            await asyncio.sleep(0.01)
+            order = self.cache.order(client_order_id)
+        if waited:
+            self._log.info(
+                f"Alpaca report for {client_order_id} released: the cache closed the ended order "
+                "and applied its reported fills"
+            )
+        return order
+
+    async def _finished_report(
+        self,
+        report: OrderStatusReport,
+        companion_fills: list[FillReport] | None = None,
+        *,
+        deliver: bool = False,
+    ) -> OrderStatusReport:
+        """Settle an ended order with real fills before delivering or returning its status once.
+
+        The continuous path is execution/src/engine/mod.rs:1679-1800: real trade IDs, then an
+        authoritative snapshot which can void fills (execution/src/reconciliation/orders.rs:117-157).
+        Re-read an older snapshot before pairing it with newer fills; never infer a missing trade.
+        Send callers deliver one bundle here. Return hooks emit only FillReports here and wait for
+        their application before returning the status, so no OrderStatusReport is delivered twice.
+        Late partial fills preserve CANCELED/EXPIRED (model/src/orders/mod.rs:1355-1376).
+        """
+        client_order_id = report.client_order_id
+        assert client_order_id is not None
+        failures = self._report_hold_failures
+        self._check_report_session(client_order_id, failures)
+        order = await self._wait_report_cache(client_order_id, lambda held: held.is_closed)
+        self._check_report_session(client_order_id, failures)
+        shown = report.filled_qty.as_decimal()
+        if deliver and shown <= order.filled_qty.as_decimal() and not companion_fills:
+            # A late ACCEPTED/TRIGGERED snapshot cannot add a fill; forwarding it can only attempt
+            # an invalid transition on the closed order (reconciliation/orders.rs:327-420).
+            return report
+        try:
+            if not deliver and shown < order.filled_qty.as_decimal():
+                # Startup mass status uses is_snapshot=true (manager.rs:980-988), unlike a plain
+                # continuous report: returning an old total here could void a genuine cached fill.
+                newer = await self._order_status_report_by(report.venue_order_id, client_order_id)
+                if newer is None or newer.client_order_id != client_order_id:
+                    raise ValueError("newer order snapshot unavailable for its cached fills")
+                report = newer
+                shown = report.filled_qty.as_decimal()
+                order = self.cache.order(client_order_id) or order
+                if shown < order.filled_qty.as_decimal():
+                    raise ValueError("newer order snapshot still shows fewer fills than the cache")
+            if shown == order.filled_qty.as_decimal() and not companion_fills:
+                return report
+            if companion_fills is None:
+                chain = {v.value for v in order.venue_order_ids}
+                chain |= await self._chain_ids(report.venue_order_id)
+                listed = self._listed_fills(await self._fill_activities(None, chain), warn=True)
+                if listed is None:
+                    raise ValueError("fill activities disagree on a trade ID's terms")
+                companion_fills = list(listed.values())
+
+            def unseen() -> list[FillReport]:
+                # Re-read after every await: a concurrent request may have delivered these fills.
+                current = self.cache.order(client_order_id) or order
+                known = {str(t) for t in current.trade_ids}
+                return [
+                    moved_report(fill, report.venue_order_id)
+                    for fill in sorted(companion_fills, key=lambda fill: fill.ts_event)
+                    if fill.trade_id.value not in known
+                ]
+
+            fills = unseen()
+            order = self.cache.order(client_order_id) or order
+            total = order.filled_qty.as_decimal() + fills_count(fills)
+            if fills and total > shown:
+                newer = await self._order_status_report_by(report.venue_order_id, client_order_id)
+                if newer is None or newer.client_order_id != client_order_id:
+                    raise ValueError("newer order snapshot unavailable for its listed fills")
+                report = newer
+                shown = report.filled_qty.as_decimal()
+                fills = unseen()
+                order = self.cache.order(client_order_id) or order
+                total = order.filled_qty.as_decimal() + fills_count(fills)
+            if total < shown or (fills and total != shown):
+                raise ValueError(
+                    f"fill activities account for {total} shares, snapshot shows {shown}"
+                )
+        except (APIError, OSError, ValueError, TypeError, KeyError, RuntimeError) as e:
+            message = (
+                f"Alpaca held report for {client_order_id} ended: additional fills unread ({e!r})"
+            )
+            self._log.error(message)
+            raise HeldReportError(message) from e
+        self._check_report_session(client_order_id, failures)
+        if deliver:
+            if fills:
+                self._handle_report(report, fills)
+            # Delivery is complete. A cache wait after this point could falsely time out and
+            # poison retry state for a report already queued in the engine.
+            return report
+        for fill in fills:
+            # A refreshed replacement ID may not be indexed yet. Individual fills must use
+            # the cached leg until the returned status reconciles that replacement.
+            self._handle_report(moved_report(fill, order.venue_order_id or report.venue_order_id))
+        order = await self._wait_report_cache(
+            client_order_id,
+            lambda held: held.is_closed and held.filled_qty.as_decimal() >= shown,
+        )
+        self._check_report_session(client_order_id, failures)
+        if shown < order.filled_qty.as_decimal():
+            message = (
+                f"Alpaca held report for {client_order_id} omitted: cache fills overtook snapshot"
+            )
+            self._log.error(message)
+            raise HeldReportError(message)
         return report
 
     async def _settled_report(self, report: OrderStatusReport) -> OrderStatusReport | None:
@@ -3927,10 +4321,15 @@ class AlpacaExecutionClient(ExecutionClient):
         their own trade IDs from Alpaca's fill activities (`_catch_up`) and the report is held back: a
         report returned to the engine can reach it before the fills just generated do (observed), and the
         engine's next check asks again. While the activities do not list them, it is held back with a
-        warning. An order the node does not hold, or holds closed, is reported as read: reconciliation
-        creates it from the report and its fill reports (`_open_order_fills`)."""
+        warning. An order the client has finished waits for the cache to close, bounded and logged;
+        additional fills are reconciled by trade ID before the report is released. A timed-out hold
+        raises, never returns a successful empty answer. An order the node does not hold is reported
+        as read: reconciliation creates it with its fill reports (`_open_order_fills`)."""
         client_order_id = report.client_order_id
         order = self.cache.order(client_order_id) if client_order_id is not None else None
+        if client_order_id in self._finished:
+            assert client_order_id is not None
+            return await self._hold_report(client_order_id, lambda: self._finished_report(report))
         if order is None or client_order_id is None or order.is_closed:
             return report
         shown = report.filled_qty.as_decimal()
@@ -4110,7 +4509,12 @@ class AlpacaExecutionClient(ExecutionClient):
             if str(order.id) in superseded or str(order.id) in not_yet:
                 continue
             report = await self._order_report(order, found)
-            report = await self._settled_report(report) if report is not None else None
+            try:
+                report = await self._settled_report(report) if report is not None else None
+            except HeldReportError:
+                # Even an empty bulk answer permits targeted lookup; its error marks coverage
+                # incomplete for just this order (manager.rs:2457-2472, 2590-2597 at the pin).
+                continue
             if report is not None:
                 reports.append(report)
         return reports
