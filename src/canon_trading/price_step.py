@@ -105,6 +105,9 @@ def up_on_step(price: Decimal) -> Decimal:
     _finite(price)
     if price > TOP:
         return price.quantize(CENT, rounding=ROUND_CEILING).quantize(SUB_DOLLAR)
+    # up onto the finest step exactly first, so the nudge below cannot take a finer price under
+    # itself (code-review-high-succ2/3), as `down_on_step` takes its floor exactly first
+    price = price.quantize(SUB_DOLLAR, rounding=ROUND_CEILING)
     found = PRICES.next_ask_price(float(price) - NUDGE, 0)
     if found is None:
         raise ValueError(f"no price at or over {price} in {PRICES.name}")

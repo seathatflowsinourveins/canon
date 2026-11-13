@@ -331,7 +331,7 @@ def test_off_step_held_stop_never_falls_when_trailing_resumes() -> None:
     assert slot.sized_loss is None
     seam._protect(slot, Decimal(3), filled + SECOND)
     old_level = slot.held_stop
-    assert old_level == Decimal("9.8049")
+    assert old_level == Decimal("9.81")  # 9.8049 held on the step from the start
 
     last.append(stamped("9.9000", filled + 2 * SECOND, filled + 2 * SECOND))
     seam._protect(slot, Decimal(3), filled + 3 * SECOND)
@@ -351,7 +351,7 @@ def test_a_finer_than_tick_average_fill_keeps_the_held_stop_when_trailing_resume
     ]
     seam._protect(slot, Decimal(100), filled + SECOND)
     old_level = slot.held_stop
-    assert old_level == Decimal("9.800001")
+    assert old_level == Decimal("9.81")  # 9.800001 held on the step from the start
 
     last.append(stamped("9.9000", filled + 2 * SECOND, filled + 2 * SECOND))
     seam._protect(slot, Decimal(100), filled + 3 * SECOND)
@@ -367,7 +367,7 @@ def test_a_print_meeting_the_rounded_up_held_stop_sells_at_once_by_limit(price: 
     seam.orders["E-1"].avg_px = 10.0149
     seam.fills[:] = [("E-1", "BUY", "3", "10.0149", filled)]
     seam._protect(slot, Decimal(3), filled + SECOND)
-    assert slot.held_stop == Decimal("9.8049") and seam.sent == []
+    assert slot.held_stop == Decimal("9.81") and seam.sent == []
 
     last.append(stamped(price, filled + 2 * SECOND, filled + 2 * SECOND))
     seam._protect(slot, Decimal(3), filled + 3 * SECOND)
@@ -474,3 +474,75 @@ def test_an_entry_whose_acceptance_time_is_unset_does_not_own_a_print_from_befor
     assert slot.held_stop == Decimal("9.80")
     assert seam.sent == []
     assert slot.exiting is False
+
+
+def test_the_unpriced_exit_is_not_priced_from_a_low_that_never_met_the_stop() -> None:
+    """code-review-high-succ2/1: a followed low the hold latched but which never met the stop (9.85 over
+    9.80) is no price for the 60 s `unpriced_exit`. With a one-sided quote and no last known price of
+    the holding (the cache's last trade a late print stamped before the entry), the sale anchors at
+    the protection anchor, the average, as before the low was read, not at the stale 9.85."""
+    seam, slot, filled, last = holding(TriggerType.LAST_PRICE)
+    seam.orders["E-1"].ts_accepted = filled - 500 * MS
+    seam.slots, seam.trades = {slot.instrument_id: slot}, 0
+    seam._protect(slot, Decimal(3), filled + SECOND)
+    assert slot.held_stop == Decimal("9.80")
+    for price, at, seen in (
+        ("9.8500", filled + 2 * SECOND, filled + 2 * SECOND),
+        ("10.2000", filled + 3 * SECOND, filled + 3 * SECOND),
+        ("10.0000", filled - 600 * MS, filled + 3 * SECOND + 1),  # late, before the entry
+    ):
+        trade = SimpleNamespace(
+            instrument_id=slot.instrument_id, price=Price.from_str(price), ts_event=at, ts_init=seen
+        )
+        last.append(trade)
+        seam.on_trade(trade)
+    seam._protect(slot, Decimal(3), filled + 61 * SECOND)
+    assert [o.kind for o in seam.sent] == ["LIMIT"]
+    assert slot.exit_record.trigger_reason == "unpriced_exit"
+    assert slot.exit_record.trigger_price != Decimal("9.85")
+    assert seam.sent[0].price.as_decimal() > Decimal("9.85")
+
+
+def test_an_off_step_held_stop_is_held_on_the_step_so_a_print_between_the_levels_meets_it() -> None:
+    """code-review-high-succ2/4: an unsized hold at an average of 10.0149 under the 2% trail is 9.8049,
+    off Alpaca's step. It is held at 9.81, the level its trailing sell would start from, from the
+    moment it is set, so a print at 9.805, between the two levels, meets it, and a later 9.90 does not
+    hide that: the hold sells by limit."""
+    seam, slot, filled, last = holding(TriggerType.LAST_PRICE, bid="9.89", ask="9.91")
+    seam.orders["E-1"].avg_px = 10.0149
+    seam.fills[:] = [("E-1", "BUY", "3", "10.0149", filled)]
+    seam.slots, seam.trades = {slot.instrument_id: slot}, 0
+    seam._protect(slot, Decimal(3), filled + SECOND)
+    assert slot.held_stop == Decimal("9.81")
+    for price, at in (("9.8050", filled + 2 * SECOND), ("9.9000", filled + 3 * SECOND)):
+        trade = SimpleNamespace(
+            instrument_id=slot.instrument_id, price=Price.from_str(price), ts_event=at, ts_init=at
+        )
+        last.append(trade)
+        seam.on_trade(trade)
+    seam._protect(slot, Decimal(3), filled + 4 * SECOND)
+    assert [o.kind for o in seam.sent] == ["LIMIT"]
+    assert slot.exiting
+
+
+def test_a_trail_resumed_from_the_held_stop_names_the_held_stop_as_its_origin() -> None:
+    """code-review-high-succ2/5: a followed price over the held stop resumes the trail from the held
+    level, and the note names it as the held stop's, not as a trigger a trailed sale had reached."""
+    seam, slot, filled, last = holding(TriggerType.LAST_PRICE, bid="9.89", ask="9.91")
+    seam._protect(slot, Decimal(3), filled + SECOND)
+    assert slot.held_stop == Decimal("9.80")
+    last.append(stamped("9.9000", filled + 2 * SECOND, filled + 2 * SECOND))
+    seam._protect(slot, Decimal(3), filled + 3 * SECOND)
+    assert [o.kind for o in seam.sent] == ["TRAILING"]
+    assert any("(held stop 9.80" in line for line in seam.said)  # 9.8000 on the sub-dollar step
+
+
+def test_a_holding_this_node_did_not_see_fill_holds_60_s_from_the_venues_fill_time() -> None:
+    """code-review-high-succ2/8: a holding with no receipt of its first fill on this node (a restart,
+    or fills reconciled before `on_order_filled` ran) keeps the venue's fill time as its hold's start,
+    as before the one-clock change, so a hold found 61 s after the fill sells as `unpriced_exit` at
+    once rather than holding another 60 s from the restart."""
+    seam, slot, filled, _ = holding(TriggerType.LAST_PRICE)  # no `on_order_filled` ran on this node
+    seam._protect(slot, Decimal(3), filled + 61 * SECOND)
+    assert [o.kind for o in seam.sent] == ["LIMIT"]
+    assert slot.exit_record.trigger_reason == "unpriced_exit"

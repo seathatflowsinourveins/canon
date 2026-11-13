@@ -89,3 +89,12 @@ def test_a_negative_offset_is_refused_above_the_top_as_below_it(bid: str) -> Non
 def test_a_bid_that_is_not_a_number_is_refused_as_a_value_error(bid: str) -> None:
     with pytest.raises(ValueError, match="no price on Alpaca's step"):
         price_step.exit_price(Decimal(bid), 0, None)
+
+
+def test_up_on_step_never_rounds_a_price_finer_than_the_step_below_itself() -> None:
+    """code-review-high-succ2/3: `up_on_step` takes a price finer than 0.0001 up, never under it, so
+    `fill_trigger` keeps a share's loss within L at an average finer than the step."""
+    assert price_step.up_on_step(Decimal("9.810001")) == Decimal("9.82")  # the cent above it
+    assert price_step.up_on_step(Decimal("0.98000001")) >= Decimal("0.98000001")
+    trigger = mover.fill_trigger(Decimal("10.010001"), Decimal("0.20"))
+    assert trigger == Decimal("9.82")

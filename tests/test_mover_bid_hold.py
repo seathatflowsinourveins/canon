@@ -63,7 +63,7 @@ def test_under_the_bid_an_off_step_held_stop_never_falls_when_trailing_resumes()
     assert slot.sized_loss is None
     seam._protect(slot, Decimal(3), filled + SECOND)
     old_level = slot.held_stop
-    assert old_level == Decimal("9.8049") and seam.sent == []
+    assert old_level == Decimal("9.81") and seam.sent == []
 
     seam.bid = "9.90"
     seam._protect(slot, Decimal(3), filled + 3 * SECOND)
@@ -82,7 +82,7 @@ def test_under_the_bid_a_bid_meeting_the_rounded_up_held_stop_sells_by_limit(bid
     seam.fills = [("E-1", OrderSide.BUY.name, "3", "10.0149", filled)]
     seam.orders["E-1"].client_order_id = slot.entry_id
     seam._protect(slot, Decimal(3), filled + SECOND)
-    assert slot.held_stop == Decimal("9.8049") and seam.sent == []
+    assert slot.held_stop == Decimal("9.81") and seam.sent == []
 
     seam.bid = bid
     seam._protect(slot, Decimal(3), filled + 3 * SECOND)
