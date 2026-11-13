@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "^(bash|terminal|terminal_send|pwsh|write|edit|multi_edit|str_replace_editor)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"$HOME/.dsh/hooks/guard.mjs\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}
