@@ -7249,7 +7249,24 @@ def test_an_outside_open_orders_fills_shown_whole_are_not_dropped_by_a_later_fai
     assert reports == [[str(uuid.UUID(int=71))]]
 
 
-@pytest.mark.parametrize("fill", ["listed", "listed-later", "update-after"])
+@pytest.mark.parametrize(
+    "fill",
+    [
+        "listed",
+        "listed-later",
+        "update-after",
+        pytest.param(
+            "update-during-read",
+            marks=pytest.mark.xfail(
+                strict=True,
+                raises=AssertionError,
+                reason="open race in the adapter: a later read that is out when the fill's own update "
+                "ends the order is logged as the read that brought the fill; this must fail until an "
+                "ended order's later reads are stopped, and the change that stops them removes the mark",
+            ),
+        ),
+    ],
+)
 def test_a_cancel_showing_a_fill_the_node_lost_ends_the_order_with_it(
     venue, monkeypatch, capfd, fill
 ) -> None:
@@ -7257,7 +7274,23 @@ def test_a_cancel_showing_a_fill_the_node_lost_ends_the_order_with_it(
     # partial fill and then delivered `canceled` showing it filled. The cancel ended the order and dropped
     # its record, so the fill was never brought, nor applied when its update came late: CANCELED with 0
     # filled where Alpaca shows 1. The fill is brought by its trade ID first, and the cancel follows it.
-    monkeypatch.setattr(canon_alpaca.execution, "FILL_READ_RETRY_SECS", 0.5)
+    #
+    # The case waits on what happens, not on the clock (it failed once in a loaded full run on fixed
+    # sleeps): the cancel's own read has returned, the test then supplies the late fill, and the strategy
+    # sees `OrderCanceled`. A later read of this order is held until the test has supplied the fill.
+    #
+    # Open in the adapter, and pinned by `update-during-read`, which must fail until it is fixed: a
+    # later read that is OUT when the fill's own update ends the order comes back, sees the order ended,
+    # and logs itself as the read that brought the fill, which the stream brought. Under load the old
+    # sleeps could have produced that in `update-after` (inferred from the code: the failing run left no
+    # output). Here the later reads of `update-after` are kept asleep for longer than the run may last
+    # (`run_with_client` ends it at 15 s), so none can be out when the update arrives, and
+    # `update-during-read` puts the update inside a read that is out. Stopping an ended order's later
+    # reads is a change to the adapter, a unit of its own; until then `update-after` no longer shows a
+    # later read waking after the order ended.
+    monkeypatch.setattr(
+        canon_alpaca.execution, "FILL_READ_RETRY_SECS", 30.0 if fill == "update-after" else 0.05
+    )
     venue.trading.script = "accept"
     strategy = trader(order_type="limit", quantity=3)
     strategy.stopped_for = "held open"
@@ -7267,6 +7300,24 @@ def test_a_cancel_showing_a_fill_the_node_lost_ends_the_order_with_it(
         await until_named(strategy, "OrderAccepted")
         await until_idle(client, venue)
         placed = placed_order(venue)
+        first_read, reading, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        read_activities = client._fill_activities
+        reads = 0
+
+        async def held_read(start, order_ids=None):
+            nonlocal reads
+            if start is not None or not order_ids or placed["id"] not in order_ids:
+                return await read_activities(start, order_ids)  # not a catch-up read of this order
+            reads += 1
+            if reads > 1:
+                reading.set()
+                await release.wait()  # bounded by the timeout below, whose `finally` releases it
+            try:
+                return await read_activities(start, order_ids)
+            finally:
+                first_read.set()  # also when the read fails, so the case says so and does not wait
+
+        monkeypatch.setattr(client, "_fill_activities", held_read)
         lost = venue.trading.update(
             placed["id"],
             "partial_fill",
@@ -7277,13 +7328,38 @@ def test_a_cancel_showing_a_fill_the_node_lost_ends_the_order_with_it(
         )
         listed = venue.trading.activities.pop() if fill != "listed" else None
         venue.trading.update(placed["id"], "canceled", status="canceled")
-        await settled(client, venue)
-        if fill == "listed-later":
-            venue.trading.activities.append(listed)
+        # A later read cannot outrun the test's late fill, even if the loop is delayed.
+        try:
+            async with asyncio.timeout(10):
+                await first_read.wait()
+                pending = client._catching_up.get(strategy.client_order_id)
+                if fill == "listed-later":
+                    venue.trading.activities.append(listed)
+                    release.set()
+                elif fill == "update-after":
+                    venue.stream.send(lost)
+                elif fill == "update-during-read":
+                    await reading.wait()  # a later read of the order is out
+                    venue.stream.send(lost)
+                await until_named(strategy, "OrderCanceled")
+        finally:
+            release.set()
+        # What became of the later reads: none was waiting when the first read brought the fill; the
+        # one that brought it ended by itself; the one the stream's fill overtook is still asleep, and
+        # ends with the client; the one that was out when the stream's fill came is let finish, so what
+        # it logs is in the log before the case reads it.
+        if fill == "listed":
+            assert pending is None and strategy.client_order_id not in client._catching_up
         elif fill == "update-after":
-            venue.stream.send(lost)
-        await asyncio.sleep(1.2)  # the later reads of the activities
-        await settled(client, venue)
+            assert pending is not None and not pending.done()
+        else:
+            assert pending is not None
+            async with asyncio.timeout(10):
+                outcome = (await asyncio.gather(pending, return_exceptions=True))[0]
+            assert fill == "update-during-read" or outcome is None, outcome
+        await settled(
+            client, venue
+        )  # whatever the adapter sends after the end is in before the checks
         cached = client.cache.order(strategy.client_order_id)
         held.append((cached.status, cached.filled_qty.as_double(), trade_ids(cached)))
         held.append(lost["execution_id"])
@@ -7297,10 +7373,11 @@ def test_a_cancel_showing_a_fill_the_node_lost_ends_the_order_with_it(
     # One brought by its own late update logs no read.
     read = {"listed": "read 1 of 3", "listed-later": "read 2 of 3"}
     caught = f"Alpaca fill catch-up for {strategy.client_order_id}: caught up on read"
+    lines = [line for line in logged(capfd).splitlines() if "fill catch-up" in line]
     if fill in read:
-        assert f"{caught} {read[fill][5:]}" in logged(capfd)
+        assert any(f"{caught} {read[fill][5:]}" in line for line in lines), lines
     else:
-        assert caught not in logged(capfd)
+        assert not any(caught in line for line in lines), lines
 
 
 def test_a_cancel_whose_lost_fill_is_never_listed_ends_with_an_error_naming_the_shares(
