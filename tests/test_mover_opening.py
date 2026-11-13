@@ -458,8 +458,12 @@ ADDED_SINCE_P1 = {
         "history_request_limit",
         "warm_up",
         "entries_by_trail_source",
+        "order_refusals",
+        "refusals",
+        "remakes_under_floor",
     ),
-    "entry": ("profile", "arming", "trail_cap", "spread_floor", "own_measure"),
+    "entry": ("profile", "arming", "trail_cap", "spread_floor", "own_measure", "entry_price"),
+    "exit": ("sales",),
     "rows": (
         "profile_k",
         "profile_pctl",
@@ -474,9 +478,10 @@ ADDED_SINCE_P1 = {
     ),
 }
 """Record keys later pieces added on purpose (the trail profile's rows, the entry switch, main's
-persistence arms, ADR 0119, and main's S2 sizing: its exit triggers, refusal and binding counts, cap
-arm, spread floor and own measure); each is checked by its own tests and taken out here, so the rest of
-the record is still compared byte for byte with P1's."""
+persistence arms, ADR 0119, main's S2 sizing: its exit triggers, refusal and binding counts, cap
+arm, spread floor and own measure, and the D3 terms' keys: each refusal's cause, each entry's price and
+each exit's sale rows); and the re-flooring ruling's
+count of remakes under the floor; each is checked by its own tests and taken out here, so the rest of the record is still compared byte for byte with P1's."""
 
 
 def as_of_p1(record):
@@ -485,6 +490,9 @@ def as_of_p1(record):
     record["entries"] = [
         {k: v for k, v in entry.items() if k not in ADDED_SINCE_P1["entry"]}
         for entry in record["entries"]
+    ]
+    record["exits"] = [
+        {k: v for k, v in row.items() if k not in ADDED_SINCE_P1["exit"]} for row in record["exits"]
     ]
     return record
 

@@ -220,6 +220,42 @@ def test_adoption_threshold_row_is_adr_0010s() -> None:
     assert "ADR 0010" in cells[3]
 
 
+def window_row(name: str) -> list[str]:
+    """The cells of one row of the rows page, by its name in backticks."""
+    text = (HANDBOOK / "rows.md").read_text()
+    row = next(line for line in text.splitlines() if line.startswith(f"| `{name}` |"))
+    return [cell.strip() for cell in row.strip().strip("|").split("|")]
+
+
+def test_the_trail_cap_row_states_the_spread_floor_and_where_a_refusal_is_written() -> None:
+    """The lead's O1-O3 and record rule 1 of 2026-11-12: the cap's row says every entry outside the
+    fixed arm trails at least the spread floor at its step, a remade sale keeps it in price terms, and
+    an entry the cap forbids is one row of the run's `refusals` by its cause."""
+    _, value, state, source, _ = window_row("TRAIL_CAP")
+    assert value.startswith("0.02 of the entry") and state == "UNCALIBRATED"
+    for words in (
+        "`SPREAD_FLOOR_M` at its step",
+        "cold-ATR",
+        "in price terms",
+        "`refusals`",
+        "`floor_over_cap`",
+        "`distance_over_cap`",
+    ):
+        assert words in value, words
+    assert "O1-O3" in source
+
+
+@pytest.mark.parametrize("name", ["TIGHTEN_CRITERION", "REENTRY_CRITERION"])
+def test_a_counted_criterion_row_is_uncalibrated_and_counts_no_profit(name: str) -> None:
+    """The lead's D4(i) and D5 of 2026-11-12: a tightening arm and a re-entry arm are read by a counted
+    criterion from the run record, registered UNCALIBRATED before a window selects them; it ranks
+    nothing and never reads profit and loss."""
+    _, value, state, source, date = window_row(name)
+    assert state == "UNCALIBRATED" and iso_date(date)
+    assert "never profit and loss" in value and "ranks nothing" in value
+    assert "Lead's D" in source
+
+
 def test_practices_lines_name_a_record_or_a_step() -> None:
     text = (HANDBOOK / "practices.md").read_text()
     assert check_practices(text, roadmap_steps()) == []

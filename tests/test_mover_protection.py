@@ -308,6 +308,7 @@ def test_window_records_protection_and_names_a_diagnostic_failure(
             self.clock = SimpleNamespace(timestamp_ns=lambda: T0 + 20 * SECOND)
             self.dropped = []
             self.history_bars = self.history_dropped = 0
+            self.remakes_under_floor = 0  # the window reads it off a Mover (`WindowReport`)
             self.ranking_records = []
             self.opened_slots = set()  # the on-demand overlay's final account check reads it
 

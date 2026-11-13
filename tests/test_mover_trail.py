@@ -13,6 +13,8 @@ from typing import Any
 from typing import cast
 
 import pytest
+from canon_alpaca.execution import not_sent_reason
+from canon_alpaca.execution import sub_penny_denial
 from nautilus_trader.indicators import AverageTrueRange
 from nautilus_trader.model import Bar
 from nautilus_trader.model import ClientOrderId
@@ -1576,11 +1578,15 @@ def test_a_non_finite_entry_average_falls_back_to_the_protection_anchor():
 # --- the lead's ruling of 2026-11-12, 21:01: a recorded tightening hands the trigger over ---------------
 
 
-def sized_cold_holding(sized_loss: str, width: str) -> tuple[Any, Any]:
+def sized_cold_holding(sized_loss: str, width: str, **rows: Any) -> tuple[Any, Any]:
     """A budget-sized entry filled at 10.00 on the cold fallback's 0.02 plan, trailing by L, and an
     ATR warmed from four minutes `width` wide, on a quote 0.01 wide."""
     seam = RatchetSeam(
-        "10.5000", trail_mode="atr", size_from_budget=True, loss_share=mover.PAPER_LOSS_SHARE
+        "10.5000",
+        trail_mode="atr",
+        size_from_budget=True,
+        loss_share=mover.PAPER_LOSS_SHARE,
+        **rows,
     )
     seam.cache.quote = lambda _: SimpleNamespace(
         bid_price=Price.from_str("10.5000"), ask_price=Price.from_str("10.5100")
@@ -1666,3 +1672,393 @@ def test_a_sized_entrys_fill_records_the_distance_l_puts_in_force_not_the_plans(
     )
     assert slot.exit_record is not None
     assert slot.exit_record.trail_distance == D("0.50")
+
+
+def sale_event(order: Any, at: int, **fields: Any) -> SimpleNamespace:
+    """An order event of one sale, in the plain attributes the Mover's handlers read."""
+    return SimpleNamespace(
+        instrument_id=AAA, client_order_id=order.client_order_id, ts_event=at, **fields
+    )
+
+
+def handling(seam: Any, slot: Any) -> Any:
+    """The Seam with the state the Mover's order-event handlers write to."""
+    seam.slots, seam.fills_to_report, seam.refused = {AAA: slot}, [], []
+    seam.order_refusals = []
+    seam.opening_states, seam.opening_outcomes = {}, {}
+    return seam
+
+
+def test_each_sale_sent_is_a_row_with_the_offsets_on_the_order_and_the_distance_the_record_gives():
+    """The lead's D3 terms of 2026-11-12, A3: after every remake the offset on the order sent equals
+    the distance the record gives. Each sale order the Mover sends is one row of its holding's exit
+    record, with the offsets read off the order, the record's distance at that moment, the trigger
+    kept and the spread at that step, so one window's record shows the term for every remake."""
+    seam, slot = sized_cold_holding("0.20", "0.15")
+    seam._protect(slot, D(5), T0 + SECOND)
+    rows = slot.exit_record.record()["sales"]
+    assert [row["client_order_id"] for row in rows] == [o.client_order_id.value for o in seam.sent]
+    assert [row["sent_ns"] for row in rows] == [T0, T0 + SECOND]
+    for row, order in zip(rows, seam.sent, strict=True):
+        assert row["kind"] == "trailing_stop_limit" and row["quantity"] == "5"
+        assert D(row["trailing_offset"]) == order.trailing_offset
+        assert D(row["limit_offset"]) == order.limit_offset
+        assert D(row["distance_in_force"]) == order.trailing_offset
+        assert D(row["spread"]) == D("0.01")
+        assert (row["kept_trigger"] is None) == (order.trigger_price is None)
+        assert row["kept_trigger"] is None or D(row["kept_trigger"]) == D(str(order.trigger_price))
+        assert (row["ended"], row["ended_ns"], row["reason"]) == (None, None, None)
+    assert D(rows[0]["distance_in_force"]) == D("0.20") > D(rows[1]["distance_in_force"])
+    assert D(rows[0]["kept_trigger"]) == D("9.80")
+
+
+def test_a_sale_rows_end_and_its_refusal_reason_come_from_its_order_events():
+    """A3 and A7 of the D3 terms: a sale row ends by its own order's events, canceled, expired, filled
+    in full across partial fills, or refused with the venue's or the risk engine's reason, and a limit
+    sale names its price and the exit's trigger kept beside it."""
+    seam, slot = sized_cold_holding("0.20", "0.15")
+    seam._protect(slot, D(5), T0 + SECOND)
+    host = handling(seam, slot)
+    first, remade = seam.sent
+    mover.Mover.on_order_canceled(host, sale_event(first, T0 + 2 * SECOND))
+    sold = {"order_side": OrderSide.SELL, "last_px": Price.from_str("10.3000")}
+    mover.Mover.on_order_filled(
+        host, sale_event(remade, T0 + 3 * SECOND, last_qty=Quantity.from_int(2), **sold)
+    )
+    rows = slot.exit_record.record()["sales"]
+    assert (rows[0]["ended"], rows[0]["ended_ns"], rows[0]["reason"]) == (
+        "canceled",
+        T0 + 2 * SECOND,
+        None,
+    )
+    assert rows[1]["ended"] is None and rows[1]["filled_quantity"] == "2"
+    mover.Mover.on_order_filled(
+        host, sale_event(remade, T0 + 4 * SECOND, last_qty=Quantity.from_int(3), **sold)
+    )
+    row = slot.exit_record.record()["sales"][1]
+    assert (row["ended"], row["ended_ns"], row["filled_quantity"]) == (
+        "filled",
+        T0 + 4 * SECOND,
+        "5",
+    )
+    slot.exit_trigger = D("9.80")
+    for at, handler, reason in (
+        (5, mover.Mover.on_order_rejected, "potential wash trade detected"),
+        (7, mover.Mover.on_order_denied, "CUM_NOTIONAL_EXCEEDS_FREE_BALANCE"),
+        (9, mover.Mover.on_order_expired, None),
+    ):
+        seam._limit_sell(slot, D(5), T0 + at * SECOND, None)
+        limit = seam.sent[-1]
+        fields = {} if reason is None else {"reason": reason}
+        handler(host, sale_event(limit, T0 + (at + 1) * SECOND, **fields))
+        row = slot.exit_record.record()["sales"][-1]
+        assert row["kind"] == "limit" and row["trailing_offset"] is None
+        assert D(row["limit_price"]) == D(str(limit.price)) and D(row["kept_trigger"]) == D("9.80")
+        ended = handler.__name__.removeprefix("on_order_")
+        assert (row["ended"], row["ended_ns"], row["reason"]) == (
+            ended,
+            T0 + (at + 1) * SECOND,
+            reason,
+        )
+
+
+def test_a_windows_sale_rows_end_by_the_simulated_venues_own_events():
+    """A3 on the real emulator and simulated venue: every sale the Mover sent is a row; each trailing
+    sale's offset equals the distance the record gave when it was sent; each row ends, and the rows'
+    filled quantities add up to the exit's."""
+    eng = engine()
+    s = strategy()
+    run(eng, s, ranker(rank((AAA, "0.25"))), tape(AAA, RISING + [10.46, 10.0, 9.9]))
+    (row,) = s.record()["exits"]
+    sales = row["sales"]
+    assert sales, row
+    for sale in sales:
+        if sale["kind"] == "trailing_stop_limit":
+            assert D(sale["trailing_offset"]) == D(sale["distance_in_force"])
+    assert [sale["ended"] for sale in sales][-1] == "filled"
+    assert sum(D(sale["filled_quantity"]) for sale in sales) == D(row["filled_quantity"])
+    eng.dispose()
+
+
+def test_each_entry_names_its_average_fill_price_as_it_fills():
+    """The lead's D3 terms of 2026-11-12, A1: a trail is checked against the spread floor in price
+    terms, so each entry names its own average fill price, updated by every BUY fill, and stays null
+    until the first."""
+    eng = engine()
+    s = strategy()
+    run(eng, s, ranker(rank((AAA, "0.25"))), tape(AAA, RISING + [10.46, 10.0, 9.9]))
+    (entry,) = s.record()["entries"]
+    buys = [f for f in s.fills if f[1] == "BUY" and f[0] == entry["client_order_id"]]
+    assert buys
+    quantity = sum((D(f[2]) for f in buys), D(0))
+    assert D(entry["entry_price"]) == sum((D(f[2]) * D(f[3]) for f in buys), D(0)) / quantity
+    eng.dispose()
+    s = strategy()
+    slot = mover.Slot(AAA, bar_type(AAA), deque(maxlen=4), deque(maxlen=5))
+    s.slots[AAA] = slot
+    slot.entry_id = ClientOrderId("BUY-1")
+    record: dict[str, Any] = {"client_order_id": "BUY-1", "entry_price": None}
+    slot.entry_record = record
+    s.entries_sent.append(record)  # as `_enter` registers each entry it sends
+    for qty, px, at in ((2, "10.0000", T0), (3, "10.5000", T0 + SECOND)):
+        s.on_order_filled(
+            SimpleNamespace(
+                instrument_id=AAA,
+                client_order_id=slot.entry_id,
+                order_side=OrderSide.BUY,
+                last_qty=Quantity.from_int(qty),
+                last_px=Price.from_str(px),
+                ts_event=at,
+            )
+        )
+    price = record["entry_price"]
+    assert isinstance(price, str) and D(price) == D("10.3")
+
+
+@pytest.mark.parametrize(
+    ("handler", "reason", "by", "cause"),
+    [
+        (
+            "on_order_rejected",
+            "Alpaca refused the order (403): potential wash trade detected. use complex orders",
+            "venue",
+            "wash_trade",
+        ),
+        (
+            "on_order_denied",
+            sub_penny_denial(Price.from_str("10.005"), "stop price"),
+            "before_venue",
+            "off_step",
+        ),
+        (
+            # Alpaca's own rejection of a price off its step, as "Orders at Alpaca" gives it
+            "on_order_rejected",
+            (
+                "invalid limit_price 290.123. sub-penny increment does not fulfill minimum "
+                "pricing criteria"
+            ),
+            "venue",
+            "off_step",
+        ),
+        ("on_order_rejected", "Alpaca refused the order (403): insufficient qty", "venue", "other"),
+        ("on_order_rejected", not_sent_reason(TimeoutError("connect")), "before_venue", "other"),
+        ("on_order_denied", "CUM_NOTIONAL_EXCEEDS_FREE_BALANCE", "before_venue", "other"),
+    ],
+)
+def test_each_refusal_names_who_refused_it_and_its_cause(handler, reason, by, cause):
+    """The lead's D3 terms of 2026-11-12, A7: Alpaca refuses no order for a cause of ours. Each refusal
+    names who refused it (the venue, or the node before the venue, which a rejection the adapter
+    proves was never sent is: `not_sent_reason`, the high read's finding 1) and its cause: a wash
+    trade (the paper text the adapter README records, "Wash trades"), a price off Alpaca's step (the
+    adapter's `sub_penny_denial` text, or Alpaca's own as "Orders at Alpaca" gives it, the evidence
+    reader's finding), or other; a sale's row carries the same cause."""
+    seam, slot = sized_cold_holding("0.20", "0.15")
+    host = handling(seam, slot)
+    (sale,) = seam.sent
+    getattr(mover.Mover, handler)(host, sale_event(sale, T0 + SECOND, reason=reason))
+    assert host.refused == [(sale.client_order_id.value, reason)]
+    assert host.order_refusals == [
+        {"client_order_id": sale.client_order_id.value, "by": by, "cause": cause, "reason": reason}
+    ]
+    (row,) = slot.exit_record.record()["sales"]
+    assert (row["reason"], row["cause"]) == (reason, cause)
+
+
+@pytest.mark.parametrize("end", ["on_order_canceled", "on_order_expired"])
+def test_a_sale_filled_after_its_cancel_or_expiry_ends_filled(end):
+    """The high read of the sale rows, finding 1: the pinned order state machine lets a canceled or
+    expired order fill ("Real world possibility", `crates/model/src/orders/mod.rs:247`, `:295`), as a
+    chase's cancel crossing a fill at Alpaca does. A row filled in full after such an end reads
+    filled, at its fill's time; a part fill leaves the earlier end."""
+    seam, slot = sized_cold_holding("0.20", "0.15")
+    host = handling(seam, slot)
+    (sale,) = seam.sent
+    getattr(mover.Mover, end)(host, sale_event(sale, T0 + SECOND))
+    sold = {"order_side": OrderSide.SELL, "last_px": Price.from_str("10.3000")}
+    mover.Mover.on_order_filled(
+        host, sale_event(sale, T0 + 2 * SECOND, last_qty=Quantity.from_int(2), **sold)
+    )
+    row = slot.exit_record.record()["sales"][0]
+    assert (row["ended"], row["ended_ns"]) == (end.removeprefix("on_order_"), T0 + SECOND)
+    mover.Mover.on_order_filled(
+        host, sale_event(sale, T0 + 3 * SECOND, last_qty=Quantity.from_int(3), **sold)
+    )
+    row = slot.exit_record.record()["sales"][0]
+    assert (row["ended"], row["ended_ns"], row["filled_quantity"]) == (
+        "filled",
+        T0 + 3 * SECOND,
+        "5",
+    )
+
+
+def test_an_entrys_average_fill_price_counts_its_own_fills_only():
+    """The pre-landing reader of A3 with O (2026-11-13), P2-1: an entry's price is its own fills'
+    average, read by its client order ID. A late fill of an earlier entry in the same name goes to
+    that entry's record, and none of it to the current one's."""
+    s = strategy()
+    slot = mover.Slot(AAA, bar_type(AAA), deque(maxlen=4), deque(maxlen=5))
+    s.slots[AAA] = slot
+    old: dict[str, Any] = {"client_order_id": "E-old", "entry_price": None}
+    new: dict[str, Any] = {"client_order_id": "E-new", "entry_price": None}
+    s.entries_sent.extend([old, new])
+    slot.entry_id, slot.entry_record = ClientOrderId("E-new"), new
+    for cid, px, at in (("E-old", "8.0000", T0), ("E-new", "10.0000", T0 + SECOND)):
+        s.on_order_filled(
+            SimpleNamespace(
+                instrument_id=AAA,
+                client_order_id=ClientOrderId(cid),
+                order_side=OrderSide.BUY,
+                last_qty=Quantity.from_int(1),
+                last_px=Price.from_str(px),
+                ts_event=at,
+            )
+        )
+    assert [D(str(row["entry_price"])) for row in (new, old)] == [D("10"), D("8")]
+
+
+@pytest.mark.parametrize("gone", ["exit_record", "slot"])
+def test_a_sale_filled_after_its_holding_is_cleared_still_ends_filled(gone):
+    """The pre-landing reader of A3 with O (2026-11-13), P2-2: a sale row is found by its client order
+    ID, so a fill that arrives after the holding's exit record is cleared (`_flat`), or after its
+    slot is removed (`_close_slot`), still reaches the row the record keeps."""
+    seam, slot = sized_cold_holding("0.20", "0.15")
+    host = handling(seam, slot)
+    (sale,) = seam.sent
+    mover.Mover.on_order_canceled(host, sale_event(sale, T0 + SECOND))
+    row = slot.exit_record
+    if gone == "slot":
+        del host.slots[AAA]
+    else:
+        slot.exit_record = None
+    sold = {"order_side": OrderSide.SELL, "last_px": Price.from_str("10.3000")}
+    mover.Mover.on_order_filled(
+        host, sale_event(sale, T0 + 2 * SECOND, last_qty=Quantity.from_int(5), **sold)
+    )
+    (kept,) = row.record()["sales"]
+    assert (kept["ended"], kept["ended_ns"], kept["filled_quantity"]) == (
+        "filled",
+        T0 + 2 * SECOND,
+        "5",
+    )
+
+
+def test_an_entrys_opening_and_reentry_rows_take_its_own_fills_only():
+    """The high review of the reader fixes (2026-11-13), should-fix 1: an entry's opening and
+    re-entry rows name its own average fill and its own first fill's time, like its `entry_price`. A
+    late fill of an earlier entry goes to that entry's rows, and none of it to the current one's."""
+    s = strategy()
+    slot = mover.Slot(AAA, bar_type(AAA), deque(maxlen=4), deque(maxlen=5))
+    s.slots[AAA] = slot
+    old_reentry: dict[str, Any] = {"reentry_price": None, "minutes_between": None, "sale_ns": T0}
+    new_reentry: dict[str, Any] = {
+        "reentry_price": None,
+        "minutes_between": None,
+        "sale_ns": T0 + MINUTE,
+    }
+    opening: dict[str, Any] = {"entry_price": None}
+    old = {"client_order_id": "E-old", "entry_price": None, "reentry": old_reentry}
+    new = {
+        "client_order_id": "E-new",
+        "entry_price": None,
+        "reentry": new_reentry,
+        "opening": opening,
+    }
+    s.entries_sent.extend([old, new])
+    slot.entry_id, slot.entry_record = ClientOrderId("E-new"), new
+    for cid, px, at in (("E-old", "8.0000", T0 + MINUTE), ("E-new", "10.0000", T0 + 3 * MINUTE)):
+        s.on_order_filled(
+            SimpleNamespace(
+                instrument_id=AAA,
+                client_order_id=ClientOrderId(cid),
+                order_side=OrderSide.BUY,
+                last_qty=Quantity.from_int(1),
+                last_px=Price.from_str(px),
+                ts_event=at,
+            )
+        )
+    assert D(str(opening["entry_price"])) == D("10")
+    assert (D(str(new_reentry["reentry_price"])), new_reentry["minutes_between"]) == (D("10"), 2.0)
+    assert (D(str(old_reentry["reentry_price"])), old_reentry["minutes_between"]) == (D("8"), 1.0)
+
+
+def test_a_late_fill_of_an_earlier_holdings_sale_sells_the_current_holding_and_keeps_its_price():
+    """The pre-landing reader of the a3fix commit (xr7-r-a3fix, 2026-11-13), P1: the shares in a name
+    are one position, so a late fill of an earlier holding's sale sells the current holding. It counts
+    toward the current holding's sold quantity, notional and final fill, and so toward the re-entry
+    state, as before the record fix; under reclaim `_flat` then keeps the sale price 10.30 a reclaim
+    is judged against, not None. The sale's own row reads filled, and the earlier holding's totals
+    do not count it a second time."""
+    seam, slot = sized_cold_holding("0.20", "0.15", reentry_arm="reclaim")
+    host = handling(seam, slot)
+    host.sold, host.sold_fill_ns, host.reentry_states = {}, {}, {}
+    (sale,) = seam.sent
+    mover.Mover.on_order_canceled(host, sale_event(sale, T0 + SECOND))
+    earlier = slot.exit_record
+    slot.exit_record = None
+    current = seam._ensure_exit(slot, D(5))  # the name held again: a new holding's record
+    sold = {"order_side": OrderSide.SELL, "last_px": Price.from_str("10.3000")}
+    mover.Mover.on_order_filled(
+        host, sale_event(sale, T0 + 2 * SECOND, last_qty=Quantity.from_int(5), **sold)
+    )
+    assert earlier.record()["sales"][0]["filled_quantity"] == "5"
+    assert (earlier.filled, earlier.notional, earlier.final_fill_ns) == (D(0), D(0), None)
+    assert (current.filled, current.notional, current.final_fill_ns) == (
+        D(5),
+        D("51.5"),
+        T0 + 2 * SECOND,
+    )
+    assert host.sold[AAA] == (T0 + 2 * SECOND, D("10.3"))
+    slot.protect_id, slot.was_held = None, True  # its own protection gone unfilled
+    host._working = lambda _slot: False
+    mover.Mover._flat(host, slot, T0 + 3 * SECOND)
+    assert host.sold[AAA] == (T0 + 3 * SECOND, D("10.3"))
+    state = host.reentry_states[AAA]
+    assert (state.sale_ns, state.sale_price) == (T0 + 2 * SECOND, D("10.3"))
+
+
+@pytest.mark.parametrize("gone", ["exit_record", "slot"])
+def test_a_late_sale_with_no_current_holding_completes_its_own_holdings_totals(gone):
+    """xr7-r-a3fix, P2: with no current holding in the name, a late fill of a sale completes the
+    totals of the holding that sent it (sold quantity, notional, final fill), as its sale row does,
+    and writes no trading state: the re-entry state belongs to a holding the slot still has."""
+    seam, slot = sized_cold_holding("0.20", "0.15")
+    host = handling(seam, slot)
+    (sale,) = seam.sent
+    mover.Mover.on_order_canceled(host, sale_event(sale, T0 + SECOND))
+    row = slot.exit_record
+    if gone == "slot":
+        del host.slots[AAA]
+    else:
+        slot.exit_record = None
+    sold = {"order_side": OrderSide.SELL, "last_px": Price.from_str("10.3000")}
+    mover.Mover.on_order_filled(
+        host, sale_event(sale, T0 + 2 * SECOND, last_qty=Quantity.from_int(5), **sold)
+    )
+    assert (row.filled, row.notional, row.final_fill_ns) == (D(5), D("51.5"), T0 + 2 * SECOND)
+    record = row.record()
+    assert (record["filled_quantity"], record["final_fill_ns"]) == ("5", T0 + 2 * SECOND)
+    assert not hasattr(host, "sold")  # the Seam has no trading state to write
+
+
+def test_minutes_between_runs_to_the_entrys_earliest_fill_whatever_order_its_fills_arrive_in():
+    """xr7-r-a3fix, P2: an earlier-stamped part fill that arrives second still sets the re-entry
+    row's `minutes_between`, from the sale to the entry's earliest own fill."""
+    s = strategy()
+    slot = mover.Slot(AAA, bar_type(AAA), deque(maxlen=4), deque(maxlen=5))
+    s.slots[AAA] = slot
+    reentry: dict[str, Any] = {"reentry_price": None, "minutes_between": None, "sale_ns": T0}
+    entry = {"client_order_id": "E-1", "entry_price": None, "reentry": reentry}
+    s.entries_sent.append(entry)
+    slot.entry_id, slot.entry_record = ClientOrderId("E-1"), entry
+    for qty, px, at in ((2, "10.0000", T0 + 3 * MINUTE), (3, "10.5000", T0 + MINUTE)):
+        s.on_order_filled(
+            SimpleNamespace(
+                instrument_id=AAA,
+                client_order_id=ClientOrderId("E-1"),
+                order_side=OrderSide.BUY,
+                last_qty=Quantity.from_int(qty),
+                last_px=Price.from_str(px),
+                ts_event=at,
+            )
+        )
+    assert (D(str(reentry["reentry_price"])), reentry["minutes_between"]) == (D("10.3"), 1.0)

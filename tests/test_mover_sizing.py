@@ -219,7 +219,12 @@ def test_each_sizing_refusal_is_counted_by_its_own_name(changes, name) -> None:
     eng.dispose()
     assert not [o for o in orders if o.side == OrderSide.BUY]
     counts = s.record()["sizing_refusals"]
-    assert set(counts) == {*REFUSALS, mover.DISTANCE_UNDER_STEP, mover.BID_AT_STOP}
+    assert set(counts) == {
+        *REFUSALS,
+        mover.DISTANCE_UNDER_STEP,
+        mover.DISTANCE_UNDER_FLOOR,
+        mover.BID_AT_STOP,
+    }
     assert counts[name] >= 1
     assert all(count == 0 for other, count in counts.items() if other != name)
     assert any(f"sizing refused: {name}" in why for why in s.dropped), s.dropped
@@ -279,6 +284,191 @@ def test_the_refuse_arm_refuses_a_trail_over_the_cap_by_name() -> None:
     assert s._entry_trail(slot, D(10), latest).trail == pytest.approx(D("0.004"))
 
 
+OWN = {"size_from_budget": True, "loss_share": PAPER_LOSS_SHARE}
+"""The `own` arm as a paper window runs it: budget-sized, so the size carries a distance over the cap."""
+
+
+@pytest.mark.parametrize(("cap", "rows"), [("clamp", {}), ("refuse", {}), ("own", OWN)])
+@pytest.mark.parametrize("arm", ["opening", None])
+def test_a_cold_atr_entry_trails_at_least_the_spread_floor_at_its_step_in_every_cap_arm(
+    cap, rows, arm
+) -> None:
+    """The lead's O1 of 2026-11-12: at every entry of every arm that tightens, the trail is at least
+    the spread floor at that step. A 0.01 fixed trail on a quote 0.15 wide at 10.00 is inside the
+    0.015 floor (2 spreads), which the cap allows, so a cold-ATR entry, the opening's included, is
+    raised to the floor whatever the cap arm."""
+    s, slot, latest = warmed(spread="0.075", trail=D("0.01"), trail_cap=cap, **rows)
+    slot.atr.reset()
+    slot.run_arm = arm
+    plan = s._entry_trail(slot, D(10), latest)
+    assert (plan.trail, plan.bound, plan.source) == (
+        D("0.015"),
+        "spread floor",
+        "cold_atr_fallback",
+    )
+    assert plan.floor == D("0.015")
+    assert (plan.exit_through, plan.chase_cap) == (D("0.015") / 4, s.settings.chase_cap)
+
+
+@pytest.mark.parametrize(
+    ("bid", "ask", "trail"),
+    [
+        ("19.7500", "20.0000", "0.025"),  # #338's second reader (Antigravity), P1-2
+        ("9.8500", "10.0000", "0.03"),  # #340's Codex reader, P1-2, and its dsh reader, F1
+        ("9.8400", "10.0000", "0.032"),  # #340's Antigravity reader, P1-2
+    ],
+)
+def test_a_cold_opening_entry_takes_the_floor_over_the_fixed_plan(bid, ask, trail) -> None:
+    """The second reader of #338 (Antigravity, P1-2), at the lead's inputs of 2026-11-13: at 09:35 New
+    York with the ATR cold, the opening arm on, cap own and budget sizing, a 19.75 x 20.00 quote puts
+    the spread floor at 0.025, over the fixed 0.02. The opening's cold entry takes the larger, so the
+    loss-bound shares are sized for 0.025, not oversized by 25% at 0.02. The readers of #340 gave two
+    more such quotes at 10.00."""
+    from types import SimpleNamespace
+
+    from nautilus_trader.model import Price
+
+    s, slot, _ = warmed(trail_cap="own", **OWN)
+    assert s.settings.trail == D("0.02")
+    slot.atr.reset()
+    slot.run_arm = "opening"
+    quote = SimpleNamespace(bid_price=Price.from_str(bid), ask_price=Price.from_str(ask))
+    plan = s._entry_trail(slot, D(ask), quote)
+    assert (plan.trail, plan.bound, plan.source) == (
+        D(trail),
+        "spread floor",
+        "cold_atr_fallback",
+    )
+
+
+def stepping_to(last: float, step: float) -> list[float]:
+    """Closes rising by `step` to `last`, the close the entry is made at, then on and back down."""
+    rising = [round(last - step * (4 - i), 4) for i in range(5)]
+    return rising + [round(last + step * i, 4) for i in (1, 2, 3)] + [1.00, 0.97]
+
+
+@pytest.mark.parametrize(
+    ("closes", "spread", "trail", "price", "least", "held"),
+    [
+        # #338's second reader (Antigravity), P1-1: an ask of 1.0000, the bid 0.9920
+        (stepping_to(0.996, 0.01), 0.004, "0.01", "1.0000", "0.016", "0.02"),
+        # #340's Codex reader, P1-1: the bid 0.9940, a floor of 0.012
+        (stepping_to(0.997, 0.01), 0.003, "0.01", "1.0000", "0.012", "0.02"),
+        # #340's Antigravity reader, P1-1: the bid 0.9910, a floor of 0.018
+        (stepping_to(0.9955, 0.01), 0.0045, "0.01", "1.0000", "0.018", "0.02"),
+        # the same reader's second input: a 0.008 floor whose stop, 0.9920, rounded down to nothing
+        (stepping_to(0.998, 0.008), 0.002, "0.005", "1.0000", "0.008", "0.01"),
+        # the A3+O reader's P2: at 1.03 the fraction 0.04 / 1.03 is not exact in a Decimal
+        (stepping_to(1.022, 0.01), 0.008, "0.01", "1.0300", "0.032", "0.04"),
+    ],
+)
+def test_an_entry_whose_stop_crosses_a_dollar_holds_at_least_the_spread_floor_and_its_loss(
+    closes, spread, trail, price, least, held
+) -> None:
+    """The second reader of #338 (Antigravity, P1-1), the lead's cross-dollar property of 2026-11-13:
+    at an ask of 1.0000 with the bid 0.9920 the spread floor is 0.016 a share. The stop sized from it,
+    0.9840, is on the sub-dollar step, and L rounded down onto the entry's cent step was 0.01, under
+    the floor. L on the entry's step is now at or above the floor, 0.02, and the size is taken for it,
+    so the loss at the stop stays within the plan. The readers of #340 gave three more such inputs.
+    The stop the size is taken again at is L under the entry exactly, so the record's stop and its loss
+    per share agree (the A3+O reader, P2: at 1.03 the stop was 0.9899 for an L of 0.04)."""
+    from tests.test_mover import tape
+
+    eng = engine()
+    s = sent(
+        max_notional=D(1000),
+        flow_share=D(1),
+        trail_mode="atr",
+        trail_cap="own",
+        trail=D(trail),
+        entry_ticks=0,
+        **OWN,
+    )
+    orders = run(eng, s, ranker(rank((AAA, "0.25"))), tape(AAA, closes, spread=spread))
+    eng.dispose()
+    buy = first_buy(orders)
+    assert buy.price.as_decimal() == D(price)
+    price = D(price)
+    entry = s.entries_sent[0]
+    floor = D(entry["spread_floor"]) * price
+    assert floor == D(least)
+    sizing = entry["sizing"]
+    loss = D(sizing["loss_per_share"])
+    assert loss >= floor
+    assert loss == price - D(sizing["stop"]) == D(held)
+    # the record names the fraction the size was taken at, which gives its stop (the high review, nit 2)
+    assert D(sizing["stop"]) == sized_stop(price, D(sizing["sized_trail"]))
+    assert D(sizing["sized_trail"]) > D(sizing["trail"])
+    assert D(sizing["loss_at_stop"]) <= D(sizing["planned_loss"])
+    assert buy.quantity.as_decimal() * loss <= D(sizing["planned_loss"])
+    first = s.sent_triggers[0]
+    assert first is not None and D(str(buy.avg_px)) - first >= floor
+
+
+def test_the_fixed_arm_keeps_its_trail_inside_the_spread_floor() -> None:
+    """O1 covers the arms that select a distance; the fixed arm is the default and does not move."""
+    s, slot, latest = warmed("fixed", spread="0.075", trail=D("0.01"))
+    plan = s._entry_trail(slot, D(10), latest)
+    assert (plan.trail, plan.bound) == (D("0.01"), "fixed")
+
+
+@pytest.mark.parametrize(
+    ("cap", "rows", "width", "spread", "cause", "distance"),
+    [
+        ("clamp", {}, "0.04", "0.11", "floor_over_cap", "0.022"),
+        ("refuse", {}, "0.04", "0.11", "floor_over_cap", "0.022"),
+        ("own", {}, "0.04", "0.11", "floor_over_cap", "0.022"),
+        ("refuse", {}, "0.5", "0.005", "distance_over_cap", "0.05"),
+        ("own", {}, "0.5", "0.005", "distance_over_cap", "0.05"),
+    ],
+)
+def test_an_entry_the_cap_forbids_is_refused_with_its_cause_and_distance(
+    cap, rows, width, spread, cause, distance
+) -> None:
+    """The lead's O2 of 2026-11-12: where the cap forbids the distance, the entry is refused by name,
+    and the refusal carries its cause and the distance the cap forbade, for the run's record."""
+    s, slot, latest = warmed(width=width, spread=spread, trail_cap=cap, **rows)
+    with pytest.raises(mover.DistanceRefusal) as refused:
+        s._entry_trail(slot, D(10), latest)
+    assert (refused.value.cause, refused.value.distance) == (cause, D(distance))
+    slot.atr.reset()  # cold, the same floor is refused
+    if cause == "floor_over_cap":
+        with pytest.raises(mover.DistanceRefusal, match="spread floor exceeds the 0.02 cap"):
+            s._entry_trail(slot, D(10), latest)
+
+
+def test_a_refused_entry_is_written_once_in_the_runs_refusals_with_its_numbers() -> None:
+    """The lead's record rule 1 of 2026-11-12: an entry refused for its distance is one row of the
+    run's `refusals`, with its cause, its distance, the cap and its time, and no line of `dropped`.
+    Written once: a name refused again at each later decision keeps its one row for that cause, which
+    counts the decisions and names the last, as batch B's `reentry_max` row does.
+    A quote 0.24 wide at about 10.20 puts the spread floor near 0.047, over the 0.02 cap."""
+    from tests.test_mover import tape
+
+    eng = engine()
+    s = strategy(trail_mode="atr", atr_n=3)
+    orders = run(eng, s, ranker(rank((AAA, "0.25"))), tape(AAA, RISING, spread=0.12))
+    eng.dispose()
+    assert not [o for o in orders if o.side == OrderSide.BUY]
+    record = s.record()
+    refusals = record["refusals"]
+    assert len(refusals) == 1, refusals
+    (row,) = refusals
+    assert set(row) == {
+        "when_ns",
+        "instrument_id",
+        "reason",
+        "distance",
+        "cap",
+        "decisions",
+        "last_ns",
+    }
+    assert (row["instrument_id"], row["reason"], row["cap"]) == (str(AAA), "floor_over_cap", "0.02")
+    assert D(row["distance"]) > D("0.02") and isinstance(row["when_ns"], int)
+    assert row["decisions"] > 1 and row["last_ns"] > row["when_ns"]
+    assert not [why for why in record["dropped"] if "cap" in why], record["dropped"]
+
+
 def test_an_unknown_cap_arm_is_refused() -> None:
     with pytest.raises(ValueError, match="trail_cap"):
         strategy(trail_cap="widen")
@@ -318,7 +508,12 @@ def test_an_error_that_is_not_a_sizing_refusal_propagates_and_is_not_counted(mon
     assert any(
         "sizing failed, not a refusal: ValueError: an upstream fault" in why for why in s.dropped
     ), s.dropped
-    assert set(s.sizing_refusals) == {*REFUSALS, mover.DISTANCE_UNDER_STEP, mover.BID_AT_STOP}
+    assert set(s.sizing_refusals) == {
+        *REFUSALS,
+        mover.DISTANCE_UNDER_STEP,
+        mover.DISTANCE_UNDER_FLOOR,
+        mover.BID_AT_STOP,
+    }
     assert not any(s.sizing_refusals.values())
 
 
@@ -461,7 +656,7 @@ def test_sizing_rows_reach_the_record_without_an_entry() -> None:
     s = strategy(max_notional=D(1000), size_from_budget=True)
     record = s.record()
     assert record["sizing_refusals"] == dict.fromkeys(
-        (*REFUSALS, mover.DISTANCE_UNDER_STEP, mover.BID_AT_STOP), 0
+        (*REFUSALS, mover.DISTANCE_UNDER_STEP, mover.DISTANCE_UNDER_FLOOR, mover.BID_AT_STOP), 0
     )
     assert record["sizing_bindings"] == {}
     assert record["rows"]["loss_share"] == "0.02"
