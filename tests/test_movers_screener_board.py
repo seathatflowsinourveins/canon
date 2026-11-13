@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import os
 from datetime import UTC
 from datetime import datetime
 from pathlib import Path
@@ -14,6 +15,7 @@ from pathlib import Path
 import pytest
 from alpaca.data.models.screener import MostActives
 from alpaca.data.models.screener import Movers
+from canon_alpaca.providers import DATA_ONLY_ENV
 
 from canon_trading import movers_screener
 from canon_trading import screener_board
@@ -224,12 +226,24 @@ def test_board_write_changes_neither_log_bytes_nor_the_three_client_calls(
     assert with_board.read_text() == json.dumps(expected) + "\n" + json.dumps(summary) + "\n"
 
 
+@pytest.fixture(autouse=True)
+def leaves_the_data_only_mode_as_it_found_it(monkeypatch):
+    """`movers_screener.main` sets data-only mode in the process (ADR 0070); a case here must not leave
+    it set, or every later test that sends an order through the adapter is refused. What a case
+    recorded with `monkeypatch` is restored first, as its teardown would."""
+    before = os.environ.get(DATA_ONLY_ENV)
+    yield
+    monkeypatch.undo()
+    assert os.environ.get(DATA_ONLY_ENV) == before, f"{DATA_ONLY_ENV} left changed by this case"
+
+
 @pytest.mark.parametrize("custom", [False, True])
 def test_main_publishes_to_default_watch_folder_or_cli_board_dir(
     tmp_path, monkeypatch, custom
 ) -> None:
     client = Client()
     monkeypatch.setattr(movers_screener, "screener_client", lambda: client)
+    monkeypatch.setenv(DATA_ONLY_ENV, "1")  # recorded, so teardown restores what main sets
     folder = tmp_path / "chosen" if custom else tmp_path / "home" / ".claude" / "canon" / "watch"
     args = ["--minutes", "1", "--log-dir", str(tmp_path)]
     if custom:
