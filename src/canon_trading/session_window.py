@@ -3272,6 +3272,8 @@ def run_window(
                         report.mover["entries_by_roster"] = roster_entries(run)
                     except Exception as e:  # noqa: BLE001
                         report.mover["entries_by_roster"] = f"not read: {type(e).__name__}: {e}"
+                    for key in ("entries_by_trail_source", "warm_up"):  # the END line's (F-2)
+                        report.mover[key] = run.get(key, "not recorded by the strategy")
                     from .movers_rank_actor import publication_lags
 
                     report.mover["publication_lags"] = publication_lags(_records(run))
