@@ -208,7 +208,10 @@ UNCALIBRATED (ADR 0088; the persistence rows are ADR 0119's).
    ADR 0092's table rows are :73 (move), :74 (ratio), :75 (baseline sessions), :76 (rises),
    :77 (first-leg window), :78 (quiet price) and :79 (pullback). No row is tuned here.
    Registered arms require a supplied `Day` in `entry_contexts`; no context, no entry. The strategy
-   fetches no entry context: live composition supplies it and selects the arm (M-c). Its one history
+   accepts roster contexts or a composition-supplied on-demand reader on one worker. Completed
+   reads are installed on the strategy thread by the step/bar handlers; a pending or failed read
+   refuses entry by name. CPython 3.14.10's `ThreadPoolExecutor.submit` / `shutdown(cancel_futures=True)`
+   (`Lib/concurrent/futures/thread.py:199-215`, `:254-274`) supplies that worker. Its native bars
    request is the ATR's warm-up (F-2), below.
    Candidates are taken best-ranked first while a slot is free, each refused by name
    (`dropped`) when the ranking is older than `rank_max_age_secs`, the name is no longer in it, its move
@@ -254,6 +257,8 @@ calendar (the run checks it); a partly filled entry is protected only from the n
 from __future__ import annotations
 
 from collections import deque
+from concurrent.futures import Future
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from dataclasses import field
 from dataclasses import replace
@@ -337,6 +342,7 @@ from .trail import profile_segment
 from .trail import validate_profile_settings
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from collections.abc import Iterable
     from collections.abc import Mapping
     from collections.abc import Sequence
@@ -538,6 +544,12 @@ a non-fixed trail; an opening over it is held by name and asked again each step 
 HISTORY_WAIT_SECS = QUERY_WAIT_SECS
 """How long a slot's warm-up may go unanswered before it is named unanswered: one adapter REST call at its
 longest. The slot enters on the cold path meanwhile; an answer after it still warms, each minute once."""
+CONTEXT_READ_LIMIT = HISTORY_REQUEST_LIMIT
+"""At most 20 entry-context reads started per rolling minute, including refreshes and retries.
+The window separately bounds actual data GET attempts, including pagination and SDK retries, at
+ADR 0093's 150/minute row; none consumes the trading-only soft line."""
+CONTEXT_RETRY_NS = BUDGET_SPAN_NS
+"""A failed read waits 60 seconds from failure before retrying (UNCALIBRATED)."""
 OVERNIGHT_HISTORY_FEED = "boats"
 """The overnight part's feed (`session_window.MOVER_PARTS["overnight"]`)."""
 OVERNIGHT_HISTORY_DELAY = timedelta(minutes=15)
@@ -1768,6 +1780,23 @@ class InstrumentLoad:
 
 
 @dataclass
+class ContextRead:
+    """One late name's Day read; only the strategy thread installs its result or live minutes."""
+
+    loaded_ns: int
+    started_ns: int = 0
+    future: Future | None = None
+    reads: int = 0
+    ready_ns: int | None = None
+    failures: list[str] = field(default_factory=list)
+    last_failure: str | None = None
+    failed_ns: int = 0
+    deferred: str | None = None
+    live_day: date | None = None
+    live: dict[int, entry_study.Minute] = field(default_factory=dict)
+
+
+@dataclass
 class HistoryLoad:
     """One slot opening's ATR warm-up (F-2): its bars request, and what its answers gave that slot."""
 
@@ -2229,14 +2258,26 @@ class Mover(Strategy):
         self.history_sent: deque[int] = deque()
         self.history_responses: list[tuple[str, bool, str | None, list[Bar]]] = []
         """Each warm-up answer since the last step, as plain values: request ID, completed, failure."""
+        self.context_reader: Callable[[InstrumentId, int], entry_study.Day] | None = None
+        """Composition's history loader, called off the event loop on one context worker."""
+        self.context_submit: Callable[[Callable[[], Any]], Future] | None = None
+        """Optional deterministic executor for simulations; otherwise the strategy's one-worker pool."""
+        self.context_stop: Callable[[], None] | None = None
+        """Stop the reader's next HTTP attempt, including another page of a read still running."""
+        self.context_budget_record: Callable[[], dict[str, Any]] | None = None
+        self.context_reads: dict[InstrumentId, ContextRead] = {}
+        self.context_sources: dict[InstrumentId, str] = {}
+        self.context_sent: deque[int] = deque()
+        self._context_executor: ThreadPoolExecutor | None = None
+        self._contexts_stopped = False
         self.entry_contexts: dict[InstrumentId, entry_study.Day] = {}
         """Explicit per-name ADR 0092 history, supplied by composition before registered-arm entry.
 
         A Day names its New York date, reference close, earlier sessions latest first, and covered
         bars since 04:00 (the study's Day contract). Callers supply complete history, with `missing`
-        naming any coverage fault; Mover fetches no entry context and refuses absent, wrong-name/day or
-        missing contexts. `covered_to` must reach the incoming minute's open: after a data gap the
-        caller supplies the missing prefix or marks it missing. Completed live bars extend coverage
+        naming any coverage fault; absent contexts use the optional reader, and wrong-name/day or
+        missing contexts never qualify. `covered_to` must reach the incoming minute's open: after a
+        data gap the caller supplies the missing prefix or marks it missing. Completed live bars extend coverage
         to that minute's end and replace that minute in the context; future minutes
         are discarded, and pre-watch history informs listing/extension only, never the rising run.
         Context survives unwatching so the listing clock is the day's, not a new slot's.
@@ -2793,6 +2834,27 @@ class Mover(Strategy):
                 for instrument, context in self.entry_contexts.items()
             },
         }
+        if self.context_reader is not None or self.context_reads:
+            record.update(
+                context_read_limit=CONTEXT_READ_LIMIT,
+                context_request_budget=(
+                    None if self.context_budget_record is None else self.context_budget_record()
+                ),
+                on_demand_contexts={
+                    str(instrument): {
+                        "source": self.context_sources.get(instrument),
+                        "loaded_ns": read.loaded_ns,
+                        "ready_ns": read.ready_ns,
+                        "seconds": self._context_seconds(instrument),
+                        "reads": read.reads,
+                        "pending": read.future is not None,
+                        "deferred": read.deferred,
+                        "failures": list(read.failures),
+                        "last_failure": read.last_failure,
+                    }
+                    for instrument, read in self.context_reads.items()
+                },
+            )
         if self.settings.opening_arm != "off":
             record["opening_refused"] = dict(self.opening_refused)
             record["opening_outcomes"] = dict(self.opening_outcomes)
@@ -2801,6 +2863,8 @@ class Mover(Strategy):
     # --- start, bars, the step -------------------------------------------------------------------------
 
     def on_start(self) -> None:
+        for instrument_id in self.entry_contexts:
+            self.context_sources.setdefault(instrument_id, "roster")
         self.subscribe_signal(RANK_SIGNAL)
         self.clock.set_timer(STEP_TIMER, timedelta(seconds=STEP_SECS), callback=self._on_step)
         if self.wind_down_at is not None:
@@ -3051,24 +3115,38 @@ class Mover(Strategy):
         if slot.entry_day != opened.date():
             slot.entry_day = opened.date()
             slot.entry_start = minute
+        if self.context_reader is not None:
+            self._finish_contexts()
+            context = self.entry_contexts.get(slot.instrument_id)
+        if (
+            context is not None
+            and context.day == opened.date()
+            and context.symbol == slot.instrument_id.symbol.value
+            and context.missing is None
+            and self.context_sources.get(slot.instrument_id) == "on_demand"
+        ):
+            context = self._fill_context_gap(slot.instrument_id, context, opened_ns, bar.ts_init)
         why = None
         if context is None:
-            why = "no entry context supplied"
+            why = self._context_pending(slot.instrument_id) or "no entry context supplied"
         elif context.symbol != slot.instrument_id.symbol.value or context.day != opened.date():
-            why = "entry context names another symbol or New York day"
+            why = (
+                self._context_pending(slot.instrument_id, refresh=True)
+                if self.context_sources.get(slot.instrument_id) == "on_demand"
+                else None
+            ) or "entry context names another symbol or New York day"
         elif context.missing is not None:
             why = f"entry context missing: {context.missing}"
         elif not entry_study.PART_START <= minute < entry_study.WINDOW_END:
             why = "outside the entry study's 04:00-16:00 New York window"
         elif context.covered_to < minute:
-            why = "entry context coverage does not reach this minute's open"
-        if why is not None:
-            self._note(slot, f"{slot.instrument_id}: entry arm {arm}: {why}")
-            return
-        assert context is not None
-        assert slot.entry_start is not None
-        known = {b.start: b for b in context.bars if b.start <= minute}
-        known[minute] = entry_study.Minute(
+            why = (
+                f"entry context coverage gap at minute {context.covered_to}; "
+                "waiting for complete cached minute bars"
+                if self.context_sources.get(slot.instrument_id) == "on_demand"
+                else "entry context coverage does not reach this minute's open"
+            )
+        live = entry_study.Minute(
             minute,
             float(bar.open.as_decimal()),
             float(bar.high.as_decimal()),
@@ -3076,6 +3154,18 @@ class Mover(Strategy):
             float(bar.close.as_decimal()),
             float(bar.volume.as_decimal()),
         )
+        if why is not None:
+            read = self.context_reads.get(slot.instrument_id)
+            if read is not None and entry_study.PART_START <= minute < entry_study.WINDOW_END:
+                if read.live_day != opened.date():
+                    read.live, read.live_day = {}, opened.date()
+                read.live[minute] = live
+            self._note(slot, f"{slot.instrument_id}: entry arm {arm}: {why}")
+            return
+        assert context is not None
+        assert slot.entry_start is not None
+        known = {b.start: b for b in context.bars if b.start <= minute}
+        known[minute] = live
         day = replace(context, bars=tuple(known[m] for m in sorted(known)), covered_to=minute + 1)
         self.entry_contexts[slot.instrument_id] = day
         seen = entry_study.listing(day, rows)
@@ -3157,6 +3247,23 @@ class Mover(Strategy):
         `manage_stop` upstream's market exit has already run before this is called."""
         if self.clock.timer_names().count(STEP_TIMER):
             self.clock.cancel_timer(STEP_TIMER)
+        self._contexts_stopped = True
+        if self.context_stop is not None:
+            self.context_stop()
+        if self._context_executor is not None:
+            self._context_executor.shutdown(wait=False, cancel_futures=True)
+            self._context_executor = None
+        self._finish_contexts()
+        for instrument_id, read in self.context_reads.items():
+            future = read.future
+            if future is None:
+                continue
+            if future.done():
+                self._finish_contexts()
+                continue
+            state = "cancelled at stop" if future.cancel() else "running at stop"
+            read.future = None
+            self._context_failed(instrument_id, read, state, self.clock.timestamp_ns())
         self._read_released_triggers()
         if self.manage_stop_set:
             return
@@ -3348,6 +3455,8 @@ class Mover(Strategy):
         return None
 
     def _watch(self, now: int) -> None:
+        if self.context_reader is not None:
+            self._finish_contexts(now)
         ranked = self._ranked(now)
         if self.settings.load_instruments:
             self._finish_instruments(now)
@@ -3366,8 +3475,15 @@ class Mover(Strategy):
                     ):
                         self._note(
                             self.slots[instrument_id],
-                            f"{instrument_id}: entry arm {self.settings.entry_arm}: no entry context supplied",
+                            f"{instrument_id}: entry arm {self.settings.entry_arm}: "
+                            + (self._context_pending(instrument_id) or "no entry context supplied"),
                         )
+                elif (
+                    instrument_id in self.slots
+                    and instrument_id in self.context_reads
+                    and instrument_id not in self.entry_contexts
+                ):
+                    self._request_context(instrument_id, now=now)
         self._reopen_late_buys(now)
         for instrument_id, slot in list(self.slots.items()):
             if instrument_id in top or self._working(slot) or self._held(slot) or slot.was_held:
@@ -3485,6 +3601,202 @@ class Mover(Strategy):
             if sizing is None or sizing.get("loss_per_share") is None
             else Decimal(sizing["loss_per_share"])
         )
+
+    # --- on-demand entry contexts -------------------------------------------------------------------
+
+    def _request_context(
+        self, instrument_id: InstrumentId, *, refresh: bool = False, now: int | None = None
+    ) -> bool:
+        """Start one bounded read, keep its pending future, or record why it is deferred.
+
+        Whole-history refreshes use the same limits as initial reads. The window's transport hook
+        bounds actual pages/retries; this bound limits submitted work, even if its worker is slow.
+        """
+        if self.context_reader is None:
+            return False
+        now = self.clock.timestamp_ns() if now is None else now
+        read = self.context_reads.get(instrument_id)
+        if read is None:
+            load = self.instrument_loads.get(instrument_id)
+            read = self.context_reads[instrument_id] = ContextRead(
+                now if load is None else load.requested_ns
+            )
+        if self._contexts_stopped or self.winding_down:
+            read.deferred = "window stopped" if self._contexts_stopped else "window winding down"
+            return True
+        if read.future is not None:
+            return True
+        known = self.entry_contexts.get(instrument_id)
+        if (
+            known is not None
+            and known.missing is not None
+            and known.day == datetime.fromtimestamp(now // SECOND_NS, NEW_YORK).date()
+        ):
+            # mover_entry_contexts' missing reasons describe prior-session reference/calendar
+            # inputs. This window has no correction signal; only a new New York day changes
+            # those inputs. Keep the named Day, including across slot reopen/refresh, instead
+            # of treating it as a transient transport failure with a 60-second retry.
+            return True
+        if read.reads and not refresh and instrument_id in self.entry_contexts:
+            return True
+        if read.last_failure is not None and now - read.failed_ns < CONTEXT_RETRY_NS:
+            return True
+        while self.context_sent and self.context_sent[0] <= now - BUDGET_SPAN_NS:
+            self.context_sent.popleft()
+        if len(self.context_sent) >= CONTEXT_READ_LIMIT:
+            read.deferred = (
+                f"entry context read held at the rolling minute limit of {CONTEXT_READ_LIMIT}"
+            )
+            return True
+        read.deferred = None
+        self.context_sent.append(now)
+        reader = self.context_reader
+        read.started_ns, read.reads = now, read.reads + 1
+        try:
+            read.future = (self.context_submit or self._submit_context)(
+                lambda: reader(instrument_id, now)
+            )
+        except Exception as error:  # noqa: BLE001 - a refused worker is named like a refused read
+            self._context_failed(instrument_id, read, f"{type(error).__name__}: {error}", now)
+        return True
+
+    def _submit_context(self, call: Callable[[], Any]) -> Future:
+        if self._context_executor is None:
+            self._context_executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="mover-entry-context"
+            )
+        return self._context_executor.submit(call)
+
+    def _context_failed(
+        self, instrument_id: InstrumentId, read: ContextRead, error: str, now: int
+    ) -> None:
+        read.failures.append(error)
+        read.last_failure, read.failed_ns = error, now
+        text = f"{instrument_id}: entry context read failed: {error}"
+        notes = self.notes.setdefault(instrument_id, [])
+        if text not in notes:
+            notes.append(text)
+            self.dropped.append(text)
+
+    def _finish_contexts(self, now: int | None = None) -> None:
+        """Install on the strategy thread. History owns its minutes; same-day live bars fill gaps."""
+        from . import early_entry_study as study
+
+        now = self.clock.timestamp_ns() if now is None else now
+        for instrument_id, read in self.context_reads.items():
+            future = read.future
+            if future is None or not future.done():
+                continue
+            read.future = None
+            error = None
+            if future.cancelled():
+                error = "cancelled at stop" if self._contexts_stopped else "cancelled"
+            elif (failed := future.exception()) is not None:
+                error = f"{type(failed).__name__}: {failed}"
+            if error is not None:
+                self._context_failed(instrument_id, read, error, now)
+                continue
+            day = future.result()
+            if day.symbol != instrument_id.symbol.value:
+                self._context_failed(instrument_id, read, "entry context names another symbol", now)
+                continue
+            read.last_failure = None
+            if day.missing is not None:
+                self.entry_contexts[instrument_id] = day
+                self.context_sources[instrument_id] = "on_demand"
+                read.ready_ns = None
+                read.deferred = "entry context missing; reread on New York day change"
+                text = (
+                    f"{instrument_id}: entry arm {self.settings.entry_arm}: "
+                    f"entry context missing: {day.missing}"
+                )
+                notes = self.notes.setdefault(instrument_id, [])
+                if text not in notes:
+                    notes.append(text)
+                    self.dropped.append(text)
+                continue
+            known = self.entry_contexts.get(instrument_id)
+            bars = {} if known is None or known.day != day.day else {b.start: b for b in known.bars}
+            if read.live_day == day.day:
+                bars.update(read.live)
+            bars.update({b.start: b for b in day.bars})
+            read.live, read.live_day = {}, None
+            covered_to = max(
+                day.covered_to,
+                known.covered_to if known is not None and known.day == day.day else 0,
+            )
+            while covered_to in bars and covered_to < study.WINDOW_END:
+                covered_to += 1
+            self.entry_contexts[instrument_id] = replace(
+                day,
+                bars=tuple(bars[m] for m in sorted(bars)),
+                covered_to=min(covered_to, study.WINDOW_END),
+            )
+            self.context_sources[instrument_id] = "on_demand"
+            if read.ready_ns is None:
+                read.ready_ns = now
+
+    def _fill_context_gap(
+        self, instrument_id: InstrumentId, day: entry_study.Day, opened_ns: int, now: int
+    ) -> entry_study.Day:
+        """Extend coverage only through complete minutes the node already holds, with no read.
+
+        Cache.bars is newest first (rc8 crates/common/src/cache/mod.rs:6276-6284).
+        The rank feed's EXTERNAL minutes are complete even when this slot's first INTERNAL
+        minute is partial. Their open/close follow adapter parse_bar and bar_closed_ns;
+        neither another day's bars nor bars received/closing after this prefix fill its gap.
+        """
+        from . import early_entry_study as study
+
+        minute = datetime.fromtimestamp(opened_ns // SECOND_NS, NEW_YORK)
+        until = min(minute.hour * 60 + minute.minute, study.WINDOW_END)
+        if day.covered_to >= until:
+            return day
+        read = self.context_reads[instrument_id]
+        bars = dict(read.live) if read.live_day == day.day else {}
+        bars.update({bar.start: bar for bar in day.bars})  # history keeps its own minutes
+        cached = self.cache.bars(BarType.from_str(f"{instrument_id}-{WARM_BAR_SPEC}"))
+        for bar in cached or []:
+            opened = datetime.fromtimestamp(bar_opened_ns(bar) // SECOND_NS, NEW_YORK)
+            start = opened.hour * 60 + opened.minute
+            if (
+                opened.date() == day.day
+                and day.covered_to <= start < until
+                and bar.ts_init <= now
+                and bar_closed_ns(bar) <= opened_ns
+            ):
+                bars.setdefault(
+                    start,
+                    study.Minute(
+                        start,
+                        float(bar.open.as_decimal()),
+                        float(bar.high.as_decimal()),
+                        float(bar.low.as_decimal()),
+                        float(bar.close.as_decimal()),
+                        float(bar.volume.as_decimal()),
+                    ),
+                )
+        covered_to = day.covered_to
+        while covered_to < until and covered_to in bars:
+            covered_to += 1
+        day = replace(day, bars=tuple(bars[m] for m in sorted(bars)), covered_to=covered_to)
+        self.entry_contexts[instrument_id] = day
+        return day
+
+    def _context_pending(self, instrument_id: InstrumentId, *, refresh: bool = False) -> str | None:
+        if not self._request_context(instrument_id, refresh=refresh):
+            return None
+        read = self.context_reads[instrument_id]
+        seconds = (self.clock.timestamp_ns() - read.loaded_ns) / SECOND_NS
+        why = read.deferred or read.last_failure
+        detail = f"; {why}" if why else ""
+        return f"entry_context_pending: {seconds:.1f} s since the name was loaded{detail}"
+
+    def _context_seconds(self, instrument_id: InstrumentId) -> float | None:
+        read = self.context_reads.get(instrument_id)
+        if read is None or read.ready_ns is None:
+            return None
+        return round((read.ready_ns - read.loaded_ns) / SECOND_NS, 3)
 
     def _instrument_reserve(self) -> int:
         return INSTRUMENT_REQUEST_RESERVE * sum(
@@ -5567,6 +5879,26 @@ class Mover(Strategy):
             "profile": None if plan.profile is None else profile_record(plan.profile),
             "notes": self._trail_notes() + ([] if plan.note is None else [plan.note]),
         }
+        if self.context_reader is not None or self.context_reads:
+            slot.entry_record.update(
+                context_source=self.context_sources.get(
+                    slot.instrument_id,
+                    "roster" if slot.instrument_id in self.entry_contexts else None,
+                ),
+                context_seconds=self._context_seconds(slot.instrument_id),
+                baseline_status=(
+                    "supplied"
+                    if slot.instrument_id in self.baseline_dollar_volume_per_minute
+                    else "absent: not in the startup roster"
+                    if slot.instrument_id in self.instrument_loads
+                    else "absent: not supplied"
+                ),
+                position_cap=(
+                    "native PositionCap and Mover sizing"
+                    if slot.instrument_id in self.position_caps
+                    else "Mover sizing only; no native PositionCap"
+                ),
+            )
         if opening_record is not None:
             slot.entry_record.update(arm="opening", opening=opening_record)
             slot.entry_record["notes"].append(OPENING_LIMIT)

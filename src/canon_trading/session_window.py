@@ -251,12 +251,14 @@ from canon_alpaca.execution import DEFINITIVE_SUBMIT_REFUSALS
 from canon_alpaca.execution import INSTRUMENT_REFUSAL
 from canon_alpaca.execution import ORDERS_PAGE_LIMIT
 from canon_alpaca.providers import CONNECT_TIMEOUT_SECS
+from canon_alpaca.providers import DATA_API
 from canon_alpaca.providers import READ_TIMEOUT_SECS
 from canon_alpaca.providers import TRADING_API
 from canon_alpaca.providers import counted
 from canon_alpaca.providers import endpoint_counts
 from canon_alpaca.providers import not_sent
 from canon_alpaca.providers import request_counts
+from canon_alpaca.providers import session_of
 from canon_alpaca.providers import with_http_timeout
 from canon_alpaca.trade_conditions import condition_counts
 from nautilus_trader.common import LogLevel
@@ -270,6 +272,7 @@ from nautilus_trader.model import OrderSide
 from nautilus_trader.model import Quantity
 from nautilus_trader.model import StrategyId
 from nautilus_trader.model import TimeInForce
+from requests.adapters import BaseAdapter
 
 from . import price_step
 from .mover import PAPER_LOSS_SHARE
@@ -1236,8 +1239,15 @@ def strategy_fills(cache, strategy_id: StrategyId) -> list[tuple[str, str, str, 
 
 LIVE_OPEN_FINDINGS = (
     (
-        "entries and rotation are confined to the startup roster: an instrument and its position cap "
-        "exist only for the names loaded at node start; on-demand loading for any ranked name is not built"
+        "late ranked names load their instrument and entry context on demand; their per-name cap is "
+        "Mover sizing alone, with no native PositionCap added while running; their dollar-volume "
+        "baseline is absent unless supplied, so opening/tier/profile rows retain that named limit"
+    ),
+    (
+        "on-demand entry contexts start at most 20 reads per rolling minute and send at most 150 "
+        "data GET attempts per rolling minute, including pages and retries (ADR 0093, UNCALIBRATED); "
+        "other data readers have their own bounds, not a shared data-API limiter; one slow context "
+        "read delays later names, and a running read's outcome at stop remains unknown"
     ),
     (
         "no boats baseline exists until Wave 2's overnight baseline, so overnight every name ranks in the "
@@ -1505,9 +1515,17 @@ def first_publication_secs(run: Mapping[str, Any]) -> float | str:
 def passed_over_without_context(run: Mapping[str, Any]) -> dict[str, Any]:
     """The ranked names a registered arm could not enter because no day context was supplied for them."""
     notes = run.get("notes") or {}
-    names = sorted(
-        str(i) for i, said in notes.items() if any(NO_CONTEXT in str(n) for n in said or ())
+    entered = {str(entry.get("instrument_id")) for entry in run.get("entries", ())}
+    missing = {str(i) for i, said in notes.items() if any(NO_CONTEXT in str(n) for n in said or ())}
+    missing.update(
+        str(instrument)
+        for instrument, read in (run.get("on_demand_contexts") or {}).items()
+        if read.get("ready_ns") is None
+        or read.get("last_failure")
+        or read.get("deferred")
+        or read.get("pending")
     )
+    names = sorted(missing - entered)
     return {"count": len(names), "names": names}
 
 
@@ -3397,6 +3415,11 @@ def run_window(
             loss_share=loss_share,
             profile_document=profile_document,
         )
+        if isinstance(strategy, Mover) and mover.get("entry_arm", "bridge") != "bridge":
+            reader = on_demand_context_reader(window_data(), calendar, feed=feed)
+            strategy.context_reader = reader
+            strategy.context_stop = reader.stop
+            strategy.context_budget_record = reader.record
         cache = node.cache
         startup_requests = endpoint_counts()
         try:
@@ -3740,6 +3763,127 @@ def mover_entry_contexts(
             reference_from=f"split-adjusted SIP daily bar of {sessions[0]}",
         )
     return contexts
+
+
+CONTEXT_DATA_REQUEST_LIMIT = 150
+"""ADR 0093's data GET/minute row, below ADR 0049's working 200 and the node's 180 ceiling.
+This limit covers on-demand entry contexts only; the window's requests_by_api counts all readers.
+"""
+
+
+class OnDemandContextReader:
+    """The roster loader on a dedicated client, with every HTTP attempt bounded and counted.
+
+    requests 2.34.2's transport-adapter contract (`docs/user/advanced.rst:968-1004`,
+    `src/requests/sessions.py:784`, `:888`) wraps the existing timeout/counter adapter, as
+    history_load's paced trade loader does. The bound is checked before delegating every send,
+    including alpaca-py's pages (`common/rest.py:371-410`) and retries (`:130-134`). No sleep
+    or history read runs on the node loop. One Mover context worker owns this client's session.
+    """
+
+    def __init__(
+        self,
+        data: StockHistoricalDataClient,
+        calendar: AlpacaCalendar | Sequence[AlpacaCalendar] | None,
+        *,
+        feed: str,
+    ) -> None:
+        self.data, self.calendar, self.feed = data, calendar, feed
+        self.clock: Callable[[], float] = time.monotonic
+        self._lock = threading.Lock()
+        self._stopped = False
+        self._sent: deque[float] = deque()
+        self._attempts = self._peak = 0
+        self._refused: Counter[str] = Counter()
+
+    def stop(self) -> None:
+        """A running HTTP call may finish; its next page/retry must not start after stop."""
+        with self._lock:
+            self._stopped = True
+
+    def record(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "api": DATA_API,
+                "scope": "on-demand entry contexts only; also counted in requests_by_api",
+                "limit_per_minute": CONTEXT_DATA_REQUEST_LIMIT,
+                "attempts": self._attempts,
+                "peak_60s": self._peak,
+                "refused": dict(self._refused),
+                "state": "UNCALIBRATED: ADR 0093's row",
+            }
+
+    def _admit(self, instrument_id: InstrumentId) -> None:
+        with self._lock:
+            if self._stopped:
+                raise RuntimeError(f"{instrument_id}: entry context reader stopped")
+            now = self.clock()
+            while self._sent and self._sent[0] <= now - 60:
+                self._sent.popleft()
+            if len(self._sent) >= CONTEXT_DATA_REQUEST_LIMIT:
+                self._refused[str(instrument_id)] += 1
+                raise RuntimeError(
+                    f"{instrument_id}: entry context data GET budget spent: "
+                    f"{CONTEXT_DATA_REQUEST_LIMIT} attempts in the rolling minute"
+                )
+            self._sent.append(now)
+            self._attempts += 1
+            self._peak = max(self._peak, len(self._sent))
+
+    def __call__(self, instrument_id: InstrumentId, at_ns: int) -> Day:
+        session = session_of(self.data)
+        if session is None:
+            raise RuntimeError(
+                f"{instrument_id}: entry context client has no requests.Session; "
+                "cannot count or bound its data GETs"
+            )
+        with_http_timeout(self.data)
+        reader = self
+
+        class BoundedAdapter(BaseAdapter):
+            def __init__(self, delegate: BaseAdapter) -> None:
+                self.delegate = delegate
+
+            def send(
+                self, request, stream=False, timeout=None, verify=True, cert=None, proxies=None
+            ):
+                reader._admit(instrument_id)
+                return self.delegate.send(
+                    request,
+                    stream=stream,
+                    timeout=timeout,
+                    verify=verify,
+                    cert=cert,
+                    proxies=proxies,
+                )
+
+            def close(self) -> None:
+                self.delegate.close()
+
+        mounted = list(session.adapters.items())
+        try:
+            for prefix, adapter in mounted:
+                session.mount(prefix, BoundedAdapter(adapter))
+            # db51d26d's conversion, local to this allowed seam: a float rounds a nanosecond
+            # before a minute/day boundary into that boundary, granting future coverage.
+            seconds, rest = divmod(at_ns, 1_000_000_000)
+            at = datetime.fromtimestamp(seconds, UTC) + timedelta(microseconds=rest // 1000)
+            return mover_entry_contexts(
+                self.data, [instrument_id.symbol.value], at, self.calendar, feed=self.feed
+            )[instrument_id]
+        finally:
+            for prefix, adapter in mounted:
+                session.mount(prefix, adapter)
+
+
+def on_demand_context_reader(
+    data: StockHistoricalDataClient,
+    calendar: AlpacaCalendar | Sequence[AlpacaCalendar] | None,
+    *,
+    feed: str,
+) -> OnDemandContextReader:
+    """Read one name with mover_entry_contexts, on Mover's worker, using a dedicated window client."""
+    return OnDemandContextReader(data, calendar, feed=feed)
 
 
 def mover_entries(run: Mapping[str, Any], cache, pick: MoverPick | None) -> list[dict[str, Any]]:
