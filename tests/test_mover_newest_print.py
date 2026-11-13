@@ -388,3 +388,43 @@ def test_a_print_set_aside_as_late_does_not_go_through_a_held_stop() -> None:
     # case does; the late 9.70 sells nothing
     assert [o.kind for o in seam.sent] == ["TRAILING"] and not slot.exiting
     assert D(str(seam.sent[0].trigger_price)) == D("9.80")
+
+
+@pytest.mark.parametrize(
+    ("trigger", "anchor"), [(TriggerType.LAST_PRICE, None), (TriggerType.BID_ASK, D("9.50"))]
+)
+def test_with_no_print_at_all_a_sale_with_no_bid_anchors_as_the_held_stop_reads(
+    trigger: TriggerType, anchor: D | None
+) -> None:
+    """With no print cached or kept, the anchor of a sale with no bid is what the held stop reads: under
+    a print trigger nothing, since a minute close is no price of this holding (the trigger unit's
+    code-review-high-succ/3), and under the bid the latest minute close (P7)."""
+    seam = cast(Any, Seam("10.20", trigger=trigger))
+    slot = seam_slot(seam)
+    seam.cache.trade = lambda _: None
+    slot.closes = deque([D("8.50"), D("9.50")], maxlen=4)
+    assert seam._last_print(slot) == anchor
+
+
+def test_persistence_arms_after_the_highest_stamp_received_not_the_newest_prints() -> None:
+    """Persistence keeps its own watermark (P2). A print kept as the newest at the venue but received
+    early (event 10 s, received 7 s) and a print set aside as late but received after it (event 9 s,
+    received 9 s): the count starts after 9 s, so a print reported later with a stamp of 8 s confirms
+    nothing, however far through the trigger it is."""
+    seam = cast(Any, Seam("10.20", breach_count=2, trigger=TriggerType.LAST_PRICE))
+    slot = seam_slot(seam)
+    seam.slots, seam.trades = {AAA: slot}, 0
+    kept = _print("10.05", T0 + 10 * SECOND)
+    kept.ts_init = T0 + 7 * SECOND
+    late = _print("10.04", T0 + 9 * SECOND)
+    for trade in (kept, late):
+        Mover.on_trade(seam, trade)
+    assert seam.late_prints["AAA.ALPACA"]["count"] == 1
+    seam._persistent_trail(slot, T0 + 10 * SECOND)
+    assert slot.trail_trigger is not None and slot.observed_ns == T0 + 9 * SECOND
+    for at in (T0 + 8 * SECOND, T0 + 8 * SECOND + SECOND // 2):
+        older = _print("9.00", at)
+        older.ts_init = T0 + 11 * SECOND
+        Mover.on_trade(seam, older)
+    seam._persistent_trail(slot, T0 + 12 * SECOND)
+    assert not slot.breach_observations and not slot.exiting

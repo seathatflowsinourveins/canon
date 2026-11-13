@@ -1791,6 +1791,9 @@ class Slot:
     the name's, not a holding's, so going flat does not clear it. Ties follow arrival order."""
     observed_ns: int = 0
     """Only strictly newer print times are read; duplicates, older prints and timers never count."""
+    stamp_seen: int = 0
+    """The highest persistence stamp (`Print.ns`) of every print received for the slot, kept, set aside
+    or ahead: persistence's own watermark at arming, apart from the readers' venue-time order (P2)."""
     sized_loss: Decimal | None = None
     """L, the loss per share the entry was sized for (`sizing.plan_for_loss`): the planned entry less its
     stepped stop, on Alpaca's step. The trailing sell holds its trigger L under the fill, then L under the
@@ -2340,6 +2343,7 @@ class Mover(Strategy):
         event = int(trade.ts_event)
         stamp = min(event, int(trade.ts_init))
         price = trade.price.as_decimal()
+        slot.stamp_seen = max(slot.stamp_seen, stamp)
         if self.persistence and slot.trail_trigger is not None and not slot.exiting:
             # Persistence keeps its own receipt-clamped stamp and watermark, independently of
             # the readers' venue-time order. Even ahead and late prints reach that watermark.
@@ -3568,10 +3572,11 @@ class Mover(Strategy):
             bought = Decimal(str(entry.avg_px))
             slot.trail_high = bought
             slot.trail_trigger = stop_trigger_price(bought - trailing)
-            # Begin after the newest print already received, on persistence's own stamp. A late
-            # report of an older print after this step must not count toward this holding's breach.
+            # Begin after the highest stamp already received, on persistence's own stamp, not the
+            # readers' venue-newest print. A late report of an older print after this step must not
+            # count toward this holding's breach. The seeded print counts as received.
             kept = slot.newest_print
-            slot.observed_ns = 0 if kept is None else kept.ns
+            slot.observed_ns = max(slot.stamp_seen, 0 if kept is None else kept.ns)
             slot.observations.clear()
             self._say(f"{slot.instrument_id}: persistence armed, trigger {slot.trail_trigger}")
             return
@@ -3942,11 +3947,13 @@ class Mover(Strategy):
         return kept
 
     def _last_print(self, slot: Slot) -> Decimal | None:
-        """The newest trade's price, else the latest minute close: the anchor of a sale with no bid."""
+        """The newest trade's price, else what the held stop reads (`_last_known`): the anchor of a
+        sale with no bid. With no print, that is the latest minute close under `BID_ASK` and nothing
+        under `LAST_PRICE`, where a close is no price of this holding (code-review-high-succ/3)."""
         newest = self._newest_trade(slot)
         if newest is not None:
             return newest.price
-        return slot.closes[-1] if slot.closes else None
+        return self._last_known(slot)[0]
 
     def _last_known(self, slot: Slot) -> tuple[Decimal | None, str]:
         """The newest trade by venue time, else the latest minute close: what the held stop reads.

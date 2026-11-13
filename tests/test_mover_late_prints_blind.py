@@ -332,10 +332,10 @@ def test_p7_ordinary_prints_ties_and_no_print_minute_fallback() -> None:
     slot = seam.open_slot()
     slot.closes.extend([Decimal("8.50"), Decimal("9.50")])
     # the trade-print trigger unit (code-review-high-succ/3): under a print trigger, with no print, a
-    # minute close is no price of this holding, so the held stop knows none; the no-bid sale still
-    # anchors on the close
+    # minute close is no price of this holding, so neither the held stop nor the no-bid sale reads one;
+    # the minute-close fallback under the bid is in test_mover_newest_print.py
     assert seam._last_known(slot) == (None, "none")
-    assert seam._last_print(slot) == Decimal("9.50")
+    assert seam._last_print(slot) is None
     for price, event, received in (("10", SECOND, SECOND), ("11", 2 * SECOND, 2 * SECOND)):
         seam.deliver(trade(price, event, received))
         assert tuple(read(seam, slot, reader) for reader in READERS) == (Decimal(price),) * 3
