@@ -55,9 +55,10 @@ A composition of upstream parts (ADR 0083, ADR 0088). What each part is, at Naut
   (`common/__init__.pyi:309`, `crates/common/src/cache/mod.rs:6276-6284`), closed in this session
   part. The adapter's `parse_bar` stamps streamed bars with receipt time, so their interval end is
   derived from the open, as that contract requires. If those leave the ATR short, under a non-fixed
-  trail the opening asks once for the name's most recent minute bars of this session part (F-2, the
-  owner's plan of 2026-11-12): upstream's `Strategy.request_bars` (`trading/__init__.pyi:993`),
-  answered through `on_data_response` (`crates/common/src/python/response.rs:330-342`), as
+  trail the opening asks once for the name's minute bars of the last hour, with no session-part bound
+  (F-2, the owner's plan of 2026-11-12; the two bounds differ on purpose, UNCALIBRATED): upstream's
+  `Strategy.request_bars` (`trading/__init__.pyi:993`), answered through `on_data_response`
+  (`crates/common/src/python/response.rs:331-342`), as
   `SessionMaCross` warms its averages. Both sources feed that slot's ATR only, each minute once, in
   time order, and nothing else (`_warm`). Fewer than `atr_n` bars, a refusal or no answer keeps the
   cold fallback, each named and counted in the record's `warm_up`. A cold-fallback holding may tighten
@@ -166,7 +167,11 @@ UNCALIBRATED (ADR 0088; the persistence rows are ADR 0119's).
    follows a fast fall below the stop the entry was sized against. A one-sided quote's zero bid is
    no price, and neither is no quote: the last trade then stands in for the bid, in the reference
    and as the sale's anchor, on every remake; it is the trade newest by its own time, not the one
-   received last. The floor is set once; released, it stays released.
+   received last. The floor is set once; released, it stays released. Every reader of the last
+   trade reads that newest print (`_newest_trade`), with an arm on or off: the price a `LAST_PRICE`
+   trigger follows, the compare with a reached trigger, the held stop and a sale with no bid. A
+   print older than one already received for the name is set aside, and counted per name with the
+   most it was late by in the record's `late_prints_set_aside`.
    `exit_ticks` prices that reference and the sale; `exit_through` still shapes entry risk sizing.
 3. *Entries.* A slot whose bars have just closed `run_bars` times in a row above the close before is a
    candidate under the explicitly selected `entry_arm="bridge"`. The default `registered` arm is
@@ -175,7 +180,8 @@ UNCALIBRATED (ADR 0088; the persistence rows are ADR 0119's).
    ADR 0092's table rows are :73 (move), :74 (ratio), :75 (baseline sessions), :76 (rises),
    :77 (first-leg window), :78 (quiet price) and :79 (pullback). No row is tuned here.
    Registered arms require a supplied `Day` in `entry_contexts`; no context, no entry. The strategy
-   makes no history request: live composition supplies history and selects the arm (M-c).
+   fetches no entry context: live composition supplies it and selects the arm (M-c). Its one history
+   request is the ATR's warm-up (F-2), below.
    Candidates are taken best-ranked first while a slot is free, each refused by name
    (`dropped`) when the ranking is older than `rank_max_age_secs`, the name is no longer in it, its move
    is over `max_move` (the no-chase cap), no quote is in the cache, the size comes to nothing, or the
@@ -234,9 +240,12 @@ from decimal import localcontext
 from itertools import groupby
 from itertools import pairwise
 from pathlib import Path
+from statistics import median_high
+from statistics import median_low
 from types import NoneType
 from typing import TYPE_CHECKING
 from typing import Any
+from typing import NamedTuple
 from zoneinfo import ZoneInfo
 
 from alpaca.common.constants import DEFAULT_RETRY_ATTEMPTS
@@ -931,10 +940,10 @@ class MoverConfig(StrategyConfig):
     Non-fixed entries scale exit_through to trail/4 and keep chase_cap at max(trail, chase_cap) (the
     lead's (ii), 2026-11-12), with an unavoidable spread floor (`spread_floor_m >= 1`) and 0.02 cap.
     An unusable spread selects fixed by name; no quote still refuses entry. An ATR that is not warm
-    (fewer than `atr_n` minute bars of this part, cached when the slot opened, requested (F-2) or live
-    since) selects fixed as `cold_atr_fallback` (the lead's (ii)), raised to the spread floor at its
-    step when that is over it (the lead's O1); such a holding tightens once to its warmed ATR's plan,
-    never wider (the lead's (b)). `liquidity_tier_cut`
+    (fewer than `atr_n` minute bars: cached when the slot opened, of this part; requested (F-2), of
+    the last hour with no part bound; or live since) selects fixed as `cold_atr_fallback` (the lead's
+    (ii)), raised to the spread floor at its step when that is over it (the lead's O1); such a holding
+    tightens once to its warmed ATR's plan, never wider (the lead's (b)). `liquidity_tier_cut`
     is baseline dollars per minute, a stand-in for size; an unknown baseline selects ATR by name.
     `ratchet_base` chooses the paired ATR or tier plan, and r/g tighten it once. All new numeric rows
     and their alternates are UNCALIBRATED. Fixed preserves explicit legacy trail/exit/chase overrides.
@@ -1257,6 +1266,10 @@ class ExitRecord:
     notional: Decimal = Decimal(0)
     bought_notional: Decimal = Decimal(0)
     trail_distance: Decimal | None = None
+    held_stop_kept: Decimal | None = None
+    """The level a held stop keeps; a cheaper fill never lowers it (the lead, 2026-11-13 08:24)."""
+    held_stop_from_average: Decimal | None = None
+    """The average fill less that kept level: negative when a cheaper fill left the stop over it."""
     peak: Decimal | None = None
     trigger_ns: int | None = None
     trigger_price: Decimal | None = None
@@ -1282,6 +1295,10 @@ class ExitRecord:
             "quantity": str(self.quantity),
             "filled_quantity": str(self.filled),
             "trail_distance": None if self.trail_distance is None else str(self.trail_distance),
+            "held_stop_kept": None if self.held_stop_kept is None else str(self.held_stop_kept),
+            "held_stop_from_average": (
+                None if self.held_stop_from_average is None else str(self.held_stop_from_average)
+            ),
             "peak_price": None if self.peak is None else str(self.peak),
             "trigger_ns": self.trigger_ns,
             "trigger_price": None if self.trigger_price is None else str(self.trigger_price),
@@ -1640,12 +1657,86 @@ class HistoryLoad:
         if self.reason is not None and self.reason.startswith(HISTORY_REFUSED):
             return "refused"
         if self.request_id is None:
-            return "held_at_limit"  # held to the end, or its slot closed before it was sent
+            # never sent: held to the end, its slot closed first (`reason` says so), or let go once the
+            # ATR was warm or the window wound down (`reason` says which); `reason` tells them apart
+            return "held_at_limit"
         if self.closed_first:
             return "slot_closed_first"
         if self.completed:
             return "warm" if self.bars + self.cached >= atr_n else "fewer_than_atr_n"
         return "unanswered"
+
+
+PRINT_AHEAD_MOST_NS = 5 * SECOND_NS
+"""How far a print's venue time may run ahead of the stream's and still order it: 5 s, UNCALIBRATED,
+the value of the adapter's `STAMP_AHEAD_MOST_NS` in its late-print setting, which lands with the
+adapter's part and measures against receipt; it is to move to this reference with it, or a host
+clock more than 5 s behind sets every print aside there. "Ahead" is measured on the venue's time as
+the stream shows it (the lead's ruling of 2026-11-13, 08:49): a print's venue time less its receipt
+here, less the same of its name's latest quotes (`Slot.quote_lag`, their upper median, so one quote
+reported late or stamped ahead moves nothing), so this host's clock offset cancels, whatever its size. A print further
+ahead has no usable time: it is neither the newest nor set aside, and `prints_stamped_ahead` counts it.
+With no quote of the name yet, the venue's time cannot be had, and the print is measured against its
+receipt as before; `prints_timed_on_receipt` counts each print so judged. A name whose every latest
+quote runs more than 5 s behind its prints sets them aside as ahead until a timely quote comes: a
+limit, counted in `prints_stamped_ahead`. NautilusTrader at the pin corrects no clock offset
+(crates/common, data, live and core read none), so the rule is ours."""
+CLOCK_QUOTES = 101
+"""The latest quotes, of every name, whose venue time less their receipt on this host (`ts_event` less
+`ts_init`) the run record summarises as `host_clock`: their median, with the least and most of every
+quote. Quotes, not prints: a print reported late, as off-exchange prints are, reads below the clocks'
+difference. A record only; the lead reads it past 2 s (`session_window.CLOCK_NOTE_MOST_MS`)."""
+QUOTE_REFERENCE_QUOTES = 9
+"""The latest quotes of a name whose upper median venue time less receipt is its reference
+(`Slot.quote_lag`). A quote's delay only lowers that difference, so the upper median leans to the
+timely quotes: with two, the timely one; with nine, up to four reported late or stamped ahead move
+nothing. A step of this host's clock is followed within five quotes. UNCALIBRATED."""
+
+
+def print_time(trade: Any, reference: int | None = None) -> int | None:
+    """The venue's time, regardless of this host's clock, unless over the ahead bound
+    (`PRINT_AHEAD_MOST_NS`): measured against its name's quotes, `reference` (`Slot.quote_lag`), else
+    its receipt.
+
+    TradeTick's `ts_event` is when the trade occurred and `ts_init` when the instance was created
+    (crates/model/src/data/trade.rs:55-58 at the pin).
+    """
+    event = int(trade.ts_event)
+    lag = event - int(trade.ts_init) - (0 if reference is None else reference)
+    return None if lag > PRINT_AHEAD_MOST_NS else event
+
+
+def quote_lag(quote: Any) -> int | None:
+    """A quote's venue time less its receipt on this host, the reference `print_time` measures a print
+    against; None with no quote."""
+    return None if quote is None else int(quote.ts_event) - int(quote.ts_init)
+
+
+class Print(NamedTuple):
+    """One price with the two times its readers need. `event_ns` orders prints and compares with
+    an entry fill, both at the venue. `ns`, the earlier of event and receipt, is persistence's own
+    stamp: a print stamped ahead of receipt cannot hide the prints after it behind that watermark. With
+    this host's clock behind the venue's, the receipt is read on the venue's clock through the name's
+    quotes (`stamp_of`), so a print reported late still stamps below the newer ones."""
+
+    ns: int
+    price: Decimal
+    event_ns: int
+
+    @classmethod
+    def of(cls, trade: Any, reference: int | None = None) -> Print:
+        event = int(trade.ts_event)
+        return cls(stamp_of(trade, reference), trade.price.as_decimal(), event)
+
+
+def stamp_of(trade: Any, reference: int | None) -> int:
+    """Persistence's stamp of a print (`Print`): the earlier of its venue time and its receipt. When
+    its name's quotes (`reference`) show this host's clock behind the venue's, the receipt is read on
+    the venue's clock; otherwise as on main, so with the clocks agreeing a quote's delay moves no
+    stamp. With the clock behind, a print received faster than the name's quotes stamps that much
+    before its venue time."""
+    receipt = int(trade.ts_init) + (0 if reference is None else max(0, reference))
+    return min(int(trade.ts_event), receipt)
 
 
 @dataclass
@@ -1676,6 +1767,21 @@ class Slot:
     limit, less the trail distance in force. Checked each step on the last trade, else the minute close."""
     held_since: int | None = None
     """When the held stop began: the entry's first fill, else the step that found no followed price."""
+    entry_received_ns: int | None = None
+    """This host's receipt of the entry's first fill (its `ts_init`), the clock the hold's bound reads;
+    None for a holding this node did not see fill (a restart, or fills reconciled before the handler)."""
+    held_low: Decimal | None = None
+    """The lowest price of the holding received while the stop is held, between steps (`on_quote`'s
+    bids under `BID_ASK`; under a print trigger `on_trade`'s prints of the holding, a late one too):
+    the hold's end reads it beside the price the cache has at that step, so a price through the held
+    stop and back before the step is not forgotten (the xr4 reader's F2)."""
+    holding_from: int | None = None
+    """While the stop is held, the venue time from which a print is of this holding, as the step last
+    read it (`_holding_since`, in `_hold`), so the trade handler reads no engine attribute; None with
+    no entry fill on record."""
+    held_at_l: Decimal | None = None
+    """The highest level L under the average fill this hold has held (`_held_at_l`): a cheaper fill
+    that lowers the average never lowers the held stop (the xr4 reader's F1; the lead's H3)."""
     floor_since: int | None = None
     """When the sale was first seen resting at its floor with the bid through it."""
     floor_released: bool = False
@@ -1722,13 +1828,19 @@ class Slot:
     breach_observations: deque[int] = field(default_factory=deque)
     breach_price: Decimal | None = None
     """The confirming print's price: a later recovery cannot lift the position's chase floor."""
-    newest_print: tuple[int, Decimal] | None = None
-    """The trade newest by its own time among those received with an arm on, with that time: what
-    stands in for a missing bid (`_last_print`). The cache's last trade is the last one received,
-    which a late report of an older print can be. It is the name's, not a holding's, so going flat
-    does not clear it. Two prints of one time are read in the order they arrived."""
+    newest_print: Print | None = None
+    """The trade newest by venue time among those cached when the slot opened and received since
+    (`_newest_trade`): what the trigger follows, the held stop reads and stands in for a missing bid.
+    The cache's last trade is the last received, which can be an older print reported late. This is
+    the name's, not a holding's, so going flat does not clear it. Ties follow arrival order."""
     observed_ns: int = 0
     """Only strictly newer print times are read; duplicates, older prints and timers never count."""
+    stamp_seen: int = 0
+    """The highest persistence stamp (`Print.ns`) of every print received for the slot, kept, set aside
+    or ahead: persistence's own watermark at arming, apart from the readers' venue-time order (P2)."""
+    quote_lags: deque[int] = field(default_factory=lambda: deque(maxlen=QUOTE_REFERENCE_QUOTES))
+    """The name's latest quotes' venue time less their receipt on this host (`on_quote`; the cache's
+    quote at the opening first)."""
     sized_loss: Decimal | None = None
     """L, the loss per share the entry was sized for (`sizing.plan_for_loss`): the planned entry less its
     stepped stop, on Alpaca's step. The trailing sell holds its trigger L under the fill, then L under the
@@ -1757,6 +1869,12 @@ class Slot:
     an answer after live bars resets the ATR and feeds it again in time order (F-2)."""
     first_live_open: int | None = None
     """The minute open of the slot's first live bar: history from that minute on is the live bars'."""
+
+    @property
+    def quote_lag(self) -> int | None:
+        """The upper median of `quote_lags` (`QUOTE_REFERENCE_QUOTES`): the reference a print is measured
+        against (`print_time`, `stamp_of`); None before any quote of the name."""
+        return median_high(self.quote_lags) if self.quote_lags else None
 
 
 def l_in_force(slot: Slot, bought: Decimal) -> Decimal | None:
@@ -1880,6 +1998,21 @@ class Mover(Strategy):
         self.protection_fallbacks = {"position average price": 0, "current bid": 0}
         self.protect_paths = {"held_stop": 0, "unpriced_exit": 0, "trail": 0}
         """How each held stop ended: sold through its level, sold after `HOLD_MOST_SECS`, or released."""
+        self.late_prints: dict[str, dict[str, int]] = {}
+        """Per symbol, prints older at the venue than one already kept: count and greatest lateness
+        in whole milliseconds rounded up, so even under 1 ms reads 1."""
+        self.prints_ahead: dict[str, int] = {}
+        """Per symbol, prints over `PRINT_AHEAD_MOST_NS` ahead of the stream (`print_time`): neither
+        newest nor late."""
+        self.prints_on_receipt: dict[str, int] = {}
+        """Per symbol, prints received (`on_trade`) and measured against their receipt for want of a
+        quote of the name (`print_time`)."""
+        self.quote_lags: deque[int] = deque(maxlen=CLOCK_QUOTES)
+        """The latest quotes' venue time less their receipt, of every name (`CLOCK_QUOTES`)."""
+        self.quote_lag_least: int | None = None
+        self.quote_lag_most: int | None = None
+        """The least and most venue time less receipt of every quote in the run, so a clock's step
+        shows; one quote reported late sets them too."""
         self.refused: list[tuple[str, str]] = []
         self.order_refusals: list[dict[str, Any]] = []
         """Each order refusal in `refused`, with who refused it and its cause (the D3 terms, A7)."""
@@ -1917,7 +2050,7 @@ class Mover(Strategy):
 
         A Day names its New York date, reference close, earlier sessions latest first, and covered
         bars since 04:00 (the study's Day contract). Callers supply complete history, with `missing`
-        naming any coverage fault; Mover fetches no history and refuses absent, wrong-name/day or
+        naming any coverage fault; Mover fetches no entry context and refuses absent, wrong-name/day or
         missing contexts. `covered_to` must reach the incoming minute's open: after a data gap the
         caller supplies the missing prefix or marks it missing. Completed live bars extend coverage
         to that minute's end and replace that minute in the context; future minutes
@@ -2074,6 +2207,17 @@ class Mover(Strategy):
         if slot is None:
             return
         if event.order_side == OrderSide.BUY:
+            # NautilusTrader d53849b216e2: OrderFilled's venue/event and initialization clocks are
+            # distinct (crates/model/src/events/order/filled.rs:78-81); the live client supplies
+            # its host clock for ts_init (python/nautilus_trader/live/clients.py:585-613). Keep the
+            # first receipt of the slot's entry for the hold, without changing the venue times in `fills`.
+            if (
+                slot.entry_received_ns is None
+                and slot.entry_id is not None
+                and event.client_order_id.value == slot.entry_id.value
+            ):
+                received = getattr(event, "ts_init", None)
+                slot.entry_received_ns = None if received is None else int(received)
             row = (
                 self._ensure_exit(slot, Decimal(0))
                 if slot.exit_record is None
@@ -2243,29 +2387,64 @@ class Mover(Strategy):
 
     def on_quote(self, quote: Any) -> None:
         self.quotes += 1
+        # the clocks' difference, in plain attributes: a handler may run while the strategy is borrowed
+        lag = int(quote.ts_event) - int(quote.ts_init)  # as `quote_lag`, for a quote that is there
+        self.quote_lags.append(lag)
+        least, most = self.quote_lag_least, self.quote_lag_most
+        self.quote_lag_least = lag if least is None else min(least, lag)
+        self.quote_lag_most = lag if most is None else max(most, lag)
         slot = self.slots.get(quote.instrument_id)
         if slot is not None:
+            slot.quote_lags.append(lag)
             bid = quote.bid_price.as_decimal()
             if bid > 0:  # a one-sided quote's zero bid is no price: keep the last real one
                 slot.last_bid = bid
+                if slot.held_since is not None and self.settings.trigger == TriggerType.BID_ASK:
+                    slot.held_low = bid if slot.held_low is None else min(slot.held_low, bid)
             row = slot.exit_record
             if bid > 0 and row is not None and row.filled < row.quantity:
                 row.peak = max(row.peak or bid, bid)
 
     def on_trade(self, trade: Any) -> None:
         self.trades += 1
-        if self.persistence:
-            slot = self.slots.get(trade.instrument_id)
-            if slot is None:
-                return
-            # No print happened after it was received: one stamped ahead of its receipt is read
-            # at its receipt, so it cannot hide the prints that follow it behind the watermark.
-            stamp = min(int(trade.ts_event), int(trade.ts_init))
-            price = trade.price.as_decimal()
-            if slot.newest_print is None or stamp >= slot.newest_print[0]:
-                slot.newest_print = (stamp, price)
-            if slot.trail_trigger is not None and not slot.exiting:
-                slot.observations.append((stamp, price))
+        slot = self.slots.get(trade.instrument_id)
+        if slot is None:
+            return
+        event = int(trade.ts_event)
+        name = str(trade.instrument_id)
+        lag = slot.quote_lag
+        if lag is None:
+            self.prints_on_receipt[name] = self.prints_on_receipt.get(name, 0) + 1
+        stamp = stamp_of(trade, lag)
+        price = trade.price.as_decimal()
+        slot.stamp_seen = max(slot.stamp_seen, stamp)
+        if self.persistence and slot.trail_trigger is not None and not slot.exiting:
+            # Persistence keeps its own receipt-clamped stamp and watermark, independently of
+            # the readers' venue-time order. Even ahead and late prints reach that watermark.
+            slot.observations.append((stamp, price))
+        kept = slot.newest_print
+        if print_time(trade, lag) is None:
+            self.prints_ahead[name] = self.prints_ahead.get(name, 0) + 1
+            return
+        late_print = kept is not None and event < kept.event_ns
+        if late_print:
+            late = self.late_prints.setdefault(name, {"count": 0, "most_late_ms": 0})
+            late["count"] += 1
+            late["most_late_ms"] = max(
+                late["most_late_ms"], -(-(kept.event_ns - event) // 1_000_000)
+            )
+        else:
+            slot.newest_print = Print(stamp, price, event)
+        if slot.held_since is not None and self.settings.trigger == TriggerType.LAST_PRICE:
+            # the hold's low is the lowest print of this holding (`_holding_since`, as
+            # `_holding_trade`) while its stop is held, whatever order the prints arrive in: one set
+            # aside as late counts, though it is never the newest price nor prices a sale (the lead's
+            # ruling of 2026-11-13, F1 (b)); one with no usable time has no place in that order. With
+            # no entry fill on record when the holding began cannot be read, so no print counts: one
+            # from before it would stay in the low once the fill is recorded
+            since = slot.holding_from
+            if since is not None and event >= since:
+                slot.held_low = price if slot.held_low is None else min(slot.held_low, price)
 
     def record(self) -> dict[str, Any]:
         """What a run's report keeps of the strategy, in plain values: its rows, the ranking it last
@@ -2344,6 +2523,10 @@ class Mover(Strategy):
             "released": sorted(self.released),
             "protection_fallbacks": dict(self.protection_fallbacks),
             "protect_paths": dict(self.protect_paths),
+            "late_prints_set_aside": {name: dict(row) for name, row in self.late_prints.items()},
+            "prints_stamped_ahead": dict(self.prints_ahead),
+            "prints_timed_on_receipt": dict(self.prints_on_receipt),
+            "host_clock": self._host_clock(),
             "sell_triggers": dict(self.sell_triggers),
             "trail_notes": self._trail_notes(),
             "exits": [row.record() for row in self.exits],
@@ -2906,6 +3089,7 @@ class Mover(Strategy):
     def _open_slot(self, instrument_id: InstrumentId) -> None:
         bar_type = BarType.from_str(f"{instrument_id}-{self.spec_suffix}")
         self.opened_slots.add(instrument_id)
+        reference = quote_lag(self.cache.quote(instrument_id))
         self.slots[instrument_id] = Slot(
             instrument_id=instrument_id,
             bar_type=bar_type,
@@ -2915,6 +3099,12 @@ class Mover(Strategy):
             if self.settings.trail_mode == "fixed"
             else AverageTrueRange(self.settings.atr_n),
             subscribed_ns=self.clock.timestamp_ns(),
+            # Cache.trades is in reverse insertion order, not venue-time order
+            # (crates/common/src/cache/mod.rs:6218-6228 at the pin).
+            newest_print=self._newest_cached(instrument_id, reference),
+            quote_lags=deque(
+                [] if reference is None else [reference], maxlen=QUOTE_REFERENCE_QUOTES
+            ),
         )
         if (state := self.reentry_states.get(instrument_id)) is not None:
             state.restart()  # only closes this slot observes count toward a turn or a crossing
@@ -2945,6 +3135,37 @@ class Mover(Strategy):
             self._request_history(slot)
             if slot.history is not None:
                 slot.history.cached = len(slot.atr_minutes)  # what the cache fed, before any answer
+
+    def _host_clock(self) -> dict[str, Any]:
+        """The venue's time less this host's receipt of the latest quotes (`CLOCK_QUOTES`), in whole
+        milliseconds rounded to the nearest: their median (`median_of` quotes), with the least and most
+        of every quote in the run (`quotes`). It is the clocks' difference less the feed's latency."""
+        least, most = self.quote_lag_least, self.quote_lag_most
+        if not self.quote_lags or least is None or most is None:
+            return {"venue_minus_receipt_ms": None, "median_of": 0, "quotes": self.quotes}
+        return {
+            "venue_minus_receipt_ms": {
+                "median": round(median_low(self.quote_lags) / 1_000_000),
+                "least": round(least / 1_000_000),
+                "most": round(most / 1_000_000),
+            },
+            "median_of": len(self.quote_lags),
+            "quotes": self.quotes,
+        }
+
+    def _newest_cached(self, instrument_id: InstrumentId, reference: int | None) -> Print | None:
+        """Seed from all cached trades by venue time, the later received on a tie. Only prints
+        received after this slot opens are counted; cached older or ahead prints are passed over."""
+        newest = max(
+            (
+                trade
+                for trade in self.cache.trades(instrument_id) or []
+                if print_time(trade, reference) is not None
+            ),
+            key=lambda trade: int(trade.ts_event),
+            default=None,
+        )
+        return None if newest is None else Print.of(newest, reference)
 
     # --- the ATR's warm-up (F-2) ---------------------------------------------------------------------
 
@@ -3333,6 +3554,7 @@ class Mover(Strategy):
             slot.profile_evaluated_ns = None
             slot.exit_record = None
             slot.protection_anchor = slot.held_stop = slot.held_since = None
+            slot.held_low = slot.held_at_l = slot.entry_received_ns = slot.holding_from = None
             slot.floor_since, slot.floor_released = None, False
             slot.trailed, slot.last_sale = False, None
 
@@ -3452,7 +3674,11 @@ class Mover(Strategy):
             bought = Decimal(str(entry.avg_px))
             slot.trail_high = bought
             slot.trail_trigger = stop_trigger_price(bought - trailing)
-            slot.observed_ns = 0
+            # Begin after the highest stamp already received, on persistence's own stamp, not the
+            # readers' venue-newest print. A late report of an older print after this step must not
+            # count toward this holding's breach. The seeded print counts as received.
+            kept = slot.newest_print
+            slot.observed_ns = max(slot.stamp_seen, 0 if kept is None else kept.ns)
             slot.observations.clear()
             self._say(f"{slot.instrument_id}: persistence armed, trigger {slot.trail_trigger}")
             return
@@ -3522,6 +3748,24 @@ class Mover(Strategy):
             # (the lead's decision (b), 2026-11-12), not a sale at once.
             self._hold(slot, held, now)
             return
+        if slot.held_since is not None and slot.held_stop is not None:
+            # the first followed price meets the held stop before the hold ends, under either trigger
+            # (the lead's H1-H3, 2026-11-12; the xr3 fast reader's SF1 and its BID_ASK twin): at or
+            # under it, the hold's sale at once, as `_hold` compares, with the hold's low received since
+            # the hold began (`Slot.held_low`; the xr4 reader's F2; the lead's H3); checked before the
+            # anchor is read, so an anchor that cannot be read does not leave the hold unchecked
+            # (code-review-high-succ/5)
+            level = slot.held_stop
+            low = at if slot.held_low is None else min(at, slot.held_low)
+            if low <= level:
+                slot.exiting, slot.trail_trigger, slot.trail_limit = True, None, None
+                self._mark_exit(slot, now, low, "held stop (followed price)")
+                if slot.entry_record is not None:
+                    slot.entry_record["held_stop_trigger"] = "followed price"
+                slot.exit_trigger = level  # before `_end_hold` clears it, as `_hold` does
+                self._end_hold(slot, now, "held_stop")
+                self._limit_sell(slot, held, now, slot.floor, anchor=at)
+                return
         try:
             bought = slot.protection_anchor = self._trail_anchor(slot)
         except RuntimeError as error:
@@ -3529,17 +3773,28 @@ class Mover(Strategy):
             self._note(slot, str(error))
             return
         # the stop held while no price was followed, read before `_end_hold` clears it: the remade sell
-        # keeps it as it keeps a reached trigger (xr7-r-heldl, P1)
-        held_level = None if slot.held_stop is None else stop_trigger_price(slot.held_stop)
+        # keeps it as it keeps a reached trigger (xr7-r-heldl, P1), rounded up onto the step, never down
+        # (xr7-cx-succ/F3)
+        held_level = (
+            None if slot.held_stop is None or slot.held_stop <= 0 else up_on_step(slot.held_stop)
+        )
+        from_hold = False
         if slot.held_since is not None:
+            # above the held stop, the trail starts from it, never lower, so the held stop goes only
+            # by a sale or by a trigger at least as high taking its place
             self._end_hold(slot, now, "trail")
+            if held_level is not None:
+                reached = slot.trail_trigger
+                from_hold = reached is None or held_level >= stop_trigger_price(reached)
+                slot.trail_trigger = held_level if reached is None else max(reached, held_level)
         # the reached trigger on Alpaca's step, one value for the check below and for the remade sell
         reached = slot.trail_trigger
         kept = None if reached is None else stop_trigger_price(reached)
         origin = None if reached is None else f"reached {reached}"
         met = "retained trigger"
-        if held_level is not None and (kept is None or held_level > kept):
-            kept, origin, met = held_level, f"held stop {held_level}", "held stop (retained)"
+        if from_hold:
+            # the held stop is the level kept, at or over any trigger a trailed sale had reached
+            origin, met = f"held stop {kept}", "held stop (retained)"
         anchor = fill_trigger(bought, slot.sized_loss)
         if anchor is not None and (kept is None or anchor > kept):
             # L under the average fill, rounded up onto the step so a share never loses more than L;
@@ -3637,20 +3892,19 @@ class Mover(Strategy):
     def _hold(self, slot: Slot, held: Decimal, now: int) -> None:
         """The lead's decision (b), 2026-11-12: with no followed price, hold a stop at the average fill,
         else the entry's limit, less the trail distance in force. It sells at once only when the last
-        known price (the last trade the cache has, else the latest minute close) is through that level,
-        so it does not depend on the missing side and adds no subscription. With no two-sided quote
-        within `HOLD_MOST_SECS` of the fill it sells by limit as an `unpriced_exit`."""
+        known price (the newest trade by venue time, else the latest minute close: `_last_known`)
+        is through that level, so it does not depend on the missing side and adds no subscription.
+        With no two-sided quote within `HOLD_MOST_SECS` of receiving the first fill it sells by limit
+        as an `unpriced_exit`."""
         if slot.held_since is None:
-            entry = self._order(slot.entry_id)
-            fills = [
-                at
-                for cid, side, *_, at in self.fills
-                if entry is not None
-                and cid == entry.client_order_id.value
-                and side == OrderSide.BUY.name
-            ]
-            # 60 s from the fill (the lead's bound); a hold after the holding was trailed, from now
-            slot.held_since = now if slot.trailed else min(fills, default=now)
+            received = slot.entry_received_ns
+            if received is None:
+                # no receipt on this node (a restart, or fills reconciled before the handler ran): the
+                # venue's time of the entry's first fill, as before the one-clock change, so a holding
+                # found long after its fill is not held a further 60 s (code-review-high-succ2/8)
+                received = self._entry_filled_ns(slot)
+            # receipt and `now` are both this host's clock; a hold after the holding was trailed starts now
+            slot.held_since = now if slot.trailed or received is None else received
             anchor = self._held_anchor(slot)
             if anchor is not None:
                 plan = slot.trail_plan
@@ -3661,7 +3915,11 @@ class Mover(Strategy):
                     self.settings.exit_through if plan is None else plan.exit_through,
                     self._floor_m(),
                 )[0]
-                slot.held_stop = anchor - distance
+                level = anchor - distance
+                # on Alpaca's step from the start, rounded up, the level its trailing sell would start
+                # from, so the hold's checks and its record read the stop in force (code-review-high-succ2/4)
+                on_step = level if level <= 0 else up_on_step(level)
+                slot.held_stop = level if on_step == level else on_step
                 slot.protection_anchor = anchor
             if slot.trail_trigger is not None:
                 # a trailed sale had reached this trigger: the hold keeps it, on Alpaca's step (#312)
@@ -3678,17 +3936,31 @@ class Mover(Strategy):
             )
         self._ensure_exit(slot, held)
         self._held_at_l(slot)
+        slot.holding_from = self._holding_since(slot)
         last, source = self._last_known(slot)
-        if slot.held_stop is not None and last is not None and last <= slot.held_stop:
+        met, by = last, source
+        low = slot.held_low
+        if slot.held_stop is not None and low is not None and low <= slot.held_stop:
+            # a followed price since the hold began met the stop: a met held stop is never forgotten, and
+            # a later print the holding does not own (a late one stamped before the entry) must not hide
+            # it (the lead's H3, 2026-11-13 09:20; the DeepSeek reader of the successor, P2). A low that
+            # never met the stop prices nothing here, the unpriced exit included (code-review-high-succ2/1)
+            met, by = low, "followed price"
+        if slot.held_stop is not None and met is not None and met <= slot.held_stop:
             slot.exiting = True
-            self._mark_exit(slot, now, last, f"held stop ({source})")
+            self._mark_exit(slot, now, met, f"held stop ({by})")
             if slot.entry_record is not None:
-                slot.entry_record["held_stop_trigger"] = source
+                slot.entry_record["held_stop_trigger"] = by
             slot.exit_trigger = slot.held_stop  # before `_end_hold` clears it
             self._end_hold(slot, now, "held_stop")
-            self._limit_sell(slot, held, now, slot.floor, anchor=last)
+            self._limit_sell(slot, held, now, slot.floor, anchor=met)
             return
-        if now - slot.held_since >= HOLD_MOST_SECS * SECOND_NS:
+        # `unpriced_exit` is for a holding with no two-sided quote; under `LAST_PRICE` one with a
+        # two-sided quote and no print of its own waits for a print or the wind-down
+        if now - slot.held_since >= HOLD_MOST_SECS * SECOND_NS and not (
+            self.settings.trigger == TriggerType.LAST_PRICE
+            and quoted_spread(self.cache.quote(slot.instrument_id)) is not None
+        ):
             anchor = last if last is not None else slot.protection_anchor
             slot.exiting = True
             self._mark_exit(slot, now, last, "unpriced_exit")
@@ -3725,10 +3997,17 @@ class Mover(Strategy):
         if at_l is None:
             return
         reached = None if slot.trail_trigger is None else stop_trigger_price(slot.trail_trigger)
+        # never lower than this hold has held at L: a cheaper fill lowers the average, not the stop
+        at_l = at_l if slot.held_at_l is None else max(at_l, slot.held_at_l)
+        slot.held_at_l = at_l
         slot.held_stop = at_l if reached is None else max(at_l, reached)
         slot.protection_anchor = anchor
         if slot.exit_record is not None:
             slot.exit_record.trail_distance = distance
+            # the kept level and its distance from the average, which a cheaper fill can make
+            # negative: the stop then sits over the average and the next price through it sells (H1)
+            slot.exit_record.held_stop_kept = slot.held_stop
+            slot.exit_record.held_stop_from_average = anchor - slot.held_stop
         if slot.entry_record is not None:
             slot.entry_record["held_stop_level"] = str(slot.held_stop)
 
@@ -3740,7 +4019,8 @@ class Mover(Strategy):
             slot.entry_record["protect_path"] = path
             slot.entry_record["held_stop_secs"] = (now - slot.held_since) / SECOND_NS
         self.protect_paths[path] += 1
-        slot.held_stop = slot.held_since = None
+        slot.held_stop = slot.held_since = slot.held_low = slot.held_at_l = None
+        slot.holding_from = None
 
     def _held_anchor(self, slot: Slot) -> Decimal | None:
         """The average fill (the entry's, else the cache's position average), else the entry's limit."""
@@ -3755,26 +4035,42 @@ class Mover(Strategy):
         price = None if entry is None else getattr(entry, "price", None)
         return None if price is None else price.as_decimal()
 
-    def _last_print(self, slot: Slot) -> Decimal | None:
-        """The price of the trade newest by its own time: of the one kept for the slot from the
-        prints received with an arm on (`Slot.newest_print`) and the cache's last trade, whichever is
-        later, else what the held stop reads (`_last_known`). The cache's trade is the one received
-        last, which an older print reported late can be: such a print is history, and neither lowers
-        a sale priced with no bid nor lifts one over a newer fall. With no arm on nothing is kept,
-        and this is the cache's last trade as before."""
+    def _newest_trade(self, slot: Slot) -> Print | None:
+        """One reader for the newest usable trade by venue time: the slot's kept print or the
+        cache's last trade, whichever is later at the venue. Cache.trade returns the last insertion,
+        not the newest event (crates/common/src/cache/mod.rs:6364-6373 at the pin); an older print
+        reported late therefore moves none of these readers. The engine's order emulator is not one
+        of them: it elects an emulated trailing sell on each trade as delivered
+        (crates/execution/src/order_emulator/emulator.rs:1093-1105), so a late print reaches it unless
+        the adapter sets it aside before the data engine. A cache trade whose venue time is unusable
+        (`print_time`) is never read, kept print or not (the lead's order of 2026-11-13, 10:01)."""
         kept = slot.newest_print
         trade = self.cache.trade(slot.instrument_id)
-        if trade is not None and (
-            kept is None or min(int(trade.ts_event), int(trade.ts_init)) > kept[0]
-        ):
-            return trade.price.as_decimal()
-        return kept[1] if kept is not None else self._last_known(slot)[0]
+        at = None if trade is None else print_time(trade, slot.quote_lag)
+        if trade is not None and at is not None and (kept is None or at > kept.event_ns):
+            return Print.of(trade, slot.quote_lag)
+        return kept
+
+    def _last_print(self, slot: Slot) -> Decimal | None:
+        """The newest trade's price, else what the held stop reads (`_last_known`): the anchor of a
+        sale with no bid. With no print, that is the latest minute close under `BID_ASK` and nothing
+        under `LAST_PRICE`, where a close is no price of this holding (code-review-high-succ/3)."""
+        newest = self._newest_trade(slot)
+        if newest is not None:
+            return newest.price
+        return self._last_known(slot)[0]
 
     def _last_known(self, slot: Slot) -> tuple[Decimal | None, str]:
-        """The last trade the cache has, else the latest minute close: what the held stop reads."""
-        trade = self.cache.trade(slot.instrument_id)
+        """The newest trade by venue time, else the latest minute close: what the held stop reads.
+        Under `LAST_PRICE` only a trade of this holding (`_holding_trade`): with none, a minute close is
+        no newer than a print of it, so nothing is known (code-review-high-succ/3); under `BID_ASK` as
+        #320 made it."""
+        trade = self._newest_trade(slot)
+        if self.settings.trigger == TriggerType.LAST_PRICE:
+            trade = None if trade is None else self._holding_trade(slot, trade)
+            return (None, "none") if trade is None else (trade.price, "last trade")
         if trade is not None:
-            return trade.price.as_decimal(), "last trade"
+            return trade.price, "last trade"
         if slot.closes:
             return slot.closes[-1], "minute close"
         return None, "none"
@@ -3830,13 +4126,50 @@ class Mover(Strategy):
         return anchor
 
     def _followed(self, slot: Slot) -> Decimal | None:
-        """The price the trailing sell's trigger follows, as the cache has it now: the bid for `BID_ASK`,
-        the last trade for `LAST_PRICE`; None before the first."""
+        """The trigger's followed price: the bid for BID_ASK, the newest trade of this holding for
+        LAST_PRICE (`_holding_trade`); None before the first."""
         if self.settings.trigger == TriggerType.BID_ASK:
             quote = self.cache.quote(slot.instrument_id)
             return None if quote is None else quote.bid_price.as_decimal()
-        trade = self.cache.trade(slot.instrument_id)
-        return None if trade is None else trade.price.as_decimal()
+        trade = self._holding_trade(slot)
+        return None if trade is None else trade.price
+
+    def _holding_trade(self, slot: Slot, trade: Print | None = None) -> Print | None:
+        """The newest print by venue time (`_newest_trade`), or None when the venue stamped it before
+        Alpaca accepted the entry (else before its first fill on record): such a print is not of this
+        holding, and one stray print would set the trigger, meet a kept one or go through the held stop
+        (`_persistent_trail` never takes the print cached before arming either). The acceptance, not the
+        fill: Alpaca stamps a fill with its trade update's time and the SIP stamps the print of that fill
+        on its own clock, which can be earlier, so the fill's own print would be dropped. All are venue
+        times (the print's `ts_event`; the order's `ts_accepted`, Alpaca's `submitted_at`; the fill's),
+        so this host's clock does not move the boundary. With no entry fill on record it is the newest
+        print. A caller may pass its own read of the newest print."""
+        trade = self._newest_trade(slot) if trade is None else trade
+        if trade is None:
+            return None
+        since = self._holding_since(slot)
+        return trade if since is None or trade.event_ns >= since else None
+
+    def _holding_since(self, slot: Slot) -> int | None:
+        """The venue time from which a print is of this holding: the earlier of Alpaca's acceptance of
+        the entry (`ts_accepted`) and its first fill on record, or None with no entry fill on record.
+        `_holding_trade` and the held stop's low (`on_trade`, through `Slot.holding_from`) both read
+        it, so a print one follows the other counts."""
+        filled = self._entry_filled_ns(slot)
+        if filled is None:
+            return None
+        entry = self._order(slot.entry_id)
+        accepted = None if entry is None else getattr(entry, "ts_accepted", None)
+        # a 0 is an unset time, no boundary: the pinned order reads None until accepted and the first
+        # fill sets it if acceptance did not (NautilusTrader d53849b216e2, crates/model/src/python/orders/
+        # mod.rs:188-190, crates/model/src/orders/mod.rs:1413-1414), but an own-book copy defaults it to 0
+        # (orders/mod.rs:539) and a stand-in or restored order may carry that
+        return filled if not accepted else min(filled, int(accepted))
+
+    def _entry_filled_ns(self, slot: Slot) -> int | None:
+        """The venue's time of the entry's first fill on record, or None."""
+        entry = None if slot.entry_id is None else slot.entry_id.value
+        return min((ns for cid, _, _, _, ns in self.fills if cid == entry), default=None)
 
     def _chase(
         self, slot: Slot, order: Any, held: Decimal, now: int, floor: Decimal | None
@@ -4663,8 +4996,12 @@ class Mover(Strategy):
         tier = self._tier_applies(slot)
         if atr is None and slot.run_arm == "opening":
             # The coordinator's rule for R2: a cold-ATR opening entry uses the fixed plan, a top-tier
-            # name included, recorded as cold_atr_fallback; it tightens once the ATR warms (b). The
-            # lead's O1 of 2026-11-12: the fixed plan is raised to a spread floor over it.
+            # name included, recorded as cold_atr_fallback; the lead's O1 of 2026-11-12: the fixed
+            # plan is raised to a spread floor over it. An opening is always top tier, so under a
+            # tier base (`tier`, `profile`, or `ratchet` on either) it keeps the fixed plan for the life
+            # of the position: once the ATR warms, `_warm_tighten` re-selects tier, not the warmed
+            # ATR's plan, and keeps the fixed one (the lead's ruling of 2026-11-13, 03:02: a tier plan
+            # would sell by a change of rule, not by price). Under the `atr` base it may tighten (b).
             return self._cold_plan(
                 f"ATR has fewer than {settings.atr_n} complete one-minute bars: opening uses the "
                 "fixed trail",
@@ -4805,8 +5142,9 @@ class Mover(Strategy):
         if (
             current is None
             or current.source == "tier"
-            # a top-tier name keeps tier: an opening's cold-ATR entry is the fixed plan, raised to its
-            # spread floor, until its ATR warms
+            # a top-tier name keeps tier: an opening's cold-ATR entry keeps the fixed plan, raised to
+            # its spread floor, for the life of the position (`_warm_tighten` keeps it once the ATR
+            # warms)
             or self._top_tier(slot)
         ):
             return False  # not a profile holding, so there is no tighten to skip

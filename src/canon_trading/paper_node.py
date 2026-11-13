@@ -36,6 +36,7 @@ from decimal import Decimal
 from typing import TYPE_CHECKING
 from typing import TypedDict
 
+from canon_alpaca.data import AlpacaDataClientConfig
 from canon_alpaca.execution import AlpacaExecutionClientConfig
 from canon_alpaca.factories import AlpacaDataClientFactory
 from canon_alpaca.factories import AlpacaExecutionClientFactory
@@ -185,6 +186,7 @@ def alpaca_paper_builder(
     max_notional_per_order: Decimal = MAX_NOTIONAL_PER_ORDER_USD,
     delay_post_stop_secs: int = DELAY_POST_STOP_SECS,
     data_load_all: bool = False,
+    trade_condition_filter: bool = False,
 ) -> LiveNodeBuilder:
     """A builder with the Alpaca data and execution clients for one or several `instrument_id`s, `risk_limits`,
     `exec_engine_config` and the timeouts every paper node here uses; the caller adds logging and builds.
@@ -196,6 +198,13 @@ def alpaca_paper_builder(
     # one GET of the asset list), so a ranking actor's wildcard bars are tallied for the whole market; the
     # execution client keeps the listed instruments (the lead's order of 2026-11-12 for the 04:00 firing).
     data_provider = InstrumentProviderConfig(load_all=True) if data_load_all else provider
+    # `trade_condition_filter`: only a print Alpaca's minute bars take becomes a tick
+    # (`AlpacaDataClientConfig`), for a strategy that elects on prints; off, the plain config as before.
+    data_config = (
+        AlpacaDataClientConfig(instrument_provider=data_provider, trade_condition_filter=True)
+        if trade_condition_filter
+        else DataClientConfig(instrument_provider=data_provider)
+    )
     return (
         LiveNode.builder(name, trader_id, Environment.SANDBOX)
         .with_risk_engine_config(
@@ -212,9 +221,7 @@ def alpaca_paper_builder(
         .with_timeout_connection(TIMEOUT_CONNECTION_SECS)
         .with_timeout_disconnection_secs(TIMEOUT_DISCONNECTION_SECS)
         .with_delay_shutdown_secs(TIMEOUT_SHUTDOWN_SECS)
-        .add_data_client(
-            "ALPACA", AlpacaDataClientFactory, DataClientConfig(instrument_provider=data_provider)
-        )
+        .add_data_client("ALPACA", AlpacaDataClientFactory, data_config)
         .add_exec_client(
             "ALPACA",
             AlpacaExecutionClientFactory,

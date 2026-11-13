@@ -1,7 +1,7 @@
 {
   "lineLayout": "expanded",
   "pathLevels": 1,
-  "elementOrder": ["project", "context", "usage", "promptCache", "cacheHitRate", "agents", "todos", "tools", "skills", "mcp", "sessionTime"],
+  "elementOrder": ["project", "context", "usage", "cost", "promptCache", "cacheHitRate", "agents", "todos", "tools", "skills", "mcp", "sessionTime"],
   "gitStatus": {
     "enabled": true,
     "showDirty": true,
@@ -66,6 +66,6 @@
     "showCompactions": true,
     "showAdvisor": true,
     "customLine": "",
-    "mergeGroups": [["context", "usage"], ["promptCache", "cacheHitRate"], ["skills", "mcp"]]
+    "mergeGroups": [["context", "usage", "cost", "promptCache", "cacheHitRate"], ["skills", "mcp", "sessionTime"]]
   }
 }

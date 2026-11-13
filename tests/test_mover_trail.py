@@ -445,7 +445,11 @@ def test_exit_record_uses_release_event_and_all_partial_fills_across_reprices():
     slot.entry_record = {"client_order_id": "BUY-1", "stopped_out": False}
     s._ensure_exit(slot, D(5))
     slot.protect_id = ClientOrderId("SELL-1")
-    s.on_quote(SimpleNamespace(instrument_id=AAA, bid_price=Price.from_str("11.0000")))
+    s.on_quote(
+        SimpleNamespace(
+            instrument_id=AAA, bid_price=Price.from_str("11.0000"), ts_event=T0, ts_init=T0
+        )
+    )
     s.on_order_released(
         SimpleNamespace(
             instrument_id=AAA,
@@ -787,7 +791,9 @@ def test_one_sided_quote_at_fill_makes_no_sale_and_leaves_a_working_held_stop():
 def test_a_print_through_the_held_stop_sells_at_once_and_names_its_source():
     seam, slot = held()
     seam._protect(slot, D(5), T0)
-    seam.cache.trade = lambda _: SimpleNamespace(price=Price.from_str("9.7900"))
+    seam.cache.trade = lambda _: SimpleNamespace(
+        price=Price.from_str("9.7900"), ts_event=T0, ts_init=T0
+    )
     seam._protect(slot, D(5), T0 + 5 * SECOND)
     assert len(seam.sent) == 1 and seam.sent[0].price == Price.from_str("9.7800")
     assert slot.exiting and slot.exit_record.trigger_reason == "held stop (last trade)"
@@ -833,7 +839,9 @@ def test_a_two_sided_quote_releases_the_held_stop_into_the_normal_trail():
 def test_a_trail_with_no_price_at_all_is_noted_and_retried_not_raised():
     """High review: an anchorless trail raised from the step timer and stopped every slot."""
     seam = Seam("0", trigger=mover.TriggerType.LAST_PRICE)
-    seam.cache.trade = lambda _: SimpleNamespace(price=Price.from_str("10.0000"))
+    seam.cache.trade = lambda _: SimpleNamespace(
+        price=Price.from_str("10.0000"), ts_event=T0, ts_init=T0
+    )
     slot = seam_slot(seam, bought=None)
     seam._protect(slot, D(5), T0)
     assert seam.sent == []
@@ -1116,7 +1124,9 @@ def test_a_chased_sale_with_no_bid_is_remade_from_the_last_price_never_back_up_a
     """Fix-round review: with no positive bid the remake fell back to the entry's average fill."""
     seam, slot = held()
     seam._protect(slot, D(5), T0)
-    seam.cache.trade = lambda _: SimpleNamespace(price=Price.from_str("9.7900"))
+    seam.cache.trade = lambda _: SimpleNamespace(
+        price=Price.from_str("9.7900"), ts_event=T0, ts_init=T0
+    )
     seam._protect(slot, D(5), T0 + 5 * SECOND)  # through the held stop: sold from 9.79
     first = seam.sent[-1]
     assert first.price == Price.from_str("9.7800")
@@ -1164,7 +1174,9 @@ def test_the_floor_wait_restarts_when_the_bid_recovers_above_the_floor():
 def test_a_held_stop_sale_marks_the_entry_stopped_out():
     seam, slot = held()
     seam._protect(slot, D(5), T0)
-    seam.cache.trade = lambda _: SimpleNamespace(price=Price.from_str("9.7900"))
+    seam.cache.trade = lambda _: SimpleNamespace(
+        price=Price.from_str("9.7900"), ts_event=T0, ts_init=T0
+    )
     seam._protect(slot, D(5), T0 + 5 * SECOND)
     assert slot.entry_record["stopped_out"] is True
 
@@ -1180,7 +1192,9 @@ def test_a_held_stop_after_a_reached_trigger_holds_at_that_trigger_on_alpacas_st
     slot.trailed, slot.trail_trigger = True, D("11.765")
     seam._protect(slot, D(5), T0)
     assert seam.sent == [] and slot.held_stop == D("11.76")
-    seam.cache.trade = lambda _: SimpleNamespace(price=Price.from_str("11.7000"))
+    seam.cache.trade = lambda _: SimpleNamespace(
+        price=Price.from_str("11.7000"), ts_event=T0, ts_init=T0
+    )
     seam._protect(slot, D(5), T0 + 5 * SECOND)
     assert len(seam.sent) == 1 and slot.exit_record.trigger_reason == "held stop (last trade)"
 
@@ -1206,8 +1220,14 @@ def test_a_one_sided_quote_leaves_the_last_positive_bid():
     s = strategy()
     slot = mover.Slot(AAA, bar_type(AAA), deque(maxlen=4), deque(maxlen=5))
     s.slots[AAA] = slot
-    s.on_quote(SimpleNamespace(instrument_id=AAA, bid_price=Price.from_str("10.0000")))
-    s.on_quote(SimpleNamespace(instrument_id=AAA, bid_price=Price.from_str("0")))
+    s.on_quote(
+        SimpleNamespace(
+            instrument_id=AAA, bid_price=Price.from_str("10.0000"), ts_event=T0, ts_init=T0
+        )
+    )
+    s.on_quote(
+        SimpleNamespace(instrument_id=AAA, bid_price=Price.from_str("0"), ts_event=T0, ts_init=T0)
+    )
     assert slot.last_bid == D("10.0000")
 
 
@@ -1251,7 +1271,9 @@ def test_a_sized_entrys_held_stop_is_l_under_the_fill_and_its_sale_keeps_that_tr
     assert seam.sent == [] and slot.held_stop == mover.fill_trigger(D("10.00"), D("0.30")) == D(
         "9.70"
     )
-    seam.cache.trade = lambda _: SimpleNamespace(price=Price.from_str("9.6900"))
+    seam.cache.trade = lambda _: SimpleNamespace(
+        price=Price.from_str("9.6900"), ts_event=T0, ts_init=T0
+    )
     seam._protect(slot, D(5), T0 + 5 * SECOND)
     assert len(seam.sent) == 1 and slot.exit_record.trigger_reason == "held stop (last trade)"
     assert D(seam.sell_triggers[seam.sent[0].client_order_id.value]) == D("9.70")

@@ -28,6 +28,7 @@ from nautilus_trader.model import TriggerType
 from canon_trading.ledger import _strategy_fields
 from canon_trading.mover import STEP_SECS
 from canon_trading.mover import Mover
+from canon_trading.mover import Print
 from canon_trading.mover import chase_floor
 from canon_trading.mover import offsets
 from canon_trading.price_step import exit_price
@@ -88,19 +89,36 @@ def quote_at(
     )
 
 
+def delayed(row: Any, by: int) -> Any:
+    """`row` as received, its venue time `by` from its receipt when it is a trade print."""
+    if by == 0 or not isinstance(row, TradeTick):
+        return row
+    return TradeTick(
+        row.instrument_id,
+        row.price,
+        row.size,
+        row.aggressor_side,
+        row.trade_id,
+        row.ts_init + by,
+        row.ts_init,
+    )
+
+
 def prefix(skew: int = 0, *, cached: str = "10.50", confirm: bool = True) -> list:
     """Four rising closes buy ten shares at 10.31, and the level is armed from that fill. Three prints
     at 10.50, 200 ms apart and after the arming step, then confirm the 10.50 high for any count up to
     three, which puts the level at 10.29. The print cached before arming is never the level. `skew`
-    moves each confirming print's event time against its receipt."""
+    moves each confirming print's event time against its receipt; a venue clock behind ours (a
+    negative skew) delays every print, those before arming too, so their order is the venue's."""
     closes = [10.0, 10.1, 10.2, 10.3]
+    behind = min(skew, 0)
     rows = [
         quote_at(0, "9.99", "10.01"),
         *tape(AAA, closes),
-        *trade_tape(AAA, closes),
+        *(delayed(row, behind) for row in trade_tape(AAA, closes)),
         quote_at(4 * MINUTE + 250 * MS, "10.29", "10.31"),
         quote_at(4 * MINUTE + SECOND + 250 * MS, "10.29", "10.31"),
-        print_at(4 * MINUTE + 500 * MS, cached),
+        print_at(4 * MINUTE + 500 * MS + behind, cached, received=4 * MINUTE + 500 * MS),
     ]
     if confirm:
         rows += [
@@ -588,7 +606,7 @@ def test_with_no_bid_a_trade_the_cache_holds_from_before_the_slots_first_print_s
     """The slot's first print can itself be a late report, older than a trade the cache already
     holds: the newer of the two by its own time stands in for the bid."""
     seam, slot = confirmed("0", "9.90")
-    slot.newest_print = (T0 - SECOND, Decimal("10.40"))
+    slot.newest_print = Print(T0 - SECOND, Decimal("10.40"), T0 - SECOND)
     seam._protect(slot, Decimal(5), T0)
     assert seam.sent[-1].price == Price.from_str("9.8900")
 
@@ -599,14 +617,14 @@ def test_with_no_bid_a_sale_remade_without_an_anchor_reads_the_same_newest_trade
     does not take a sale from 10.26 to 9.89."""
     seam, slot = confirmed("0", "9.90")
     seam.last_ns = T0 - SECOND
-    slot.newest_print = (T0, Decimal("10.27"))
+    slot.newest_print = Print(T0, Decimal("10.27"), T0)
     seam._limit_sell(slot, Decimal(5), T0, None)
     assert seam.sent[-1].price == Price.from_str("10.2600")
 
 
 def test_with_no_print_kept_the_plain_sale_reads_the_cache_as_before() -> None:
-    """Nothing is kept with the arm off, and nothing before a slot's first print: the plain sale then
-    prices from the cache's last trade, as it did."""
+    """Nothing is kept before a slot's first print: the plain sale then prices from the cache's last
+    trade, as it did."""
     seam, slot = confirmed("0", "9.90")
     assert slot.newest_print is None
     seam._limit_sell(slot, Decimal(5), T0, None)
@@ -674,9 +692,9 @@ def test_a_gap_through_the_level_sells_on_the_first_limit_priced_through_the_bid
 def test_watermark_and_gap_read_each_print_at_the_earlier_of_its_event_and_receipt(
     skew: int,
 ) -> None:
-    """A venue clock 20 s behind or ahead of this node's: every print carries the same skew, and the
-    count runs on one clock either way, the print's own when it is behind and the receipt's when it
-    is ahead."""
+    """A venue clock 20 s behind or ahead of this node's: every print carries the same skew (when
+    behind, those before arming too, as a delayed feed delays them all), and the count uses venue
+    time when behind and receipt time when ahead."""
     first = START + 100 * MS
     s, orders, held = replay(
         [
@@ -767,11 +785,19 @@ def test_trade_handlers_queue_plain_pairs_and_only_the_step_confirms() -> None:
     slot = s.slots[AAA]
     slot.trail_trigger = LEVEL
     borrowed.slots[AAA] = slot
+    slot.newest_print = None  # the replay's later prints would make this one a late report
     trade = print_at(first, "10.28")
     Mover.on_trade(borrowed, trade)
+    late = print_at(first - 50 * MS, "10.10")
+    Mover.on_trade(borrowed, late)
     Mover.on_quote(borrowed, quote_at(first))
-    assert tuple(slot.observations) == ((trade.ts_event, Decimal("10.28")),)
-    assert borrowed.trades == borrowed.quotes == 1
+    # Both reach the count's own watermark in the step; the readers set the late one aside here.
+    assert tuple(slot.observations) == (
+        (trade.ts_event, Decimal("10.28")),
+        (late.ts_event, Decimal("10.10")),
+    )
+    assert borrowed.late_prints == {"AAA.ALPACA": {"count": 1, "most_late_ms": 50}}
+    assert borrowed.trades == 2 and borrowed.quotes == 1
 
 
 def test_nothing_is_sent_while_the_managed_market_exit_owns_the_holding() -> None:

@@ -45,6 +45,7 @@ from nautilus_trader.model import ActorId
 from nautilus_trader.model import BarType
 from nautilus_trader.model import StrategyId
 from nautilus_trader.model import TimeInForce
+from nautilus_trader.model import TriggerType
 
 from .mover import PAPER_LOSS_SHARE
 from .mover import RANK_SIGNAL
@@ -350,6 +351,7 @@ def mover_universe_parts(
     planned_loss: Decimal | None = None,
     loss_share: Decimal | None = None,
     trail_cap: str = TRAIL_CAP_DEFAULT,
+    trigger: TriggerType = TriggerType.BID_ASK,
 ) -> tuple[Mover, tuple[PositionCap, ...]]:
     """One strategy and independent position monitors on the loaded roster. The ranking arrives only
     on the bus; the startup order is not a substitute. Every name has an entry share bound, and a name
@@ -393,6 +395,7 @@ def mover_universe_parts(
             market_exit_interval_ms=market_exit_interval_ms,
             market_exit_max_attempts=market_exit_max_attempts,
             **dict(trail_rows or {}),
+            trigger=trigger,
         )
     )
     strategy.entry_contexts.update(entry_contexts or {})

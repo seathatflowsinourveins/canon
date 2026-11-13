@@ -1532,46 +1532,59 @@ def test_a_ratcheted_sized_holdings_held_stop_follows_a_later_fill_too():
     assert slot.held_stop == D("10.79")
 
 
-def test_a_tightened_holdings_held_stop_follows_a_lower_average_at_the_tightened_plans_distance():
-    """The high review of the held-stop fix, test gap: at a lower average, 9.90, the tightened plan's
-    offset is closer than L, so the stop follows at the plan's distance, and the exit record names
-    the distance used."""
+def test_a_tightened_holdings_held_stop_keeps_its_level_at_a_lower_average_and_sells_through_it():
+    """The lead's ruling of 2026-11-13 08:24 on #343's lower-average case: a held stop's level never
+    falls. Held at the 10.80 average L = 0.21 under it (10.59), the entry then fills lower, to a 9.90
+    average: the stop stays at 10.59, now 0.69 over the average, and the exit record names that kept
+    level and its distance from the average. The last known price, 10.00, is through it, so the hold
+    sells at once by limit (H1), with 10.59 as the exit's trigger."""
     seam, slot = tightened_at_l()
     slot.closes = deque([D(11)], maxlen=4)
     seam._hold(slot, D(10), T0 + 3 * MINUTE)
+    assert slot.held_stop == D("10.59")
     seam.orders["E-1"].avg_px = 9.90
-    slot.trail_trigger = None  # no trigger reached, so the level is the distance's alone
-    seam.bid = "10.00"
+    slot.trail_trigger = None  # no trigger reached, so the level is the hold's alone
     slot.closes = deque([D("10.00")], maxlen=4)
+    sent = len(seam.sent)
     seam._hold(slot, D(15), T0 + 3 * MINUTE + SECOND)
-    distance = slot.exit_record.trail_distance
-    assert distance < slot.sized_loss
-    assert slot.held_stop == mover.fill_trigger(D("9.90"), distance)
+    assert D(slot.entry_record["held_stop_level"]) == D("10.59")
+    record = slot.exit_record.record()
+    assert D(record["held_stop_kept"]) == D("10.59")
+    assert D(record["held_stop_from_average"]) == D("-0.69")
+    assert [o.kind for o in seam.sent[sent:]] == ["LIMIT"]
+    assert slot.exiting is True
+    assert slot.exit_trigger == D("10.59")
 
 
-def test_a_tightened_holdings_held_stop_keeps_the_floor_in_price_terms_at_a_lower_average():
-    """#343's held stop under O3: at a lower average, 9.60, the tightened plan's 0.02 is 0.20, but the
-    plan was taken on a spread whose floor is 0.30 in price terms, over L's 0.21, so the remade sale
-    trails by L and the held stop follows at L too (9.39), not at the plan's 0.20 (9.40)."""
+def test_a_tightened_holdings_kept_held_stop_remakes_at_the_floor_in_price_terms_at_a_lower_average():
+    """#343's held stop under O3, with the lead's ruling of 2026-11-13 08:24: at a lower average, 9.60,
+    the tightened plan's 0.02 is 0.20, but the plan was taken on a spread whose floor is 0.30 in price
+    terms, over L's 0.21, so the distance in force is L. The held stop keeps its 10.59 rather than
+    following to 9.39, the exit record names the kept level, its distance from the average and the
+    distance in force, and the sale remade when a followed price returns over it starts from 10.59
+    and trails by that distance."""
     seam, slot = tightened_at_l()
     slot.closes = deque([D(11)], maxlen=4)
     seam._hold(slot, D(10), T0 + 3 * MINUTE)
     slot.trail_plan = replace(slot.trail_plan, spread=D("0.30") / seam.settings.spread_floor_m)
     seam.orders["E-1"].avg_px = 9.60
-    slot.trail_trigger = None  # no trigger reached, so the level is the distance's alone
-    seam.bid = "10.00"
-    slot.closes = deque([D("10.00")], maxlen=4)
+    slot.trail_trigger = None  # no trigger reached, so the level is the hold's alone
     seam._hold(slot, D(15), T0 + 3 * MINUTE + SECOND)
     in_force = mover.offsets_in_force(
         slot, D("9.60"), slot.trail_plan.trail, slot.trail_plan.exit_through, seam._floor_m()
     )[0]
     assert in_force == D("0.21")
-    assert slot.held_stop == D("9.39") == mover.fill_trigger(D("9.60"), in_force)
+    assert slot.held_stop == D("10.59")
+    record = slot.exit_record.record()
+    assert D(record["held_stop_kept"]) == D("10.59")
+    assert D(record["held_stop_from_average"]) == D("-0.99")
+    assert D(record["trail_distance"]) == in_force
     sent = len(seam.sent)
     seam.bid = "12.50"  # a followed price over the held stop: the sale is remade for all held
     seam._protect(slot, D(15), T0 + 3 * MINUTE + 2 * SECOND)
     (remade,) = seam.sent[sent:]
     assert remade.trailing_offset == in_force
+    assert remade.trigger_price == Price.from_str("10.5900")
 
 
 def test_a_tightened_holding_with_no_room_for_l_keeps_its_held_stop_as_before():

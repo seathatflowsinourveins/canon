@@ -65,7 +65,7 @@ The count, with `breach_count` or `high_count` above one, on trade prints only (
 | A breach | `breach_count` counted prints at or under the level with no print above it between them. The count never expires: a thin name sells at its second print however late it comes. |
 | A new high | `high_count` counted prints above the confirmed high, none at or under it between them; the level rises to the lowest of them less the trail, on Alpaca's price step, never down. |
 | The level's start | The entry's average fill as it stands at the arming step, less the trail; never a cached print. The start is not re-based as a partly filled entry fills further; the trail's distance is, being taken from the current average each step. |
-| A print's time | The earlier of its event time and its receipt. A print with the last print's time may reset an arm and never counts; an older one, a late report, does neither. |
+| A print's time | The earlier of its event time and its receipt, the receipt read on the venue's clock when its name's quotes show this host's clock behind (the highest of the name's latest nine quotes' event time less receipt, the least-delayed quote's). A print with the last print's time may reset an arm and never counts; an older one, a late report, does neither. |
 | The sale | A DAY limit `exit_ticks` through the bid of the first step after the confirming print, so it never rests above the bid as the emulator's released limit can; then the existing chase. Its floor is `chase_cap` under a first price taken from the lower of the confirming print and the bid at that step. A one-sided quote's zero bid is no price, and neither is no quote: the last trade then stands in for the bid, for the floor and for the sale and each remake of it, so a recovery cannot lift the sale and a fall under the print is followed. The last trade is the one newest by a print's time as the row above reads it, not the one received last. The floor is set once; released after its wait, it stays released. The exit's record is marked at the confirming print's own time and price, as a stop-out. |
 | The rows | `breach_count` 1 and `high_count` 1 (both off), `confirm_gap_ms` 100. The on row is 2, 2 and 100 ms. |
 
@@ -76,8 +76,16 @@ The count, with `breach_count` or `high_count` above one, on trade prints only (
   the quote does not count, one at the bid does; consolidated feed only; with no quote newer than a
   stated age, a row, the count alone applies and the record says so; off until a paper window has
   shown it. The protector does not elect on prints again before it (the lead, 2026-11-12).
-* **No paper window has run it**, and none can: a window has no flag for the trigger or the rows.
-  Closed by those flags and a window whose record names the rows.
+* **No paper window has run it**, and none can: the trigger has a window flag (`--trigger`), but the
+  count rows have none yet (the selection unit). Closed by that flag and a window whose record names
+  the rows.
+* **No print trigger overnight.** The trade-condition filter a print trigger turns on is read for
+  sip's tapes A, B and C only, so an overnight part, which streams boats, refuses `--trigger
+  last_price` by name, and a full window on the bid is refused (the lead, 2026-11-12): account B
+  stands idle from 20:00 to 04:00. Closed by an overnight measure on paper, for the names a ranking
+  picks, of how often each prints on boats and its longest gap (a print trigger sells nothing while a
+  name does not print), of the condition codes boats prints carry and which of them Alpaca's boats
+  minute bars take, and of how often a boats quote is one-sided.
 * **The protector does not use it, and the Mover only on the fixed trail.** A trail plan's distance,
   its tighten and its chase cap (ADR 0088's `trail_mode`) are
   not carried into the held level. Closed by that change in each, with its tests.
@@ -91,6 +99,15 @@ The count, with `breach_count` or `high_count` above one, on trade prints only (
   17.7 s, and 47.6 s among those that qualify (another session's measurement, UNVERIFIED here).
 * **The window's protection diagnostics** read sell orders, so a holding under an arm reads as
   unprotected for its whole life. Closed before a window turns an arm on.
+* **The two clocks.** NautilusTrader at the pin corrects no clock offset, so the reference is ours:
+  a name's quotes give the venue's time as the stream shows it, and a print more than 5 s ahead of
+  it has no usable time. With no quote of the name, the receipt stands in and the run record counts
+  each print so judged (`prints_timed_on_receipt`). With this host's clock behind, a print received
+  faster than the name's quotes stamps up to that difference before its venue time. The record
+  carries the clocks' difference (`host_clock`), and a window more than 2 s apart goes to the lead.
+  The adapter's own 5 s bound, which lands with its part, measures against receipt and is to move to
+  the same reference. A name whose nine latest quotes all run more than 5 s behind its prints sets
+  its prints aside as ahead until a timely quote comes; `prints_stamped_ahead` counts them.
 
 ### Consequences
 

@@ -72,6 +72,7 @@ from nautilus_trader.model import StrategyId
 from nautilus_trader.model import Symbol
 from nautilus_trader.model import TimeInForce
 from nautilus_trader.model import TraderId
+from nautilus_trader.model import TriggerType
 from nautilus_trader.risk import RiskEngineConfig
 from nautilus_trader.trading import Strategy
 from requests import Response
@@ -1713,6 +1714,7 @@ def quiet_window(
     check_fills=(),
     baseline_file=True,
     trail=None,
+    trigger="bid_ask",
 ):
     """A window of `strategy` whose node runs at once, its strategy having seen `quotes`, `trades` and
     `live_bars`, and its node log holding the lines `log`; returns the report or the error, and the
@@ -1782,6 +1784,7 @@ def quiet_window(
                 baseline_path=baseline,
                 request_limit_per_minute=request_limit_per_minute,
                 **(trail or {}),
+                trigger=trigger,
             )
         )
     except RuntimeError as e:
@@ -7239,6 +7242,32 @@ def test_an_auto_part_that_runs_another_strategy_names_the_trail_flags_it_does_n
     assert f"runs {session_window.DEFAULT_STRATEGY}" in out
 
 
+def test_an_auto_part_that_runs_another_strategy_names_the_trigger_it_does_not_run(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    """`--session auto --mover --trigger last_price` in a regular part that runs another strategy runs
+    the bid_ask default; it says so, as for the trail flags (code-review-high-succ/2, AGENTS.md rule 5)."""
+    seen = []
+
+    class At(Account):
+        def get_clock(self) -> Clock:
+            return clock(datetime(2026, 11, 10, 11, 0, tzinfo=NEW_YORK), is_open=True)
+
+    def window(config, **_kwargs):
+        seen.append((config.strategy, config.trigger))
+        raise session_window.WindowSkipped("the test stops here")
+
+    monkeypatch.setattr(session_window, "EXTENDED_READY", True)
+    monkeypatch.setattr(session_window, "paper_trading", lambda: At())
+    monkeypatch.setattr(session_window, "run_window", window)
+    argv = ["--session", "auto", "--mover", "--log-dir", str(tmp_path), "--trigger", "last_price"]
+    assert session_window.main(argv) == 0
+    assert seen == [(session_window.DEFAULT_STRATEGY, "bid_ask")]
+    out = capsys.readouterr().out
+    assert "--trigger last_price not run" in out
+    assert f"runs {session_window.DEFAULT_STRATEGY}" in out
+
+
 def test_an_auto_part_names_a_trail_flag_given_at_its_fixed_row_as_not_run(
     monkeypatch, tmp_path, capsys
 ) -> None:
@@ -10195,3 +10224,283 @@ def test_an_arm_flag_is_refused_where_mover_cannot_run_it_and_said_where_a_part_
     capsys.readouterr()
     assert session_window.window_config(args, "extended").opening_arm == "off"
     assert "--opening-arm on" in capsys.readouterr().err
+
+
+def test_a_mover_window_elects_its_trailing_sell_on_the_trigger_it_is_given() -> None:
+    """Persistence step 1 (the lead's ruling of 2026-11-12, 11:26): a breach is a trade print, which is
+    upstream's LAST_PRICE election, chosen per window by --trigger; every window keeps the bid unless
+    told otherwise, so nothing that runs today changes."""
+    assert WindowConfig().trigger == "bid_ask"
+    mover_args = ["--session", "regular", "--strategy", "Mover", "--mover"]
+    assert session_window._args(mover_args).trigger == "bid_ask"
+    assert session_window._args([*mover_args, "--trigger", "last_price"]).trigger == "last_price"
+    with pytest.raises(SystemExit):
+        session_window._args([*mover_args, "--trigger", "mid"])
+    with pytest.raises(ValueError, match="trigger"):
+        WindowConfig(trigger="mid")
+
+
+@pytest.mark.parametrize(
+    ("trigger", "elected"), [("bid_ask", "BID_ASK"), ("last_price", "LAST_PRICE")]
+)
+def test_a_mover_window_hands_its_trigger_to_the_strategy(
+    tmp_path, trigger: str, elected: str
+) -> None:
+    ends = AT + timedelta(minutes=30)
+    node, s, _ = session_window.window_node(
+        WindowConfig(
+            symbol="LLL",
+            mover=True,
+            strategy="Mover",
+            session="extended",
+            log_dir=tmp_path,
+            trigger=trigger,
+        ),
+        wind_down_at=ends - timedelta(seconds=session_window.FLATTEN_SECS),
+        log_name=f"trigger-{trigger}",
+        feed="sip",
+        part="after-hours",
+        pick=mover_pick(),
+        entry_notional=Decimal(500),
+        loss_share=PAPER_LOSS_SHARE,
+        ends=ends,
+    )
+    try:
+        assert isinstance(s, session_window.Mover)
+        assert s.settings.trigger == getattr(TriggerType, elected)
+    finally:
+        node.dispose()
+
+
+@pytest.mark.parametrize("trigger", ["bid_ask", "last_price"])
+def test_a_mover_window_records_its_trigger(monkeypatch, tmp_path, trigger: str) -> None:
+    monkeypatch.setattr(session_window, "window_data", lambda: Quoted())
+    monkeypatch.setattr(session_window, "choose_mover", lambda *a, **k: mover_pick())
+    outcome, latest, _ = quiet_window(
+        monkeypatch,
+        tmp_path,
+        quotes=1,
+        trades=0,
+        account=Assets(),
+        mover=True,
+        strategy="Mover",
+        trigger=trigger,
+    )
+    assert not isinstance(outcome, Exception), outcome
+    assert latest["mover"]["trigger"] == trigger
+
+
+def test_a_print_trigger_on_a_window_without_mover_is_refused_by_name(
+    monkeypatch, tmp_path
+) -> None:
+    """--trigger last_price elects only Mover's trailing sell: a strategy with none, or a part that runs
+    the bridge in Mover's place, refuses it by name instead of selling on the bid unsaid
+    (code-review-high-print/1)."""
+    with pytest.raises(ValueError, match="trigger last_price elects Mover's trailing sell"):
+        WindowConfig(strategy="SessionMaCross", trigger="last_price")
+    monkeypatch.setitem(
+        session_window.MOVER_PARTS,
+        "after-hours",
+        replace(
+            session_window.MOVER_PARTS["after-hours"],
+            bridge_reason="Mover's order path unavailable",
+        ),
+    )
+    monkeypatch.setattr(session_window, "choose_mover", lambda *a, **k: a_pick())
+    with pytest.raises(session_window.WindowRefused, match="runs the bridge.*trigger last_price"):
+        quiet_window(
+            monkeypatch,
+            tmp_path,
+            quotes=5,
+            trades=5,
+            account=Evening(17),
+            session="extended",
+            mover=True,
+            strategy="Mover",
+            trigger="last_price",
+        )
+
+
+def data_client_configs(monkeypatch) -> list:
+    """Every config the node's Alpaca data client factory is handed, as the client receives it."""
+    from canon_trading import paper_node
+
+    configs: list = []
+    original = paper_node.AlpacaDataClientFactory.create
+
+    def create(**kwargs):
+        configs.append(kwargs["config"])
+        return original(**kwargs)
+
+    monkeypatch.setattr(paper_node.AlpacaDataClientFactory, "create", staticmethod(create))
+    return configs
+
+
+@pytest.mark.parametrize("trigger", ["bid_ask", "last_price"])
+def test_a_print_trigger_turns_the_data_clients_trade_condition_filter_on(
+    monkeypatch, tmp_path, trigger: str
+) -> None:
+    """A selected row that needs something turns it on (the lead's rule): under `last_price` a print
+    elects the sale, so only a print Alpaca's minute bars take may become a tick
+    (`AlpacaDataClientConfig.trade_condition_filter`); under `bid_ask` the data client's config is the
+    plain one it was (code-review-high-trig/1)."""
+    from canon_alpaca.data import AlpacaDataClientConfig
+    from nautilus_trader.config import DataClientConfig
+
+    configs = data_client_configs(monkeypatch)
+    ends = AT + timedelta(minutes=30)
+    node, _, _ = session_window.window_node(
+        WindowConfig(
+            symbol="LLL",
+            mover=True,
+            strategy="Mover",
+            session="extended",
+            log_dir=tmp_path,
+            trigger=trigger,
+        ),
+        wind_down_at=ends - timedelta(seconds=session_window.FLATTEN_SECS),
+        log_name=f"filter-{trigger}",
+        feed="sip",
+        part="after-hours",
+        pick=mover_pick(),
+        entry_notional=Decimal(500),
+        loss_share=PAPER_LOSS_SHARE,
+        ends=ends,
+    )
+    try:
+        [config] = configs
+        assert config.instrument_provider.load_all is True
+        if trigger == "last_price":
+            assert isinstance(config, AlpacaDataClientConfig)
+            assert config.trade_condition_filter is True
+        else:
+            assert type(config) is DataClientConfig
+    finally:
+        node.dispose()
+
+
+@pytest.mark.parametrize("trigger", ["bid_ask", "last_price"])
+def test_a_mover_windows_record_says_whether_the_trade_condition_filter_is_on(
+    monkeypatch, tmp_path, trigger: str
+) -> None:
+    monkeypatch.setattr(session_window, "window_data", lambda: Quoted())
+    monkeypatch.setattr(session_window, "choose_mover", lambda *a, **k: mover_pick())
+    outcome, latest, _ = quiet_window(
+        monkeypatch,
+        tmp_path,
+        quotes=1,
+        trades=0,
+        account=Assets(),
+        mover=True,
+        strategy="Mover",
+        trigger=trigger,
+    )
+    assert not isinstance(outcome, Exception), outcome
+    assert latest["mover"]["trade_condition_filter"] is (trigger == "last_price")
+    # a print trigger's open limits are named in its record, and only in its (xr3 fast reader, note 3)
+    named = set(latest["mover"].get("open_findings", ()))
+    assert (set(session_window.PRINT_TRIGGER_FINDINGS) <= named) is (trigger == "last_price")
+
+
+def test_a_print_trigger_on_a_part_off_the_sip_feed_is_refused_by_name(
+    monkeypatch, tmp_path
+) -> None:
+    """The filter's table is measured on sip prints only, and the adapter refuses a trade subscription
+    on any other feed with it on; a part that streams another feed refuses `last_price` before any
+    read, by name, instead of failing at the node's first subscription."""
+    monkeypatch.setitem(
+        session_window.MOVER_PARTS,
+        "after-hours",
+        replace(session_window.MOVER_PARTS["after-hours"], feed=DataFeed.BOATS.value),
+    )
+    monkeypatch.setattr(
+        session_window, "choose_mover", lambda *a, **k: pytest.fail("a mover was chosen")
+    )
+    with pytest.raises(session_window.WindowRefused, match="sip.*after-hours part streams boats"):
+        quiet_window(
+            monkeypatch,
+            tmp_path,
+            quotes=5,
+            trades=5,
+            account=Evening(17),
+            session="extended",
+            mover=True,
+            strategy="Mover",
+            trigger="last_price",
+        )
+
+
+def test_the_trigger_flag_is_refused_unless_mover_runs_and_reaches_only_its_parts(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    """`--trigger` is Mover's, as `--slots` are: refused when the arguments are read unless the run
+    names Mover or runs it outside the regular session with --mover, and under `--session auto` passed
+    only to a part that runs Mover; the regular part's SessionMaCross keeps the default
+    (code-review-high-trig/2)."""
+    with pytest.raises(SystemExit):
+        session_window._args(["--session", "regular", "--trigger", "last_price"])
+    assert "--trigger" in capsys.readouterr().err
+    for session in ("extended", "auto"):
+        args = session_window._args(["--session", session, "--mover", "--trigger", "last_price"])
+        assert args.trigger == "last_price"
+    seen = []
+
+    def window(config, **_kwargs):
+        seen.append((config.strategy, config.session, config.trigger))
+        raise session_window.WindowSkipped("the test stops here")
+
+    monkeypatch.setattr(session_window, "EXTENDED_READY", True)
+    monkeypatch.setattr(session_window, "run_window", window)
+    for hour, is_open, named in ((11, True, []), (11, True, ["Mover"]), (17, False, [])):
+
+        class At(Account):
+            def get_clock(self, _hour=hour, _is_open=is_open) -> Clock:
+                return clock(datetime(2026, 11, 10, _hour, 0, tzinfo=NEW_YORK), is_open=_is_open)
+
+        monkeypatch.setattr(session_window, "paper_trading", lambda _at=At: _at())
+        argv = ["--session", "auto", "--mover", "--trigger", "last_price"]
+        argv += ["--regular-strategy", *named] if named else []
+        assert session_window.main([*argv, "--log-dir", str(tmp_path)]) == 0
+    assert seen == [
+        (session_window.DEFAULT_STRATEGY, "regular", "bid_ask"),
+        ("Mover", "regular", "last_price"),
+        ("Mover", "extended", "last_price"),
+    ]
+
+
+def test_the_window_config_hands_its_trigger_to_movers_own_check(monkeypatch) -> None:
+    """`WindowConfig` checks its rows with `MoverConfig` and hands it the trigger, so a refusal of
+    Mover's that turns on the trigger fires when the window is configured; an unknown trigger name is
+    refused by the window, by name, before that check (code-review-high-trig/5)."""
+    real = session_window.MoverConfig
+    triggers: list = []
+
+    def check(**rows):
+        triggers.append(rows.get("trigger"))
+        return real(**rows)
+
+    monkeypatch.setattr(session_window, "MoverConfig", check)
+    WindowConfig(strategy="Mover", mover=True, trigger="last_price")
+    assert triggers == [TriggerType.LAST_PRICE]
+    triggers.clear()
+    with pytest.raises(
+        ValueError, match=re.escape("trigger must be one of ('bid_ask', 'last_price'), got 'mid'")
+    ):
+        WindowConfig(trigger="mid")
+    assert triggers == []
+
+
+def test_a_refused_windows_record_carries_the_trigger_its_config_had(monkeypatch, tmp_path) -> None:
+    """The record a refusal leaves names the trigger once the window's config was made
+    (code-review-high-trig/6)."""
+
+    def window(config, **_kwargs):
+        raise session_window.WindowRefused("the test refuses here")
+
+    monkeypatch.setattr(session_window, "run_window", window)
+    monkeypatch.setattr(session_window, "paper_account", lambda: "windows")
+    argv = ["--session", "extended", "--mover", "--trigger", "last_price"]
+    assert session_window.main([*argv, "--log-dir", str(tmp_path)]) == 1
+    latest = json.loads((tmp_path / "latest.json").read_text())
+    assert latest["result"] == "refused: the test refuses here"
+    assert latest["trigger"] == "last_price"
