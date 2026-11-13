@@ -345,3 +345,29 @@ def test_a_print_stamped_before_alpaca_accepted_the_entry_is_still_not_of_the_ho
     seam.orders["E-1"].ts_accepted = filled - SECOND
     last.append(stamped("10.0500", filled - SECOND - 1, filled))
     assert seam._followed(slot) is None
+
+
+def test_under_a_print_trigger_a_held_stop_counts_a_print_from_alpacas_acceptance_as_it_follows_one() -> (
+    None
+):
+    """Held at 9.80; between two steps a print through the stop arrives, stamped after Alpaca accepted
+    the entry but before its first fill, then one at 9.90. `_holding_trade` follows such a print, so the
+    hold's end counts it too and sells through the stop, not arming a trail from 9.90 (L6's note on the
+    late-prints port: `held_low` bounded on the fill alone)."""
+    seam, slot, filled, last = holding(TriggerType.LAST_PRICE, bid="9.89", ask="9.91")
+    seam.orders["E-1"].ts_accepted = filled - 500 * MS  # the 10.00 print below is before it
+    seam.slots, seam.trades = {slot.instrument_id: slot}, 0
+    last.append(stamped("10.0000", filled - SECOND, filled - SECOND))
+    seam._protect(slot, Decimal(3), filled + SECOND)
+    for price, at, seen in (
+        ("9.7000", filled - 200 * MS, filled + 2 * SECOND),
+        ("9.9000", filled + 2 * SECOND + 1, filled + 2 * SECOND + 1),
+    ):
+        trade = SimpleNamespace(
+            instrument_id=slot.instrument_id, price=Price.from_str(price), ts_event=at, ts_init=seen
+        )
+        last.append(trade)
+        seam.on_trade(trade)
+    seam._protect(slot, Decimal(3), filled + 3 * SECOND)
+    assert [o.kind for o in seam.sent] == ["LIMIT"] and slot.exiting
+    assert slot.exit_record.trigger_reason == "held stop (followed price)"

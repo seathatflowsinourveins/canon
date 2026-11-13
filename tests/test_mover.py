@@ -2877,6 +2877,7 @@ class Seam:
     _followed = Mover._followed
     _holding_trade = Mover._holding_trade
     _entry_filled_ns = Mover._entry_filled_ns
+    _holding_since = Mover._holding_since
     on_quote = Mover.on_quote
     on_trade = Mover.on_trade
     _limit_sell = Mover._limit_sell

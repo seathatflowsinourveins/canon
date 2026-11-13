@@ -2269,9 +2269,9 @@ class Mover(Strategy):
             and slot.held_since is not None
             and self.settings.trigger == TriggerType.LAST_PRICE
         ):
-            # a print of this holding (`_holding_trade`'s boundary) while its stop is held
-            filled = self._entry_filled_ns(slot)
-            if filled is None or int(trade.ts_event) >= filled:
+            # a print of this holding (`_holding_since`, as `_holding_trade`) while its stop is held
+            since = self._holding_since(slot)
+            if since is None or int(trade.ts_event) >= since:
                 price = trade.price.as_decimal()
                 slot.held_low = price if slot.held_low is None else min(slot.held_low, price)
         if self.persistence:
@@ -3908,13 +3908,20 @@ class Mover(Strategy):
         trade = self.cache.trade(slot.instrument_id)
         if trade is None:
             return None
+        since = self._holding_since(slot)
+        return trade if since is None or int(trade.ts_event) >= since else None
+
+    def _holding_since(self, slot: Slot) -> int | None:
+        """The venue time from which a print is of this holding: the earlier of Alpaca's acceptance of
+        the entry (`ts_accepted`) and its first fill on record, or None with no entry fill on record.
+        `_holding_trade` and the held stop's low (`on_trade`) both read it, so a print one follows the
+        other counts."""
         filled = self._entry_filled_ns(slot)
         if filled is None:
-            return trade
+            return None
         entry = self._order(slot.entry_id)
         accepted = None if entry is None else getattr(entry, "ts_accepted", None)
-        since = filled if accepted is None else min(filled, int(accepted))
-        return None if int(trade.ts_event) < since else trade
+        return filled if accepted is None else min(filled, int(accepted))
 
     def _entry_filled_ns(self, slot: Slot) -> int | None:
         """The venue's time of the entry's first fill on record, or None."""
