@@ -8,11 +8,11 @@ above holding flat at doubled costs, with a deflated Sharpe ratio of 0.95 or abo
 requirement's walk-forward wording is not what governs ([philosophy.md](philosophy.md)). This table is not
 the registry: "registry" here means `canon/upstreams.json`, the pinned upstreams.
 
-The strategy is to read its settings from these values, and a value missing here is unavailable, never
-defaulted; that reading is not yet built (roadmap step 7). A row whose source is "the owner's
+The strategy is to read its settings from these values, and a value missing from `rows/` is unavailable,
+never defaulted; that reading is not yet built (roadmap step 7). A row whose source is "the owner's
 requirement" rests on the requirement of 2026-11-11, an instruction and not evidence; where ADR 0083
 also states it, the row says so, and where it does not, no record holds it yet. `tests/test_handbook.py`
-checks the table's form: a unique name, a value, one of the two states, a source and an ISO date. ADR 0087,
+checks each row's form: a unique name, a value, one of the two states, a source and an ISO date. ADR 0087,
 0088, 0089, 0091, 0101 and 0106 are `proposed` as this page is written: a row citing one is what is built and
 on `main`, and open until the record is accepted.
 

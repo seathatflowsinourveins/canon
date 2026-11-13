@@ -223,7 +223,9 @@ def check_practices(text: str, steps: set[str]) -> list[str]:
 
 def row_fragments() -> list[Path]:
     """Every file under `rows/`, at any depth: `test_one_row_one_file` holds each to its shape."""
-    return sorted(path for path in ROWS.rglob("*") if path.is_file())
+    return sorted(
+        path for path in ROWS.rglob("*") if path.is_file() and not path.name.startswith(".")
+    )
 
 
 def row_cells(name: str) -> list[str]:
@@ -286,7 +288,7 @@ def test_one_row_one_file() -> None:
     one line: its table line. A row's table is its folder and its name is its file's slug."""
     fragments = row_fragments()
     assert fragments, "no row files under docs/handbook/rows/"
-    places: dict[str, set[int]] = {}
+    tables: set[str] = set()
     for path in fragments:
         assert path.parent.parent == ROWS, f"{path.relative_to(ROOT)} is not under one table folder"
         table = path.parent.name
@@ -300,11 +302,10 @@ def test_one_row_one_file() -> None:
         assert path.name == f"{path.name[:3]}-{name.lower().replace('_', '-')}.md", (
             f"{path.relative_to(ROOT)} does not name its row {name}"
         )
-        place = int(path.name[:3])
-        places.setdefault(table, set())
-        assert place not in places[table], f"{path.relative_to(ROOT)}: a second place {place}"
-        places[table].add(place)
-    assert sorted(places) == sorted(ROWS_TABLES), f"tables {sorted(places)}, expected {ROWS_TABLES}"
+        tables.add(table)
+    # A place orders a table and need not be unique: two units that take one free place still write
+    # two files, read in the order of their slugs, so neither has to renumber.
+    assert sorted(tables) == sorted(ROWS_TABLES), f"tables {sorted(tables)}, expected {ROWS_TABLES}"
 
 
 def test_rows_page_is_an_index_and_lists_no_row() -> None:
@@ -320,7 +321,10 @@ def test_rows_page_is_an_index_and_lists_no_row() -> None:
             assert ROW_SEPARATOR.fullmatch(after), (
                 f"line {index + 1}: the header has no separator row"
             )
-    assert [line for line in text.splitlines() if line.startswith("| `")] == []
+    tables = [index for index, line in enumerate(lines) if line == ROWS_HEADER]
+    kept = {index for start in tables for index in (start, start + 1)}
+    stray = [line for index, line in enumerate(lines) if "|" in line[:2] and index not in kept]
+    assert stray == [], f"rows.md holds a table line that is not a header or its separator: {stray}"
     for table in ROWS_TABLES:
         assert f"(rows/{table}/)" in text, f"rows.md points at nothing for {table}"
 
@@ -342,7 +346,7 @@ def test_two_row_adds_under_the_same_table_merge_clean(tmp_path: Path) -> None:
     adds: dict[str, Path] = {}
     for branch, name, row in (
         ("first-add", "480-first-add.md", "`FIRST_ADD`"),
-        ("second-add", "490-second-add.md", "`SECOND_ADD`"),
+        ("second-add", "480-second-add.md", "`SECOND_ADD`"),
     ):
         assert git_in(repo, "checkout", "--quiet", base).returncode == 0
         assert git_in(repo, "checkout", "--quiet", "-b", branch).returncode == 0
@@ -362,7 +366,9 @@ def test_two_row_adds_under_the_same_table_merge_clean(tmp_path: Path) -> None:
 
 def practice_fragments() -> list[Path]:
     """Every file under `practices/`, at any depth: `test_one_practice_one_file` holds each to its shape."""
-    return sorted(path for path in PRACTICES.rglob("*") if not path.is_dir())
+    return sorted(
+        path for path in PRACTICES.rglob("*") if path.is_file() and not path.name.startswith(".")
+    )
 
 
 def fragment_line(path: Path) -> str:
