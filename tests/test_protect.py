@@ -2078,7 +2078,8 @@ def test_a_long_bought_a_minute_before_the_close_gets_its_stop(capsys) -> None:
     _no_sale_open_or_cancel(paper)
 
 
-def test_under_one_sends_bound_to_the_close_the_run_reads_nothing_else(capsys) -> None:
+def test_under_one_sends_bound_to_the_close_the_run_reads_nothing_else(capsys, monkeypatch) -> None:
+    monkeypatch.setattr(protect, "monotonic", lambda: 0.0)  # no wall-clock time passes in the run
     margin = int(protect.SEND_MARGIN.total_seconds())
     close = NOW + timedelta(seconds=margin - 1)
     paper = Paper(positions=[_position("AAA", "10")], next_close=close.isoformat())
@@ -2089,14 +2090,61 @@ def test_under_one_sends_bound_to_the_close_the_run_reads_nothing_else(capsys) -
         positions=[_position("AAA", "10")],
         next_close=(NOW + timedelta(seconds=margin)).isoformat(),
     )
-    assert (
-        _run(at_margin, Data({"AAA": AAA_BOOK}), capsys)[0] != 3
-    )  # it starts; its send is checked
+    # exactly the margin is enough at the start and at the send: the stop goes out
+    assert _run(at_margin, Data({"AAA": AAA_BOOK}), capsys)[0] == 0
+    assert [r.symbol for r in at_margin.submitted] == ["AAA"]
     on_time = Paper(
         positions=[_position("AAA", "10")],
         next_close=(NOW + timedelta(seconds=margin + 2)).isoformat(),
     )
     assert _run(on_time, Data({"AAA": AAA_BOOK}), capsys)[0] == 0
+    assert [r.symbol for r in on_time.submitted] == ["AAA"]
+
+
+def test_the_clock_reads_own_wait_counts_against_the_close(capsys, monkeypatch) -> None:
+    """The clock's time is the server's when it answered: a read that took 10 s to come back leaves 10 s
+    less to the close than its stamp says, so the run counts from before it asked."""
+    passed = [0.0]
+    monkeypatch.setattr(protect, "monotonic", lambda: passed[0])
+    margin = int(protect.SEND_MARGIN.total_seconds())
+    paper = Paper(
+        positions=[_position("AAA", "10")],
+        next_close=(NOW + timedelta(seconds=margin + 5)).isoformat(),
+    )
+    original = paper.get_clock
+
+    def slow():
+        passed[0] += 10.0
+        return original()
+
+    paper.get_clock = slow  # type: ignore[method-assign]
+    code, lines = _run(paper, Data({"AAA": AAA_BOOK}), capsys)
+    assert code == 3 and not paper.submitted and paper.calls == [("get_clock", None)], lines
+    assert f"too near the close: {margin - 5} s to the close" in "\n".join(lines)
+
+
+def test_a_symbol_reached_after_the_margin_has_nothing_read_for_it(capsys, monkeypatch) -> None:
+    """Once less than one send's bound is left, a later symbol is named unprotected before its quote,
+    bars or orders are read: nothing it could read would be sent."""
+    passed = [0.0]
+    monkeypatch.setattr(protect, "monotonic", lambda: passed[0])
+    paper = Paper(
+        positions=[_position("AAA", "10"), _position("BBB", "5")],
+        next_close="2026-11-12T15:01:00Z",
+    )
+    original = paper.submit_order
+
+    def slow(order_data):
+        passed[0] += 40.5  # the first send took 40.5 s, leaving 19.5 s to the close
+        return original(order_data)
+
+    paper.submit_order = slow  # type: ignore[method-assign]
+    data = Data({"AAA": AAA_BOOK, "BBB": BBB_BOOK})
+    code, lines = _run(paper, data, capsys)
+    assert code == 2 and [r.symbol for r in paper.submitted] == ["AAA"]
+    assert not [a for a in data.asked if getattr(a[1], "symbol_or_symbols", None) == "BBB"]
+    (line,) = [x for x in lines if x.startswith("unprotected BBB:")]
+    assert "19 s to the close" in line  # whole seconds left, never rounded up
 
 
 def test_a_send_the_close_would_overtake_is_refused_by_name_and_not_sent(
