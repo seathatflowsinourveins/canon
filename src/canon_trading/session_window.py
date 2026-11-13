@@ -25,7 +25,20 @@ check's sources, ADR 0060), and the long-only sources 2026-11-11:
 * `crates/live/src/node/mod.rs` and `python/node.rs` at the pin (`d53849b216e2`): the node bounds each
   stage of its own stop (`delay_post_stop`, `timeout_disconnection`, `timeout_shutdown`), logs the one that
   ran out and goes on; cancelling the task awaiting `run_async` "requests the same graceful shutdown, waits
-  for it to finish", so neither a cancel nor `asyncio.run`'s exit can end a stop that hangs.
+  for it to finish", so neither a cancel nor `asyncio.run`'s exit can end a stop that hangs. Its
+  `run_async` doc: "The host owns the loop and its signal handling, so this installs no signal handlers".
+* CPython v3.14.10 at the pin (`b703b2c5e704`): `Doc/library/signal.rst:20-22`, SIGINT "is translated into
+  a KeyboardInterrupt exception if the parent process has not changed it", so a window started with
+  SIGINT ignored (as a non-interactive shell starts a command with `&`) keeps it ignored;
+  `Doc/library/asyncio-runner.rst:170-178`, `Runner.run` installs a SIGINT handler that cancels the main
+  task and then raises KeyboardInterrupt, which `Lib/asyncio/runners.py:112-113` does only on the main
+  thread and only when SIGINT's handler is `signal.default_int_handler`; Python's default for SIGTERM
+  ends the process with no `finally` run. `window_signals` therefore handles both for the whole window.
+* macOS `timeout(1)` (`man timeout`): "For any other signals delivered to timeout, it will propagate them
+  to command", to its whole process group; uv at its pin, `crates/uv-command-support/src/child.rs:117-122`,
+  forwards SIGTERM to its child, and SIGINT when stdin is not a terminal. So one TERM to the task reaches
+  this process two or three times; as in `custody.py:715-720` (`_stop`), a second signal is ignored, and
+  `paper:session`'s `bounded` forwards a stop to `timeout` and waits for it within its KILL deadline.
 * alpaca-py 0.45.0, `common/rest.py` (`RESTClient._request`, `_one_request`) and `common/constants.py`: a
   request answered 429 or 504 is sent again, `DEFAULT_RETRY_ATTEMPTS` (3) times, `DEFAULT_RETRY_WAIT_SECONDS`
   (3) apart; `TradingClient` does not pass `retry_attempts` on, and the constructor ignores anything under 1.
@@ -157,12 +170,14 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import functools
 import json
 import logging
 import math
 import os
 import re
+import signal
 import subprocess
 import sys
 import tempfile
@@ -311,8 +326,10 @@ from .session_ma_cross import through_the_touch
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from collections.abc import Generator
     from collections.abc import Mapping
     from collections.abc import Sequence
+    from types import FrameType
 
     from nautilus_trader.common import Cache
 
@@ -595,6 +612,13 @@ LAST_CLOSE_SECS = last_close_secs(PART_SLOTS)
 """`last_close_secs` with the most names a window holds (about 515 s)."""
 AFTER_END_SECS = after_end_secs(PART_SLOTS)
 """`after_end_secs` with the most names a window holds (about 755 s)."""
+STOP_GRACE_SECS = math.ceil(AFTER_END_SECS) + 30
+"""How long `mise run paper:session`'s `bounded()` waits, after it passes a stop on as SIGTERM, before it
+kills the window's process group (`stopgrace` in `mise.toml`, which a test holds to this): the wind-down
+after a stop at its longest (`AFTER_END_SECS`, which does not depend on the session part: 755 s with
+`PART_SLOTS` names in pre-market, regular, after-hours and overnight alike, 725 s with one), and 30 s for the
+record's write and the process's exit (UNCALIBRATED). A kill at it leaves the record `stopping`
+(`_WindowSignals`); the task's own deadline still kills at its time."""
 SKEW_SECS = 60
 """How far this host's clock may be from Alpaca's: the window runs to an end taken from Alpaca's clock, timed
 on this host's."""
@@ -606,6 +630,10 @@ PAPER_LOCK_WAIT_SECS = 3900
 `STREAM_LOCK_WAIT_SECS`; a window holds account B's, not that one, since 2026-11-11), and how long
 `mise run paper:test` waits for account A's lock (`lockwait` in `mise.toml`); no window takes that lock,
 since windows run on account B under their own (ADR 0069). Tests read both, so the three cannot drift."""
+REFERENCES_BEFORE_NODE_SECS = 120.0
+"""How long a Mover window waits, before its node is built, for the reference read started with the stream
+sample (UNCALIBRATED: the snapshot read measured about 45 s for the whole market on account A on
+2026-11-12, at 1.1 s a request of 400)."""
 START_UP_SECS = 30
 """The process's start before Alpaca's clock is first read (`uv run`, the imports)."""
 LONGEST_WINDOW_SECS = math.floor(
@@ -1176,15 +1204,17 @@ def subscriptions(run: Mapping[str, Any], feed: str, assets: object) -> list[dic
     ]
 
 
-def start_reference_read(trading: TradingClient, notes: list[str]) -> ReferenceReader:
+def start_reference_read(
+    trading: TradingClient, notes: list[str]
+) -> tuple[ReferenceReader, Future[ReferenceRead]]:
     """Start the rank actor's reference read for the whole market before the node exists, so it runs
     during the stream sample and the first generation does not wait for it (the owner's plan of
     2026-11-12, Wave 0 (b); measured at about 90 s for 14,406 symbols on 2026-11-12). The symbols are the
     assets the data client's `load_all` loads (one GET, `assets_request`'s default filter); the key is the
     actor's own (`reference_cutoff`, `trade_date`) for now. The read runs on its own thread with the
-    environment's pair, GET only (`alpaca_reference_reader`)."""
+    environment's pair, GET only (`alpaca_reference_reader`). Returns the actor's reader and the read
+    itself, which `references_before_node` waits for before the node is built."""
     import threading
-    from concurrent.futures import Future
 
     from canon_alpaca.providers import assets_request
 
@@ -1217,7 +1247,43 @@ def start_reference_read(trading: TradingClient, notes: list[str]) -> ReferenceR
 
     future.set_running_or_notify_cancel()
     threading.Thread(target=read, name="reference-pre-read", daemon=True).start()
-    return prefetched_reference_reader(future, symbols, key, notes)
+    return prefetched_reference_reader(future, symbols, key, notes), future
+
+
+def references_before_node(
+    read: Future[ReferenceRead] | None, notes: list[str], bound_secs: float
+) -> dict[str, object]:
+    """Wait at most `bound_secs` for the window's reference read, so the node starts with every reference
+    in (the lead's hold of 2026-11-12, item (i)), and return what the record carries: the read's wall time,
+    the names it asked for, those with a close and those left without one, when it came in and how long
+    the window waited. A read that did not start, failed, is not in within the bound or found no close
+    refuses the window by name before any node exists."""
+    if read is None:
+        raise WindowRefused(f"the reference read did not start ({'; '.join(notes)})")
+    began = time.monotonic()
+    try:  # `exception` raises TimeoutError only for the wait; a read that failed with one returns it
+        error = read.exception(timeout=bound_secs)
+    except TimeoutError:
+        raise WindowRefused(
+            f"the reference read was not in within {bound_secs:g} s of the node's start"
+        ) from None
+    if error is not None:
+        raise WindowRefused(
+            f"the reference read failed: {type(error).__name__}: {error}"
+        ) from error
+    done = read.result()
+    from .movers_rank_actor import reference_problem
+
+    # the actor's own test of a read, so the node never starts on one the actor would refuse and read again
+    # (code review of the snapshot read, finding 3)
+    if (problem := reference_problem(done)) is not None:
+        raise WindowRefused(f"the reference read is not usable: {problem}")
+    return {
+        **done.counts(),
+        "before_node": True,
+        "in_at": datetime.fromtimestamp(done.read_ns / 1e9, UTC).isoformat(timespec="milliseconds"),
+        "waited_secs": round(time.monotonic() - began, 2),
+    }
 
 
 def dollar_basis() -> dict[str, str]:
@@ -1610,6 +1676,11 @@ class StopTimedOut(RuntimeError):
     `main` then ends the process, since the node's task still runs and nothing can end it (module header)."""
 
 
+class WindowSignalled(KeyboardInterrupt):
+    """The window's node was stopped by a signal, SIGINT or SIGTERM, which the message names; raised as
+    an interrupt, so the window's `finally` checks the account and writes the record as for Ctrl-C."""
+
+
 _ABANDONED: list = []
 """A runner, the node's task and its worker calls (`Calls`) left after a stop timed out, held so neither
 the runner nor the task is collected (the hosted run would then drive its shutdown inline,
@@ -1648,14 +1719,34 @@ def write_record(
         report.result = f"failed: {type(snapshot_error).__name__}: {snapshot_error}"
         report.ended = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     _finish_request_measurement(report)
-    log_dir = records_dir(log_dir)
-    body = json.dumps(asdict(report) if isinstance(report, WindowReport) else report, indent=2)
     if isinstance(report, WindowReport):
-        write_atomically(log_dir / f"window-{report.started}.json", body)
-    write_atomically(log_dir / "latest.json", body)
+        signalled = _SIGNALS.first
+        _write_window_record(log_dir, report)
+        if _SIGNALS.first != signalled:  # the handler's mark came during this write, which is older
+            _write_window_record(log_dir, report)
+    else:
+        write_atomically(records_dir(log_dir) / "latest.json", json.dumps(report, indent=2))
     if snapshot_error is not None and not isinstance(snapshot_error, Exception):
         raise snapshot_error
     return snapshot_error
+
+
+def _write_window_record(log_dir: Path, report: WindowReport) -> None:
+    """`window-<stamp>.json` and `latest.json` for `report`, as `_shown_record` gives it; changes nothing in
+    `report`, so the signal handler may call it between any two steps of the main thread."""
+    log_dir = records_dir(log_dir)
+    body = json.dumps(_shown_record(report), indent=2)
+    write_atomically(log_dir / f"window-{report.started}.json", body)
+    write_atomically(log_dir / "latest.json", body)
+
+
+def _shown_record(report: WindowReport) -> dict:
+    """`report` as a record, with a still `running` result shown as stopping once a signal came, so after a
+    signal the record never reads `running` again (`_WindowSignals`)."""
+    fields = asdict(report)
+    if fields["result"] == "running" and _SIGNALS.first is not None:
+        fields["result"] = f"stopping: {_SIGNALS.first} received; the window has not finished"
+    return fields
 
 
 def _request_measurement_status(fields: dict, budget: dict) -> str:
@@ -2670,6 +2761,7 @@ def run_window(
     basis: str | None = None
     pick: MoverPick | None = None
     reference_reader: ReferenceReader | None = None
+    reference_read: Future[ReferenceRead] | None = None
     reference_notes: list[str] = []
     entry_contexts: dict[InstrumentId, Day] = {}
     allocation: MoverAllocation | None = None
@@ -2703,8 +2795,8 @@ def run_window(
             allocation = mover_allocation(
                 trading, row.slots if config.slots is None else config.slots
             )
-            try:  # a pre-read that cannot start is named, and the actor reads at its own call
-                reference_reader = start_reference_read(trading, reference_notes)
+            try:  # a pre-read that cannot start is named; `references_before_node` then refuses the window
+                reference_reader, reference_read = start_reference_read(trading, reference_notes)
             except Exception as e:  # noqa: BLE001
                 reference_notes.append(f"not pre-read: {type(e).__name__}: {e}")
         pick = choose_mover(
@@ -2855,6 +2947,10 @@ def run_window(
         overnight = "; ".join(overnight_said)  # re-checked name by name above
     else:
         overnight = "; ".join(overnight_eligibility(trading, symbol) for symbol in window_symbols)
+    if config.strategy == MOVER and config.mover:
+        mover["references"] = references_before_node(
+            reference_read, reference_notes, REFERENCES_BEFORE_NODE_SECS
+        )
 
     now = clock.timestamp.astimezone(NEW_YORK)
     seconds, shortened = window_seconds(config.minutes, (end_of_session - now).total_seconds())
@@ -2884,6 +2980,8 @@ def run_window(
             limit_per_minute=config.request_limit_per_minute,
         ),
     )
+    # from here a signal marks the record stopping at once, whether or not run_window's `finally` runs
+    _SIGNALS.record = (config.log_dir, report)
     initial_snapshot_error = write_record(config.log_dir, report)
     if initial_snapshot_error is not None:
         raise initial_snapshot_error  # the failed record is already on disk; no node was started
@@ -3030,6 +3128,7 @@ def run_window(
         _mark_request_interrupted(report, e)
         raise
     finally:
+        _SIGNALS.left_node()  # the wind-down, whether or not the node ran: a signal now is only noted
         try:
             _wait_for_calls(_ABANDONED[abandoned_before:], report)
             if cache is not None and len(_ABANDONED) > abandoned_before:
@@ -3099,8 +3198,15 @@ def run_window(
                     report.result = f"failed: {no_data}"
                 elif over_budget:
                     report.result = f"failed: {over_budget}"
+                elif _SIGNALS.first is not None:  # it came after the node: the wind-down finished
+                    report.result = (
+                        f"failed: WindowSignalled: {_SIGNALS.first} after the node stopped; "
+                        "the wind-down finished"
+                    )
                 else:
                     report.result = "ok"
+                if _SIGNALS.first is not None and "WindowSignalled" not in report.result:
+                    report.errors.append(f"{_SIGNALS.first} received; the wind-down finished")
             except BaseException as e:
                 failure = failure or e
                 _mark_request_interrupted(report, e)
@@ -4049,22 +4155,108 @@ def _wait_for_calls(abandoned: list, report: WindowReport) -> None:
         )
 
 
+class _WindowSignals:
+    """What SIGINT and SIGTERM do in a window (module header): the first is named in `first` and later
+    ones are ignored; before the node it raises `WindowSignalled`, while the node runs it cancels the
+    run's main task (whose `finally` asks the node to stop), and after the node it is only noted, so the
+    wind-down (flatten, account check, record) finishes and the record names it."""
+
+    def __init__(self) -> None:
+        self.first: str | None = None
+        self.phase = "before"
+        self.run: tuple[asyncio.AbstractEventLoop, asyncio.Task] | None = None
+        self.record: tuple[Path, WindowReport] | None = None
+
+    def handle(self, signum: int, frame: FrameType | None) -> None:
+        if self.first is not None:
+            return  # a forwarded copy, or a second stop: the first one's stop is under way
+        self.first = signal.Signals(signum).name
+        if self.record is not None and self.record[1].result == "running":
+            # never `running` again: a kill before the window's end leaves this mark. The report is not
+            # changed here, only a copy written (`_shown_record`); a result already set is left as it is.
+            try:
+                _write_window_record(*self.record)
+            except Exception as e:  # noqa: BLE001 - the stop goes on; said on stderr
+                print(f"paper:session: the stopping mark was not written: {e}", file=sys.stderr)
+        if self.phase == "node":
+            if self.run is not None:  # else the loop has not started yet: `enter_node` cancels
+                loop, task = self.run
+                loop.call_soon_threadsafe(self._cancel, task)
+        elif self.phase == "before":
+            raise WindowSignalled(f"stopped by {self.first}")
+
+    def enter_node(self, loop: asyncio.AbstractEventLoop, task: asyncio.Task) -> None:
+        self.phase, self.run = "node", (loop, task)
+        if self.first is not None:  # one came as the run started
+            task.cancel()
+
+    def _cancel(self, task: asyncio.Task) -> None:
+        if (
+            self.phase == "node"
+        ):  # not once the stop is under way: cancelling its wait would abandon it
+            task.cancel()
+
+    def node_starts(self) -> None:
+        """From before the node's loop runs: a signal is held for `enter_node`, never raised in the loop."""
+        self.phase, self.run = "node", None
+
+    def left_node(self) -> None:
+        self.phase, self.run = "after", None
+
+
+_SIGNALS = _WindowSignals()
+
+
+@contextlib.contextmanager
+def window_signals() -> Generator[None]:
+    """SIGINT and SIGTERM handled by `_SIGNALS` for the span, on the main thread only, where Python lets a
+    handler be set; the handlers found are put back after (one Python did not set, which `signal.signal`
+    returns as None, as the default). SIGINT gets a handler even when the window started with it
+    ignored, and `asyncio.Runner` then installs none of its own (module header)."""
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    _SIGNALS.__init__()
+    found = {s: signal.signal(s, _SIGNALS.handle) for s in (signal.SIGINT, signal.SIGTERM)}
+    try:
+        yield
+    finally:
+        for s, handler in found.items():
+            signal.signal(s, signal.SIG_DFL if handler is None else handler)
+        _SIGNALS.__init__()  # nothing of this window's signal reaches a later one in the process (review)
+
+
 def _run_node(node: LiveNode, ends: datetime) -> None:
     """`asyncio.run(_run_until(node, ends))`, except after a stop past `STOP_TIMEOUT_SECS`: closing the
     loop then would cancel the node's task and wait for the same stop, so the loop and the task are left
-    (`_ABANDONED`) and `StopTimedOut` raised."""
+    (`_ABANDONED`) and `StopTimedOut` raised. A signal while the node runs cancels the run
+    (`window_signals`), and the cancellation is raised as `WindowSignalled`, naming the signal."""
     runner = asyncio.Runner()
     calls = Calls()
     runner.get_loop().set_default_executor(calls)
     started: list[asyncio.Task] = []
+    _SIGNALS.node_starts()
     try:
         stuck = runner.run(_run_until(node, ends, started))
-    except BaseException:
-        if started and not started[0].done():  # interrupted (Ctrl-C) while the stop still runs
+    except BaseException as e:
+        _SIGNALS.left_node()
+        left = bool(started) and not started[0].done()
+        if (
+            left
+        ):  # interrupted (Ctrl-C), or a signal's stop past `STOP_TIMEOUT_SECS`: the stop still runs
             _abandon(runner, started[0], calls)
         else:  # the node ended with its own error: close as after a clean stop, raise that error
             _close_runner(runner, started[0] if started else None, calls)
+        if isinstance(e, asyncio.CancelledError) and _SIGNALS.first is not None:
+            why = f"stopped by {_SIGNALS.first}"
+            if left:
+                why += f"; the node did not stop within {STOP_TIMEOUT_SECS:g} s, left running"
+            elif started and not started[0].cancelled() and started[0].exception() is not None:
+                own = started[0].exception()
+                why += f"; the node's stop failed: {type(own).__name__}: {own}"
+            raise WindowSignalled(why) from e
         raise
+    _SIGNALS.left_node()
     if stuck is None:
         if not _close_runner(runner, started[0], calls):
             raise StopTimedOut(
@@ -4084,6 +4276,9 @@ async def _run_until(node: LiveNode, ends: datetime, started: list) -> asyncio.T
     task is also put in `started`, for the caller to see after an interrupt."""
     task = asyncio.ensure_future(node.run_async())
     started.append(task)
+    current = asyncio.current_task()
+    assert current is not None
+    _SIGNALS.enter_node(asyncio.get_running_loop(), current)
     try:
         # `ends` is a wall-clock time: read again every `END_TICK_SECS`, since the loop's own clock is
         # monotonic and stopped while the machine slept, which carried a window past its part (2026-11-11)
@@ -4096,6 +4291,7 @@ async def _run_until(node: LiveNode, ends: datetime, started: list) -> asyncio.T
                 break
             await asyncio.wait({task}, timeout=min(left, END_TICK_SECS))
     finally:
+        _SIGNALS.left_node()  # the stop is asked for here: a signal from now on is only noted
         if not task.done():
             node.handle().stop()
         await asyncio.wait({task}, timeout=STOP_TIMEOUT_SECS)
@@ -4261,7 +4457,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
     code = 1
     try:
-        code = _main(args)
+        with window_signals():
+            code = _main(args)
+            if (
+                _SIGNALS.first is not None
+            ):  # it came after the node: recorded failed, the wind-down finished
+                code = 128 + signal.Signals[_SIGNALS.first].value
+    except WindowSignalled as e:
+        # a stop: said, and the exit a shell gives for the signal (128 + its number)
+        print(f"paper:session: {e}", file=sys.stderr)
+        named = re.search(r"stopped by (SIG[A-Z]+)", str(e))
+        code = 128 + signal.Signals[named.group(1)].value if named else 1
+        if _ABANDONED:
+            try:
+                write_heartbeat(args.log_dir, f"failed: {type(e).__name__}: {e}")
+            except OSError:
+                pass
     except BaseException as e:
         if not _ABANDONED:
             raise

@@ -289,7 +289,9 @@ def test_real_engine_events_reach_the_protection_record_without_changing_orders(
 
 
 @pytest.mark.parametrize("broken", [False, True])
-def test_window_records_protection_and_names_a_diagnostic_failure(monkeypatch, tmp_path, broken):
+def test_window_records_protection_and_names_a_diagnostic_failure(
+    monkeypatch, tmp_path, broken, references_in
+):
     from canon_trading import session_window
     from tests.test_session_window import Assets
     from tests.test_session_window import Quoted

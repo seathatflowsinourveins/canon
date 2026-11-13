@@ -538,6 +538,12 @@ paper running 600; status; rc=$?
 check "paper window running for 10 minutes: ok"   eval 'rowis "$TMP/status.out" "paper session" ok && [ "$rc" = 0 ]'
 paper running $((75 * 60)); status; rc=$?
 check "paper window running after 75 minutes: DIED, exit 1" eval 'rowis "$TMP/status.out" "paper session" DIED && [ "$rc" != 0 ]'
+# a signal, then a kill before the wind-down finished, leaves the record `stopping` (session_window._shown_record)
+paper "stopping: SIGTERM received; the window has not finished" 600; status; rc=$?
+check "paper window stopping for 10 minutes (a signal, its wind-down under way): ok" eval 'rowis "$TMP/status.out" "paper session" ok && [ "$rc" = 0 ]'
+paper "stopping: SIGTERM received; the window has not finished" $((75 * 60)); status; rc=$?
+check "... still stopping after 75 minutes: DIED, exit 1, the wind-down cut short and the account maybe not flat" \
+      eval 'rowis "$TMP/status.out" "paper session" DIED && [ "$rc" != 0 ] && grep -q "the wind-down was cut short" "$TMP/status.out"'
 # a window killed in mid-run, then a later firing that ran under the paper lock and found nothing to run
 paper running 1200; heartbeat 60 "nothing to run: the regular session is closed"; status; rc=$?
 check "a running record older than a later run's heartbeat (that run held the paper lock): DIED, exit 1, the account maybe not flat" \
@@ -1713,9 +1719,9 @@ check "mise.gateway.toml installs omniroute at the registry's pin ($gwv, ${gwpin
       eval '[ -n "$gwv" ] && [ "tag:v$gwv" = "$gwpin" ] && grep -q "version = \"$gwv\"" "$ROOT/mise.gateway.lock"'
 check "... and a plain mise.toml installs no gateway" eval '! grep -q "omniroute" "$ROOT/mise.toml"'
 # every keychain service mise.toml's paper tasks name is one the bootstrap rows look up, and both are named
-# (ADR 0029, ADR 0069) (timeout(1)'s own `-s KILL` names a signal, not a service)
+# (ADR 0029, ADR 0069) (timeout(1)'s and kill(1)'s own `-s KILL` name a signal, not a service)
 paper_names() {
-  grep -vE 'timeout(\(1\))? -s ' "$ROOT/mise.toml" | grep -oE '(-s |svc=)[A-Za-z0-9"$_-]+' | sed -E 's/^(-s |svc=)//' | grep -vxF -e '"$svc"' -e '"$other"'
+  grep -vE '(timeout(\(1\))?|kill) -s ' "$ROOT/mise.toml" | grep -oE '(-s |svc=)[A-Za-z0-9"$_-]+' | sed -E 's/^(-s |svc=)//' | grep -vxF -e '"$svc"' -e '"$other"'
   grep -oE 'others="[^"]*"' "$ROOT/mise.toml" | sed -E 's/^others="//; s/"$//' | tr ' ' '\n'   # paper:store's two other services
 }
 # shellcheck disable=SC2034  # read by the eval'd check below

@@ -34,10 +34,15 @@ What it reads, and from whom:
   through alpaca-py 0.45.0 (`alpaca-py@c42add7c0a70`), on a client whose session refuses every method but
   GET in data-only mode and has the adapter's timeout (`canon_alpaca.providers.with_http_timeout`,
   `require_get_only`), in a worker thread, never on the event loop:
-  `StockHistoricalDataClient.get_stock_bars(StockBarsRequest(timeframe=TimeFrame.Day,
-  adjustment=Adjustment.SPLIT, feed=DataFeed.SIP))` for the latest completed regular close of each symbol
-  ("Historical bars": "`split`: adjust price and volume for forward and reverse stock splits", default
-  `raw`), and `CorporateActionsClient.get_corporate_actions(CorporateActionsRequest(types=[forward_split,
+  `StockHistoricalDataClient.get_stock_snapshot(StockSnapshotRequest(feed=DataFeed.SIP))` for the latest
+  completed regular close of each symbol ("Snapshots", https://docs.alpaca.markets/us/reference/stocksnapshots-1.md:
+  "the latest trade, latest quote, latest minute bar, current daily bar and previous daily bar"; of the two
+  daily bars the latest dated before the cutoff is the reference; the lead's ruling of 2026-11-12, measured
+  at about 1.2 s a request of 400 against 18 to 27 s for 500 symbols of daily bars). Which daily bar is
+  "current" before the regular open is UNVERIFIED (stocksnapshots-1.md:260 says no more); taking the
+  latest of the two dated before the cutoff is right either way, and the first pre-market read settles
+  it. The snapshot's bars are not split-adjusted; a split since the reference session is caught by the
+  split filter below, as before. And `CorporateActionsClient.get_corporate_actions(CorporateActionsRequest(types=[forward_split,
   reverse_split], start, end))` for the splits since. They are read at start, again when the trade date
   rolls at 20:00 New York, and retried on the next tick when a read failed or came back unusable. The
   reference is always a session before the trade date (`movers_rank.rank` refuses anything else), so the
@@ -64,10 +69,10 @@ Each tick's outcome is one log line, `movers-rank record {json}`, with the laten
 and stay null here.
 
 Rows, all UNCALIBRATED: `PUBLISH_INTERVAL_SECS`, `PUBLISH_OFFSET_SECS`, `MAX_DATA_AGE_SECS`,
-`REFERENCE_LOOKBACK_DAYS`, `REFERENCE_READ_BOUND_SECS`, `PRE_READ_WAIT_SECS`. `REF_BATCH` and
+`REFERENCE_READ_BOUND_SECS`, `PRE_READ_WAIT_SECS`, `SNAPSHOT_TRIES`. `REF_BATCH` and
 `UNUSABLE_READS_REFUSED` are choices, not documented limits.
 
-Each reference read says what it did as it happens: every daily-bars batch and the splits read write one
+Each reference read says what it did as it happens: every snapshot request and the splits read write one
 line each from the read's own thread (`READ_LOG`), with the time, the duration and the outcome; each
 attempt's outcome is a `movers-rank reference read {json}` line at the first tick that sees it finished,
 and every record names the attempt in flight, the last attempt's failure, an attempt past
@@ -93,20 +98,19 @@ from datetime import time
 from datetime import timedelta
 from pathlib import Path
 from time import monotonic
+from time import sleep
 from time import time_ns
 from typing import TYPE_CHECKING
 from typing import Protocol
 from zoneinfo import ZoneInfo
 
-from alpaca.data.enums import Adjustment
 from alpaca.data.enums import CorporateActionsType
 from alpaca.data.enums import DataFeed
 from alpaca.data.historical.corporate_actions import CorporateActionsClient
 from alpaca.data.historical.stock import StockHistoricalDataClient
-from alpaca.data.models import BarSet
+from alpaca.data.models.snapshots import Snapshot
 from alpaca.data.requests import CorporateActionsRequest
-from alpaca.data.requests import StockBarsRequest
-from alpaca.data.timeframe import TimeFrame
+from alpaca.data.requests import StockSnapshotRequest
 from canon_alpaca.constants import VENUE
 from canon_alpaca.providers import credentials_from_env
 from canon_alpaca.providers import require_get_only
@@ -140,10 +144,19 @@ MAX_DATA_AGE_SECS = movers_rank.MAX_DATA_AGE_SECS
 """Default maximum age of each name's latest bar and of a generation's latest bar (UNCALIBRATED)."""
 TRADE_DATE_ROLL = time(20, 0)
 """A trade date's bars open in [the day before at 20:00, the day at 20:00) New York (`movers_rank`)."""
+REF_BATCH = 400
+"""Symbols a snapshot request names (a choice, the movers recorder's on account A; Alpaca documents no
+limit on `symbols`)."""
+SNAPSHOT_TRIES = 3
+"""Attempts at one snapshot request before the read fails by name (the lead's ruling of 2026-11-12: a
+failed request is retried alone, a bounded number of times, and never restarts the read)."""
+SNAPSHOT_RETRY_SECS = 1.0
+"""The wait before a failed snapshot request is asked again (UNCALIBRATED)."""
 REFERENCE_LOOKBACK_DAYS = 10
-"""Calendar days of daily bars read for each symbol's latest completed regular close (UNCALIBRATED)."""
-REF_BATCH = 500
-"""Symbols a daily-bars request names (a choice: the page's limit is on data points, 10,000)."""
+"""How old, in calendar days before the cutoff, a snapshot's daily bar may be and still give a reference
+(UNCALIBRATED; the bound the daily-bars read had): a name whose latest bar is older, one halted or not
+traded for weeks, is left without a reference, so its move is never measured from a stale close and the
+splits read starts no earlier than this (code review of the snapshot read, finding 2)."""
 REFERENCE_READ_BOUND_SECS = 300.0
 """How long one attempt at the references and splits may run before every record names it as unread by
 this bound, rather than "not read yet" (UNCALIBRATED; the whole market's pre-read took about 90 s on
@@ -191,6 +204,20 @@ class ReferenceRead:
     references: Mapping[str, movers_rank.Reference]
     splits: movers_rank.SplitRead | None
     read_ns: int
+    asked: int | None = None
+    """The names the read asked for, when the reader counts them."""
+    wall_secs: float | None = None
+    """The read's wall time, references and splits, when the reader times it."""
+
+    def counts(self) -> dict[str, object]:
+        """The read's wall time and its three counts, for a record (the lead's ruling of 2026-11-12)."""
+        with_close = len(self.references)
+        return {
+            "wall_secs": None if self.wall_secs is None else round(self.wall_secs, 2),
+            "names_asked": self.asked,
+            "with_close": with_close,
+            "without_close": None if self.asked is None else self.asked - with_close,
+        }
 
 
 def reference_problem(read: ReferenceRead) -> str | None:
@@ -472,6 +499,15 @@ class MoversRankActor(DataActor):
         # bounded, so a whole-market universe keeps each minute's record small
         record["stale_symbols"] = stale[:STALE_NAMED]
         record["stale_count"] = len(stale)
+        # a split since the reference session: the snapshot's close is not adjusted, so the name is left
+        # out by movers_rank's filter, named and counted here (the lead's ruling (1) of 2026-11-12)
+        split = [
+            r.instrument_id.symbol.value
+            for r in generation.rows
+            if "corporate_action" in r.excluded_by
+        ]
+        record["corporate_action_symbols"] = split[:STALE_NAMED]
+        record["corporate_action_count"] = len(split)
         record["assets"] = len(self._assets)
         record["bars"] = self.bars_received
         record["references_read_ns"] = refs.read_ns
@@ -797,10 +833,11 @@ def prefetched_reference_reader(
 
 
 def alpaca_reference_reader(symbols: Sequence[str], cutoff: date, session: date) -> ReferenceRead:
-    """Each symbol's latest completed regular close before `cutoff` from Alpaca's split-adjusted daily
-    `sip` bars, and the forward and reverse splits from the earliest of those closes to `session`, on
-    GET-only clients built from the environment's pair. Runs on the actor's worker thread, or the window's
-    pre-read thread, and logs each batch from there (`read_log`)."""
+    """Each symbol's latest completed regular close before `cutoff` from Alpaca's `sip` snapshots, and the
+    forward and reverse splits from the earliest of those closes to `session`, on GET-only clients built
+    from the environment's pair, with the read's wall time and the names it asked for. Runs on the actor's
+    worker thread, or the window's pre-read thread, and logs each request from there (`read_log`)."""
+    began = monotonic()
     api_key, secret_key = credentials_from_env()
     bars = with_http_timeout(StockHistoricalDataClient(api_key=api_key, secret_key=secret_key))
     actions = with_http_timeout(CorporateActionsClient(api_key=api_key, secret_key=secret_key))
@@ -812,11 +849,13 @@ def alpaca_reference_reader(symbols: Sequence[str], cutoff: date, session: date)
         references=references,
         splits=read_splits(actions, references, session, log=log),
         read_ns=time_ns(),
+        asked=len(symbols),
+        wall_secs=monotonic() - began,
     )
 
 
-class DailyBars(Protocol):
-    def get_stock_bars(self, request_params: StockBarsRequest) -> object: ...
+class Snapshots(Protocol):
+    def get_stock_snapshot(self, request_params: StockSnapshotRequest) -> object: ...
 
 
 class CorporateActions(Protocol):
@@ -838,56 +877,85 @@ def read_log() -> Callable[[str], None]:
 
 
 def read_references(
-    client: DailyBars,
+    client: Snapshots,
     symbols: Sequence[str],
     cutoff: date,
     log: Callable[[str], None] | None = None,
+    pause: Callable[[float], None] = sleep,
 ) -> dict[str, movers_rank.Reference]:
-    """Each symbol's split-adjusted daily close of the latest New York date before `cutoff` within
-    `REFERENCE_LOOKBACK_DAYS`; a symbol with none is left out, so unknown. `log` is handed one line a
-    batch as it ends: its number, the time, its symbols, how many had a close, and its duration, or the
-    error it failed with, which is raised."""
-    start = datetime.combine(cutoff - timedelta(days=REFERENCE_LOOKBACK_DAYS), time(0), NEW_YORK)
-    end = datetime.combine(cutoff, time(0), NEW_YORK) - timedelta(microseconds=1)
+    """Each symbol's close of the latest of its snapshot's two daily bars (`dailyBar`, `prevDailyBar`)
+    dated, in New York, before `cutoff`; a symbol with neither is left out, so unknown. `REF_BATCH`
+    symbols a request, on `sip`; a bar older than `REFERENCE_LOOKBACK_DAYS` before the cutoff, or a close of
+    zero or less, gives none. A request that fails transiently (`_transient`) is asked again alone after
+    `SNAPSHOT_RETRY_SECS`, up to `SNAPSHOT_TRIES` attempts, any other failure at once; the last failure is
+    raised, and the requests before it are not asked
+    again. `log` is handed one line a request as it ends: its number, the attempt, the time, its symbols,
+    how many had a close, and its duration, or the error it failed with."""
     found: dict[str, movers_rank.Reference] = {}
+    oldest = cutoff - timedelta(days=REFERENCE_LOOKBACK_DAYS)
     batches = math.ceil(len(symbols) / REF_BATCH)
     for n, i in enumerate(range(0, len(symbols), REF_BATCH), start=1):
         batch = list(symbols[i : i + REF_BATCH])
-        began = monotonic()
-        try:
-            result = client.get_stock_bars(
-                StockBarsRequest(
-                    symbol_or_symbols=batch,
-                    timeframe=TimeFrame.Day,
-                    start=start,
-                    end=end,
-                    adjustment=Adjustment.SPLIT,
-                    feed=DataFeed.SIP,
+        for attempt in range(1, SNAPSHOT_TRIES + 1):
+            began = monotonic()
+            try:
+                result = client.get_stock_snapshot(
+                    StockSnapshotRequest(symbol_or_symbols=batch, feed=DataFeed.SIP)
                 )
+            except Exception as error:
+                transient = _transient(error)
+                if log is not None:
+                    log(
+                        f"reference batch {n}/{batches} attempt {attempt}/{SNAPSHOT_TRIES} "
+                        f"{_iso(time_ns())} {len(batch)} symbols failed after "
+                        f"{monotonic() - began:.2f} s: {type(error).__name__}: {error}"
+                    )
+                if attempt == SNAPSHOT_TRIES or not transient:
+                    raise
+                pause(SNAPSHOT_RETRY_SECS)
+                continue
+            break
+        if not isinstance(result, dict) or not all(
+            isinstance(v, Snapshot) for v in result.values()
+        ):
+            raise TypeError(
+                "alpaca-py returned raw snapshot data; the client must use raw_data=False"
             )
-        except Exception as error:
-            if log is not None:
-                log(
-                    f"reference batch {n}/{batches} {_iso(time_ns())} {len(batch)} symbols failed "
-                    f"after {monotonic() - began:.2f} s: {type(error).__name__}: {error}"
-                )
-            raise
-        if not isinstance(result, BarSet):
-            raise TypeError("alpaca-py returned raw bar data; the client must use raw_data=False")
         before = len(found)
-        for symbol, daily in result.data.items():
-            done = [b for b in daily if b.timestamp.astimezone(NEW_YORK).date() < cutoff]
-            if done:
-                last = max(done, key=lambda b: b.timestamp)
+        for symbol, snapshot in result.items():
+            daily = [
+                bar
+                for bar in (snapshot.daily_bar, snapshot.previous_daily_bar)
+                if bar is not None and oldest <= bar.timestamp.astimezone(NEW_YORK).date() < cutoff
+            ]
+            # a close of zero or less is no reference (movers_stream.reference_close's rule)
+            if daily and max(daily, key=lambda b: b.timestamp).close > 0:
+                last = max(daily, key=lambda b: b.timestamp)
                 found[symbol] = movers_rank.Reference(
                     close=last.close, session=last.timestamp.astimezone(NEW_YORK).date()
                 )
         if log is not None:
             log(
-                f"reference batch {n}/{batches} {_iso(time_ns())} {len(batch)} symbols, "
-                f"{len(found) - before} with a close, {monotonic() - began:.2f} s"
+                f"reference batch {n}/{batches} attempt {attempt}/{SNAPSHOT_TRIES} {_iso(time_ns())} "
+                f"{len(batch)} symbols, {len(found) - before} with a close, {monotonic() - began:.2f} s"
             )
     return found
+
+
+def _transient(error: BaseException) -> bool:
+    """Whether a failed snapshot request may succeed if asked again: a 429 or a 5xx from Alpaca (alpaca-py's
+    `APIError.status_code`, `alpaca/common/exceptions.py`, which has already retried 429 and 504 itself), or
+    the connection or its timeout (`requests` and the OS); a 4xx other than 429, or a request alpaca-py
+    refused, is not, and is raised at once (code review of the snapshot read, finding 8)."""
+    import requests
+    from alpaca.common.exceptions import APIError
+
+    if isinstance(error, APIError):
+        status = error.status_code
+        return status is None or status == 429 or status >= 500
+    return isinstance(
+        error, (requests.ConnectionError, requests.Timeout, TimeoutError, ConnectionError)
+    )
 
 
 def read_splits(
