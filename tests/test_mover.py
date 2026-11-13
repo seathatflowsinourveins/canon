@@ -2538,6 +2538,8 @@ class Borrowed:
         self.trades = 0
         self.persistence = False
         self.slots: dict = {}
+        self.late_prints: dict = {}
+        self.prints_ahead: dict = {}
         self.opening_states: dict = {}
         self.opening_outcomes: dict = {}
         self.sale_rows: dict = {}
@@ -2894,6 +2896,7 @@ class Seam:
     _held_anchor = Mover._held_anchor
     _last_known = Mover._last_known
     _last_print = Mover._last_print
+    _newest_trade = Mover._newest_trade
     _position_average = Mover._position_average
     _entry_trail = Mover._entry_trail
     _cold_plan = Mover._cold_plan
@@ -2925,6 +2928,8 @@ class Seam:
         self.sell_triggers: dict[str, str] = {}
         self.protection_fallbacks = {"position average price": 0, "current bid": 0}
         self.protect_paths = {"held_stop": 0, "unpriced_exit": 0, "trail": 0}
+        self.late_prints: dict[str, dict[str, Any]] = {}
+        self.prints_ahead: dict[str, int] = {}
         self.fills: list = []
         self.recent = 0
         self.baseline_dollar_volume_per_minute: dict = {}

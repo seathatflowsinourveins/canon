@@ -2056,6 +2056,15 @@ def _mark_request_interrupted(report: WindowReport, error: BaseException) -> Non
         report.request_budget["measurement_status"] = "interrupted"
 
 
+def clock_notes(run: dict[str, Any]) -> dict[str, Any]:
+    """Report Mover prints whose venue times exceeded the ahead-of-receipt bound, when any did.
+    These prints could not be ordered; the count names the clock discrepancy beside the run."""
+    ahead = run.get("prints_stamped_ahead") or {}
+    return (
+        {"prints_stamped_ahead": dict(ahead)} if any(count > 0 for count in ahead.values()) else {}
+    )
+
+
 def write_heartbeat(log_dir: Path, outcome: str) -> None:
     """Write `last-firing.json` on every run, a window or not, a run by hand included: status shows its
     outcome, and `scheduled` says whether the schedule started it (`SCHEDULED_ENV`, or the runner's
@@ -3316,6 +3325,7 @@ def run_window(
                     }
                 if isinstance(strategy, Mover):
                     report.mover["run"] = run = strategy.record()
+                    report.mover.update(clock_notes(run))
                     try:  # the lead's order of 2026-11-11; one that cannot be read is named
                         result_inputs = (
                             strategy_fills(cache, strategy_id),
