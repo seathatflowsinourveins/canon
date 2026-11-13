@@ -4,13 +4,26 @@
 # the top of that file, where TOML keeps keys that belong to no table, and changes nothing else in it; a
 # setting the file already has with another value is left as it is and named. A setting is a top-level key,
 # or one entry of a top-level table (permissions.canon-worker is one setting, written as an inline table).
-# Keys, https://learn.chatgpt.com/docs/config-file/config-reference: `model` ("Model to use (e.g.,
+# Keys, https://learn.chatgpt.com/docs/config-file/config-reference: `model` (the reference's own example: "Model to use (e.g.,
 # gpt-6.1-sol)") and `model_reasoning_effort` ("Reasoning effort advertised by the selected model"). The
-# values are the ones ADR 0045 rule 7 starts every Codex review with (`--model gpt-6.1-sol --effort max`), so a
-# session started with no flags runs the same; canon/models.json's runtimes section names them and
-# scripts/test-lanes holds the two together.
-model = "gpt-6.1-sol"
+# values are the most capable model Codex offers at `max` (ADR 0059 rule 4, ADR 0045 rule 7: `--model
+# gpt-6-astra --effort max`), so a session started with no flags runs the same; canon/models.json's runtimes
+# section names them and scripts/test-lanes holds the two together.
+model = "gpt-6-astra"
 model_reasoning_effort = "max"
+# ADR 0005, Codex service tier: standard unless a dispatch asks for Fast. `default` is Codex's sentinel for
+# "the user intentionally selected no service tier, so model catalog defaults should not apply"
+# (SERVICE_TIER_DEFAULT_REQUEST_VALUE, codex-rs/protocol/src/config_types.rs at the pin); it is left out of
+# the request itself (service_tier_for_request, codex-rs/protocol/src/openai_models.rs). A
+# dispatch a lane or a firing waits on gets Fast from `service_tier = "fast"` in its own workspace's
+# .codex/config.toml, a project layer that ranks above this file (ADR 0005); .gitignore keeps it out of git.
+service_tier = "default"
+# ADR 0005: no "Approaching rate limits" prompt. At 90% of a usage window the TUI offers "Switch to
+# gpt-6-luna" as its first, preselected item, which an Enter sent to a worker's terminal accepts, moving
+# the session to Luna at Luna's default effort (codex-rs/tui/src/chatwidget/rate_limits.rs at the pin).
+# `[notice] hide_rate_limit_model_nudge` is the key "Keep current model (never show again)" writes
+# (codex-rs/core/src/config/edit.rs).
+notice.hide_rate_limit_model_nudge = true
 # ADR 0034 rule 1 (https://learn.chatgpt.com/docs/permissions): `approval_policy = "never"` (a refused command
 # fails and the model carries on), and a profile that extends the built-in `:workspace` with the `/tmp` folder
 # read-only (`:slash_tmp`) and Codex's sign-in file denied, made the default with `default_permissions`.

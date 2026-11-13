@@ -74,11 +74,16 @@
   "runtimes": [
     {
       "runtime": "codex",
-      "model": "gpt-6.1-sol",
+      "read_at": "2026-11-12",
+      "model": "gpt-6-astra",
+      "model_rule": "the most capable model Codex offers, at an effort of at least high (the owner's standing instruction, 2026-11-12; ADR 0059 rule 4)",
       "effort": "max",
-      "set_in": "${CODEX_HOME:-~/.codex}/config.toml (model, model_reasoning_effort)",
+      "service_tier": "default",
+      "service_tier_rule": "standard by default; fast for a dispatch a lane, a fix round or a firing waits on, stated by service_tier = \"fast\" in that worker's workspace .codex/config.toml (ADR 0005)",
+      "rate_limit_model_nudge": "off: notice.hide_rate_limit_model_nudge = true (ADR 0005)",
+      "set_in": "${CODEX_HOME:-~/.codex}/config.toml (model, model_reasoning_effort, service_tier, notice.hide_rate_limit_model_nudge)",
       "template": "home/.codex/defaults.toml",
-      "checked_by": "scripts/bootstrap --check, row codex defaults"
+      "checked_by": "scripts/bootstrap --check, rows codex defaults and codex service tier (MISMATCH or NOT SET fails the check); scripts/lanes --rates flags a conversation on another model (OFF-MODEL)"
     },
     {
       "runtime": "antigravity",

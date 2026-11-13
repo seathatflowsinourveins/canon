@@ -554,8 +554,12 @@ proc_list() {
 
 # rates_report -> one JSON object on stdout
 rates_report() {
-  local now otlp t base rc=0 present=false
+  local now otlp t base rc=0 present=false reg
   now=$(date -u +%s)
+  # the model canon/models.json registers for Codex (ADR 0059 rule 4), from the repository this copy runs in;
+  # empty when there is none (the installed copy under the Claude config folder), and then nothing is flagged
+  reg=$(jq -r '[.runtimes[]? | select(.runtime == "codex") | .model // empty] | first // empty' \
+        "${CANON_MODELS_FILE:-$(dirname "$0")/../canon/models.json}" 2>/dev/null) || reg=""
   otlp="${CANON_OTLP_FILE:-$CFG/otel/logs.jsonl}"
   t=$(mktemp -d) || return 1
   base=$(build_report 2>"$t/ledger.err") || rc=$?
@@ -577,7 +581,7 @@ rates_report() {
   fi
   proc_list | jq -R 'split("\t") | {pid: .[0], etime: .[1], rt: .[2], cwd: (.[3] // "")}' | jq -s . > "$t/procs" \
     || { rm -rf "$t"; echo "lanes: ERROR: could not list processes" >&2; return 1; }
-  jq -n --argjson now "$now" --argjson win "$WINDOW" --arg otlp "$otlp" --argjson present "$present" \
+  jq -n --argjson now "$now" --argjson win "$WINDOW" --arg otlp "$otlp" --argjson present "$present" --arg reg "$reg" \
      --argjson ledger "$([ "$rc" = 0 ] && echo true || echo false)" --rawfile ledger_err "$t/ledger.err" \
      --argjson have_lsof "$(command -v lsof >/dev/null 2>&1 && echo true || echo false)" \
      --slurpfile base "$t/base" --slurpfile rec "$t/otlp" --slurpfile procs "$t/procs" '
@@ -596,12 +600,13 @@ rates_report() {
         | {out_tokens: $out, tok_s: (($out / ($win * 60)) | r2),
            gen_tok_s: (if $dur != null then ((($timed | map(.out // 0) | add) / ($dur / 1000)) | r2) else null end),
            spend_window_usd: ($m | map(.cost // empty) | if length > 0 then add | r4 else null end),
-           measured: true, note: "", model_seen: ($m | map(.model // empty) | last)}
+           measured: true, note: "", model_seen: ($m | map(.model // empty) | last),
+           models_seen: ($m | map(.model // empty) | unique)}
         # events with no token count (a cost-only turn, a completion with no usage) are not a measured zero
         | if $counted > 0 then . else . + {out_tokens: null, tok_s: null, gen_tok_s: null, measured: false,
             note: "not measured: no event in the window carries an output token count"} end;
       def unmeasured($why): {out_tokens: null, tok_s: null, gen_tok_s: null, spend_window_usd: null,
-                             measured: false, note: ("not measured: " + $why), model_seen: null};
+                             measured: false, note: ("not measured: " + $why), model_seen: null, models_seen: []};
     ($r | map(select(.rt == "codex")) | length > 0) as $codex_otlp
     | {
         generated_at: ($now | todate),
@@ -624,12 +629,20 @@ rates_report() {
                elif $seen[$s.sid] then measure("claude-code"; $s.sid)
                else unmeasured("this session sent no api_request event to the OTLP file (telemetry not enabled for it)") end) as $m
             | {lane: $s.lane, runtime: "claude-code", model: ($m.model_seen // $s.model), state: $s.state,
-               id: $s.sid, spend_session_usd: $s.cost_usd} + ($m | del(.model_seen)) ),
+               id: $s.sid, spend_session_usd: $s.cost_usd} + ($m | del(.model_seen, .models_seen)) ),
           ( $w | map(select(.rt == "codex")) | group_by(.sid)[] | .[0].sid as $sid
             | measure("codex"; $sid) as $m
+            # any turn in the window on another model marks it, not only the last (ADR 0005: a build any part
+            # of which ran on another model is labelled)
+            | ([($m.models_seen // [])[] | select(. != $reg)]) as $others
+            | ($reg != "" and ($others | length) > 0) as $off
             | {lane: "-", runtime: "codex", model: $m.model_seen, state: "events in window", id: $sid, spend_session_usd: null}
-              + ($m | del(.model_seen))
-              + {note: ((if $m.measured then "" else $m.note + "; " end) + "per conversation; no documented field names its directory or process")} ),
+              + ($m | del(.model_seen, .models_seen))
+              + {registered_model: (if $reg == "" then null else $reg end), off_model: $off,
+                 note: ((if $off then "OFF-MODEL: \($others | join(", ")), not the registered \($reg) (canon/models.json); " else "" end)
+                        + (if $m.measured then "" else $m.note + "; " end)
+                        + (if $reg == "" then "registered model not read: no canon/models.json beside this copy; " else "" end)
+                        + "per conversation; no documented field names its directory or process")} ),
           ( $procs[0][]
             | {lane: (if .cwd == "" then "?" else (.cwd | split("/") | last) end), runtime: .rt, model: null,
                state: ("running " + .etime), id: ("pid " + .pid), spend_session_usd: null}
@@ -638,7 +651,7 @@ rates_report() {
                     else unmeasured("Codex sends no telemetry here: [otel] exporter is none by default, and it has only OTLP exporters") end)
                  elif .rt == "muse-code" then unmeasured("Muse Code documents no token telemetry: its event log has no documented path or schema")
                  elif .rt == "antigravity" then unmeasured("Antigravity documents no token telemetry for interactive sessions")
-                 else unmeasured("DeepSeek Harness documents no token telemetry") end | del(.model_seen)) )
+                 else unmeasured("DeepSeek Harness documents no token telemetry") end | del(.model_seen, .models_seen)) )
         ],
         sources: [
           {runtime: "claude-code", source: "OTLP api_request events (tok/s, spend); ledger and status line (lanes, state, session cost)",

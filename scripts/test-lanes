@@ -261,6 +261,12 @@ n() { printf '{"key":"%s","value":{"%s":%s}}' "$1" "$2" "$3"; }
   rec "[$(s event.name codex.sse_event),$(s event.kind response.completed),$(s conversation.id c-1),$(s model gpt-x),$(s user.email someone@example.com),$(s output_token_count 1200)]" "$((NOW - 90))000000000"
   rec "[$(s event.name codex.sse_event),$(s event.kind response.output_text.delta),$(s conversation.id c-1),$(s output_token_count 777)]" "$((NOW - 80))000000000"
   rec "[$(s event.name codex.turn_cost),$(s conversation.id c-1),$(n usage.estimated_usd doubleValue 0.05)]" "$((NOW - 70))000000000"
+  # a Codex conversation on the model canon/models.json registers for Codex
+  rec "[$(s event.name codex.sse_event),$(s event.kind response.completed),$(s conversation.id c-2),$(s model "$(jq -r '.runtimes[] | select(.runtime == "codex") | .model' "$ROOT/canon/models.json")"),$(s output_token_count 600)]" "$((NOW - 60))000000000"
+  # a Codex conversation that ran some turns on gpt-6-luna and came back to the registered model
+  for cm in "$(jq -r '.runtimes[] | select(.runtime == "codex") | .model' "$ROOT/canon/models.json")" gpt-6-luna "$(jq -r '.runtimes[] | select(.runtime == "codex") | .model' "$ROOT/canon/models.json")"; do
+    rec "[$(s event.name codex.sse_event),$(s event.kind response.completed),$(s conversation.id c-3),$(s model "$cm"),$(s output_token_count 100)]" "$((NOW - 55))000000000"
+  done
   # an event.timestamp with an offset falls back to observedTimeUnixNano: 300 more tokens in the window
   jq -cn --arg on "$((NOW - 30))000000000" '{resourceLogs: [{scopeLogs: [{logRecords: [{timeUnixNano: "0", observedTimeUnixNano: $on,
      attributes: [{key: "event.name", value: {stringValue: "api_request"}}, {key: "session.id", value: {stringValue: "s-otel"}},
@@ -286,6 +292,13 @@ check "ended session left out"                     w '[.workers[] | select(.id =
 check "idle session silent for seven hours left out" w '[.workers[] | select(.id == "s-old")] | length == 0'
 check "codex conversation: only response.completed counts, 2 tok/s, spend from turn_cost" \
       w '.workers[] | select(.runtime == "codex" and .id == "c-1") | .tok_s == 2 and .out_tokens == 1200 and .spend_window_usd == 0.05 and .model == "gpt-x"'
+# shellcheck disable=SC2034  # read by the eval'd checks below
+cx_reg=$(jq -r '.runtimes[] | select(.runtime == "codex") | .model' "$ROOT/canon/models.json")
+check "a codex conversation on another model than canon/models.json's: off_model, the note naming both" \
+      w '.workers[] | select(.id == "c-1") | .off_model == true and .registered_model == "'"$cx_reg"'" and (.note | test("OFF-MODEL: gpt-x, not the registered '"$cx_reg"'"))'
+check "... one that ran part of the window on gpt-6-luna and came back is flagged, naming luna" \
+      w '.workers[] | select(.id == "c-3") | .off_model == true and (.note | test("OFF-MODEL: gpt-6-luna"))'
+check "... one on the registered model is not flagged" w '.workers[] | select(.id == "c-2") | .off_model == false and (.note | test("OFF-MODEL") | not)'
 check "one codex process row; its helpers, direct or through a shell, are left out" \
       w '[.workers[] | select(.runtime == "codex" and (.id | startswith("pid")))] | length == 1 and .[0].id == "pid 101" and .[0].lane == "proc-101"'
 check "... not measured, pointing at the conversation rows" w '.workers[] | select(.id == "pid 101") | .note | test("per conversation")'
@@ -298,7 +311,7 @@ check "corrupt and misshapen OTLP lines counted, metrics line not" w '.otlp_unre
 check "no attribute beyond the named ones is copied out" eval '! grep -q "someone@example.com" "$TMP/rates.json"'
 check "every runtime names its source"             w '[.sources[].runtime] == ["claude-code","codex","muse-code","antigravity","deepseek-harness"]'
 rates > "$TMP/rates.out" 2>&1; rc=$?
-check "rates table prints, one line per worker"    eval '[ "$rc" = 0 ] && [ "$(grep -cE "^(otel|none|-|proc-[0-9]+|\?) " "$TMP/rates.out")" = 7 ]'
+check "rates table prints, one line per worker"    eval '[ "$rc" = 0 ] && [ "$(grep -cE "^(otel|none|-|proc-[0-9]+|\?) " "$TMP/rates.out")" = 9 ] && grep -q "OFF-MODEL: gpt-x" "$TMP/rates.out"'
 CANON_OTLP_FILE="$RD/otel/absent.jsonl" rates --json > "$TMP/rates.json" 2>/dev/null; rc=$?
 check "no OTLP file: exit 0, every row not measured" w '.otlp_file_present == false and ([.workers[] | select(.measured)] | length == 0)'
 check "... the claude row names the missing file"  w '.workers[] | select(.id == "s-otel") | .note | test("no OTLP log file")'
@@ -2618,7 +2631,7 @@ check "an existing Codex config gets the table appended, its own lines kept" \
 check "... on a line of its own after the last one"  grep -qxF '[profiles.fast]' "$CX"
 # Codex's default model and effort (ADR 0059): the key it lacks goes at the top, one it sets is the owner's
 check "... the default effort it lacked written at its top, its own model kept and named" \
-      eval 'tomlis "$CX" "d[\"model_reasoning_effort\"] == \"max\" and d[\"model\"] == \"o3\" and d[\"profiles\"][\"fast\"][\"model\"] == \"x\"" && grep -q "added      model_reasoning_effort, approval_policy, default_permissions, permissions.canon-worker to $CX" "$TMP/bs.out" && grep -q "KEPT       $CX sets model to another value" "$TMP/bs.out"'
+      eval 'tomlis "$CX" "d[\"model_reasoning_effort\"] == \"max\" and d[\"model\"] == \"o3\" and d[\"profiles\"][\"fast\"][\"model\"] == \"x\"" && grep -q "added      model_reasoning_effort, service_tier, notice.hide_rate_limit_model_nudge, approval_policy, default_permissions, permissions.canon-worker to $CX" "$TMP/bs.out" && grep -q "MISMATCH   $CX sets model to another value" "$TMP/bs.out"'
 check "... with each step's copy of the file kept under its own name" \
       test "$(find "$HOME/.codex" -name "config.toml.replaced-*" | wc -l | tr -d ' ')" = 2
 CLAUDE_CONFIG_DIR="$C3" bs --user-config
@@ -2644,8 +2657,8 @@ CLAUDE_CONFIG_DIR="$C3" bs --check
 check "... and check calls it OWNER"              rowis "$TMP/bs.out" "codex telemetry" OWNER
 # Codex's config is read as TOML (claims of a second reader, 2026-11-10): a quoted key is the owner's otel
 # table, and an [otel] line inside a multi-line string is no table at all
-printf "%s\nmodel = \"o3\"\nmodel_reasoning_effort = \"low\"\n['otel']\nexporter = 'none'\n" "$(grep -e '^approval_policy' -e '^default_permissions' -e '^permissions' "$ROOT/home/.codex/defaults.toml")" > "$CX"
-cp "$CX" "$TMP/cx.before"   # the worker profile already set, so only otel is in question
+printf "%s\nmodel = \"o3\"\nmodel_reasoning_effort = \"low\"\n['otel']\nexporter = 'none'\n" "$(grep -e '^service_tier' -e '^notice' -e '^approval_policy' -e '^default_permissions' -e '^permissions' "$ROOT/home/.codex/defaults.toml")" > "$CX"
+cp "$CX" "$TMP/cx.before"   # the service tier and the worker profile already set, so only otel is in question
 CLAUDE_CONFIG_DIR="$C3" bs --user-config
 check "a quoted ['otel'] table is the owner's: left as it is, still valid TOML" \
       eval 'cmp -s "$CX" "$TMP/cx.before" && tomlis "$CX" "d[\"otel\"] == {\"exporter\": \"none\"}" && grep -q "sets otel itself" "$TMP/bs.out"'
@@ -2945,13 +2958,17 @@ cp "$TMP/models.keep" "$BS/canon/models.json"; rm -rf "$HOME/.gemini"
 # codex defaults: an active profile that sets the model overrides the top level, so check names it
 mkdir -p "$HOME/.codex"
 printf '%s\nprofile = "fast"\n\n[profiles.fast]\nmodel = "o3"\n' "$CXDEF" > "$CX"
-CLAUDE_CONFIG_DIR="$C" bs --check
-check "codex defaults with an active profile setting another model: OWNER, naming the profile" \
-      eval 'rowis "$TMP/bs.out" "codex defaults" OWNER && grep -q "active profile fast" "$TMP/bs.out"'
-printf '%s\n' "$CXDEF" > "$CX"; CLAUDE_CONFIG_DIR="$C" bs --check
+CLAUDE_CONFIG_DIR="$C" bs --check; rc=$?
+check "codex defaults with an active profile setting another model: MISMATCH, naming the profile, exit 1" \
+      eval 'rowis "$TMP/bs.out" "codex defaults" MISMATCH && grep -q "active profile fast" "$TMP/bs.out" && [ "$rc" != 0 ]'
+printf '%s\n' "$CXDEF" > "$CX"; CLAUDE_CONFIG_DIR="$C" bs --check; cx_rc=$?
 check "codex defaults as home/.codex/defaults.toml: ok" rowis "$TMP/bs.out" "codex defaults" ok
-: > "$CX"; CLAUDE_CONFIG_DIR="$C" bs --check
-check "an empty Codex config: NOT SET, naming the fix" eval 'rowis "$TMP/bs.out" "codex defaults" "NOT SET" && grep -q "lacks model, model_reasoning_effort" "$TMP/bs.out"'
+check "... the template turns the rate-limit switch prompt off" tomlis "$ROOT/home/.codex/defaults.toml" 'd["notice"] == {"hide_rate_limit_model_nudge": True}'
+printf '%s\n' "$CXDEF" | sed 's/^model = .*/model = "gpt-6.1-sol"/' > "$CX"; CLAUDE_CONFIG_DIR="$C" bs --check; rc=$?
+check "another model than canon/models.json's: MISMATCH, exit 1 where the canon config exits $cx_rc" \
+      eval 'rowis "$TMP/bs.out" "codex defaults" MISMATCH && grep -q "sets model to another value" "$TMP/bs.out" && [ "$rc" = 1 ] && [ "$cx_rc" = 0 ]'
+: > "$CX"; CLAUDE_CONFIG_DIR="$C" bs --check; rc=$?
+check "an empty Codex config: NOT SET, naming the fix, exit 1" eval 'rowis "$TMP/bs.out" "codex defaults" "NOT SET" && grep -q "lacks model, model_reasoning_effort, notice.hide_rate_limit_model_nudge" "$TMP/bs.out" && [ "$rc" = 1 ]'
 if [ "$(id -u)" = 0 ]; then skip "an unreadable Codex config" "root reads a file whatever its mode"
 else
   printf '%s\n' "$CXDEF" > "$CX"; chmod 000 "$CX"; CLAUDE_CONFIG_DIR="$C" bs --check; chmod 644 "$CX"
@@ -2960,12 +2977,40 @@ else
 fi
 check "home/.codex/defaults.toml holds what canon/models.json gives Codex" \
       eval 'tomlis "$ROOT/home/.codex/defaults.toml" "{k: d[k] for k in (\"model\", \"model_reasoning_effort\")} == {\"model\": \"$(jq -r ".runtimes[] | select(.runtime == \"codex\") | .model" "$ROOT/canon/models.json")\", \"model_reasoning_effort\": \"$(jq -r ".runtimes[] | select(.runtime == \"codex\") | .effort" "$ROOT/canon/models.json")\"}"'
+# the Codex service tier (ADR 0005): its own row, apart from model and effort
+check "home/.codex/defaults.toml holds the service tier canon/models.json gives Codex" \
+      eval 'tomlis "$ROOT/home/.codex/defaults.toml" "d.get(\"service_tier\") == \"$(jq -r ".runtimes[] | select(.runtime == \"codex\") | .service_tier" "$ROOT/canon/models.json")\""'
+printf '%s\n[otel]\nexporter = "none"\n' "$(printf '%s\n' "$CXDEF" | grep -v '^service_tier')" > "$CX"; cp "$CX" "$TMP/cx.before"
+CLAUDE_CONFIG_DIR="$C" bs --check
+check "a config without the service tier: codex service tier NOT SET, naming it, codex defaults still ok" \
+      eval 'rowis "$TMP/bs.out" "codex service tier" "NOT SET" && grep -q "lacks service_tier" "$TMP/bs.out" && rowis "$TMP/bs.out" "codex defaults" ok'
+CLAUDE_CONFIG_DIR="$C" bs --user-config
+check "user-config adds service_tier = default (standard) to a config that lacks it" \
+      eval 'tomlis "$CX" "d[\"service_tier\"] == \"default\"" && grep -q "added      service_tier to $CX" "$TMP/bs.out"'
+check "... the rest of the file kept line for line below it" \
+      eval 'tail -n "$(wc -l < "$TMP/cx.before")" "$CX" | cmp -s - "$TMP/cx.before"'
+CLAUDE_CONFIG_DIR="$C" bs --check
+check "... and check calls it ok"                  rowis "$TMP/bs.out" "codex service tier" ok
+printf '%s\n[otel]\nexporter = "none"\n' "$(awk '/^service_tier = / { $0 = "service_tier = \"flex\"" } 1' <<< "$CXDEF")" > "$CX"; cp "$CX" "$TMP/cx.before"   # its own otel table, so only the tier is in question
+CLAUDE_CONFIG_DIR="$C" bs --user-config
+check "a service tier the owner chose is left as it is, and named" \
+      eval 'cmp -s "$CX" "$TMP/cx.before" && grep -q "MISMATCH   $CX sets service_tier to another value" "$TMP/bs.out"'
+CLAUDE_CONFIG_DIR="$C" bs --check
+check "... and check calls it MISMATCH, codex defaults still ok" \
+      eval 'rowis "$TMP/bs.out" "codex service tier" MISMATCH && rowis "$TMP/bs.out" "codex defaults" ok'
+printf '%s\n' "$CXDEF" | sed 's/^service_tier = .*/service_tier = "priority"/' > "$CX"; CLAUDE_CONFIG_DIR="$C" bs --check
+check "service_tier = priority (fast) in the user config, where canon's default is standard: MISMATCH" rowis "$TMP/bs.out" "codex service tier" MISMATCH
+check "a dispatch's .codex/config.toml (its tier) is ignored by git, so it is never committed" git -C "$ROOT" check-ignore -q .codex/config.toml
+printf '%s\nprofile = "slow"\n\n[profiles.slow]\nservice_tier = "flex"\n' "$CXDEF" > "$CX"; CLAUDE_CONFIG_DIR="$C" bs --check
+check "an active profile setting another service tier: MISMATCH, naming the profile" \
+      eval 'rowis "$TMP/bs.out" "codex service tier" MISMATCH && grep -q "active profile slow" "$TMP/bs.out"'
+rm -f "$HOME/.codex/config.toml.replaced-"*
 # ADR 0034's worker profile: the template holds it, --user-config adds it to a config that lacks it, leaving
 # the owner's other keys and permission profiles alone, and a second run changes nothing
 check "home/.codex/defaults.toml holds ADR 0034's worker profile, made the default, with approvals never" \
       tomlis "$ROOT/home/.codex/defaults.toml" 'd["approval_policy"] == "never" and d["default_permissions"] == "canon-worker" and d["permissions"] == {"canon-worker": {"extends": ":workspace", "filesystem": {":slash_tmp": "read", "~/.codex/auth.json": "deny"}}}'
 rm -f "$HOME/.codex/config.toml.replaced-"*
-printf '%s\n' "$(grep -e '^model' "$ROOT/home/.codex/defaults.toml")" > "$CX"
+printf '%s\n' "$(grep -e '^model' -e '^service_tier' -e '^notice' "$ROOT/home/.codex/defaults.toml")" > "$CX"
 printf 'web_search = "cached"\n\n[permissions.mine]\nextends = ":read-only"\n\n[otel]\nexporter = "none"\n' >> "$CX"
 cp "$CX" "$TMP/cx.before"
 CLAUDE_CONFIG_DIR="$C" bs --check
@@ -2991,10 +3036,46 @@ check "another default profile is the owner's: left as it is, and named" \
       eval 'cmp -s "$CX" "$TMP/cx.before" && grep -q "KEPT       $CX sets default_permissions to another value" "$TMP/bs.out"'
 CLAUDE_CONFIG_DIR="$C" bs --check
 check "... and check calls it OWNER"               rowis "$TMP/bs.out" "codex permissions" OWNER
-printf '%s\n[otel]\nexporter = "none"\n[permissions]\nmine = { extends = ":read-only" }\n' "$(grep -e '^model' "$ROOT/home/.codex/defaults.toml")" > "$CX"; cp "$CX" "$TMP/cx.before"
+printf '%s\n[otel]\nexporter = "none"\n[permissions]\nmine = { extends = ":read-only" }\n' "$(grep -e '^model' -e '^service_tier' -e '^notice' "$ROOT/home/.codex/defaults.toml")" > "$CX"; cp "$CX" "$TMP/cx.before"
 CLAUDE_CONFIG_DIR="$C" bs --user-config; rc=$?
 check "a [permissions] table the dotted key cannot join: the top-level keys written, the profile named, the run fails" \
       eval '[ "$rc" != 0 ] && tomlis "$CX" "d[\"approval_policy\"] == \"never\" and d[\"default_permissions\"] == \"canon-worker\" and d[\"permissions\"] == {\"mine\": {\"extends\": \":read-only\"}}" && grep -q "FAILED     permissions.canon-worker cannot be written at the top of $CX" "$TMP/bs.out"'
+# Codex writes other keys into [notice] itself (the full-access warning), so the nudge key joins that table
+printf '%s\n[otel]\nexporter = "none"\n[notice]\nhide_full_access_warning = true\n' "$(grep -v -e '^notice' "$ROOT/home/.codex/defaults.toml")" > "$CX"; cp "$CX" "$TMP/cx.before"
+CLAUDE_CONFIG_DIR="$C" bs --user-config; rc=$?
+check "a [notice] table without the nudge key: the key written into it, the rest kept line for line, exit 0" \
+      eval '[ "$rc" = 0 ] && tomlis "$CX" "d[\"notice\"] == {\"hide_full_access_warning\": True, \"hide_rate_limit_model_nudge\": True}" && [ "$(grep -v "^hide_rate_limit_model_nudge = true\$" "$CX")" = "$(cat "$TMP/cx.before")" ] && grep -q "added      notice.hide_rate_limit_model_nudge to $CX" "$TMP/bs.out"'
+CLAUDE_CONFIG_DIR="$C" bs --check; rc=$?
+check "... and check calls codex defaults ok" eval 'rowis "$TMP/bs.out" "codex defaults" ok'
+printf '%s\n[features]\nfast_mode = false\n' "$CXDEF" > "$CX"; CLAUDE_CONFIG_DIR="$C" bs --check; rc=$?
+check "features.fast_mode = false with canon's standard tier: codex service tier ok, the check not failed by it" \
+      eval 'rowis "$TMP/bs.out" "codex service tier" ok && rowis "$TMP/bs.out" "codex defaults" ok'
+# a [permissions] table blocks only the permissions profile; the nudge key is still written
+printf '%s\n[otel]\nexporter = "none"\n[permissions]\nmine = { extends = ":read-only" }\n' "$(grep -e '^model' -e '^service_tier' "$ROOT/home/.codex/defaults.toml")" > "$CX"
+CLAUDE_CONFIG_DIR="$C" bs --user-config; rc=$?
+check "a [permissions] table and no notice key: the nudge key written, only permissions.canon-worker FAILED" \
+      eval 'tomlis "$CX" "d[\"notice\"] == {\"hide_rate_limit_model_nudge\": True}" && grep -q "FAILED     permissions.canon-worker cannot" "$TMP/bs.out" && ! grep -q "FAILED .*notice" "$TMP/bs.out"'
+# a quoted ["notice"] header the search does not find: the nudge key is named, the top-level keys still written
+printf '[otel]\nexporter = "none"\n["notice"]\nhide_full_access_warning = true\n' > "$CX"
+CLAUDE_CONFIG_DIR="$C" bs --user-config; rc=$?
+check "a quoted [\"notice\"] header: model and service_tier still written, the nudge key named FAILED" \
+      eval 'tomlis "$CX" "\"model\" in d and \"service_tier\" in d" && grep -q "FAILED     notice.hide_rate_limit_model_nudge" "$TMP/bs.out"'
+# a config saved with CRLF endings, and one whose [notice] header is its last line with no newline
+printf '%s\n[otel]\nexporter = "none"\n[notice]\nhide_full_access_warning = true\n' "$(grep -v -e '^notice' "$ROOT/home/.codex/defaults.toml")" | sed 's/$/\r/' > "$CX"
+CLAUDE_CONFIG_DIR="$C" bs --user-config; rc=$?
+check "a CRLF config with a [notice] table: the nudge key written into it, exit 0" \
+      eval '[ "$rc" = 0 ] && tomlis "$CX" "d[\"notice\"] == {\"hide_full_access_warning\": True, \"hide_rate_limit_model_nudge\": True}"'
+printf '%s\n[otel]\nexporter = "none"\n[notice]' "$(grep -v -e '^notice' "$ROOT/home/.codex/defaults.toml")" > "$CX"
+CLAUDE_CONFIG_DIR="$C" bs --user-config; rc=$?
+check "a last [notice] header with no newline: the nudge key written into it, exit 0" \
+      eval '[ "$rc" = 0 ] && tomlis "$CX" "d[\"notice\"] == {\"hide_rate_limit_model_nudge\": True}"'
+printf 'model = \n' > "$CX"; CLAUDE_CONFIG_DIR="$C" bs --check; rc=$?
+check "a Codex config that is not valid TOML: codex defaults INVALID, the check fails" \
+      eval 'rowis "$TMP/bs.out" "codex defaults" INVALID && [ "$rc" = 1 ]'
+printf '%s\n[otel]\nexporter = "none"\nprofile = "p"\n[profiles.p]\nmodel = "o3"\n' "$CXDEF" | awk '/^profile = /{next} {print} END{}' > "$CX.tmp"; { echo 'profile = "p"'; cat "$CX.tmp"; } > "$CX"; rm -f "$CX.tmp"
+CLAUDE_CONFIG_DIR="$C" bs --user-config
+check "--user-config calls an active profile's other model MISMATCH, as --check does" \
+      grep -q "MISMATCH   the active profile in $CX sets model" "$TMP/bs.out"
 printf '%s\nprofile = "x"\nprofiles = "x"\n' "$CXDEF" > "$CX"; CLAUDE_CONFIG_DIR="$C" bs --check
 check "a profiles key that is not a table is read, not called a missing python" \
       eval 'rowis "$TMP/bs.out" "codex permissions" ok && ! grep -q "no python3 with tomllib" "$TMP/bs.out"'
