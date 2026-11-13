@@ -201,6 +201,10 @@ export HOME="$TMP/home"; mkdir -p "$HOME"
 unset CLAUDE_CONFIG_DIR CANON_LEDGER_HOME AUTOMATION_SKIP_LAUNCHD CANON_LAUNCHAGENTS_DIR CODEX_HOME DSH_HOME \
       DISABLE_AUTOUPDATER DISABLE_UPDATES CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC CLAUDE_CODE_DISABLE_ADVISOR_TOOL \
       DSH_PERMISSION_MODE DSH_TUI_PRESET DSH_TUI_BACKEND
+# the desktop check bootstrap's desktop profile row runs reads these; the app's path points into the temp folder,
+# at nothing, so no case reads the real app, and a case that wants one points it at a stand-in
+unset DSH_DESKTOP_SETTINGS DSH_DESKTOP_RECORD DSH_DESKTOP_RECORD_PATH
+export DSH_DESKTOP_APP="$TMP/no-desktop-app"
 PINNED=$(sed -n 's/^MISE_VERSION="v\([^"]*\)".*/\1/p' "$ROOT/scripts/bootstrap")
 echo "$PINNED macos-arm64 (stub)" > "$STUB/mise-version"
 CCPIN="2.1.321"   # the claude-code pin the bootstrap fixture's registry sets, whatever the real one is
@@ -1695,6 +1699,7 @@ fi
 # ---------- bootstrap ----------
 echo "bootstrap:"
 BS="$TMP/bs"; mkdir -p "$BS/scripts" "$BS/canon"; cp "$ROOT/scripts/bootstrap" "$BS/scripts/"; cp -R "$ROOT/home" "$BS/home"; : > "$BS/mise.toml"
+cp "$ROOT/scripts/dsh-profiles" "$ROOT/scripts/dsh-desktop-check" "$BS/scripts/"   # the checks its dsh profile rows run
 jq -n --arg t "tag:v$CCPIN" '{upstreams: [{id: "claude-code", track: $t}]}' > "$BS/canon/upstreams.json"
 cp "$ROOT/canon/models.json" "$BS/canon/models.json"   # the real lane table: the template's pins are held to it
 bs() { CANON_CURL="$B/curl" "$BS/scripts/bootstrap" "$@" > "$TMP/bs.out" 2>&1; }
@@ -1920,6 +1925,102 @@ rm "$T2/kernel.json"; bs --check
 check "no dsh-tui profile and nothing to name: absent" \
       eval 'rowis "$TMP/bs.out" "dsh-tui worker defaults" absent && grep -q "no dsh-tui profile at $DP" "$TMP/bs.out"'
 rm -rf "$HOME/.dsh" "$HOME/.dsh-tui"
+# the DeepSeek Harness profile rows: each runs its read-only check from the checkout and sums it up in one line,
+# here against stand-in records in the checkout's copy and a DSH_HOME, desktop app and settings file in the temp
+# folder, so no case reads the real app or profiles; that neither row changes the exit status is shown after the
+# codex defaults rows, where every other row is as canon has it
+DH="$TMP/dsh-home"; DAPP="$TMP/dsh-app/DeepSeek Harness.app"; DSET="$TMP/dsh-desktop-settings.json"
+dsh_bs() { DSH_HOME="$DH" DSH_DESKTOP_APP="$DAPP" DSH_DESKTOP_SETTINGS="$DSET" bs --check; }
+dsh_plist() {
+  mkdir -p "$DAPP/Contents"
+  printf '<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0">\n<dict>\n\t<key>CFBundleShortVersionString</key>\n\t<string>%s</string>\n</dict>\n</plist>\n' "$1" > "$DAPP/Contents/Info.plist"
+}
+jq -n '{profiles: {alpha: {"pkg-a": "1.0.0"}, beta: {"pkg-b": "2.0.0"}, desktop: {"@deepseek-ai/dsh-base": "1.2.3"}}}' > "$BS/home/dsh/profiles.json"
+jq -n '{app_version: "1.2.3", update_channel: "stable", bundles_absent: ["@deepseek-ai/dsh-inspector"], rows_off: ["session-log-deepseek"]}' > "$BS/home/dsh/desktop.json"
+mkdir -p "$DH/profiles/alpha" "$DH/profiles/beta" "$DH/profiles/desktop"
+echo '{"dependencies": {"pkg-a": "1.0.0"}}' > "$DH/profiles/alpha/package.json"
+echo '{"dependencies": {"pkg-b": "2.0.0"}}' > "$DH/profiles/beta/package.json"
+echo '{"dependencies": {"@deepseek-ai/dsh-base": "1.2.3"}, "dsh": {"profile": {"bundles": ["@deepseek-ai/dsh-base"]}}}' > "$DH/profiles/desktop/package.json"
+printf -- '- id: session-log-deepseek\n  config:\n    enabled: false\n' > "$DH/profiles/desktop/cordis.patch.yml"
+dsh_plist 1.2.3; echo '{"updates": {"channel": "stable"}}' > "$DSET"
+dsh_bs
+check "dsh profiles as recorded: ok, naming them" \
+      eval 'rowis "$TMP/bs.out" "dsh profiles" ok && grep -q "^  dsh profiles  *ok  *3 profiles as home/dsh/profiles.json records them: alpha, beta, desktop$" "$TMP/bs.out"'
+check "the dsh desktop profile as recorded: ok, counting its items" \
+      eval 'rowis "$TMP/bs.out" "dsh desktop profile" ok && grep -q "^  dsh desktop profile  *ok  *5 items as home/dsh/desktop.json records them$" "$TMP/bs.out"'
+# four profiles off the record: another spec, a package.json that is not JSON, and two in no record, one of them
+# with a name shown as bootstrap shows a value
+echo '{"dependencies": {"pkg-a": "1.0.1"}}' > "$DH/profiles/alpha/package.json"
+echo 'not json' > "$DH/profiles/beta/package.json"
+mkdir -p "$DH/profiles/gamma" "$DH/profiles/Zed wild!"
+echo '{"dependencies": {}}' > "$DH/profiles/gamma/package.json"
+echo '{"dependencies": {"pkg-z": "0.1.0"}}' > "$DH/profiles/Zed wild!/package.json"
+dsh_bs
+check "dsh profiles off the record: DIFFERS, with the count, the first three, the rest counted and the command" \
+      eval 'rowis "$TMP/bs.out" "dsh profiles" DIFFERS && grep -qF "4 profiles in $DH/profiles are not as home/dsh/profiles.json records them: Zed?wild? UNRECORDED, alpha DIFFERS, beta UNKNOWN, and 1 more; every difference: scripts/dsh-profiles" "$TMP/bs.out"'
+check "... the desktop row still ok" rowis "$TMP/bs.out" "dsh desktop profile" ok
+# the profiles back as recorded; the desktop profile off its record in all five items, its app behind it
+rm -rf "$DH/profiles/gamma" "$DH/profiles/Zed wild!"
+echo '{"dependencies": {"pkg-a": "1.0.0"}}' > "$DH/profiles/alpha/package.json"
+echo '{"dependencies": {"pkg-b": "2.0.0"}}' > "$DH/profiles/beta/package.json"
+echo '{"dependencies": {"@deepseek-ai/dsh-base": "1.2.3"}, "dsh": {"profile": {"bundles": ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-inspector"]}}}' > "$DH/profiles/desktop/package.json"
+printf -- '- id: session-log-deepseek\n  config:\n    enabled: true\n' > "$DH/profiles/desktop/cordis.patch.yml"
+dsh_plist 1.2.2; echo '{"updates": {"channel": "nightly"}}' > "$DSET"
+dsh_bs
+check "the dsh desktop profile off the record: DIFFERS, with the count, the first three, the rest counted and the command" \
+      eval 'rowis "$TMP/bs.out" "dsh desktop profile" DIFFERS && grep -qF "5 of 5 items are not as home/dsh/desktop.json records them: app version, update channel, bundle @deepseek-ai/dsh-inspector, and 2 more; every difference: scripts/dsh-desktop-check" "$TMP/bs.out"'
+check "... the profiles row still ok" rowis "$TMP/bs.out" "dsh profiles" ok
+# nothing to compare is absent, found before a check runs: dsh-desktop-check exits 2 when nothing is installed
+DSH_HOME="$TMP/no-dsh" DSH_DESKTOP_APP="$TMP/no-dsh-app" bs --check
+check "no DeepSeek Harness: both rows absent, naming what is not there" \
+      eval 'rowis "$TMP/bs.out" "dsh profiles" absent && grep -qF "no $TMP/no-dsh/profiles:" "$TMP/bs.out" && rowis "$TMP/bs.out" "dsh desktop profile" absent && grep -qF "no desktop app at $TMP/no-dsh-app and no desktop profile at $TMP/no-dsh/profiles/desktop" "$TMP/bs.out"'
+mkdir -p "$TMP/dsh-bare/profiles/node_modules"
+DSH_HOME="$TMP/dsh-bare" DSH_DESKTOP_APP="$DAPP" DSH_DESKTOP_SETTINGS="$DSET" bs --check
+check "a profiles folder with no profile in it: dsh profiles absent, as its check exits 0 with no ok row" \
+      eval 'rowis "$TMP/bs.out" "dsh profiles" absent && grep -qF "none of the 3 profiles home/dsh/profiles.json records is in $TMP/dsh-bare/profiles" "$TMP/bs.out"'
+check "... and the desktop app with no desktop profile: UNKNOWN, naming the two inputs its check cannot read" \
+      eval 'rowis "$TMP/bs.out" "dsh desktop profile" UNKNOWN && grep -qF "scripts/dsh-desktop-check cannot read 2 of its inputs: $TMP/dsh-bare/profiles/desktop/package.json, $TMP/dsh-bare/profiles/desktop/cordis.patch.yml; run: scripts/dsh-desktop-check" "$TMP/bs.out"'
+# a check that exits with a code it does not document, here after lines that read as ok, or one that is not in the
+# checkout: UNKNOWN, never ok or absent
+for c in dsh-profiles dsh-desktop-check; do
+  printf '#!/bin/bash\necho "  dsh profile alpha  ok  1 packages as recorded"\necho "ok app version"\nexit 3\n' > "$BS/scripts/$c"
+done
+dsh_bs
+check "a check that exits 3, which it does not document: both rows UNKNOWN, naming the exit" \
+      eval 'rowis "$TMP/bs.out" "dsh profiles" UNKNOWN && grep -qF "scripts/dsh-profiles exited 3, which it does not document" "$TMP/bs.out" && rowis "$TMP/bs.out" "dsh desktop profile" UNKNOWN && grep -qF "scripts/dsh-desktop-check exited 3, which it does not document" "$TMP/bs.out"'
+# a check that cannot run exits 2 with a message on stderr and no row: UNKNOWN, quoting the message
+for c in dsh-profiles dsh-desktop-check; do
+  printf '#!/bin/bash\necho "%s: cannot run here" >&2\nexit 2\n' "$c" > "$BS/scripts/$c"
+done
+dsh_bs
+check "a check that cannot run (exit 2, a message and no row): both rows UNKNOWN, quoting the message" \
+      eval 'rowis "$TMP/bs.out" "dsh profiles" UNKNOWN && grep -qF "scripts/dsh-profiles exited 2: cannot run here; run: scripts/dsh-profiles" "$TMP/bs.out" && rowis "$TMP/bs.out" "dsh desktop profile" UNKNOWN && grep -qF "scripts/dsh-desktop-check exited 2: cannot run here; run: scripts/dsh-desktop-check" "$TMP/bs.out"'
+# a check that exits 0 with nothing to read, or with a line its exit 0 rules out: UNKNOWN, naming what it
+# printed, never ok or absent
+printf '#!/bin/bash\nexit 0\n' > "$BS/scripts/dsh-profiles"
+printf '#!/bin/bash\necho "ok app version"\necho "DIFFERS update channel nightly (recorded stable)"\nexit 0\n' > "$BS/scripts/dsh-desktop-check"
+dsh_bs
+check "dsh-profiles exits 0 but prints no row: dsh profiles UNKNOWN, saying so, never absent" \
+      eval 'rowis "$TMP/bs.out" "dsh profiles" UNKNOWN && grep -qF "scripts/dsh-profiles exited 0 but printed no row; run: scripts/dsh-profiles" "$TMP/bs.out"'
+check "dsh-desktop-check exits 0 but prints a DIFFERS line: dsh desktop profile UNKNOWN, naming it, never ok" \
+      eval 'rowis "$TMP/bs.out" "dsh desktop profile" UNKNOWN && grep -qF "scripts/dsh-desktop-check exited 0 but printed DIFFERS update channel nightly (recorded stable); run: scripts/dsh-desktop-check" "$TMP/bs.out"'
+printf '#!/bin/bash\necho "  dsh profile alpha  absent  no package.json"\necho "  dsh profile beta  DIFFERS  pkg-b 2.0.1, recorded 2.0.0"\nexit 0\n' > "$BS/scripts/dsh-profiles"
+printf '#!/bin/bash\necho "ok app version"\necho "MISSING /x/package.json"\nexit 0\n' > "$BS/scripts/dsh-desktop-check"
+dsh_bs
+check "dsh-profiles exits 0 but prints a DIFFERS row and no ok one: UNKNOWN, naming the row, never absent" \
+      eval 'rowis "$TMP/bs.out" "dsh profiles" UNKNOWN && grep -qF "scripts/dsh-profiles exited 0 but printed beta DIFFERS; run: scripts/dsh-profiles" "$TMP/bs.out"'
+check "dsh-desktop-check exits 0 but prints a MISSING line: UNKNOWN, naming it, never ok" \
+      eval 'rowis "$TMP/bs.out" "dsh desktop profile" UNKNOWN && grep -qF "scripts/dsh-desktop-check exited 0 but printed MISSING /x/package.json; run: scripts/dsh-desktop-check" "$TMP/bs.out"'
+printf '#!/bin/bash\necho "  dsh profile alpha  ok  1 packages as recorded"\necho "  dsh profile gamma  UNRECORDED  1 packages, in no record"\nexit 0\n' > "$BS/scripts/dsh-profiles"
+dsh_bs
+check "dsh-profiles exits 0 but prints an UNRECORDED row beside an ok one: UNKNOWN, naming the row, never ok" \
+      eval 'rowis "$TMP/bs.out" "dsh profiles" UNKNOWN && grep -qF "scripts/dsh-profiles exited 0 but printed gamma UNRECORDED; run: scripts/dsh-profiles" "$TMP/bs.out"'
+rm "$BS/scripts/dsh-profiles" "$BS/scripts/dsh-desktop-check"; dsh_bs
+check "... and with neither check in the checkout: both rows UNKNOWN, naming the missing check" \
+      eval 'rowis "$TMP/bs.out" "dsh profiles" UNKNOWN && grep -qF "no executable scripts/dsh-profiles in this checkout" "$TMP/bs.out" && rowis "$TMP/bs.out" "dsh desktop profile" UNKNOWN && grep -qF "no executable scripts/dsh-desktop-check in this checkout" "$TMP/bs.out"'
+cp "$ROOT/scripts/dsh-profiles" "$ROOT/scripts/dsh-desktop-check" "$BS/scripts/"
+cp "$ROOT/home/dsh/profiles.json" "$ROOT/home/dsh/desktop.json" "$BS/home/dsh/"
+rm -rf "$DH" "$TMP/dsh-app" "$DSET" "$TMP/dsh-bare"
 # the OmniRoute rows (ADR 0056), optional: not installed is absent and passes; installed, its version is held
 # to the registry's pin; with no database the providers row is absent, otherwise the provider_connections
 # table, read by sqlite3 under query_only, decides: a connection whose provider, name or default model says
@@ -3207,6 +3308,23 @@ check "... the template turns the rate-limit switch prompt off" tomlis "$ROOT/ho
 printf '%s\n' "$CXDEF" | sed 's/^model = .*/model = "gpt-6.1-sol"/' > "$CX"; CLAUDE_CONFIG_DIR="$C" bs --check; rc=$?
 check "another model than canon/models.json's: MISMATCH, exit 1 where the canon config exits $cx_rc" \
       eval 'rowis "$TMP/bs.out" "codex defaults" MISMATCH && grep -q "sets model to another value" "$TMP/bs.out" && [ "$rc" = 1 ] && [ "$cx_rc" = 0 ]'
+# neither DeepSeek Harness profile row changes the exit status: with every other row as canon has it --check exits
+# 0, so a dsh row that set it would show; stand-in checks print a row that differs, then exit 3
+printf '%s\n' "$CXDEF" > "$CX"; DR="$TMP/dsh-rc"; mkdir -p "$DR/profiles/desktop"
+dsh_rc() { CLAUDE_CONFIG_DIR="$C" DSH_HOME="$1" bs --check; }
+dsh_rc "$TMP/no-dsh"; rc=$?
+check "every other row as canon has it and no DeepSeek Harness: both dsh rows absent, --check exits 0" \
+      eval 'rowis "$TMP/bs.out" "dsh profiles" absent && rowis "$TMP/bs.out" "dsh desktop profile" absent && [ "$rc" = 0 ]'
+printf '#!/bin/bash\necho "  dsh profile alpha  DIFFERS  pkg-a 1.0.1, recorded 1.0.0"\nexit 1\n' > "$BS/scripts/dsh-profiles"
+printf '#!/bin/bash\necho "DIFFERS app version 1.2.2 (recorded 1.2.3)"\nexit 1\n' > "$BS/scripts/dsh-desktop-check"
+dsh_rc "$DR"; rc=$?
+check "... both dsh rows DIFFERS: --check still exits 0" \
+      eval 'rowis "$TMP/bs.out" "dsh profiles" DIFFERS && rowis "$TMP/bs.out" "dsh desktop profile" DIFFERS && [ "$rc" = 0 ]'
+for c in dsh-profiles dsh-desktop-check; do printf '#!/bin/bash\nexit 3\n' > "$BS/scripts/$c"; done
+dsh_rc "$DR"; rc=$?
+check "... both dsh rows UNKNOWN: --check still exits 0" \
+      eval 'rowis "$TMP/bs.out" "dsh profiles" UNKNOWN && rowis "$TMP/bs.out" "dsh desktop profile" UNKNOWN && [ "$rc" = 0 ]'
+cp "$ROOT/scripts/dsh-profiles" "$ROOT/scripts/dsh-desktop-check" "$BS/scripts/"; rm -rf "$DR"
 : > "$CX"; CLAUDE_CONFIG_DIR="$C" bs --check; rc=$?
 check "an empty Codex config: NOT SET, naming the fix, exit 1" eval 'rowis "$TMP/bs.out" "codex defaults" "NOT SET" && grep -q "lacks model, model_reasoning_effort, notice.hide_rate_limit_model_nudge" "$TMP/bs.out" && [ "$rc" = 1 ]'
 if [ "$(id -u)" = 0 ]; then skip "an unreadable Codex config" "root reads a file whatever its mode"

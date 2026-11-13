@@ -19,6 +19,9 @@ export HOME="$T/login-fixture" CODEX_HOME="$T/login-fixture/.codex"
 export CLAUDE_CONFIG_DIR="$HOME/.claude"
 export PATH="$T/bin:/usr/bin:/bin" USER=login-fixture LOGNAME=login-fixture
 unset DSH_HOME ORCA_CLI_COMMAND ORCA_DEV_REPO_ROOT
+# bootstrap's desktop profile row looks for the app here, at nothing, never at the real one
+unset DSH_DESKTOP_SETTINGS DSH_DESKTOP_RECORD DSH_DESKTOP_RECORD_PATH
+export DSH_DESKTOP_APP="$T/no-desktop-app"
 for tool in security xcode-select; do printf '#!/bin/bash\nexit 1\n' > "$T/bin/$tool"; done
 for tool in claude codex agy muse dsh; do
   printf '#!/bin/bash\n[ "$1" = --version ] && { echo "7.8.9"; exit; }; exit 1\n' > "$T/bin/$tool"
@@ -605,4 +608,81 @@ assert all(results.values()), "round-2 medium and low findings"
 PY
 }
 html_v2_medium_regressions
+# Every status word scripts/bootstrap's row() prints is one report_rows reads: a row with another word makes the
+# HTML and the digest name bootstrap a failed source. One row for each word bootstrap printed that the list lacked.
+bootstrap_words_parse() {
+  local html=0 digest=0 row
+  {
+    printf 'Toolchain:\n'
+    for row in 'dsh profiles:DIFFERS' 'codex version:absent' 'update channel:MISMATCH' 'fable alias:PINNED' \
+               'agy default model:INVALID' 'omniroute:OTHER' 'dsh-tui worker defaults:OVERRIDE'; do
+      printf '  %-24s %-9s %s\n' "${row%:*}" "${row##*:}" 'fixture detail'
+    done
+    sed -n '/^Runtimes/,$p' "$T/bootstrap"
+  } > "$T/words-bootstrap"
+  BOOTSTRAP_FILE="$T/words-bootstrap" "$T/repo/scripts/manifest" --html "$T/words.html" --run "$EXPECTED_RUN" || html=$?
+  BOOTSTRAP_FILE="$T/words-bootstrap" "$T/repo/scripts/manifest" --digest --run "$EXPECTED_RUN" --since 2026-11-11T00:00:00Z \
+    > "$T/words-digest" || digest=$?
+  python3 - "$T" "$html" "$digest" <<'PY'
+import re
+import sys
+from html import unescape
+from pathlib import Path
+root, html_rc, digest_rc = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+page = unescape((root / "words.html").read_text()) if (root / "words.html").exists() else ""
+lines = (root / "words-digest").read_text().splitlines()
+source = re.search(r'<tr data-source="bootstrap">.*?</tr>', page)
+rows = {"dsh profiles": "DIFFERS", "codex version": "absent", "update channel": "MISMATCH", "fable alias": "PINNED",
+        "agy default model": "INVALID", "omniroute": "OTHER", "dsh-tui worker defaults": "OVERRIDE"}
+results = {f"HTML toolchain row {name}: {word}": re.search(re.escape(name) + r"</td><td><span[^>]*>" + word + "</span>", page) is not None
+           for name, word in rows.items()}
+results["HTML exit 0, the bootstrap source reported"] = html_rc == "0" and source is not None and "UNVERIFIED" not in source[0]
+results["digest exit 0, no source failed"] = digest_rc == "0" and len(lines) == 10 and lines[9] == "Sources failed: none"
+for name, passed in results.items():
+    print(("  pass  " if passed else "  FAIL  ") + name)
+if not all(results.values()):
+    print("        HTML exit " + html_rc + ": " + (" ".join(re.sub(r"<[^>]+>", " ", source[0]).split()) if source else "no bootstrap source row"))
+    print("        digest exit " + digest_rc + ": " + (lines[9] if len(lines) == 10 else f"{len(lines)} lines"))
+assert all(results.values()), "status words bootstrap prints"
+PY
+}
+# A guard on scripts/bootstrap's source: each literal status word it passes to row() is in report_rows' list. It
+# reads each line that is not a comment for `row` at the start of a command (the line's, or after ; & | { ( ) then
+# else do) with a first argument and then a status, a bare word or a quoted string. It cannot see what a status in
+# a variable holds (codex_settings_row's "$other", OWNER or MISMATCH, is counted, not checked), a call split over
+# lines, or a status row printed without row().
+bootstrap_row_words() {
+  python3 - "$ROOT/scripts/bootstrap" "$ROOT/scripts/manifest" <<'PY'
+import re
+import sys
+from pathlib import Path
+bootstrap = Path(sys.argv[1]).read_text().splitlines()
+listed = re.search(r'^\s*tokens = r"([^"]*)"$', Path(sys.argv[2]).read_text(), re.M)
+assert listed, "scripts/manifest: no tokens list in report_rows"
+tokens = set(listed[1].split("|"))
+call = re.compile(r'''(?:^|[;&|{()]|\b(?:then|else|do))\s*row\s+(?:"[^"]*"|'[^']*'|[^\s"';&|()]+)\s+("[^"]*"|'[^']*'|\$\{?\w+\}?|[A-Za-z][A-Za-z-]*)(?=[\s;)]|$)''')
+words, variables, unlisted = set(), [], {}
+for number, line in enumerate(bootstrap, 1):
+    if line.lstrip().startswith("#"):
+        continue
+    for match in call.finditer(line):
+        word = match[1].strip("\"'")
+        if "$" in word:
+            variables.append(f"L{number} {word}")
+            continue
+        words.add(word)
+        if word not in tokens:
+            unlisted.setdefault(word, []).append(f"L{number}")
+print(f"        {len(words)} literal status words in scripts/bootstrap's row() calls; in a variable, not checked: {', '.join(variables) or 'none'}")
+for word, places in sorted(unlisted.items()):
+    print(f"  FAIL  bootstrap prints {word} ({', '.join(places)}), which report_rows does not list")
+assert {"ok", "MISSING", "UNKNOWN"} <= words, "the guard read no row() call"
+assert not unlisted, "status words report_rows does not list"
+print("  pass  every literal status word bootstrap's row() prints is in report_rows' list")
+PY
+}
+words_rc=0
+bootstrap_words_parse || words_rc=1
+bootstrap_row_words || words_rc=1
+[ "$words_rc" = 0 ] || { echo 'FAIL: a status word scripts/bootstrap prints is not one scripts/manifest reads'; exit 1; }
 echo 'manifest: all offline cases passed'
