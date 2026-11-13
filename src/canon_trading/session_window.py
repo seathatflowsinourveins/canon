@@ -274,6 +274,7 @@ from .mover import PAPER_LOSS_SHARE
 from .mover import TRAIL_CAP_DEFAULT
 from .mover import TRAIL_CAPS
 from .mover import TRAIL_SETTINGS
+from .mover import TRIGGERS as MOVER_TRIGGERS
 from .mover import Mover
 from .mover import MoverConfig
 from .mover import baseline_per_minute
@@ -348,6 +349,12 @@ if TYPE_CHECKING:
 
 NEW_YORK = ZoneInfo("America/New_York")
 SESSIONS = ("regular", "extended")
+WINDOW_TRIGGERS = {trigger.name.lower(): trigger for trigger in MOVER_TRIGGERS}
+"""The `--trigger` choices, by name: those `MoverConfig.trigger` accepts (`mover.TRIGGERS`)."""
+PRINT_TRIGGERS = frozenset({"last_price"})
+"""The `--trigger` choices that elect on trade prints. A window with one turns its data client's
+`trade_condition_filter` on, so only a print Alpaca's minute bars take becomes a tick, and its record
+says so; the filter is measured on sip prints only, so a part on another feed refuses it."""
 MOVER_SPARES = 2
 """Startup roster names beyond the held slots (UNCALIBRATED); watched so a free slot can rotate."""
 OVERNIGHT_STARTS = dt_time(20, 0)
@@ -749,6 +756,14 @@ class WindowConfig:
     re-ranks it in the node; `symbol` labels the primary name. The compatibility bridge takes one."""
     slots: int | None = None
     """`Mover`'s slots, where the run sets them; else the session part's (`mover_window.part_slots`)."""
+    trigger: str = "bid_ask"
+    """What elects the Mover's emulated trailing sell (`MoverConfig.trigger`): `bid_ask`, the bid of
+    every quote, or `last_price`, a trade print (persistence step 1, the lead's ruling of 2026-11-12).
+    Chosen per window by --trigger; UNCALIBRATED. Under `last_price` a name that stops printing is not
+    sold however far its bid falls, until a print or the wind-down, the remade sell's check included
+    (`Mover._followed` reads the last trade, which can be minutes old outside the regular session, and
+    none from before the entry's fill). It turns the data client's trade-condition filter on
+    (`PRINT_TRIGGERS`)."""
     spares: int = MOVER_SPARES
     """Additional qualified startup names watched by Mover, beyond its held slots."""
     baseline_path: Path | None = None
@@ -793,12 +808,17 @@ class WindowConfig:
     """Documented Trading API budget setting for the record, not a reported account limit."""
 
     def __post_init__(self) -> None:
+        if self.trigger not in WINDOW_TRIGGERS:
+            raise ValueError(
+                f"trigger must be one of {tuple(WINDOW_TRIGGERS)}, got {self.trigger!r}"
+            )
         MoverConfig(
             max_notional=Decimal(1),
             max_move=Decimal(1),
             trail_cap=self.trail_cap,
             extended_hours=self.session == "extended",
             **{name: getattr(self, name) for name in TRAIL_SETTINGS},
+            trigger=WINDOW_TRIGGERS[self.trigger],
         )
         check_limit(self.request_limit_per_minute)
         if self.reentry_arm == "vwap":
@@ -816,6 +836,10 @@ class WindowConfig:
             raise ValueError(
                 f"opening_arm {self.opening_arm!r} is refused: the opening is judged on Alpaca's "
                 "minute bars from 09:30, which this window does not request yet"
+            )
+        if self.trigger != "bid_ask" and self.strategy != MOVER:
+            raise ValueError(
+                f"trigger {self.trigger} elects Mover's trailing sell; {self.strategy} has none"
             )
         if self.session not in SESSIONS:
             raise ValueError(f"session must be one of {SESSIONS}, got {self.session!r}")
@@ -1633,6 +1657,7 @@ def window_node(
             trail_cap=config.trail_cap,
             rank_max_age_secs=RANK_MAX_AGE_SECS,
             trail_rows={name: getattr(config, name) for name in TRAIL_SETTINGS},
+            trigger=WINDOW_TRIGGERS[config.trigger],
         )
         # Paper opt-in: every name outside the startup roster (with `data_load_all`, the whole market;
         # a name missing from the cache by a native instrument request) may enter under the upstream
@@ -1656,6 +1681,7 @@ def window_node(
             max_order_submit_rate=runs.max_order_submit_rate,
             max_notional_per_order=order_cap,
             data_load_all=mover is not None,
+            trade_condition_filter=mover is not None and config.trigger in PRINT_TRIGGERS,
         )
         .with_logging(
             LoggerConfig(
@@ -2904,8 +2930,18 @@ def run_window(
         row = MOVER_PARTS[part]
         feed = row.feed
         if config.session == "extended" or config.strategy == MOVER:
+            if row.bridge_reason and config.trigger != "bid_ask":
+                raise WindowRefused(
+                    f"the {part} part runs the bridge in Mover's place ({row.bridge_reason}), "
+                    f"which has no trailing sell for trigger {config.trigger}"
+                )
             config = replace(config, strategy=DEFAULT_STRATEGY if row.bridge_reason else MOVER)
         if config.strategy == MOVER:
+            if config.trigger in PRINT_TRIGGERS and feed != DataFeed.SIP.value:
+                raise WindowRefused(
+                    f"trigger {config.trigger} turns on the trade-condition filter, measured on sip "
+                    f"prints only, and the {part} part streams {feed}"
+                )
             slots_in_use = row.slots if config.slots is None else config.slots
             if slots_in_use + config.spares > MOVER_CHECKS:
                 raise WindowRefused(
@@ -3087,6 +3123,9 @@ def run_window(
         mover["slots"] = row.slots if config.slots is None else config.slots
         mover["allocation"] = allocation.record()
         mover["spares"] = config.spares
+        # the window's selection by its --trigger name; `run.rows.trigger` is Mover's own spelling
+        mover["trigger"] = config.trigger
+        mover["trade_condition_filter"] = config.trigger in PRINT_TRIGGERS
         mover["roster_requested"] = mover["slots"] + config.spares
         mover["roster"] = [
             {
@@ -4743,6 +4782,13 @@ def _parser() -> argparse.ArgumentParser:
         f"{DEFAULT_ARM}, named as the default",
     )
     parser.add_argument(
+        "--trigger",
+        choices=tuple(WINDOW_TRIGGERS),
+        default=WindowConfig.trigger,
+        help="what elects Mover's trailing sell: bid_ask, every quote's bid (the default), or "
+        "last_price, a trade print (persistence step 1)",
+    )
+    parser.add_argument(
         "--baseline-path", type=Path, help="default: catalog/movers-baseline/<feed>.json"
     )
     parser.add_argument(
@@ -4799,7 +4845,12 @@ def window_config(args: argparse.Namespace, session: str) -> WindowConfig:
     profile = _profile_rows(args)
     if args.strategy == MOVER:
         # the trail rows and arm as named, or `DEFAULT_ARM`'s when none is (`_mover_trail`)
-        rows.update(_mover_trail(args), **profile, trail_profile_path=args.trail_profile_path)
+        rows.update(
+            _mover_trail(args),
+            **profile,
+            trail_profile_path=args.trail_profile_path,
+            trigger=args.trigger,
+        )
         for name in ARM_FLAGS:
             if (arm := getattr(args, name)) is None:
                 continue
@@ -4878,6 +4929,11 @@ def _args(argv: Sequence[str] | None) -> argparse.Namespace:
                 f"{flag} is {MOVER}'s, so it needs --strategy or --regular-strategy {MOVER}, or "
                 "--mover outside the regular session"
             )
+    if args.trigger != WindowConfig.trigger and not runs_mover:
+        parser.error(
+            f"--trigger elects {MOVER}'s trailing sell, so it needs --strategy or --regular-strategy "
+            f"{MOVER}, or --mover outside the regular session"
+        )
     # where Mover runs: the regular session under `--regular-strategy Mover`, or `--strategy Mover`
     # where no regular strategy is named; every extended part under `--mover`
     regular = args.session != "extended" and MOVER == (
@@ -4962,6 +5018,7 @@ def _refused_arm(args: argparse.Namespace) -> dict[str, Any]:
 
 def _main(args: argparse.Namespace) -> int:
     session = args.session
+    config: WindowConfig | None = None
     try:
         trading = market = None
         market_read_at: float | None = None
@@ -5009,6 +5066,7 @@ def _main(args: argparse.Namespace) -> int:
                     "session": session,
                     "strategy": args.strategy,
                     "result": f"refused: {e}",
+                    **({} if config is None else {"trigger": config.trigger}),
                     "started_epoch": time.time(),
                     "started": datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ"),
                     "stale_after": STALE_RUNNING_SECS,

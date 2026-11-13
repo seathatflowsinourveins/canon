@@ -3771,8 +3771,9 @@ class Mover(Strategy):
         return kept[1] if kept is not None else self._last_known(slot)[0]
 
     def _last_known(self, slot: Slot) -> tuple[Decimal | None, str]:
-        """The last trade the cache has, else the latest minute close: what the held stop reads."""
-        trade = self.cache.trade(slot.instrument_id)
+        """The last trade of this holding (`_holding_trade`), else the latest minute close: what the held
+        stop reads."""
+        trade = self._holding_trade(slot)
         if trade is not None:
             return trade.price.as_decimal(), "last trade"
         if slot.closes:
@@ -3831,12 +3832,26 @@ class Mover(Strategy):
 
     def _followed(self, slot: Slot) -> Decimal | None:
         """The price the trailing sell's trigger follows, as the cache has it now: the bid for `BID_ASK`,
-        the last trade for `LAST_PRICE`; None before the first."""
+        the last trade of this holding for `LAST_PRICE` (`_holding_trade`); None before the first."""
         if self.settings.trigger == TriggerType.BID_ASK:
             quote = self.cache.quote(slot.instrument_id)
             return None if quote is None else quote.bid_price.as_decimal()
-        trade = self.cache.trade(slot.instrument_id)
+        trade = self._holding_trade(slot)
         return None if trade is None else trade.price.as_decimal()
+
+    def _holding_trade(self, slot: Slot) -> Any:
+        """The cache's last trade, or None when it is stamped before the entry's first fill: such a print
+        is not of this holding, and one stray print would set the trigger, meet a kept one or go through
+        the held stop (`_persistent_trail` never takes the print cached before arming either). Its stamp
+        is the earlier of its event and receipt (`on_trade`)."""
+        trade = self.cache.trade(slot.instrument_id)
+        if trade is None:
+            return None
+        entry = None if slot.entry_id is None else slot.entry_id.value
+        filled = min((ns for cid, _, _, _, ns in self.fills if cid == entry), default=None)
+        if filled is not None and min(int(trade.ts_event), int(trade.ts_init)) < filled:
+            return None
+        return trade
 
     def _chase(
         self, slot: Slot, order: Any, held: Decimal, now: int, floor: Decimal | None

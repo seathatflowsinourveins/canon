@@ -76,8 +76,9 @@ The count, with `breach_count` or `high_count` above one, on trade prints only (
   the quote does not count, one at the bid does; consolidated feed only; with no quote newer than a
   stated age, a row, the count alone applies and the record says so; off until a paper window has
   shown it. The protector does not elect on prints again before it (the lead, 2026-11-12).
-* **No paper window has run it**, and none can: a window has no flag for the trigger or the rows.
-  Closed by those flags and a window whose record names the rows.
+* **No paper window has run it**, and none can: the trigger has a window flag (`--trigger`), but the
+  count rows have none yet (the selection unit). Closed by that flag and a window whose record names
+  the rows.
 * **The protector does not use it, and the Mover only on the fixed trail.** A trail plan's distance,
   its tighten and its chase cap (ADR 0088's `trail_mode`) are
   not carried into the held level. Closed by that change in each, with its tests.
