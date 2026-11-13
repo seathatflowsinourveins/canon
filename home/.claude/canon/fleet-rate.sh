@@ -2,9 +2,11 @@
 # The status line's first-line label: the session's lines added and removed, when it has changed any, then the
 # fleet's output speed and how many Claude Code sessions are working, e.g. "+156 -23 │ Fleet out 108 tok/s · 9
 # working" (ADR 0007). The speed is the report's fleet GEN: the output tokens of every timed request in its window
-# over those requests' durations, the measure Claude HUD's own "out:" takes for one response (src/speed.ts at
-# v0.15.0), so the two read alike; a report with no timed request, or none of that summary, shows the working
-# sessions alone. The summed TOK/S is the fleet's work, not a speed, and stays in scripts/lanes --rates.
+# over those requests' durations, the ratio Claude HUD's own "out:" takes for its session's latest response
+# (src/speed.ts at v0.15.0); the HUD leaves out subagents' requests and takes no reading under 500 ms of API
+# time, where the fleet counts every timed request. A report with no timed request, a speed under 0.5 tok/s
+# (which would show as 0), or no such summary shows the working sessions alone. The fleet's TOK/S is its
+# work, not a speed, and stays in scripts/lanes --rates.
 # Usage: fleet-rate.sh [<lines added> <lines removed>]. statusline.sh passes the input's documented
 # cost.total_lines_added and cost.total_lines_removed (https://code.claude.com/docs/en/statusline.md); the lines
 # are shown only when both are whole numbers of at most nine digits and one is above zero, a count of a million or
@@ -83,7 +85,7 @@ if [ "${first#* }" = due ] && [ -x "$lanes" ]; then
            (.fleet // {}) as $f
            | (if ($f.working | type) == "number" then $f.working
               else [(.workers // [])[] | select(.runtime == "claude-code" and .state == "working")] | length end) as $n
-           | ($f.gen_tok_s | if type == "number" and . > 0 then round else null end) as $g
+           | ($f.gen_tok_s | if type == "number" and round > 0 then round else null end) as $g
            | {t: (now | floor), label: ("Fleet " + (if $g != null then "out \($g) tok/s · " else "" end) + "\($n) working")}' \
            > "$tmp" 2>/dev/null && [ -s "$tmp" ]; then
         mv -f "$tmp" "$cache" && tmp=""

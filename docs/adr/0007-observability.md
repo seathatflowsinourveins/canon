@@ -337,17 +337,22 @@ sets the HUD's options at v0.15.0 (`src/config.ts`, `src/schema.ts`). The choice
   minutes, and how many Claude Code sessions are working, both from `scripts/lanes --rates` (installed as
   `canon/lanes`). The speed is the report's fleet GEN, the output tokens of every timed request of the
   measured workers over the total of those requests' durations, one ratio, so a long request weighs as long
-  as it ran. That is how the HUD's own `out:` measures its session's latest response, a response's output
-  tokens over the API time it added (`src/speed.ts` at v0.15.0), so the two read alike; both include the
-  wait for the first token, so neither is a model's streaming speed alone. Until 2026-11-13 the label
-  showed the measured workers' output tokens per second summed, `Fleet <n> tok/s`, which is the fleet's
-  work, not its speed: it grows with the sessions open, not with how fast any of them writes (at 17:31 UTC
-  that day, 636 tok/s summed while 463 timed requests ran at 103 tok/s, each session's between 81 and 120).
-  The sum stays in the report's fleet line and its JSON. Only Claude Code's requests carry a duration: Codex's `response.completed` event has
-  token counts and `ttft_ms` but no duration (`codex-rs/otel/src/events/session_telemetry.rs`,
-  `sse_event_completed`, at the pinned tag), so Codex counts in the work and not in the speed. A report
-  with no timed request in its window, or one from an installed `lanes` older than this summary, shows
-  the working sessions alone, never a zero. The label reaches the HUD through
+  as it ran. The HUD's own `out:` takes the same ratio for its session's latest response, its output tokens
+  over the API time it added (`src/speed.ts` at v0.15.0), but the two can differ: the HUD leaves out
+  subagents' requests and takes no reading from a response under 500 ms of API time, where the fleet counts
+  every timed request. Both include the wait for the first token, so neither is a model's streaming speed
+  alone. Until 2026-11-13 the label showed the measured workers' output tokens per second summed,
+  `Fleet <n> tok/s`, which is the fleet's work, not its speed: it grows with the sessions open, not with how
+  fast any of them writes (at 17:31 UTC that day, 636 tok/s summed while 463 timed requests ran at
+  103 tok/s, each session's between 81 and 120). That work stays in the report's fleet line and its JSON,
+  as the measured workers' output tokens over the window's seconds. Only Claude Code's events give one
+  request's output tokens and its duration together: Codex's `response.completed` event has the token
+  counts and `ttft_ms` but no duration, and its events that carry a duration (`codex.api_request`,
+  `codex.websocket_request`, each stream event) have no token count, and nothing joins them to a response
+  (`codex-rs/otel/src/events/session_telemetry.rs` at the pinned tag), so Codex counts in the work and not
+  in the speed. A report with no timed request in its window, a speed under 0.5 tok/s, or one from an
+  installed `lanes` older than this summary shows the working sessions alone, never a zero. The label
+  reaches the HUD through
   its `--extra-cmd`, which runs a command on every render and shows the `label` of its JSON, at most 50
   characters, only with `CLAUDE_HUD_ALLOW_EXTRA_CMD` set (README, "--extra-cmd"; `src/extra-cmd.ts` and
   `collector.mjs` at v0.15.0); `statusline.sh` sets both when `canon/fleet-rate.sh` is installed. The
@@ -622,8 +627,13 @@ Read 2026-11-09 (fetched; fetches are model-summarised).
   failed, errno 1`: use 30 s or more."
 * Read 2026-11-13 for the fleet's speed. Claude HUD at v0.15.0, the installed copy, `src/speed.ts`: "speed is
   the finished response's output over the API time it added", from `context_window.current_usage.output_tokens`
-  and `cost.total_api_duration_ms`, below 500 ms of API time no reading. Codex at the pinned tag
-  (`scripts/canon src codex-cli`), `codex-rs/otel/src/events/session_telemetry.rs`: `sse_event_completed`
-  logs `codex.sse_event` with `event.kind` `response.completed`, the token counts and `ttft_ms`, and no
-  duration; the `duration_ms` other `codex.sse_event` records carry is the wait for that one stream event
-  (`log_sse_event`), not the response's.
+  and `cost.total_api_duration_ms`, below 500 ms of API time no reading, and "API time from requests that
+  leave the main usage untouched (subagents) folds into the baseline instead of being charged to the next
+  response". Codex at the pinned tag, rust-v0.167.1 (`scripts/canon src codex-cli`),
+  `codex-rs/otel/src/events/session_telemetry.rs`: `sse_event_completed` logs `codex.sse_event` with
+  `event.kind` `response.completed`, the token counts and `ttft_ms`, and no duration;
+  `record_api_request` and `record_websocket_request` log `codex.api_request` and
+  `codex.websocket_request` with `duration_ms` and no token count, and `response.completed` names no
+  request to join them by; the `duration_ms` other `codex.sse_event` records carry is the wait for that
+  one stream event (`log_sse_event`, which `codex-rs/core/src/client.rs` calls from `on_sse_poll`), not
+  the response's.

@@ -323,12 +323,14 @@ printf '{"t":%s,"label":"Fleet 7 tok/s · 1 working"}' "$((FNOW + 3600))" > "$FR
 rm -f "$TMP/fleet.count" "$FR/canon/fleet-rate.tried"; out=$(fr); waitfor "$TMP/fleet.count"
 check "a summary dated ahead of the clock: no label, and a refresh starts" '[ -z "$out" ] && [ "$(runs)" = 1 ]'
 unlocked
-# with no speed to show, the working sessions alone: a report with no timed request in its window, and one from a
-# lanes that has no fleet summary yet (the installed copy is older than fleet-rate.sh), which shows no figure of its own
-for case_ in nogen nofleet; do
+# with no speed to show, the working sessions alone: a report with no timed request in its window, one from a
+# lanes that has no fleet summary yet (the installed copy is older than fleet-rate.sh), which shows no figure of its own,
+# and a speed under 0.5 tok/s, which would round to 0
+for case_ in nogen nofleet lowgen; do
   case "$case_" in
     nogen)   printf '%s\n' '{"workers":[{"runtime":"claude-code","state":"working","measured":true,"tok_s":3}],"fleet":{"working":1,"tok_s":3,"gen_tok_s":null,"gen_requests":0}}' > "$TMP/stub.json" ;;
     nofleet) printf '%s\n' '{"workers":[{"runtime":"claude-code","state":"working","measured":true,"tok_s":3},{"runtime":"claude-code","state":"working","measured":false}]}' > "$TMP/stub.json" ;;
+    lowgen)  printf '%s\n' '{"workers":[],"fleet":{"working":3,"tok_s":0.2,"gen_tok_s":0.3,"gen_requests":1}}' > "$TMP/stub.json" ;;
   esac
   rm -f "$TMP/fleet.count" "$FR/canon/fleet-rate.tried" "$FR/canon/fleet-rate.json"
   FLEET_STUB_JSON="$TMP/stub.json" fr >/dev/null; waitfor "$FR/canon/fleet-rate.json"; unlocked
@@ -337,6 +339,8 @@ for case_ in nogen nofleet; do
                '[ "$(jq -r .label "$FR/canon/fleet-rate.json")" = "Fleet 1 working" ]' ;;
     nofleet) check "a report without the fleet summary: the working sessions counted from its rows, no speed" \
                '[ "$(jq -r .label "$FR/canon/fleet-rate.json")" = "Fleet 2 working" ]' ;;
+    lowgen)  check "a fleet speed that rounds to 0 (0.3 tok/s): the working sessions alone, never out 0" \
+               '[ "$(jq -r .label "$FR/canon/fleet-rate.json")" = "Fleet 3 working" ]' ;;
   esac
 done
 # the status line hands the HUD the label's command and the opt-in, only when fleet-rate.sh is installed
