@@ -3897,18 +3897,24 @@ class Mover(Strategy):
         return None if trade is None else trade.price.as_decimal()
 
     def _holding_trade(self, slot: Slot) -> Any:
-        """The cache's last trade, or None when the venue stamped it before the entry's first fill on
-        record: such a print is not of this holding, and one stray print would set the trigger, meet a
-        kept one or go through the held stop (`_persistent_trail` never takes the print cached before
-        arming either). Both times are the venue's (the print's `ts_event`, the fill's), so this host's
-        clock does not move the boundary. With no entry fill on record it is the cache's last trade."""
+        """The cache's last trade, or None when the venue stamped it before Alpaca accepted the entry
+        (else before its first fill on record): such a print is not of this holding, and one stray print
+        would set the trigger, meet a kept one or go through the held stop (`_persistent_trail` never
+        takes the print cached before arming either). The acceptance, not the fill: Alpaca stamps a fill
+        with its trade update's time and the SIP stamps the print of that fill on its own clock, which
+        can be earlier, so the fill's own print would be dropped. All are venue times (the print's
+        `ts_event`; the order's `ts_accepted`, Alpaca's `submitted_at`; the fill's), so this host's clock
+        does not move the boundary. With no entry fill on record it is the cache's last trade."""
         trade = self.cache.trade(slot.instrument_id)
         if trade is None:
             return None
         filled = self._entry_filled_ns(slot)
-        if filled is not None and int(trade.ts_event) < filled:
-            return None
-        return trade
+        if filled is None:
+            return trade
+        entry = self._order(slot.entry_id)
+        accepted = None if entry is None else getattr(entry, "ts_accepted", None)
+        since = filled if accepted is None else min(filled, int(accepted))
+        return None if int(trade.ts_event) < since else trade
 
     def _entry_filled_ns(self, slot: Slot) -> int | None:
         """The venue's time of the entry's first fill on record, or None."""

@@ -320,3 +320,28 @@ def test_under_a_print_trigger_a_first_print_above_the_held_stop_arms_the_trail_
     assert [o.kind for o in seam.sent] == ["TRAILING"] and not slot.exiting
     assert seam.sent[0].trigger_price is not None
     assert Decimal(str(seam.sent[0].trigger_price)) == Decimal("9.80")
+
+
+def test_a_print_of_the_entrys_own_fill_stamped_before_alpacas_fill_time_is_followed() -> None:
+    """Alpaca stamps a fill with its trade update's time (the adapter's fill `ts_event`), and the SIP
+    stamps the print of that fill on its own clock, which can be earlier. A print stamped after Alpaca
+    accepted the entry (`ts_accepted`, its `submitted_at`) is of this holding, so the print of the
+    fill itself is followed. Under `last_price` with a one-sided quote, dropping it would sell the
+    holding as `unpriced_exit` after 60 s (the late-prints port's code review, on the successor's
+    boundary)."""
+    seam, slot, filled, last = holding(TriggerType.LAST_PRICE)
+    seam.orders["E-1"].ts_accepted = filled - SECOND
+    last.append(stamped("10.0500", filled - 200 * MS, filled + 50 * MS))
+    assert seam._followed(slot) == Decimal("10.05")
+    seam._protect(slot, Decimal(3), filled + SECOND)
+    seam._protect(slot, Decimal(3), filled + 61 * SECOND)
+    assert seam.sent and not slot.exiting
+
+
+def test_a_print_stamped_before_alpaca_accepted_the_entry_is_still_not_of_the_holding() -> None:
+    """The boundary moves back only to Alpaca's acceptance: a print stamped before it is no price of
+    this holding, as before."""
+    seam, slot, filled, last = holding(TriggerType.LAST_PRICE, bid="10.04", ask="10.06")
+    seam.orders["E-1"].ts_accepted = filled - SECOND
+    last.append(stamped("10.0500", filled - SECOND - 1, filled))
+    assert seam._followed(slot) is None
