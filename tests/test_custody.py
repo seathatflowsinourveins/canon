@@ -300,7 +300,7 @@ def test_a_replacement_whose_replaced_order_is_not_listed_freezes_the_symbol() -
     quantity, why = opened(venue)
     assert quantity is None
     assert why == (
-        "an order of ours in SPY replaces one the listing of the last 1 day, 0:00:00 does not hold, "
+        "an order of ours in SPY replaces one the listing of the current trading week does not hold, "
         "whose fills it carries, so the quantity ours opened is not established"
     )
     report = close(venue)
@@ -822,7 +822,7 @@ def test_a_chain_never_counts_more_than_it_filled_so_a_foreign_share_is_not_sold
     report = close(venue)
     assert venue.sent == []
     assert report.frozen["SPY"] == [
-        "38 SPY held, but our orders opened 20 in the last 1 day, 0:00:00"
+        "38 SPY held, but our orders opened 20 in the current trading week"
     ]
 
 
@@ -865,7 +865,7 @@ def test_a_replacement_a_hand_made_takes_none_of_our_replaced_orders_fills() -> 
     report = close(venue)
     assert venue.sent == []
     assert report.frozen["SPY"] == [
-        "20 SPY held, but our orders opened 18 in the last 1 day, 0:00:00"
+        "20 SPY held, but our orders opened 18 in the current trading week"
     ]
 
 
@@ -1800,9 +1800,221 @@ def test_a_quantity_ours_did_not_open_freezes_the_symbol() -> None:
     report = close(venue)
     assert venue.sent == [] and venue.canceled == []
     assert report.frozen == {
-        "AAPL": ["5 AAPL held, but our orders opened 0 in the last 1 day, 0:00:00"],
-        "SPY": ["3 SPY held, but our orders opened 1 in the last 1 day, 0:00:00"],
+        "AAPL": ["5 AAPL held, but our orders opened 0 in the current trading week"],
+        "SPY": ["3 SPY held, but our orders opened 1 in the current trading week"],
     }
+
+
+def test_our_long_opened_three_days_ago_in_this_trading_week_is_ours() -> None:
+    venue = Venue(datetime(2026, 11, 13, 15, tzinfo=UTC))
+    venue.hold("SPY", 3)
+    venue.history[-1] = venue.history[-1].model_copy(
+        update={"submitted_at": venue.now - timedelta(days=3)}
+    )
+
+    (holding,) = custody.read_holdings(cast(Any, venue), venue.now)
+    assert holding.opened == Decimal(3)
+    assert holding.frozen == []
+    assert holding.ours_left() == ["position of 3 SPY (ours opened 3)"]
+
+
+def test_our_long_opened_eight_trading_days_ago_stays_frozen_and_named() -> None:
+    venue = Venue(datetime(2026, 11, 13, 15, tzinfo=UTC))
+    venue.hold("SPY", 3)
+    # Tuesday Nov 3 to Friday Nov 13: eight weekday sessions, ten calendar days.
+    venue.history[-1] = venue.history[-1].model_copy(
+        update={"submitted_at": datetime(2026, 11, 3, 15, tzinfo=UTC)}
+    )
+
+    (holding,) = custody.read_holdings(cast(Any, venue), venue.now)
+    assert holding.opened == 0
+    assert holding.frozen and "3 SPY held, but our orders opened 0" in holding.frozen[0]
+    assert holding.ours_left() == []
+    report = close(venue)
+    assert "SPY" in report.frozen
+    assert venue.sent == [] and venue.canceled == []
+
+
+def test_a_three_day_mixed_lineage_long_still_freezes_its_whole_symbol() -> None:
+    venue = Venue(datetime(2026, 11, 13, 15, tzinfo=UTC))
+    venue.hold("SPY", 2)
+    venue.hold("SPY", 1, client_order_id=FOREIGN[0])
+    venue.history = [
+        order.model_copy(update={"submitted_at": venue.now - timedelta(days=3)})
+        for order in venue.history
+    ]
+
+    (holding,) = custody.read_holdings(cast(Any, venue), venue.now)
+    assert holding.opened == 2 and holding.held == 3
+    assert holding.frozen and "3 SPY held, but our orders opened 2" in holding.frozen[0]
+    report = close(venue)
+    assert "SPY" in report.frozen
+    assert venue.sent == [] and venue.canceled == []
+
+
+@pytest.mark.parametrize(
+    ("now", "start"),
+    [
+        ("2026-11-13T15:00:00+00:00", "2026-11-09T01:00:00+00:00"),
+        ("2026-11-09T00:30:00+00:00", "2026-11-02T01:00:00+00:00"),
+        ("2026-11-09T01:30:00+00:00", "2026-11-09T01:00:00+00:00"),
+        ("2026-03-09T00:30:00+00:00", "2026-03-09T00:00:00+00:00"),
+        ("2026-03-08T23:30:00+00:00", "2026-03-02T01:00:00+00:00"),
+    ],
+)
+def test_lineage_never_reads_before_the_current_sunday_evening_open(now, start) -> None:
+    """The 24/5 week starts Sunday 20:00 New York, including either side of the DST change."""
+    venue = Venue(datetime.fromisoformat(now))
+    venue.hold("SPY", 1)
+    venue.history[-1] = venue.history[-1].model_copy(
+        update={"submitted_at": datetime.fromisoformat(start) + timedelta(minutes=1)}
+    )
+
+    (holding,) = custody.read_holdings(cast(Any, venue), venue.now)
+    (request,) = [
+        request
+        for name, request in venue.calls
+        if name == "get_orders" and _value(request.status) == "all"
+    ]
+    assert request.after == datetime.fromisoformat(start)
+    assert holding.opened == 1 and holding.frozen == []
+
+
+class PagedVenue(Venue):
+    """The pinned GetOrdersRequest's bounds, submission-time sort and 500-row limit.
+
+    The SDK says 'until' without specifying equality; exercise both interpretations. The older
+    Venue deliberately preserves listing order for the replacement-chain permutation tests.
+    """
+
+    def __init__(self, now: datetime, *, until_inclusive: bool = True) -> None:
+        super().__init__(now)
+        self.until_inclusive = until_inclusive
+
+    def get_orders(self, filter: Any = None):
+        self.calls.append(("get_orders", filter))
+        found = [
+            order
+            for order in self.history
+            if (
+                _value(filter.status) == "all"
+                or _value(order.status) not in session_window.TERMINAL
+            )
+            and (not filter.symbols or order.symbol in filter.symbols)
+            and (filter.after is None or order.submitted_at > filter.after)
+            and (
+                filter.until is None
+                or order.submitted_at < filter.until
+                or (self.until_inclusive and order.submitted_at == filter.until)
+            )
+        ]
+        found.sort(key=lambda order: order.submitted_at, reverse=_value(filter.direction) != "asc")
+        return found[: filter.limit or 50]
+
+
+@pytest.mark.parametrize("until_inclusive", [True, False])
+@pytest.mark.parametrize("foreign_first", [False, True])
+def test_a_week_of_fills_across_three_pages_is_read_whole_and_paced(
+    monkeypatch, until_inclusive: bool, foreign_first: bool
+) -> None:
+    venue = PagedVenue(datetime(2026, 11, 13, 15, tzinfo=UTC), until_inclusive=until_inclusive)
+    venue.held["SPY"] = Decimal(1003)
+    for n in range(1003):
+        venue.open(
+            client_order_id=FOREIGN[0]
+            if foreign_first and n == 0
+            else f"O-20261109-150000-001-001-{n}",
+            qty="1",
+            filled_qty="1",
+            status="filled",
+            submitted_at=(
+                datetime(2026, 11, 9, 15, tzinfo=UTC) + timedelta(minutes=4 * n)
+            ).isoformat(),
+        )
+    sleeps: list[float] = []
+    monkeypatch.setattr(custody.time, "sleep", sleeps.append)
+
+    (holding,) = custody.read_holdings(cast(Any, venue), venue.now)
+    assert holding.opened == (1002 if foreign_first else 1003)
+    assert bool(holding.frozen) == foreign_first
+    requests = [
+        request
+        for name, request in venue.calls
+        if name == "get_orders" and _value(request.status) == "all"
+    ]
+    assert len(requests) == 3
+    assert all(request.after == datetime(2026, 11, 9, 1, tzinfo=UTC) for request in requests)
+    assert sleeps == [session_window.POLL_SECS, session_window.POLL_SECS]
+
+
+def test_a_full_page_of_equal_timestamps_cannot_hide_more_fills(monkeypatch) -> None:
+    venue = PagedVenue(REGULAR)
+    venue.held["SPY"] = Decimal(501)
+    for n in range(501):
+        venue.open(
+            client_order_id=f"O-20261111-145000-001-001-{n}",
+            qty="1",
+            filled_qty="1",
+            status="filled",
+            submitted_at=(venue.now - timedelta(minutes=10)).isoformat(),
+        )
+    monkeypatch.setattr(custody.time, "sleep", lambda seconds: None)
+
+    (holding,) = custody.read_holdings(cast(Any, venue), venue.now)
+    assert holding.opened is None and holding.frozen
+    assert "pagination" in holding.frozen[0]
+    assert holding.ours_left() == []
+
+
+@pytest.mark.parametrize("until_inclusive", [True, False])
+def test_recent_fills_with_the_same_submission_time_cross_a_page_without_loss(
+    monkeypatch, until_inclusive: bool
+) -> None:
+    """Under either reading of `until`: Alpaca's reference calls it exclusive, and then only the
+    microsecond added to the page's earliest time brings the tied fills onto the next page."""
+    venue = PagedVenue(REGULAR, until_inclusive=until_inclusive)
+    venue.hold("SPY", 3, client_order_id=None)
+    for n in range(499):
+        venue.open(
+            client_order_id=f"O-20261111-145500-001-001-{n}",
+            status="canceled",
+            submitted_at=(venue.now - timedelta(minutes=5)).isoformat(),
+        )
+    for n in range(3):
+        venue.open(
+            client_order_id=f"O-20261111-145000-001-001-{n}",
+            status="filled",
+            filled_qty="1",
+            submitted_at=(venue.now - timedelta(minutes=10)).isoformat(),
+        )
+    monkeypatch.setattr(custody.time, "sleep", lambda seconds: None)
+
+    (holding,) = custody.read_holdings(cast(Any, venue), venue.now)
+    assert holding.opened == 3 and holding.frozen == []
+
+
+def test_a_failed_later_history_page_never_uses_the_partial_net(monkeypatch) -> None:
+    venue = PagedVenue(REGULAR)
+    venue.hold("SPY", 1)
+    for n in range(500):
+        venue.open(
+            client_order_id=f"O-20261111-145500-001-001-{n}",
+            status="canceled",
+            submitted_at=(venue.now - timedelta(seconds=n)).isoformat(),
+        )
+    get_orders = venue.get_orders
+
+    def fail_later(filter):
+        if filter.until is not None:
+            raise APIError('{"code": 42910000, "message": "do not print this body"}', _status(429))
+        return get_orders(filter)
+
+    monkeypatch.setattr(venue, "get_orders", fail_later)
+    monkeypatch.setattr(custody.time, "sleep", lambda seconds: None)
+
+    with pytest.raises(custody.ReadFailed, match="the orders in SPY failed: APIError") as failed:
+        custody.read_holdings(cast(Any, venue), venue.now)
+    assert "429" in str(failed.value) and "do not print" not in str(failed.value)
 
 
 def test_a_short_is_never_bought_back() -> None:
@@ -1815,7 +2027,9 @@ def test_a_short_is_never_bought_back() -> None:
     assert all(_value(f.status) == "open" for f in listed)  # a frozen symbol's history is not read
 
 
-def test_a_full_listing_of_the_symbols_orders_freezes_it() -> None:
+def test_a_full_listing_that_cannot_advance_freezes_the_symbol(monkeypatch) -> None:
+    # This stand-in ignores `until`, so the truncated history never becomes a complete listing.
+    monkeypatch.setattr(custody.time, "sleep", lambda seconds: None)
     venue = Venue(REGULAR)
     venue.hold("SPY", 1)
     for n in range(2, custody.ORDERS_PAGE_LIMIT + 1):
@@ -2231,3 +2445,168 @@ def test_a_hands_own_sell_chain_with_fills_on_two_links_running_leaves_our_count
             submitted_at=(venue.now - timedelta(minutes=10 - n)).isoformat(),
         )
     assert opened(venue) == (Decimal(10), "")
+
+
+class OddVenue(PagedVenue):
+    """A venue that does not do what the request asks: it answers oldest first, keeps only whole
+    seconds of `until`, or ignores `after`."""
+
+    oldest_first = False
+    until_to_seconds = False
+    ignores_after = False
+
+    def get_orders(self, filter: Any = None):
+        if filter is not None and _value(filter.status) == "all":
+            changed: dict[str, Any] = {}
+            if self.until_to_seconds and filter.until is not None:
+                changed["until"] = filter.until.replace(microsecond=0)
+            if self.oldest_first:
+                changed["direction"] = "asc"
+            if self.ignores_after:
+                changed["after"] = None
+            filter = filter.model_copy(update=changed)
+        return super().get_orders(filter)
+
+
+WEEK_NOW = datetime(2026, 11, 13, 15, tzinfo=UTC)
+"""Friday 10:00 New York; the trading week began Sunday 2026-11-08 20:00 New York."""
+
+
+def _a_week_with_a_hands_buy(venue: Venue, sell_at: datetime) -> None:
+    """Ours buys 10, a hand buys 5, ours sells 5 at `sell_at`, and 500 orders of ours fill nothing:
+    10 are held and only 5 of them are ours, so the symbol must freeze."""
+    monday = datetime(2026, 11, 9, 15, tzinfo=UTC)
+    venue.held["SPY"] = Decimal(10)
+    venue.open(
+        client_order_id="O-20261109-150000-001-001-1",
+        qty="10",
+        filled_qty="10",
+        status="filled",
+        submitted_at=monday.isoformat(),
+    )
+    venue.open(
+        client_order_id=FOREIGN[0],
+        qty="5",
+        filled_qty="5",
+        status="filled",
+        submitted_at=(monday + timedelta(hours=1)).isoformat(),
+    )
+    venue.open(
+        client_order_id="O-20261111-150000-001-001-9",
+        qty="5",
+        filled_qty="5",
+        side="sell",
+        status="filled",
+        submitted_at=sell_at.isoformat(),
+    )
+    edge = datetime(2026, 11, 12, 15, 0, 0, 900000, tzinfo=UTC)
+    for n in range(500):
+        venue.open(
+            client_order_id=f"O-20261112-150000-001-001-{n + 100}",
+            qty="1",
+            filled_qty="0",
+            status="canceled",
+            submitted_at=(edge + timedelta(microseconds=n)).isoformat(),
+        )
+
+
+def test_a_week_with_a_hands_buy_read_in_two_pages_counts_only_ours(monkeypatch) -> None:
+    """The scene the next three cases bend, on a venue that does as asked: the net is ours' 5."""
+    venue = OddVenue(WEEK_NOW)
+    _a_week_with_a_hands_buy(venue, datetime(2026, 11, 11, 15, tzinfo=UTC))
+    monkeypatch.setattr(custody.time, "sleep", lambda seconds: None)
+
+    (holding,) = custody.read_holdings(cast(Any, venue), venue.now)
+    assert holding.opened == 5 and holding.held == 10
+    assert holding.frozen == ["10 SPY held, but our orders opened 5 in the current trading week"]
+
+
+def test_a_history_answered_oldest_first_is_not_counted(monkeypatch) -> None:
+    """A venue that ignores `direction`: the first page is the oldest 500, the walk would stop
+    after it with our later sell unread, and every held share would read as ours (a reviewer's
+    reproduction, 2026-11-13)."""
+    venue = OddVenue(WEEK_NOW)
+    venue.oldest_first = True
+    _a_week_with_a_hands_buy(venue, datetime(2026, 11, 13, 14, tzinfo=UTC))
+    monkeypatch.setattr(custody.time, "sleep", lambda seconds: None)
+
+    (holding,) = custody.read_holdings(cast(Any, venue), venue.now)
+    assert holding.opened is None and holding.frozen
+    assert "not newest first" in holding.frozen[0]
+
+
+@pytest.mark.parametrize("until_inclusive", [True, False])
+def test_a_history_whose_next_page_drops_the_orders_at_the_edge_is_not_counted(
+    monkeypatch, until_inclusive: bool
+) -> None:
+    """A venue that keeps only whole seconds of `until`: our sell, in the edge's second and older
+    than the page's oldest order, is on no page, and every held share would read as ours (the same
+    reviewer). The orders at a page's earliest time must come back on the next page."""
+    venue = OddVenue(WEEK_NOW, until_inclusive=until_inclusive)
+    venue.until_to_seconds = True
+    _a_week_with_a_hands_buy(venue, datetime(2026, 11, 12, 15, 0, 0, 300000, tzinfo=UTC))
+    monkeypatch.setattr(custody.time, "sleep", lambda seconds: None)
+
+    (holding,) = custody.read_holdings(cast(Any, venue), venue.now)
+    assert holding.opened is None and holding.frozen
+    assert "does not hold the orders at the edge" in holding.frozen[0]
+
+
+def test_a_later_history_page_with_an_order_from_before_the_week_is_not_counted(
+    monkeypatch,
+) -> None:
+    venue = OddVenue(WEEK_NOW)
+    venue.ignores_after = True
+    _a_week_with_a_hands_buy(venue, datetime(2026, 11, 11, 15, tzinfo=UTC))
+    venue.open(
+        client_order_id="O-20261030-150000-001-001-1",
+        qty="5",
+        filled_qty="5",
+        status="filled",
+        submitted_at=datetime(2026, 10, 30, 15, tzinfo=UTC).isoformat(),
+    )
+    monkeypatch.setattr(custody.time, "sleep", lambda seconds: None)
+
+    (holding,) = custody.read_holdings(cast(Any, venue), venue.now)
+    assert holding.opened is None and holding.frozen
+    assert "outside the time asked for" in holding.frozen[0]
+
+
+def test_an_order_that_changed_between_two_history_pages_is_not_counted(monkeypatch) -> None:
+    """The order at a page's edge is read on both pages; a fill arriving between them shows as a
+    row that differs, and neither count is taken."""
+    venue = PagedVenue(WEEK_NOW)
+    _a_week_with_a_hands_buy(venue, datetime(2026, 11, 11, 15, tzinfo=UTC))
+    get_orders = venue.get_orders
+
+    def filling(filter):
+        found = get_orders(filter)
+        if _value(filter.status) == "all" and filter.until is not None:
+            found[0] = found[0].model_copy(update={"filled_qty": "1"})
+        return found
+
+    monkeypatch.setattr(venue, "get_orders", filling)
+    monkeypatch.setattr(custody.time, "sleep", lambda seconds: None)
+
+    (holding,) = custody.read_holdings(cast(Any, venue), venue.now)
+    assert holding.opened is None and holding.frozen
+    assert "changed across history pages" in holding.frozen[0]
+
+
+def test_a_full_history_page_with_an_undated_order_is_not_counted(monkeypatch) -> None:
+    venue = PagedVenue(WEEK_NOW)
+    _a_week_with_a_hands_buy(venue, datetime(2026, 11, 11, 15, tzinfo=UTC))
+    get_orders = venue.get_orders
+
+    def undated(filter):
+        found = get_orders(filter)
+        if _value(filter.status) == "all":
+            found[3] = found[3].model_copy(update={"submitted_at": None})
+        return found
+
+    monkeypatch.setattr(venue, "get_orders", undated)
+    monkeypatch.setattr(custody.time, "sleep", lambda seconds: None)
+
+    (holding,) = custody.read_holdings(cast(Any, venue), venue.now)
+    assert holding.opened is None and holding.frozen
+    assert "no dated submission boundary" in holding.frozen[0]
