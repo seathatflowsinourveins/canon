@@ -109,6 +109,10 @@ TICK_BUCKETS = ("under 3", "3 to 5", "5 to 10", "over 10")
 
 
 def tick_bucket(ticks: float) -> str:
+    # NaN and infinity compare false into "over 10" and nothing measures into "under 3": a trail
+    # with no finite positive width has no bucket (sr-a-329 P3-1)
+    if not math.isfinite(ticks) or ticks <= 0:
+        raise ValueError(f"a trail's ticks must be finite and positive, not {ticks}")
     if ticks < 3:
         return TICK_BUCKETS[0]
     if ticks < 5:
@@ -287,6 +291,8 @@ def reentry_signal(
     eligible: Callable[[int], bool] | None = None,
 ) -> Signal | None:
     """The sale-bar close seeds the low; entries start strictly on later bar closes."""
+    if not (math.isfinite(distance) and distance > 0):
+        raise ValueError(f"a re-entry needs a positive trail to measure its fall, not {distance}")
     low, low_index, rises = bars[sold_index].close, sold_index, 0
     below = vwap is not None and bars[sold_index].close < vwap[sold_index]
     k, d = (int(x) for x in arm.split("-")[1:]) if arm.startswith("turn-") else (0, 0)
@@ -513,7 +519,10 @@ class ReplayContext:
         out = []
         for b, atr in zip(self.bars, self.atr, strict=True):
             fraction = trail_fraction(exit_arm, b.close, atr, self.top)
-            out.append(None if fraction is None else study.snap(fraction * b.close))
+            distance = None if fraction is None else study.snap(fraction * b.close)
+            # a positive trail that snaps to nothing (a Wilder ATR decayed under 5e-10 on a flat
+            # tape) is no trail: the bar is not ready, as with a zero ATR, never a zero-width walk
+            out.append(distance if distance is not None and distance > 0 else None)
         self._distances[exit_arm] = tuple(out)
         return self._distances[exit_arm]
 
@@ -940,6 +949,10 @@ def new_returns(*, histogram: bool) -> dict[str, Any]:
 
 
 def add_return(target: dict[str, Any], value: float) -> None:
+    # without bins nothing else reads the value, and a NaN would sum to a NaN mean beside a 0.0
+    # deviation (`max(0.0, nan)` is 0.0)
+    if not math.isfinite(value):
+        raise ValueError(f"a return must be finite, not {value}")
     target["returns_count"] += 1
     target["returns_bps_sum"] += value
     target["returns_bps_sumsq"] += value * value
@@ -1248,6 +1261,13 @@ def write_tick_table(out: Any, sums: dict[Key, dict[str, Any]]) -> None:
         out.write(f"| {key[0]} | {key[3]} | {key[5]} | " + " | ".join(cells) + " |\n")
 
 
+def _refuse_constant(path: Path) -> Callable[[str], Any]:
+    def refuse(constant: str) -> Any:
+        raise ValueError(f"shard {path} holds {constant}, which no figure may be")
+
+    return refuse
+
+
 def merge(paths: Sequence[Path], output: Path, name: str) -> Path:
     """One summary from shard runs: their tier aggregates and counts summed. Every shard is complete,
     the shards are exactly 0/n to n-1/n of one n, and they ran the same code on the same inputs."""
@@ -1256,16 +1276,20 @@ def merge(paths: Sequence[Path], output: Path, name: str) -> Path:
     used: dict[str, int] = defaultdict(int)
     metadata = []
     for path in paths:
-        complete = False
+        complete, described = False, 0
         with path.open() as stream:
             for line in stream:
-                record = json.loads(line)
+                # a shard written before the aggregate lines refused NaN may still hold one
+                record = json.loads(line, parse_constant=_refuse_constant(path))
                 if record["kind"] == "metadata":
                     metadata.append(record)
+                    described += 1
                 elif record["kind"] == "aggregate" and record["group"].startswith("tier:"):
                     key = tuple(record[f] for f in KEY_FIELDS)
                     sums[key].append(record)
                 elif record["kind"] == "completion":
+                    if complete:
+                        raise ValueError(f"shard {path} has more than one completion record")
                     complete = True
                     for field, value in record["counts"].items():
                         counts[field] += value
@@ -1273,6 +1297,9 @@ def merge(paths: Sequence[Path], output: Path, name: str) -> Path:
                         used[day] += value
         if not complete:
             raise ValueError(f"shard incomplete: {path}")
+        # each file names its own shard, so a file's counts are never taken on another's metadata
+        if described != 1:
+            raise ValueError(f"shard {path} has {described} metadata records, not one")
     specs = [tuple(int(x) for x in m["shard"].split("/")) for m in metadata]
     ns = {n for _, n in specs}
     if len(ns) != 1 or sorted(k for k, _ in specs) != list(range(ns.pop())):
@@ -1467,7 +1494,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             records = {key: aggregate_record(key, sums[key]) for key in mine}
             for key in mine:
                 sums.pop(key)
-                stream.write(json.dumps(records[key]) + "\n")
+                stream.write(json.dumps(records[key], allow_nan=False) + "\n")
             for key in mine:
                 if key[1] == "run-2" and key[6] == "ohlc":
                     symbol_table.write(table_row(records[key], records.get((*key[:6], "adaptive"))))
@@ -1478,7 +1505,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     flush=True,
                 )
         for key, aggregate in sorted(sums.items()):
-            stream.write(json.dumps(aggregate_record(key, aggregate)) + "\n")
+            stream.write(json.dumps(aggregate_record(key, aggregate), allow_nan=False) + "\n")
         counts["unloaded_symbol_days"] = (
             len(development) * len(symbols) - counts["loaded_symbol_days"]
         )
