@@ -120,14 +120,17 @@ on `cc-plugin-you-should-know@builtin`, a mod built into the pinned Claude Code 
 note above the prompt. The docs say the side agent has no tools and cannot change what Claude does.
 Each check is a background request to the session's model, billed for the mod's instructions and its
 reply. Notes and dismissed topics are kept in `~/.claude/plugins/store/cc-plugin-you-should-know*`.
-It loads only in a direct first-party session that fetches feature flags, and Orca is launched with
-`DO_NOT_TRACK=1`, which every agent it starts inherits and which turns that fetch off ("Features that need
-feature-flag fetching", env-vars.md). So canon's user settings set `DO_NOT_TRACK` to `"0"` in `env`, which
-overrides the inherited value for Claude Code alone (a settings `env` value replaces one exported by the
-shell, env-vars.md). Claude Code then also sends its own analytics to Anthropic again, which the owner
-accepted on 2026-11-12. Orca and the other runtimes keep `DO_NOT_TRACK=1`. The owner turns it on, never a
-session, with `/plugin enable cc-plugin-you-should-know@builtin`, and turns it off with
-`/plugin disable cc-plugin-you-should-know@builtin`. Read 2026-11-12 in
+It loads only in a direct first-party session that fetches feature flags, which Orca's `DO_NOT_TRACK=1`
+turns off. ADR 0139
+records how canon's user settings let Claude Code fetch them, and what of the claude.ai account that fetch
+would otherwise bring in. The owner turns the mod on, never a session, with
+`/plugin enable cc-plugin-you-should-know@builtin`, and off with
+`/plugin disable cc-plugin-you-should-know@builtin`. Checked 2026-11-13: in a session Orca started once
+ADR 0139's `DO_NOT_TRACK` setting was in place, the owner turned the mod on with `/plugin`, which answered
+`Enabled cc-plugin-you-should-know`, and the user settings' `enabledPlugins` now holds
+`"cc-plugin-you-should-know@builtin": true` (read). That session's `/plugin` also listed two built-in mods, on by
+default in Claude Code 2.1.323, that the docs read here do not describe, `cc-plugin-easel` and
+`cc-plugin-privacy`; what they do is UNVERIFIED. Read 2026-11-12 in
 https://code.claude.com/docs/en/interactive-mode.md ("You should know suggestions") and
 https://code.claude.com/docs/en/plugins/mods/overview.md ("Mods built into Claude Code"). The mod's
 source is not among those the docs publish, so what it sends beyond the documented check is UNVERIFIED.
@@ -175,3 +178,8 @@ Read 2026-11-10. `fetched`: downloaded whole with `curl` and read, not summarise
   `resolved`), the files named above read from a clone at that tag;
   https://code.claude.com/docs/en/discover-plugins.md — `claude plugin install`, `enable` and `marketplace
   add` "as ordinary terminal commands", and `owner/repo#ref` "to pin a branch or tag" (`fetched`, raw).
+* You should know exception, 2026-11-12: https://code.claude.com/docs/en/interactive-mode.md and
+  https://code.claude.com/docs/en/plugins/mods/overview.md (`fetched`). Corrected 2026-11-13 after a review:
+  the user settings that let Claude Code fetch its feature flags, and keep the claude.ai account's skills,
+  plugins and connectors out, are a decision of their own, now ADR 0139 with its sources; the check names
+  the owner as the one who turned the mod on, and the "direct" condition stays.

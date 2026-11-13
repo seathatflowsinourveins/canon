@@ -2490,6 +2490,8 @@ fi
 mkdir -p "$C/canon"; echo "# previous" > "$C/canon/ledger.sh"
 CLAUDE_CONFIG_DIR="$C" bs --user-config; rc=$?
 check "user-config into a directory with a space: exit 0" test "$rc" = 0
+check "... a new settings.json, with a NOTE saying what each of ADR 0139's four settings changes" \
+      eval 'grep -qF "installed  $C/settings.json" "$TMP/bs.out" && [ "$(grep -c "^  NOTE       .*(ADR 0139)\$" "$TMP/bs.out")" = 4 ] && grep -q "NOTE       DO_NOT_TRACK \"0\": .*sends its usage metrics" "$TMP/bs.out" && grep -qF "moves those already synced to $C/skills/.trash/" "$TMP/bs.out"'
 check "no Codex folder: Codex telemetry skipped, nothing created" \
       eval '[ ! -e "$HOME/.codex" ] && grep -q "skipped    Codex telemetry: no $HOME/.codex" "$TMP/bs.out"'
 bak=$(find "$C/canon" -name 'ledger.sh.replaced-*'); bak=${bak%%$'\n'*}
@@ -2552,6 +2554,8 @@ check "an existing settings.json gets the missing telemetry variables, keeping i
       jqt "$C3/settings.json" '.model == "mine" and .env.MY_VAR == "1" and .env.CLAUDE_CODE_ENABLE_TELEMETRY == "1" and .env.OTEL_LOGS_EXPORTER == "otlp"'
 check "... and the model keys it lacks, the owner's model kept and named (ADR 0059)" \
       eval 'jqt "$C3/settings.json" ".availableModels == $(jq -c .availableModels "$ROOT/home/.claude/settings.json") and .modelPicker == $(jq -c .modelPicker "$ROOT/home/.claude/settings.json") and (.env | has(\"ANTHROPIC_DEFAULT_FABLE_MODEL\") | not)" && grep -q "KEPT .*sets model to another value than home/.claude/settings.json" "$TMP/bs.out"'
+check "... and ADR 0139's four settings, which it lacked, as the template sets them, with a NOTE for each" \
+      eval 'jqt "$C3/settings.json" ".env.DO_NOT_TRACK == \"0\" and .syncClaudeAiSkills == false and .syncClaudeAiPlugins == false and .disableClaudeAiConnectors == true" && [ "$(grep -c "^  NOTE       .*(ADR 0139)\$" "$TMP/bs.out")" = 4 ]'
 check "... leaves a value the owner set, and names it" \
       eval 'jqt "$C3/settings.json" ".env.OTEL_METRICS_EXPORTER == \"otlp\"" && grep -q "sets OTEL_METRICS_EXPORTER to another value" "$TMP/bs.out"'
 check "... keeping the previous file beside it" \
@@ -2569,6 +2573,12 @@ check "a second run adds nothing again"           eval '[ "$(grep -c "^\[otel\]"
 CLAUDE_CONFIG_DIR="$C3" bs --check
 check "check names the owner's differing value, without failing on it" \
       eval 'rowis "$TMP/bs.out" "telemetry settings" OWNER && grep -q "sets OTEL_METRICS_EXPORTER to another value" "$TMP/bs.out"'
+# the owner's own values for ADR 0139's settings: kept and named, and no NOTE, since none of canon's was added
+C7="$TMP/cfg7"; mkdir -p "$C7"
+echo '{"syncClaudeAiSkills":true,"syncClaudeAiPlugins":true,"disableClaudeAiConnectors":false,"env":{"DO_NOT_TRACK":"1"}}' > "$C7/settings.json"
+CLAUDE_CONFIG_DIR="$C7" bs --user-config
+check "the owner's skill and plugin sync, connectors and DO_NOT_TRACK are kept and named, with no NOTE (ADR 0139)" \
+      eval 'jqt "$C7/settings.json" ".syncClaudeAiSkills == true and .syncClaudeAiPlugins == true and .disableClaudeAiConnectors == false and .env.DO_NOT_TRACK == \"1\"" && grep -q "KEPT       $C7/settings.json sets DO_NOT_TRACK to another value" "$TMP/bs.out" && grep -q "KEPT       $C7/settings.json sets syncClaudeAiSkills, syncClaudeAiPlugins, disableClaudeAiConnectors to another value" "$TMP/bs.out" && ! grep -q "^  NOTE " "$TMP/bs.out"'
 echo '{"env":[]}' > "$C3/settings.json"; CLAUDE_CONFIG_DIR="$C3" bs --user-config; rc=$?
 check "an env that is not an object: named, the run finishes" \
       eval 'grep -q "not a JSON object with an object env" "$TMP/bs.out" && grep -q "New Claude Code sessions" "$TMP/bs.out"'
@@ -2697,6 +2707,20 @@ C3="$TMP/cfg3"; mkdir -p "$C3/canon"; cp "$C/canon/"*.sh "$C3/canon/"; cp "$C/CL
 pin_settings() { jq "$1" "$C/settings.json" > "$C3/settings.json"; CLAUDE_CONFIG_DIR="$C3" bs --check; }
 pin_settings '.'; rc=$?
 check "... and the whole check passes: exit 0"     test "$rc" = 0
+check "... ADR 0139's three rows ok, and the telemetry row names DO_NOT_TRACK \"0\"" \
+      eval 'rowis "$TMP/bs.out" "claude.ai skill sync" ok && rowis "$TMP/bs.out" "claude.ai plugin sync" ok && rowis "$TMP/bs.out" "claude.ai connectors" ok && grep -q "^  telemetry settings .*DO_NOT_TRACK \"0\": feature flags fetched" "$TMP/bs.out"'
+pin_settings 'del(.syncClaudeAiSkills, .syncClaudeAiPlugins, .disableClaudeAiConnectors)'; rc=$?
+check "ADR 0139's settings unset: each NOT SET, naming what then syncs or connects, exit 1" \
+      eval 'rowis "$TMP/bs.out" "claude.ai skill sync" "NOT SET" && rowis "$TMP/bs.out" "claude.ai plugin sync" "NOT SET" && rowis "$TMP/bs.out" "claude.ai connectors" "NOT SET" && grep -q "downloads and loads its plugins" "$TMP/bs.out" && [ "$rc" != 0 ]'
+pin_settings '.syncClaudeAiSkills = true | .syncClaudeAiPlugins = true | .disableClaudeAiConnectors = false'; rc=$?
+check "... set the other way: skill and plugin sync MISMATCH, naming rule 2, exit 1; connectors OWNER, naming canon's project settings" \
+      eval 'rowis "$TMP/bs.out" "claude.ai skill sync" MISMATCH && rowis "$TMP/bs.out" "claude.ai plugin sync" MISMATCH && grep -q "loads its plugins, which the canon has not adopted (rule 2, ADR 0139)" "$TMP/bs.out" && rowis "$TMP/bs.out" "claude.ai connectors" OWNER && grep -q "outside canon.s checkouts, whose project settings keep them off" "$TMP/bs.out" && [ "$rc" != 0 ]'
+pin_settings '.disableClaudeAiConnectors = false'; rc=$?
+check "... connectors alone set the other way: OWNER, not a failure" \
+      eval 'rowis "$TMP/bs.out" "claude.ai connectors" OWNER && rowis "$TMP/bs.out" "claude.ai skill sync" ok && [ "$rc" = 0 ]'
+pin_settings '.env.DO_NOT_TRACK = "1"'; rc=$?
+check "DO_NOT_TRACK \"1\" in the settings: the telemetry row OWNER, naming it, not a failure" \
+      eval 'rowis "$TMP/bs.out" "telemetry settings" OWNER && grep -q "sets DO_NOT_TRACK to another value" "$TMP/bs.out" && [ "$rc" = 0 ]'
 pin_settings ".env.ANTHROPIC_DEFAULT_FABLE_MODEL = \"$fable_id\""; rc=$?
 check "fable pinned to canon/models.json's model: PINNED, it would not follow the vendor, exit 1" \
       eval 'rowis "$TMP/bs.out" "fable alias" PINNED && grep -q "will not follow the vendor" "$TMP/bs.out" && [ "$rc" != 0 ]'
@@ -2783,6 +2807,12 @@ check "a template that pins an alias: MISMATCH, exit 1" \
 jq 'del(.availableModels)' "$TMP/template.keep" > "$BS/home/.claude/settings.json"; pin_settings '.'; rc=$?
 check "a template with no allowlist: UNKNOWN, exit 1, not a silent pass" \
       eval 'rowis "$TMP/bs.out" "model settings" UNKNOWN && [ "$rc" != 0 ]'
+echo '{' > "$BS/home/.claude/settings.json"; pin_settings '.'; rc=$?
+check "a template that cannot be read: ADR 0139's rows UNKNOWN, not dropped, exit 1" \
+      eval 'rowis "$TMP/bs.out" "claude.ai settings" UNKNOWN && [ "$rc" != 0 ]'
+jq 'del(.env.DO_NOT_TRACK)' "$TMP/template.keep" > "$BS/home/.claude/settings.json"; pin_settings '.'; rc=$?
+check "a template without DO_NOT_TRACK: the telemetry row does not credit an installed \"0\" to ADR 0139" \
+      eval 'rowis "$TMP/bs.out" "telemetry settings" ok && ! grep -q "DO_NOT_TRACK \"0\": feature flags fetched" "$TMP/bs.out"'
 cp "$TMP/template.keep" "$BS/home/.claude/settings.json"
 # --user-config on settings an earlier template rendered: the values ADR 0059 and ADR 0065 retire go, the
 # owner's stay
