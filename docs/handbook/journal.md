@@ -121,3 +121,16 @@ ten fields as list lines, in this order, each with a value:
 * status: open
 * supersedes: none
 * source: lead
+
+### L0007: Rounding every remake of an adopted level up onto the step sold a holding at a stop the bid never met
+
+* area: exits
+* session: 2026-11-13
+* result: In three offline engine cases, a Mover that adopted a holding and remade its protective sell for more shares raised the emulator's reached trigger onto the next step (9.9637 to 9.97, 1.1809 to 1.19), and a bid between the two (9.9650, 1.19) sold the whole holding on one observation; floored as main floors every slot's, nothing sold
+* evidence: tests/test_mover_adopt_remake_floor.py
+* lesson: Only the supplied adoption level rounds up onto the step, so a confirmed breach is never below it; every remake's kept trigger floors onto the step, since raising a trigger the emulator reached sells a bid that never met it
+* change: the remake's kept trigger floors for every slot, adopted or not, in the pull request that lands `Mover.adopt_holding`
+* next: The first paper window that calls `adopt_holding` counts its remakes
+* status: adopted
+* supersedes: none
+* source: review

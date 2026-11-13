@@ -1415,7 +1415,9 @@ def test_a_slot_warms_its_atr_from_the_cached_minute_bars_newest_first():
     for bar in bars[-4:]:
         reference.handle_bar(bar)
     assert slot.atr.initialized and slot.atr.value == pytest.approx(reference.value)
-    assert any("ATR warmed from 4 cached" in note for note in s.notes[AAA])
+    # The note is written when the slot opens (a refused adoption opens none); the engine case below
+    # checks it.
+    assert slot.atr_warm_bars == 4
 
 
 def test_too_few_cached_bars_leave_the_atr_cold_and_bars_after_now_are_not_used():
