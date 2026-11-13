@@ -53,13 +53,13 @@
 # canon/models.json's), a top-level "model" outside canon/models.json MISMATCH, and reports the update channel
 # and the auto-compact window in effect from the settings and this environment.
 # --install also sets up the review-only workers (ADR 0045), each as its upstream documents: it adds
-# home/dsh/review.patch.yml's rows (session-log upload off, dsh-memento off) to the dsh-tui profile's user
-# patch, ${DSH_HOME:-~/.dsh}/profiles/dsh-tui/cordis.patch.yml, after the rows already there (dsh-TUI
-# v0.17.0 docs/configuration.en.md), and removes from ~/.zshrc the two lines an earlier --install wrote to
-# turn Antigravity's self-updater off (ADR 0065 reverses ADR 0045 on this), keeping a copy. A patch that
-# already names either row, or is not a
-# YAML block sequence or [], is left alone with review.patch.yml.canon-proposed beside it to merge by hand;
-# an older canon block is replaced where it stands.
+# home/dsh/review.patch.yml's rows (session-log upload off, dsh-memento off, and approval requests refused
+# under every permission preset, ADR 0136) to the dsh-tui profile's user patch,
+# ${DSH_HOME:-~/.dsh}/profiles/dsh-tui/cordis.patch.yml, after the rows already there (dsh-TUI v0.17.0
+# docs/configuration.en.md), and removes from ~/.zshrc the two lines an earlier --install wrote to turn
+# Antigravity's self-updater off (ADR 0065 reverses ADR 0045 on this), keeping a copy. A patch that already
+# names one of those rows, or is not a YAML block sequence or [], is left alone with
+# review.patch.yml.canon-proposed beside it to merge by hand; an older canon block is replaced where it stands.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -581,14 +581,17 @@ DSH_PATCH_SRC="$ROOT/home/dsh/review.patch.yml"
 DSH_MARK_BEGIN='# canon bootstrap: review settings'
 DSH_MARK_END='# end canon bootstrap: review settings'
 dsh_profile_dir() { printf '%s/profiles/dsh-tui' "${DSH_HOME:-$HOME/.dsh}"; }
-# A row the user patch could already hold for one of these ids: block or flow style, quoted or not
-DSH_ID_RE='id:[[:space:]]*["'"'"']?(session-log-deepseek|memento)["'"'"']?([[:space:],}#]|$)'
+# A row the user patch could already hold for one of these ids: block or flow style, the key and the value each
+# quoted or not, a space before the colon or not. The key and the value are each matched whole, so a key that only
+# ends in id (uid, grid) is another key. An id spelled another way YAML allows (a tag, an anchor or alias, an
+# explicit ? key, an escape, the value on the next line) is not read: a limit ADR 0136 records.
+DSH_ID_RE='(^|[[:space:]{[,])(id|"id"|'"'"'id'"'"')[[:space:]]*:[[:space:]]*["'"'"']?(session-log-deepseek|memento|approval|permission)["'"'"']?([[:space:],}#]|]|$)'
 # dsh_block <file>: the canon block in a patch file, marker to end marker; dsh_outside <file>: every other line
 dsh_block() { awk -v b="$DSH_MARK_BEGIN" -v e="$DSH_MARK_END" 'index($0, b) == 1 && !on && !done { on = 1 } on { print } on && $0 == e { on = 0; done = 1 }' "$1"; }
 dsh_outside() { awk -v b="$DSH_MARK_BEGIN" -v e="$DSH_MARK_END" 'index($0, b) == 1 && !on && !done { on = 1; next } on && $0 == e { on = 0; done = 1; next } !on { print }' "$1"; }
 # dsh_state <file>: current (the block as home/dsh/review.patch.yml has it, no other row for its ids),
-# stale (an older canon block, no other row), conflict (a row for one of its ids outside the block), none,
-# unreadable (the file is there but cannot be read, so nothing about it is known)
+# stale (a canon block that differs from it, no other row), conflict (a row for one of its ids outside the
+# block), none, unreadable (the file is there but cannot be read, so nothing about it is known)
 dsh_state() {
   local outside
   [ -f "$1" ] || { echo none; return; }
@@ -604,9 +607,10 @@ dsh_row() {
   local dir dst; dir=$(dsh_profile_dir); dst="$dir/cordis.patch.yml"
   if [ ! -d "$dir" ]; then row "dsh-tui review patch" absent "no dsh-tui profile at $dir"; return; fi
   case "$(dsh_state "$dst")" in
-    current)  row "dsh-tui review patch" ok "session log and dsh-memento off in $dst" ;;
-    conflict) row "dsh-tui review patch" "NOT SET" "another row in $dst sets session-log-deepseek or memento; merge home/dsh/review.patch.yml by hand" ;;
+    current)  row "dsh-tui review patch" ok "session log and dsh-memento off, approval requests refused, in $dst" ;;
+    conflict) row "dsh-tui review patch" "NOT SET" "another row in $dst sets session-log-deepseek, memento, approval or permission; merge home/dsh/review.patch.yml by hand" ;;
     unreadable) row "dsh-tui review patch" UNKNOWN "$dst cannot be read" ;;
+    stale)    row "dsh-tui review patch" "NOT SET" "$dst holds a canon block that differs from home/dsh/review.patch.yml; run: scripts/bootstrap --install, which replaces it where it stands and keeps a copy" ;;
     *)        row "dsh-tui review patch" "NOT SET" "home/dsh/review.patch.yml's rows are not in $dst; run: scripts/bootstrap --install" ;;
   esac
 }
@@ -1017,7 +1021,7 @@ install_reviewer_settings() {
           note "  kept       the previous cordis.patch.yml as $bak"
         fi
         cat "$tmp" > "$dst"; rm -f "$tmp"
-        note "  added      session log upload off and dsh-memento off to $dst; restart dsh-tui to apply"
+        note "  added      session log upload off, dsh-memento off and approval requests refused to $dst; restart dsh-tui to apply"
       fi
     fi
   fi
