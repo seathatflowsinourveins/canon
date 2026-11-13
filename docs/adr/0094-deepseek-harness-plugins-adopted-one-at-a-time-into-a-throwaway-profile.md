@@ -39,7 +39,8 @@ Chosen: **option 2**, in the orchestrator's order. Option 1 is what ADR 0086 rec
 
 1. **Where.** Each plugin is installed with `DSH_HOME=<throwaway> dsh plugin --profile trial-<id> add
    github:<repo>#<commit>`, never into `~/.dsh` or a profile in use. Each is a named configuration and
-   stays `UNVERIFIED` until the review and build evals score it (ADR 0057).
+   stays `UNVERIFIED` until the review and build evals score it (ADR 0057). Amended 2026-11-13 by ADR 0143:
+   a plugin adopted for the desktop app goes into its `desktop` profile itself, the owner's enhanced tier.
 2. **Order.** dsh-ci-context; then dsh-trellis (`1264459640/dsh-trellis` `d30f232e6419`), dsh-ci-diet
    (`0disoft/dsh-ci-diet` `a98294d0946f`) and the file-based `dsh-automations`
    (`romany-saad/dsh-plugins` `4cd615bf9c19`, `packages/dsh-automations`), the last three in the build
