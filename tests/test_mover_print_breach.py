@@ -514,11 +514,40 @@ def test_the_unpriced_exit_is_not_priced_from_a_low_that_never_met_the_stop() ->
         )
         last.append(trade)
         seam.on_trade(trade)
+    # Late prints keeps the venue-newest print, the 10.20, so the late print no longer hides it (the
+    # next case). The state this case reads, no print of the holding kept, is set here so the
+    # successor's property is still checked.
+    slot.newest_print = None
     seam._protect(slot, Decimal(3), filled + 61 * SECOND)
     assert [o.kind for o in seam.sent] == ["LIMIT"]
     assert slot.exit_record.trigger_reason == "unpriced_exit"
     assert slot.exit_record.trigger_price != Decimal("9.85")
     assert seam.sent[0].price.as_decimal() > Decimal("9.85")
+
+
+def test_a_late_print_from_before_the_entry_no_longer_hides_the_holding_s_print() -> None:
+    """The same prints with late prints in force: the 10.20 is the venue-newest print and is followed,
+    whatever the cache received last, so the hold ends on it above the stop and the trail starts from
+    the held stop; no unpriced exit."""
+    seam, slot, filled, last = holding(TriggerType.LAST_PRICE)
+    seam.orders["E-1"].ts_accepted = filled - 500 * MS
+    seam.slots, seam.trades = {slot.instrument_id: slot}, 0
+    seam._protect(slot, Decimal(3), filled + SECOND)
+    assert slot.held_stop == Decimal("9.80")
+    for price, at, seen in (
+        ("9.8500", filled + 2 * SECOND, filled + 2 * SECOND),
+        ("10.2000", filled + 3 * SECOND, filled + 3 * SECOND),
+        ("10.0000", filled - 600 * MS, filled + 3 * SECOND + 1),  # late, before the entry
+    ):
+        trade = SimpleNamespace(
+            instrument_id=slot.instrument_id, price=Price.from_str(price), ts_event=at, ts_init=seen
+        )
+        last.append(trade)
+        seam.on_trade(trade)
+    assert slot.newest_print is not None and slot.newest_print.price == Decimal("10.20")
+    seam._protect(slot, Decimal(3), filled + 61 * SECOND)
+    assert [o.kind for o in seam.sent] == ["TRAILING"] and not slot.exiting
+    assert seam.sent[0].trigger_price.as_decimal() == Decimal("9.80")
 
 
 def test_an_off_step_held_stop_is_held_on_the_step_so_a_print_between_the_levels_meets_it() -> None:
