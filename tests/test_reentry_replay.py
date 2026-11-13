@@ -5,6 +5,8 @@ import sqlite3
 from dataclasses import replace
 from datetime import date
 from datetime import datetime
+from decimal import Decimal
+from math import isfinite
 from pathlib import Path
 
 import pytest
@@ -1032,3 +1034,88 @@ def test_a_bar_as_far_from_its_high_as_its_low_takes_the_low_first() -> None:
     # first; in floats 0.0999...64 < 0.1000...14 took the high first and stopped on the low.
     bar = study.Minute(600, 10.3, 10.4, 10.2, 10.3, 100)
     assert study.protect((bar,), 10.0, 10.0, study.GROSS, adaptive=True) is None
+
+
+def test_a_decayed_positive_atr_does_not_make_reentry_divide_by_zero(monkeypatch) -> None:
+    # sr-c-335 F1: Wilder's ATR on a flat tape decays by 13/14 a bar to a positive value under
+    # 5e-10, whose trail snaps to 0.0; that bar is not ready, never a zero-width walk.
+    tape = (
+        *(study.Minute(570 + i, 10.0, 10.01, 10.0, 10.0, 100_000) for i in range(14)),
+        study.Minute(584, 10.01, 10.01, 10.01, 10.01, 100_000),
+        study.Minute(585, 9.99, 10.0, 9.99, 10.0, 100_000),
+        *(study.Minute(586 + i, 10.0, 10.0, 10.0, 10.0, 100) for i in range(287)),
+    )
+
+    def listing(day, rows):
+        return tuple(
+            study.Listed(b.start + 1, 0.0, 0.0, None, None, b.start <= 585 or b.start >= 870)
+            for b in day.bars
+        )
+
+    monkeypatch.setattr(study, "listing", listing)
+    today = study.Day("TEST", date(2026, 8, 18), tape, (), 10.0)
+    context = r3.ReplayContext(today, {}, True, slot_budget=Decimal(1000))
+    atr = context.atr[300]
+    assert atr is not None and 0 < atr < 5e-10
+    assert context.distances("own-1")[300] is None
+    result = context.replay("own-1", "reclaim", 1, 0)
+    assert result["entry_minutes"][0] == 585
+    assert isfinite(result["net_dollars"])
+
+
+@pytest.mark.parametrize("distance", [0.0, -0.01, float("inf"), float("nan")])
+def test_a_reentry_signal_refuses_a_trail_with_no_width(distance) -> None:
+    tape = bars([10.0, 9.8, 10.2])
+    with pytest.raises(ValueError, match="positive trail"):
+        r3.reentry_signal(tape, 0, 10, distance, "reclaim", None)
+
+
+def test_a_merge_refuses_a_file_with_completion_but_no_metadata(tmp_path) -> None:
+    # sr-c-335 F2: a file's counts are taken only on its own metadata record.
+    whole = shard_file(tmp_path / "whole.jsonl", "0/1")
+    headless = tmp_path / "headless.jsonl"
+    headless.write_text(whole.read_text().split("\n", 1)[1])
+    with pytest.raises(ValueError, match="metadata"):
+        r3.merge([whole, headless], tmp_path, "merged")
+
+
+def test_a_merge_refuses_a_shard_with_two_completion_records(tmp_path) -> None:
+    whole = shard_file(tmp_path / "whole.jsonl", "0/1")
+    lines = whole.read_text().splitlines()
+    completion = next(line for line in lines if '"completion"' in line)
+    whole.write_text("\n".join([*lines, completion]) + "\n")
+    with pytest.raises(ValueError, match="completion"):
+        r3.merge([whole], tmp_path, "merged")
+
+
+@pytest.mark.parametrize("ticks", [float("nan"), float("inf"), float("-inf"), 0.0, -1.0])
+def test_a_tick_bucket_refuses_a_non_finite_or_non_positive_trail(ticks) -> None:
+    # sr-a-329 P3-1: NaN and infinity compared false into "over 10", nothing into "under 3".
+    with pytest.raises(ValueError, match="tick"):
+        r3.tick_bucket(ticks)
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_a_return_that_is_not_finite_is_refused_without_a_histogram(value) -> None:
+    # sr-a-329 P3-1: without bins a NaN return gave a NaN mean beside a 0.0 deviation.
+    aggregate = r3.new_aggregate(histogram=False)
+    with pytest.raises(ValueError, match="return"):
+        r3.add_return(aggregate, value)
+
+
+def test_a_trail_that_snaps_to_nothing_leaves_its_bar_not_ready() -> None:
+    # sr-c-335 F1 without the indicator's numbers: an ATR whose trail snaps to 0.0 is no trail.
+    tape = tuple(study.Minute(570 + i, 10.0, 10.0, 10.0, 10.0, 100) for i in range(3))
+    context = r3.ReplayContext(replace(day([]), bars=tape), {}, False)
+    context.atr = (None, 4e-10, 0.05)
+    assert context.distances("own-1") == (0.2, None, 0.05)  # a cold ATR takes the fixed trail
+
+
+def test_a_merge_refuses_a_shard_that_holds_nan(tmp_path) -> None:
+    # sr-a-329 P3-1: a shard written before the aggregate lines refused NaN may hold one.
+    whole = shard_file(tmp_path / "whole.jsonl", "0/1")
+    head, tail = whole.read_text().splitlines()
+    aggregate = {"kind": "aggregate", "group": "tier:top", "returns_bps_sum": float("nan")}
+    whole.write_text("\n".join([head, json.dumps(aggregate), tail]) + "\n")
+    with pytest.raises(ValueError, match="NaN"):
+        r3.merge([whole], tmp_path, "merged")
