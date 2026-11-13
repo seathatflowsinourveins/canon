@@ -7,6 +7,8 @@ review-by: 2027-02-09
 
 # Landing workflow: a branch, one check, a squash merge, and no manual merge step
 
+Amended 2026-11-13: [ADR 0144](0144-a-landing-runs-the-quick-checks-here-and-the-full-suite-once-on-github.md) replaces the full local landing run with the quick set; the hosted gate stays.
+
 ## Context and Problem Statement
 
 The owner's standing instruction (2026-11-09) is that work lands automatically once it passes its checks.

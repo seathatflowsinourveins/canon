@@ -180,8 +180,9 @@ The owner's standing instruction (2026-11-09): work lands automatically once its
 
 1. One branch per change. A session that runs in parallel with another works in its own git worktree;
    two sessions never write in one checkout.
-2. Commit, then run `scripts/land`. It runs `scripts/ci` on what is committed, on a branch that contains
-   the current `main`, and lands the branch. A branch behind `main` is rebased if it was never pushed;
+2. Commit, then run `scripts/land`. It runs the quick checks (`scripts/ci --staged`) on what is committed,
+   on a branch that contains the current `main`, and lands the branch after the hosted full suite passes
+   where there is an `origin` remote (ADR 0144). A branch behind `main` is rebased if it was never pushed;
    once pushed, `origin/main` is merged into it instead, since a rebase could only be pushed with force. With an `origin` remote, `gh` must be signed in, or it stops
    and lands nothing; it checks every address it would publish, pushes, opens a pull request, posts the
    `review` and `signoff` statuses, and waits up to nine minutes (`LAND_WAIT_SECONDS`, default 540) for
