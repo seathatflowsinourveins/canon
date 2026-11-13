@@ -760,3 +760,113 @@ def test_a_merge_names_a_shard_written_without_a_slot_budget(tmp_path) -> None:
     zero = shard_file(tmp_path / "0.jsonl", "0/2", slot_budget="20000")
     with pytest.raises(ValueError, match="slot_budget"):
         r3.merge([zero, old], tmp_path, "old")
+
+
+# The lead's overnight breakdown (2026-11-12): F2's per-entry figures by the trail's ticks at entry.
+
+
+@pytest.mark.parametrize(
+    ("ticks", "bucket"),
+    [
+        (2.99, "under 3"),
+        (3, "3 to 5"),
+        (4.99, "3 to 5"),
+        (5, "5 to 10"),
+        (10, "5 to 10"),
+        (10.01, "over 10"),
+    ],
+)
+def test_a_trails_ticks_fall_in_the_registered_buckets(ticks, bucket) -> None:
+    assert r3.tick_bucket(ticks) == bucket
+
+
+def test_each_entry_records_its_trails_distance_in_alpacas_ticks() -> None:
+    # A 2% trail on a 1.20 name is 2.4 cent ticks; on a 10.60 name, 21.2; under a dollar the step is
+    # 0.0001, so a 0.50 name's trail is 100 ticks.
+    for close, ticks in ((1.2, 2.4), (10.6, 21.2), (0.5, 100)):
+        tape = tuple(study.Minute(570 + i, close, close, close, close, 100) for i in range(3))
+        context = r3.ReplayContext(replace(day([]), bars=tape), {}, True)
+        assert context.sale("fixed", 1, 0)["trail_ticks"] == pytest.approx(ticks)
+    # The replay keeps one figure per entry, in entry order: on a tape that enters, each is the 2%
+    # trail at a close of that tape in cents.
+    today = day([10.4, 10.5, 10.6, 10.5, 10.3, 10.8, 10.7, 10.4, 10.9, 12])
+    result = r3.ReplayContext(today, {}, True).replay("fixed", "reclaim", 2, 5)
+    assert result["entries"] > 0
+    assert len(result["trail_ticks"]) == len(result["entry_returns_bps"]) == result["entries"]
+    closes = {round(b.close * 2, 6) for b in today.bars}
+    assert all(round(t, 6) in closes for t in result["trail_ticks"])
+
+
+@pytest.mark.parametrize(("close", "exit_arm"), [(0.015, "fixed"), (0.01, "fixed-3")])
+def test_a_trail_of_exactly_three_ticks_is_not_counted_under_three(close, exit_arm) -> None:
+    # 0.015 x 2% and 0.01 x 3% are 0.0003, three 0.0001 ticks, which floats put a hair under 3.
+    tape = tuple(study.Minute(570 + i, close, close, close, close, 100) for i in range(3))
+    context = r3.ReplayContext(replace(day([]), bars=tape), {}, True)
+    ticks = context.sale(exit_arm, 1, 0)["trail_ticks"]
+    assert ticks == 3
+    assert r3.tick_bucket(ticks) == "3 to 5"
+
+
+def test_a_merge_refuses_a_shard_written_before_the_tick_split() -> None:
+    old = r3.new_aggregate(histogram=True)
+    old.update(returns_count=2, returns_bps_sum=-20.0)
+    del old["by_ticks"]
+    with pytest.raises(ValueError, match="by_ticks"):
+        r3.merge_aggregates([old])
+    empty = r3.new_aggregate(histogram=True)
+    del empty["by_ticks"]
+    assert r3.merge_aggregates([empty])["returns_count"] == 0
+
+
+def test_the_tick_tables_header_states_each_bounds_side_and_the_records_scope() -> None:
+    assert "3 to under 5, 5 to 10 inclusive" in r3.TICK_HEADER
+    header = r3.report_header("abc", [DAY])
+    assert "Every arm's aggregate in the JSONL carries `by_ticks`" in header
+
+
+def test_the_per_entry_figures_split_by_ticks_and_merge() -> None:
+    result = {
+        "refusal": None,
+        "entries": 2,
+        "stop_outs": 0,
+        "reentries": 0,
+        "net_dollars": 0.0,
+        "given_back_dollars": 0.0,
+        "turnover_dollars": 0.0,
+        "guard_skips_count": 0,
+        "cold_atr_fallbacks": 0,
+        "falls": [],
+        "entry_returns_bps": [-50.0, 30.0],
+        "trail_ticks": [2.4, 21.2],
+        "shares": [1, 1],
+        "size_refusals": {},
+        "size_bounds": {},
+    }
+    one, two = r3.new_aggregate(histogram=True), r3.new_aggregate(histogram=True)
+    r3.add_to_aggregate(one, result)
+    r3.add_to_aggregate(two, result)
+    assert one["by_ticks"]["under 3"]["returns_count"] == 1
+    assert one["by_ticks"]["under 3"]["returns_bps_sum"] == -50.0
+    assert one["by_ticks"]["over 10"]["returns_bps_bins"] == {30: 1}
+    merged = r3.merge_aggregates([one, two])
+    assert merged["by_ticks"]["under 3"]["returns_count"] == 2
+    record = r3.aggregate_record(("tier:top", "run-2", "fixed", "reclaim", 2, 0, "ohlc"), merged)
+    assert record["by_ticks"]["under 3"]["mean_return_bps"] == -50.0
+    assert record["by_ticks"]["over 10"]["median_return_bin_bps"] == 30
+
+
+def test_the_summary_tables_f2s_per_entry_figures_by_ticks() -> None:
+    import io
+
+    sums = {}
+    for order, value in (("ohlc", -50.0), ("adaptive", -70.0)):
+        a = r3.new_aggregate(histogram=True)
+        r3.add_return(a["by_ticks"]["under 3"], value)
+        sums[("tier:other", "run-2", "fixed", "reclaim", 2, 0, order)] = a
+    sums[("tier:other", "run-2", "atr-1", "reclaim", 2, 0, "ohlc")] = r3.new_aggregate()
+    out = io.StringIO()
+    r3.write_tick_table(out, sums)
+    text = out.getvalue()
+    assert "F2" in text and "under 3" in text
+    rows = [line for line in text.splitlines() if line.startswith("| tier:")]
+    assert rows == ["| tier:other | reclaim | 0 | 1 -50.0 -50; 1 -70.0 -70 | -; - | -; - | -; - |"]
