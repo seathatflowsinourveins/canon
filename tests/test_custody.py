@@ -32,6 +32,7 @@ from alpaca.trading.models import Position
 from alpaca.trading.models import TradeAccount
 from alpaca.trading.requests import LimitOrderRequest
 from alpaca.trading.requests import MarketOrderRequest
+from canon_alpaca.execution import replacement_client_order_id
 
 from canon_trading import custody
 from canon_trading import paper_node
@@ -92,6 +93,238 @@ def test_any_other_client_order_id_is_foreign(client_order_id) -> None:
 @pytest.mark.parametrize("client_order_id", MISSING)
 def test_an_order_with_no_client_order_id_is_never_ours(client_order_id) -> None:
     assert custody.lineage(client_order_id) == custody.MISSING
+
+
+STAMP = 1_762_999_999_123_456_789
+"""A clock reading, as the adapter puts one after the count of a replacement's client order ID."""
+
+
+@pytest.mark.parametrize("client_order_id", [o for o in OURS if o.startswith("O-")])
+def test_a_replacement_our_adapter_sent_reads_as_ours(client_order_id) -> None:
+    """R1 (the lead, 2026-11-12): the adapter gives its own replacement the node's ID with a clock
+    stamp after the count, which is still an ID of our nodes' form."""
+    sent = replacement_client_order_id(client_order_id, STAMP)
+    assert sent is not None and sent != client_order_id
+    assert custody.lineage(sent) == custody.OURS
+
+
+def test_a_replacement_a_hand_made_is_foreign_although_it_replaces_ours() -> None:
+    """R2: an order replaced by hand carries an ID Alpaca made. It freezes its symbol and is never
+    canceled, whatever it replaces: nothing a hand touched is ours to end."""
+    venue = Venue(REGULAR)
+    venue.hold("SPY", 1)
+    # the stop of ours it replaced is no longer open, and is not listed
+    by_hand = venue.open(
+        client_order_id=str(uuid4()), symbol="SPY", side="sell", replaces=str(uuid4())
+    )
+    report = close(venue)
+    assert venue.sent == [] and venue.canceled == []
+    assert report.frozen["SPY"] == ["open a foreign order: sell 1 SPY limit, new"]
+    assert any(
+        o.client_order_id == by_hand.client_order_id and _value(o.status) == "new"
+        for o in venue.history
+    )
+
+
+def test_our_own_replacement_of_our_stop_is_canceled_like_any_order_of_ours() -> None:
+    """R1 where it is acted on: the replaced stop no longer freezes its symbol. The stop it replaced
+    is not listed, as one placed before the lookback is not, and with no fill it carries none."""
+    venue = Venue(REGULAR)
+    venue.hold("SPY", 1)
+    replacement = venue.open(
+        client_order_id=replacement_client_order_id("O-20261111-145500-001-001-2", STAMP),
+        symbol="SPY",
+        side="sell",
+        replaces=str(uuid4()),
+    )
+    report = close(venue)
+    assert venue.canceled == [replacement.client_order_id]
+    assert report.frozen == {}
+
+
+@pytest.mark.parametrize("client_order_id", FOREIGN)
+def test_no_foreign_order_reads_as_ours_through_its_replacement(client_order_id) -> None:
+    """R3: the replacement's ID is derived from the order's own, so what was foreign stays foreign."""
+    sent = replacement_client_order_id(client_order_id, STAMP)
+    assert sent is None or custody.lineage(sent) == custody.FOREIGN
+
+
+@pytest.mark.parametrize(
+    "client_order_id",
+    [
+        *(o for o in OURS if o.startswith(custody.CHECK_CLOSE_PREFIX)),
+        "canon-close-20261111T150424Z-1-12345678",  # a random tail that happens to be all digits
+    ],
+)
+def test_a_replacement_of_a_checks_close_is_never_read_as_ours(client_order_id) -> None:
+    """The limit of R1: only an ID of the form a node writes keeps its form through a replace. A
+    close the account check or the close-only form placed ends in eight hex digits, so its replacement
+    gets Alpaca's ID or, when those digits are all decimal, one that is no longer a close's: foreign
+    either way. No node replaces such an order."""
+    assert custody.lineage(client_order_id) == custody.OURS
+    sent = replacement_client_order_id(client_order_id, STAMP)
+    assert sent is None or custody.lineage(sent) == custody.FOREIGN
+
+
+def chain(
+    venue: Venue,
+    *filled: str,
+    qty: str = "20",
+    last: str = "filled",
+    side: str = "buy",
+    by_hand: tuple[int, ...] = (),
+    first: str | None = None,
+    first_age: timedelta = timedelta(minutes=10),
+) -> None:
+    """An order of ours for `qty` replaced once for each further entry of `filled`, as Alpaca lists a
+    chain: each replaced order with its own fills and `replaced_by`, each replacement with `replaces`
+    and a filled quantity that counts the fills before it (ADR 0042, paper, 2026-11-10). A replacement
+    is the adapter's, under the first order's ID with a clock stamp, unless its place is in `by_hand`,
+    which gives it an ID Alpaca made. The first order was submitted `first_age` ago, each replacement
+    within the last ten minutes."""
+    ids = [str(uuid4()) for _ in filled]
+    first = first or NODE_BUY
+    for n, quantity in enumerate(filled):
+        is_last = n == len(filled) - 1
+        age = first_age if n == 0 else timedelta(minutes=10 - n)
+        venue.open(
+            id=ids[n],
+            client_order_id=first
+            if n == 0
+            else str(uuid4())
+            if n in by_hand
+            else replacement_client_order_id(first, STAMP + n),
+            symbol="SPY",
+            side=side,
+            qty=qty,
+            filled_qty=quantity,
+            status=last if is_last else "replaced",
+            replaces=ids[n - 1] if n else None,
+            replaced_by=None if is_last else ids[n + 1],
+            submitted_at=(venue.now - age).isoformat(),
+        )
+
+
+def opened(venue: Venue) -> tuple[Decimal | None, str]:
+    return custody._opened(cast(Any, venue), "SPY", venue.now)
+
+
+def test_a_hands_replacement_in_the_middle_of_a_chain_takes_its_own_fills_out_of_ours() -> None:
+    """Ours filled 16, a hand replaced it and 2 more filled, and the node replaced that one: the last
+    order is ours again and shows 20, the whole chain's. Ours filled 16 and then 2 after the hand's
+    18: 18, neither the 36 of the two orders of ours nor the chain's 20."""
+    venue = Venue(REGULAR)
+    chain(venue, "16", "18", "20", by_hand=(1,))
+    assert opened(venue) == (Decimal(18), "")
+
+
+def test_a_chain_of_our_sells_takes_its_fills_away_once() -> None:
+    venue = Venue(REGULAR)
+    venue.hold("SPY", 12)  # 20 bought by ours in the lookback, 8 of them sold by the chain
+    venue.history[-1] = venue.history[-1].model_copy(update={"qty": "20", "filled_qty": "20"})
+    chain(venue, "5", "8", side="sell", first="O-20261111-145500-001-001-2")
+    assert opened(venue) == (Decimal(12), "")
+
+
+def test_an_order_of_our_form_that_replaces_a_foreign_one_counts_only_its_own_fills() -> None:
+    """Nothing foreign reads as ours through a chain either: the 5 a foreign order filled stay
+    foreign when an order of our form replaces it and shows 8."""
+    venue = Venue(REGULAR)
+    foreign = str(uuid4())
+    venue.open(
+        id=foreign, client_order_id=str(uuid4()), filled_qty="5", qty="20", status="replaced"
+    )
+    venue.open(client_order_id=OURS[1], filled_qty="8", qty="20", status="filled", replaces=foreign)
+    assert opened(venue) == (Decimal(3), "")
+
+
+def test_a_replacement_whose_replaced_order_is_not_listed_freezes_the_symbol() -> None:
+    """A buy of ours working for more than the lookback filled 18 before it and was replaced inside
+    it: the replacement shows 20, of which only 2 are the lookback's, and the listing does not hold
+    the order that says so. With 18 foreign shares held the 20 would match and all be sold. What
+    cannot be established freezes."""
+    venue = Venue(REGULAR)
+    venue.hold("SPY", 20, client_order_id=None)
+    chain(venue, "18", "20", first_age=custody.LINEAGE_LOOKBACK + timedelta(hours=1))
+    quantity, why = opened(venue)
+    assert quantity is None
+    assert why == (
+        "an order of ours in SPY replaces one the listing of the last 1 day, 0:00:00 does not hold, "
+        "whose fills it carries, so the quantity ours opened is not established"
+    )
+    report = close(venue)
+    assert venue.sent == []
+    assert report.frozen["SPY"] == [why]
+
+
+@pytest.mark.parametrize("filled", [("18", "20"), ("16", "18", "20"), ("0", "20")])
+def test_a_chain_of_our_own_replacements_counts_its_fills_once(filled) -> None:
+    """Now that the adapter's replacement reads as ours, a partly filled buy and its replacement are
+    both in the count, and the replacement's filled quantity already holds the first one's fills. The
+    long of 20 is what the chain opened, not the sum: it is closed, and nothing is frozen."""
+    venue = Venue(REGULAR)
+    venue.hold("SPY", 20, client_order_id=None)
+    chain(venue, *filled)
+    report = close(venue)
+    assert report.frozen == {}
+    (sent,) = venue.sent
+    assert (sent.symbol, sent.qty) == ("SPY", 20)
+
+
+def test_a_chain_never_counts_more_than_it_filled_so_a_foreign_share_is_not_sold() -> None:
+    """The case the sum would get wrong the dangerous way: 18 foreign shares beside the 20 a chain of
+    ours filled. Summed, ours would read 38, the long would match and the close would sell all of it."""
+    venue = Venue(REGULAR)
+    venue.hold("SPY", 38, client_order_id=None)
+    chain(venue, "18", "20")
+    report = close(venue)
+    assert venue.sent == []
+    assert report.frozen["SPY"] == [
+        "38 SPY held, but our orders opened 20 in the last 1 day, 0:00:00"
+    ]
+
+
+def test_a_replacement_that_carries_no_fills_leaves_the_replaced_orders_own() -> None:
+    """A replacement Alpaca rejected after `replaced` may show no fills: the chain still counts what
+    the replaced order filled."""
+    venue = Venue(REGULAR)
+    venue.hold("SPY", 18, client_order_id=None)
+    chain(venue, "18", "0", last="rejected")
+    report = close(venue)
+    assert report.frozen == {}
+    (sent,) = venue.sent
+    assert (sent.symbol, sent.qty) == ("SPY", 18)
+
+
+def test_a_replacement_a_hand_made_takes_none_of_our_replaced_orders_fills() -> None:
+    """Ours filled 18 and was then replaced by hand: the replacement is foreign and its fills are
+    not ours, so the 18 still count and the 20 held do not match."""
+    venue = Venue(REGULAR)
+    venue.hold("SPY", 20, client_order_id=None)
+    by_hand = str(uuid4())
+    venue.open(
+        client_order_id=NODE_BUY,
+        side="buy",
+        qty="20",
+        filled_qty="18",
+        status="replaced",
+        replaced_by=by_hand,
+        submitted_at=(venue.now - timedelta(minutes=10)).isoformat(),
+    )
+    venue.open(
+        id=by_hand,
+        client_order_id=str(uuid4()),
+        side="buy",
+        qty="20",
+        filled_qty="20",
+        status="filled",
+        submitted_at=(venue.now - timedelta(minutes=9)).isoformat(),
+    )
+    report = close(venue)
+    assert venue.sent == []
+    assert report.frozen["SPY"] == [
+        "20 SPY held, but our orders opened 18 in the last 1 day, 0:00:00"
+    ]
 
 
 def test_the_lineage_is_the_one_our_nodes_and_checks_are_built_with() -> None:

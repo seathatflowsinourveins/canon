@@ -13,9 +13,16 @@ a long of two shares adopted at start, a DAY trailing stop for both is accepted;
 `trailing_stop` with the trail asked; a replace to one share with a tighter trail is taken; and the
 cancel ends it. What Alpaca holds is read over REST from its open orders, never by a venue order ID.
 Recorded and printed, not required, because no page read says when Alpaca fills them in: the high-water
-mark, whether the stop price follows from it and the trail, and the lineage custody reads for the
-replaced stop. By custody's rule an order Alpaca made by replacing one of ours is foreign, which is what
-`paper:close` and a task that places stops will see after any replace.
+mark, and whether the stop price follows from it and the trail.
+
+The replace is also the paper proof of the client order ID the adapter names on it (ADR 0129, "A
+replacement's ID"): Alpaca's reference gives a replace a `client_order_id`, "A unique identifier for the
+new order", and a replace that keeps the order's own is refused, 422 (ADR 0042). Required here: the
+replaced stop comes back under the node's own ID with a clock stamp after its count, and custody reads
+it as ours, as `paper:close` and a task that places stops will read it. The ID is never printed; what
+is printed is which of the three it is (the node's own, the node's own with a stamp, another). If Alpaca
+refuses the replace, the walk ends with the refusal as the adapter reports it, Alpaca's status and
+message in it, and the stop is canceled.
 
 The order is DAY, not GTC: the paper task ends a run that overstays with a kill, which runs no `finally`,
 and a DAY stop left behind ends with the session where a GTC one would rest for days. GTC through the
@@ -39,6 +46,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import re
 import threading
 import time
 from datetime import UTC
@@ -48,6 +56,7 @@ from typing import Any
 
 import pytest
 from alpaca.common.exceptions import APIError
+from canon_alpaca.execution import REPLACEMENT_STAMP_DIGITS
 from canon_alpaca.execution import AlpacaExecutionClientConfig
 from canon_alpaca.factories import AlpacaExecutionClientFactory
 from nautilus_trader.common import Environment
@@ -88,8 +97,22 @@ def text(value: object) -> str:
     return "none" if value is None else str(getattr(value, "value", value))
 
 
-def at_alpaca(trading: Any) -> dict[str, str]:
-    """What Alpaca holds as the symbol's one open order, with no venue order ID and no price."""
+def which_id(carried: object, own: str) -> str:
+    """Which client order ID an order carries, against the node's own for the stop: that one, the one
+    the adapter names on a replace (`canon_alpaca.execution.replacement_client_order_id`), or another."""
+    if not own or not isinstance(carried, str):
+        return "another"
+    if carried == own:
+        return "the node's own"
+    stamped = re.fullmatch(
+        re.escape(own) + f"[0-9]{{{REPLACEMENT_STAMP_DIGITS}}}", carried, re.ASCII
+    )
+    return "the node's own with a clock stamp" if stamped else "another"
+
+
+def at_alpaca(trading: Any, own: str = "") -> dict[str, str]:
+    """What Alpaca holds as the symbol's one open order, with no venue order ID, no client order ID
+    and no price. `own` is the client order ID the node gave the stop."""
     orders = seam.open_orders(trading)
     assert len(orders) == 1, f"{len(orders)} open {seam.SYMBOL} orders, not one"
     (order,) = orders
@@ -107,6 +130,7 @@ def at_alpaca(trading: Any) -> dict[str, str]:
         "high-water mark": "none" if order.hwm is None else "set",
         "stop price follows the mark and the trail": follows,
         "position intent": text(order.position_intent),
+        "client order ID": which_id(order.client_order_id, own),
         "lineage": custody.lineage(order.client_order_id),
     }
 
@@ -116,6 +140,7 @@ def read_stop(
     quantity: int,
     percent: Decimal,
     seconds: float = READ_SECS,
+    own: str = "",
     *,
     stop: threading.Event | None = None,
 ) -> dict:
@@ -130,7 +155,7 @@ def read_stop(
     while True:
         settled = False
         try:
-            seen = at_alpaca(trading)
+            seen = at_alpaca(trading, own)
             settled = (
                 Decimal(seen["quantity"]) == quantity
                 and seen["trail percent"] != "none"
@@ -293,9 +318,10 @@ async def reads(strategy: Any, trading: Any) -> None:
         while strategy.phase != "done":
             for name, (quantity, percent) in asked.items():
                 if strategy.phase == f"waiting for the {name} read" and name not in strategy.read:
+                    own = strategy.own[-1].value if strategy.own else ""
                     try:
                         strategy.read[name] = await asyncio.to_thread(
-                            read_stop, trading, quantity, percent, stop=stop
+                            read_stop, trading, quantity, percent, READ_SECS, own, stop=stop
                         )
                     except Exception as e:  # noqa: BLE001 - whatever it is, the walk must hear of it
                         strategy.read[name] = {"failed": type(e).__name__}
@@ -384,10 +410,14 @@ def test_paper_a_trailing_stop_rests_at_alpaca_is_replaced_and_is_canceled() -> 
         # the mark and the stop price are Alpaca's to fill in, when is not documented: a stop price
         # that contradicts them fails, one not yet shown is only printed
         assert held_stop["stop price follows the mark and the trail"] != "no", (name, held_stop)
-    # The stop as placed carries the node's own client order ID. Its replacement carries one Alpaca
-    # made, since the adapter's replace names none, and reads foreign by custody's rule
-    # (`custody.py`, "Lineage"): printed above, not required.
-    assert first["lineage"] == custody.OURS, first
+    # The stop as placed carries the node's own client order ID, and its replacement the one the
+    # adapter named on the replace: the node's own with a clock stamp, which custody reads as ours
+    # (`custody.py`, "Lineage"). An ID Alpaca made instead would read foreign and fails here.
+    assert (first["client order ID"], first["lineage"]) == ("the node's own", custody.OURS), first
+    assert (second["client order ID"], second["lineage"]) == (
+        "the node's own with a clock stamp",
+        custody.OURS,
+    ), second
     for expected in ("OrderSubmitted", "OrderAccepted", "OrderCanceled"):
         assert names.count(expected) == 1, names
     # at least one: the engine's open-order check adds an update of its own when it sees the trigger

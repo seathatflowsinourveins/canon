@@ -57,10 +57,12 @@ from canon_alpaca.constants import ACCOUNT_ID
 from canon_alpaca.constants import ENV_API_KEY
 from canon_alpaca.constants import ENV_SECRET_KEY
 from canon_alpaca.constants import USD
+from canon_alpaca.execution import REPLACEMENT_STAMP_DIGITS
 from canon_alpaca.execution import AlpacaExecutionClient
 from canon_alpaca.execution import AlpacaExecutionClientConfig
 from canon_alpaca.execution import FilledReading
 from canon_alpaca.execution import fill_report
+from canon_alpaca.execution import replacement_client_order_id
 from canon_alpaca.execution import send_order_commands_once
 from canon_alpaca.factories import AlpacaDataClientFactory
 from canon_alpaca.factories import AlpacaExecutionClientFactory
@@ -1694,8 +1696,14 @@ def test_modify_is_updated_when_alpacas_stream_confirms_the_replace(venue) -> No
     ((replaced_id, request),) = venue.trading.replace_requests
     assert replaced_id == old["id"]
     assert isinstance(request, ReplaceOrderRequest)
-    # The current price is sent for a limit order; no client order ID (Alpaca refuses one kept).
-    assert (request.limit_price, request.qty, request.client_order_id) == (150.5, None, None)
+    # The current price is sent for a limit order, and a new client order ID of the order's own form
+    # (Alpaca refuses one kept): the order's own with a clock stamp after its count.
+    assert (request.limit_price, request.qty) == (150.5, None)
+    own = old["client_order_id"]
+    assert request.client_order_id == replacement_client_order_id(
+        own, int(request.client_order_id[-REPLACEMENT_STAMP_DIGITS:])
+    )
+    assert new["client_order_id"] == request.client_order_id != own
 
 
 def test_no_update_comes_from_the_patch_answer_alone(venue) -> None:
@@ -1719,8 +1727,8 @@ def test_no_update_comes_from_the_patch_answer_alone(venue) -> None:
 
 @pytest.mark.parametrize("cold", [False, True], ids=["mapped", "after-restart"])
 def test_fill_on_the_replacement_reaches_the_nodes_order(venue, cold) -> None:
-    # The replacement's updates carry a client order ID Alpaca made; "after-restart" empties the
-    # client's map first, so the fill is traced back through `replaces`.
+    # The replacement's updates carry a client order ID that is not the node's own; "after-restart"
+    # empties the client's map first, so the fill is traced back through `replaces`.
     venue.trading.script = "accept"
     strategy = modifier()
 

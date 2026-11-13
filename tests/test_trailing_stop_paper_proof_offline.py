@@ -19,6 +19,7 @@ from typing import Any
 import pytest
 from canon_alpaca.constants import ENV_API_KEY
 from canon_alpaca.constants import ENV_SECRET_KEY
+from canon_alpaca.execution import replacement_client_order_id
 from nautilus_trader.model import OrderSide
 from nautilus_trader.model import Quantity
 from nautilus_trader.model import TimeInForce
@@ -30,6 +31,8 @@ from tests import test_paper_venue_trailing_stop as paper
 
 OURS = "O-20261112-143000-001-001-1"
 """A client order ID of the form our nodes write (`custody.NODE_CLIENT_ORDER_ID`)."""
+REPLACED = replacement_client_order_id(OURS, 1_762_999_999_123_456_789)
+"""The ID the adapter names when it replaces that order."""
 
 
 def alpaca_order(**changes: Any) -> SimpleNamespace:
@@ -65,6 +68,7 @@ def test_what_alpaca_holds_is_read_with_no_venue_id_and_no_price(
         "high-water mark": "set",
         "stop price follows the mark and the trail": "yes",
         "position intent": "sell_to_close",
+        "client order ID": "another",
         "lineage": custody.OURS,
     }
     assert "200" not in "".join(read.values()) and "190" not in "".join(read.values())
@@ -77,8 +81,10 @@ def test_what_alpaca_holds_is_read_with_no_venue_id_and_no_price(
         ({"stop_price": "189.00"}, "no", custody.OURS),
         ({"hwm": None}, "unknown", custody.OURS),
         ({"stop_price": None}, "unknown", custody.OURS),
-        # a replacement carries an ID Alpaca made: foreign by custody's rule
+        # a replacement under an ID Alpaca made, as a replace by hand leaves: foreign by custody's rule
         ({"client_order_id": "0f6d2c1e-5d2b-4c0e-9d57-7f1f0a3e2b11"}, "yes", custody.FOREIGN),
+        # the adapter's own replacement: the node's ID with a clock stamp after its count
+        ({"client_order_id": REPLACED}, "yes", custody.OURS),
     ],
 )
 def test_the_stop_price_is_checked_against_the_mark_and_the_trail(
@@ -88,6 +94,40 @@ def test_the_stop_price_is_checked_against_the_mark_and_the_trail(
     read = paper.at_alpaca(object())
     assert read["stop price follows the mark and the trail"] == follows
     assert read["lineage"] == lineage
+
+
+@pytest.mark.parametrize(
+    ("carried", "named"),
+    [
+        (OURS, "the node's own"),
+        (REPLACED, "the node's own with a clock stamp"),
+        (f"{OURS}123", "another"),  # more digits after the count, and not a stamp's nineteen
+        ("0f6d2c1e-5d2b-4c0e-9d57-7f1f0a3e2b11", "another"),
+        (None, "another"),
+    ],
+)
+def test_the_id_alpaca_returns_is_named_against_the_nodes_own_and_never_printed(
+    monkeypatch: pytest.MonkeyPatch, carried: str | None, named: str
+) -> None:
+    """The paper proof records whether a replaced stop comes back under the ID the adapter sent: the
+    node's own with nineteen digits after it. The ID itself is not in what is read."""
+    monkeypatch.setattr(
+        seam, "open_orders", lambda trading: [alpaca_order(client_order_id=carried)]
+    )
+    read = paper.at_alpaca(object(), OURS)
+    assert read["client order ID"] == named
+    assert OURS not in "".join(read.values())
+
+
+def test_a_read_names_the_id_against_the_stop_the_strategy_placed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    listing(monkeypatch, [[alpaca_order(qty="1", trail_percent="4.0", client_order_id=REPLACED)]])
+    read = paper.read_stop(object(), 1, Decimal(4), own=OURS)
+    assert (read["client order ID"], read["lineage"]) == (
+        "the node's own with a clock stamp",
+        custody.OURS,
+    )
 
 
 @pytest.mark.parametrize("count", [0, 2])

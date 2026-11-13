@@ -474,6 +474,9 @@ class FakeOrdersClient(FakeTradingClient):
         self.submit_delay = 0.0
         self.submitted: list[OrderRequest] = []
         self.replace_script = "replaced"
+        # Whether a replacement keeps the client order ID a replace names, as Alpaca documents. False
+        # is the case no page describes and a client must not be silent about: the ID is made anyway.
+        self.keeps_named_id = True
         self.replace_delay = 0.0  # holds the replace answer back after `replaced` is sent
         self.replace_error: Exception | None = None
         self.lookup_error: Exception | None = None  # raised by `get_order_by_client_id`
@@ -600,7 +603,9 @@ class FakeOrdersClient(FakeTradingClient):
         `replaced` carrying the old order with `replaced_by` ("replaced"), `order_replace_rejected` for the
         old order ("reject"), or nothing ("silent", for `confirm_replace` to send later). A second replace
         of a replaced order answers 422 "order already replaced", and one keeping a client order ID 422
-        "client_order_id must be unique", as observed. `replace_error` is raised instead of answering;
+        "client_order_id must be unique", as observed; a new client order ID, which Alpaca documents
+        ("A unique identifier for the new order") and no paper run has tried, is given to the
+        replacement. `replace_error` is raised instead of answering;
         with `took_before_error`, the replace is taken first, as for a submit."""
         self._count_sends()
         self.replace_requests.append((str(order_id), order_data))
@@ -613,13 +618,17 @@ class FakeOrdersClient(FakeTradingClient):
             raise api_error(404, 40410000, "order not found")
         if old["status"] == "replaced":
             raise api_error(422, 42210000, "order already replaced")
-        if getattr(order_data, "client_order_id", None) is not None:
+        named = getattr(order_data, "client_order_id", None)
+        carried = {raw["client_order_id"] for raw in (*self._placed.values(), *self.orders)}
+        if named is not None and named in carried:
             raise api_error(422, 40010001, "client_order_id must be unique")
         now = datetime.now(UTC).isoformat()
         new = {
             **old,
             "id": str(uuid.uuid4()),
-            "client_order_id": str(uuid.uuid4()),
+            "client_order_id": named
+            if named is not None and self.keeps_named_id
+            else str(uuid.uuid4()),
             "replaces": old["id"],
             "replaced_by": None,
             # Paper, 2 of 2 runs (ADR 0042): a replacement of a partly filled order is answered

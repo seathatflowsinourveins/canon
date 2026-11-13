@@ -91,8 +91,10 @@ the new order ID", but a success "does NOT guarantee the existing open order has
 `OrderUpdated` is generated only when Alpaca's stream shows the replace took effect: its `replaced` for an
 order of the node's chain, which carries the old order with `replaced_by` (observed), with the replacement's
 values from the answer or, failing that, from Alpaca; if neither yields them, nothing is generated and
-reconciliation settles the order. The replacement gets a client order ID Alpaca makes (one kept is refused,
-observed). A 422 refusal is `OrderModifyRejected` unless Alpaca shows the order already replaced as asked (a
+reconciliation settles the order. The replacement is sent a new client order ID of the order's own form
+(`replacement_client_order_id`): one kept is refused (observed), and the reference gives the replace a
+`client_order_id`, "A unique identifier for the new order. Automatically generated if not sent." Alpaca
+makes the ID where the order's own has no numeric last field to build on. A 422 refusal is `OrderModifyRejected` unless Alpaca shows the order already replaced as asked (a
 second replace is refused "order already replaced", observed);
 `order_replace_rejected` is `OrderModifyRejected` too. Denied before Alpaca: no venue order ID, a fractional
 quantity, a quantity or price that is not positive, and a sub-penny price; what only Alpaca knows (an order in
@@ -1070,6 +1072,51 @@ def order_description(order: AlpacaOrder) -> str:
     )
 
 
+CLIENT_ORDER_ID_MAX = 128
+"""Alpaca's limit on a client order ID, the replacement's included: "A unique identifier for the new
+order. Automatically generated if not sent. (<= 128 characters)" ("Replace Order by ID", request body,
+https://docs.alpaca.markets/us/reference/patchorderbyorderid-1.md, read 2026-11-12)."""
+REPLACEMENT_STAMP_DIGITS = 19
+"""The width of the clock stamp in a replacement's client order ID: nanoseconds since the epoch, which
+is nineteen digits until 2286 and is padded to that before."""
+
+
+def replacement_client_order_id(client_order_id: str, stamp_ns: int) -> str | None:
+    """The client order ID a replacement of the node's order `client_order_id` is sent with: the same
+    ID with `stamp_ns`, at a fixed width, after its last field; None when that field is not a number,
+    when nothing comes before it, when the stamp is not a count of that width, or when the result
+    would pass Alpaca's limit, and Alpaca then makes the ID as it did before.
+
+    A replacement must carry a new ID: Alpaca refuses one the order already carries, 422
+    "client_order_id must be unique" (paper, 2026-11-10, ADR 0042). Deriving it from the order's own
+    keeps the form: `O-20261112-143000-001-001-7` gives `O-20261112-143000-001-001-7` and nineteen
+    digits, still an ID of the node's form to whoever reads an account by it (the lead's ruling,
+    2026-11-12, ADR 0129), while an order whose own ID has another form keeps that other form. It is
+    never an ID the node writes, whose counts are short, and the fixed width keeps two orders'
+    replacements apart: the count is what is left when the stamp is taken off.
+    """
+    if not 0 <= stamp_ns < 10**REPLACEMENT_STAMP_DIGITS:
+        return None
+    base, dash, count = client_order_id.rpartition("-")
+    if not (base and dash and count.isascii() and count.isdigit()):
+        return None
+    found = f"{base}-{count}{stamp_ns:0{REPLACEMENT_STAMP_DIGITS}d}"
+    return found if len(found) <= CLIENT_ORDER_ID_MAX else None
+
+
+def names_replacement(client_order_id: str, carried: object) -> bool:
+    """Whether `carried` is an ID `replacement_client_order_id` gives a replacement of the node's order
+    `client_order_id`: that ID and exactly the stamp's digits. It tells what this client names from an
+    ID Alpaca or a hand made; it is never read for which order a replacement belongs to."""
+    return (
+        isinstance(carried, str)
+        and len(carried) == len(client_order_id) + REPLACEMENT_STAMP_DIGITS
+        and carried.startswith(client_order_id)
+        and carried[len(client_order_id) :].isascii()
+        and carried[len(client_order_id) :].isdigit()
+    )
+
+
 def replaces_as_asked(replacement: AlpacaOrder, request: ReplaceOrderRequest, order: Any) -> bool:
     """Whether Alpaca's replacement has the terms the replace request asked for, a quantity the request
     leaves out being the node order's own: a request that omits a field asks to keep it."""
@@ -1560,6 +1607,8 @@ class AlpacaExecutionClient(ExecutionClient):
         self._stream_thread: threading.Thread | None = None
         self._owner_loop: asyncio.AbstractEventLoop | None = None
         self._stopping = False
+        # The clock reading the last replacement's client order ID carries (`_replacement_stamp`).
+        self._last_replacement_stamp = 0
         # One alpaca-py call at a time on its one requests.Session (see data.py); rebuilt in `_connect`.
         self._rest_lock = asyncio.Lock()
         # Orders this client has seen Alpaca acknowledge, and orders it has seen reach a final state, so
@@ -2146,8 +2195,10 @@ class AlpacaExecutionClient(ExecutionClient):
         guarantee the existing open order has been replaced". So `OrderUpdated` is not generated from the
         answer: it comes with Alpaca's `replaced` trade update for the node's order, which carries the old
         order with `replaced_by` (observed on paper, ADR 0042). The answer is kept for that update's values,
-        and the replacement's Alpaca client order ID is mapped to the node's order. Alpaca refuses a
-        replacement that keeps the original client order ID (observed), so none is sent.
+        and the replacement is mapped to the node's order by its Alpaca order ID. Alpaca refuses a
+        replacement that keeps the original client order ID (observed), so a new one of the same form
+        is named (`replacement_client_order_id`). Whether the replacement carries it is checked
+        where a replacement is adopted (`_adopt`), whichever way it got there.
         """
         order = self.cache.order(command.client_order_id)
         if order is None:
@@ -2189,6 +2240,11 @@ class AlpacaExecutionClient(ExecutionClient):
             and command.params
             and "trailing_offset" in command.params
             else None,
+            # A new ID of the order's own form, so the replacement reads as the order did to whoever
+            # reads the account by client order ID; never the order's own, which Alpaca refuses.
+            client_order_id=replacement_client_order_id(
+                order.client_order_id.value, self._replacement_stamp()
+            ),
         )
         record = self._record(order)
         record.pending[venue_order_id.value] += 1
@@ -2225,6 +2281,16 @@ class AlpacaExecutionClient(ExecutionClient):
             self._see(record, answer)
         if answer_id != record.current and answer_id not in record.superseded:
             record.answers[answer_id] = answer  # `replaced` takes it; adopted already, not kept
+
+    def _replacement_stamp(self) -> int:
+        """The node's clock in nanoseconds, and never the same reading twice in one run: two replaces in
+        one reading of the clock still get two IDs. Across runs it rests on that clock not having
+        stepped back past an earlier replace of the same order; if it has, Alpaca refuses the ID as not
+        unique and the modify is rejected by name."""
+        self._last_replacement_stamp = max(
+            self.clock.timestamp_ns(), self._last_replacement_stamp + 1
+        )
+        return self._last_replacement_stamp
 
     async def _replace_refused(
         self,
@@ -2446,8 +2512,8 @@ class AlpacaExecutionClient(ExecutionClient):
             return "contingent orders and order lists are not supported"
         if not order.quantity.as_double().is_integer():
             return f"quantity {order.quantity} is fractional; whole shares only"
-        if len(order.client_order_id.value) > 128:
-            return "client order ID is longer than Alpaca's 128 characters"
+        if len(order.client_order_id.value) > CLIENT_ORDER_ID_MAX:
+            return f"client order ID is longer than Alpaca's {CLIENT_ORDER_ID_MAX} characters"
         if getattr(order, "display_qty", None) is not None:  # a market order has no such field
             # Alpaca's order has no display quantity field ("Create an Order"); a stop-market order can
             # carry one in NautilusTrader too, and it would be sent at its full quantity.
@@ -2694,9 +2760,10 @@ class AlpacaExecutionClient(ExecutionClient):
         """The client order ID of the order an Alpaca order's `replaces` chain starts from, or None if it
         has none NautilusTrader can hold.
 
-        A replacement carries a client order ID Alpaca made (observed), so it is traced back through its
-        `replaces` links. Each link is resolved from what costs no read first: the client's index, the
-        node's cache (`ClientCache.client_order_id`, which holds every venue order ID a node order has
+        A replacement never carries the node's own client order ID: it carries the one this client sent
+        with the replace (`replacement_client_order_id`) or one Alpaca made (observed). Neither is read
+        for what it replaces; it is traced back through its `replaces` links. Each link is resolved from
+        what costs no read first: the client's index, the node's cache (`ClientCache.client_order_id`, which holds every venue order ID a node order has
         had), and the orders already fetched; only then is the order read, at most `MAX_REPLACE_CHAIN`
         times, and a walk that would need more fails by name rather than stopping at an order that is not
         the chain's first. An order Alpaca names in `replaces` and does not find (404) is a chain that
@@ -3217,6 +3284,16 @@ class AlpacaExecutionClient(ExecutionClient):
         if record.current == replacement_id:
             return  # adopted already: one transition, one `OrderUpdated`
         self._see(record, replacement)
+        if replacement.replaces is not None and not names_replacement(
+            order.client_order_id.value, replacement.client_order_id
+        ):
+            # Alpaca made the ID (none could be named, or the one named was not kept), or a hand
+            # replaced the order: said here, once for the replacement, by whichever path adopts it.
+            self._log.warning(
+                f"The replacement of {order.client_order_id} carries a client order ID this client "
+                "did not name: it is the node's by its `replaces` link only, and an account read by "
+                "client order ID does not show it as the node's"
+            )
         # The fills before this replacement: the record's view of the orders it replaced, or the node's
         # own count, all of it on those orders until this one is adopted.
         earlier = max(

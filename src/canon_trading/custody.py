@@ -37,8 +37,12 @@ open order in the window's symbol (ADR 0060, "Bad", 2026-11-11). Our nodes are b
 `O-YYYYMMDD-HHMMSS-001-001-N`; the account check after a window's stop writes
 `canon-close-YYYYMMDDTHHMMSSZ-N-<8 hex>` (`session_window.CLOSE_ID_PREFIX`, ADR 0060), and the close-only
 form the same with `hand-` after the prefix. An ID of any other form is foreign, and an order with no ID
-is never ours either (`MISSING`), since nothing shows it is ours. An order Alpaca made by replacing one of ours
-carries an ID Alpaca made, and is foreign by this rule: no window strategy replaces an order (ADR 0060). On
+is never ours either (`MISSING`), since nothing shows it is ours. A replacement is read by its own ID like
+any order: whose it is never follows from what it replaces. One our adapter sent carries the replaced
+order's ID with a clock stamp after its count (`canon_alpaca.execution.replacement_client_order_id`, ADR
+0129), which is of our nodes' form, so it is ours; that holds for an ID a node wrote, and a close of the
+check's or of this form is replaced by no node and would not keep its form. One made any other way, by hand
+or by another tool, carries an ID Alpaca made or one its maker chose, and is foreign whatever it replaces. On
 account A, the paper tests' own orders that carry IDs of another form (a test's hand-made ID, another trader's
 or another strategy tag) read foreign too: the rule names what our window and paper nodes write, and nothing
 else is treated as theirs.
@@ -52,7 +56,13 @@ quantity, type, limit, status and lineage.
 
 Quantity (`read_holdings`). Alpaca's position carries no client order ID, so the quantity ours opened is read
 from the venue's orders: the net fill (buys add, sells take away) of every order of our lineage in the
-symbol submitted in the last `LINEAGE_LOOKBACK` (`status=all`, so a partly filled open order counts). A long
+symbol submitted in the last `LINEAGE_LOOKBACK` (`status=all`, so a partly filled open order counts). An
+order that replaces another counts only what it filled beyond that one: Alpaca's replacement "carries the
+order on", its filled quantity counting the fills before it (ADR 0042, paper, 2026-11-10), so a chain of
+ours is counted once, and the fills of a foreign order in a chain stay foreign whatever replaced it. A
+replacement of ours with fills whose replaced order the listing does not hold (one working since before the
+lookback) carries fills that cannot be told apart, and freezes the symbol; one with no fills, as a resting
+stop tightened days after it was placed, carries none and counts nothing. A long
 is ours to close only when it is exactly that net. On an account held long-only, ours at the lookback's start
 is not negative, so the net over the lookback is never more than what ours holds now, and a match never takes
 a foreign share; a lookback too short to hold our entry gives a mismatch, which freezes the symbol rather than
@@ -280,12 +290,6 @@ def _qty(field: object) -> Decimal:
     return Decimal(str(field)) if field not in (None, "") else Decimal(0)
 
 
-def _signed_fill(order: Order) -> Decimal:
-    """What `order` has filled, signed: a buy adds, a sell takes away."""
-    filled = _qty(order.filled_qty)
-    return filled if _value(order.side) == "buy" else -filled
-
-
 def describe(order: Order) -> str:
     """An order by name for a report: ours by its client order ID, a foreign one by what it is (never its
     ID, which may be the owner's)."""
@@ -335,8 +339,25 @@ def _opened(trading: TradingClient, symbol: str, now: datetime) -> tuple[Decimal
             f"{len(orders)} orders in {symbol} in the last {LINEAGE_LOOKBACK}, the most one listing "
             "returns, so the quantity ours opened is not established"
         )
-    ours = [o for o in orders if lineage(o.client_order_id) == OURS]
-    return sum((_signed_fill(o) for o in ours), Decimal(0)), ""
+    listed = {str(o.id): o for o in orders}
+    opened = Decimal(0)
+    for order in orders:
+        if lineage(order.client_order_id) != OURS:
+            continue
+        filled = _qty(order.filled_qty)
+        if order.replaces is not None and filled > 0:
+            # a replacement carries on the fills of the order it replaces, whoever placed that one:
+            # only what it filled beyond them is its own (one with no fills carries none)
+            replaced = listed.get(str(order.replaces))
+            if replaced is None:
+                return None, (
+                    f"an order of ours in {symbol} replaces one the listing of the last "
+                    f"{LINEAGE_LOOKBACK} does not hold, whose fills it carries, so the quantity ours "
+                    "opened is not established"
+                )
+            filled = max(Decimal(0), filled - _qty(replaced.filled_qty))
+        opened += filled if _value(order.side) == "buy" else -filled
+    return opened, ""
 
 
 def read_holdings(trading: TradingClient, now: datetime) -> list[Holding]:

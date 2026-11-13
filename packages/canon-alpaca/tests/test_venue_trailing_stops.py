@@ -24,7 +24,9 @@ from alpaca.trading.models import TradeUpdate
 from alpaca.trading.requests import ReplaceOrderRequest
 from alpaca.trading.requests import TrailingStopOrderRequest
 from canon_alpaca import execution
+from canon_alpaca.execution import REPLACEMENT_STAMP_DIGITS
 from canon_alpaca.execution import AlpacaExecutionClientConfig
+from canon_alpaca.execution import replacement_client_order_id
 from canon_alpaca.execution import replaces_as_asked
 from nautilus_trader.model import ClientOrderId
 from nautilus_trader.model import OrderSide
@@ -321,7 +323,9 @@ def test_trailing_offset_modify_uses_the_existing_replace_chain(
         assert target == old_id.value and request.trail == 2.5
         assert request.qty == (3 if quantity_change else None)
         assert request.limit_price is None and request.stop_price is None
-        assert request.client_order_id is None
+        assert request.client_order_id == replacement_client_order_id(
+            order.client_order_id.value, int(request.client_order_id[-REPLACEMENT_STAMP_DIGITS:])
+        )
         updated = client.cache.order(order.client_order_id)
         assert updated.venue_order_id != old_id
         assert updated.quantity == Quantity.from_int(3 if quantity_change else 2)
