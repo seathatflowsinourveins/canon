@@ -196,6 +196,40 @@ it too; a bar
 ending exactly at 04:00 is in segment 31, and one starting exactly at 04:00 in segment 32. Booleans are unknown reference/open prices, not 0 or 1;
 order caps must be numeric positive finite amounts, and compute time a nonnegative integer clock.
 
+**Amendment, 2026-11-13: the evening SIP baseline.** `scripts/automation install` installs
+`local.canon.movers-baseline`, checked every 900 seconds while awake, gated to 20:15–04:00 New York.
+Its own fresh clone of origin/main prepares Alpaca's calendar and active equity definitions through
+`paper:history tests --baseline-inputs`, using account A's existing pair, GET only; history is loaded
+by `paper:history tests --bars 1-MINUTE` at ADR 0093's pace into
+`CANON_HOME/movers-baseline-catalog/sip`, never the main checkout's catalog. The next calendar date
+on or after the runner's 20:00 rollover supplies the trade date, weekends and holidays included;
+the five prior calendar sessions supply its history. `paper:history tests baseline` writes SIP to
+`CANON_HOME/movers-baseline/<trade date>/sip.json` through its existing
+temporary-file/rename writer. That root is the one the paper runner is to read with `--baseline-dir`;
+until the runner's change lands, nothing on main reads it, and windows read `catalog/movers-baseline/`
+in their clone. The input step makes two trading-API GETs (calendar and assets) under `paper:history`,
+whose row in ADR 0093 counts none; ADR 0093 is not amended here. Failed preparation or loading publishes nothing; a failed writer's
+output is removed. A file the writer completed is kept: a finish after 04:00 is named as failed in
+the status row, and the file stays for that day's later windows. Complete dates are reused, and a date
+completed earlier the same evening needs no clone and no request. A firing that finds another firing or
+an install holding its lock skips that check and leaves the last status. The job holds only private clone/catalog locks,
+never a paper account lock; its tasks share a six-hour bound, shortened to that trade date's 04:00
+SIP opening. The `movers baseline` status row names failure, missing firing, stale status and completion.
+Maintenance installs it from main by the normal `differs`/`install` path; uninstall retains the data.
+The first real night's completion before 04:00 is **UNVERIFIED**. The file cannot exist at the 20:00
+overnight opening: the SIP session it needs ends then, and the writer waits the 15-minute publication
+delay. No window reads it then. In `src/canon_trading/session_window.py` (read 2026-11-13, on main and
+on the runner's branch) an overnight Mover window streams `boats` (`MOVER_PARTS`), so it asks for the
+next date's `boats.json`. With no such file it ranks in the dollar tier. The first window to read the
+next date's `sip.json` is that date's pre-market at 04:00, and the job's deadline is that opening. This
+job writes no `boats` baseline.
+Known limits, from the review of 2026-11-13. A TERM to the job's main process, as launchd's unload
+sends, reaches the firing's own clean-up only through launchd's process-group handling (UNVERIFIED).
+The private catalog keeps every night's instrument definitions and bars, and nothing prunes it. The
+writer counts every equity the catalog holds when it computes the excluded share, so a whole-market
+universe that grows past `--max-excluded-share` stops the writer by name. How large that share is on a
+real night is UNVERIFIED.
+
 ### Consequences
 
 * Good: every figure is a function of plain inputs, so a replay on the catalog computes what paper did.

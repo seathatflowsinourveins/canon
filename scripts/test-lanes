@@ -517,6 +517,11 @@ cp "$R/home/.claude/canon/paper-session.sh" "$AH/canon/paper-session.sh"   # ins
 cp "$R/scripts/automation" "$AH/canon/movers-recorder.sh"
 cp "$R/home/.claude/canon/paper-session.sh" "$AH/canon/movers-checkout.sh"
 jq -n --argjson e "$(date +%s)" '{at_epoch: $e, outcome: "idle", day: "2026-11-11", commit: "none: nothing ran", exit_code: 0, note: "outside its weekday window"}' > "$AH/canon/watch/movers-recorder.json"
+# the evening baseline installed as the tree has it, its last firing complete (ADR 0087; its own cases are
+# in tests/test_movers_baseline_automation.py)
+cp "$R/scripts/automation" "$AH/canon/movers-baseline.sh"
+cp "$R/home/.claude/canon/paper-session.sh" "$AH/canon/movers-baseline-checkout.sh"
+jq -n --argjson e "$(date +%s)" '{at_epoch: $e, outcome: "ok", exit_code: 0, note: "sip 2026-11-12 complete", commit: "b123456789abcdef0123456789abcdef01234567"}' > "$AH/canon/watch/movers-baseline.json"
 # the maintenance agent installed as the tree has it, its last round fresh and ok (scripts/test-maintenance
 # covers its row)
 cp "$R/home/.claude/canon/maintenance.sh" "$AH/canon/maintenance.sh"
@@ -865,15 +870,16 @@ if command -v plutil >/dev/null 2>&1; then
   mv "$STUB/launchctl-print" "$STUB/kept-print"; : > "$STUB/track-bootstrap"; echo 4 > "$STUB/slow-bootout"
   for l in local.canon.lanes-watch local.canon.paper-session local.canon.movers-recorder local.canon.otel-collector local.canon.maintenance; do printf '\tstate = running\n' > "$STUB/launchctl-print-$l"; done
   : > "$STUB/launchctl.log"; unkeep; linst 5; rc=$?
-  # (the nightly study's agent, ADR 0089, was not loaded, so it is loaded too: five in all)
-  check "an install over running agents waits for each to stop, then loads it: exit 0, four loaded again and the nightly study's for the first time, the maintenance agent's unchanged job kept" \
-        eval '[ "$rc" = 0 ] && [ "$(grep -c "^  loaded     local.canon" "$TMP/install.out")" = 5 ] && grep -q "^  loaded     local.canon.nightly-study" "$TMP/install.out" && grep -q "^  loaded     local.canon.movers-recorder" "$TMP/install.out" && grep -q "^  kept       local.canon.maintenance loaded: its plist is unchanged" "$TMP/install.out" && ! grep -q "Bootstrap failed" "$TMP/install.out" && grep -q "state = running" "$STUB/launchctl-print-local.canon.otel-collector"'
+  # (the nightly study's agent, ADR 0089, and the evening baseline's, ADR 0087, were not loaded, so they
+  # are loaded too: six in all)
+  check "an install over running agents waits for each to stop, then loads it: exit 0, four loaded again and the nightly study's and the evening baseline's for the first time, the maintenance agent's unchanged job kept" \
+        eval '[ "$rc" = 0 ] && [ "$(grep -c "^  loaded     local.canon" "$TMP/install.out")" = 6 ] && grep -q "^  loaded     local.canon.nightly-study" "$TMP/install.out" && grep -q "^  loaded     local.canon.movers-baseline" "$TMP/install.out" && grep -q "^  loaded     local.canon.movers-recorder" "$TMP/install.out" && grep -q "^  kept       local.canon.maintenance loaded: its plist is unchanged" "$TMP/install.out" && ! grep -q "Bootstrap failed" "$TMP/install.out" && grep -q "state = running" "$STUB/launchctl-print-local.canon.otel-collector"'
   # only the collector loaded now, and it does not stop in time
   echo 100 > "$STUB/slow-bootout"; rm -f "$STUB/stopping-"* "$STUB/launchctl-print-local.canon."*; printf '\tstate = running\n' > "$OTL"
   : > "$STUB/launchctl.log"; unkeep; linst 1; rc=$?
   check "... one that does not stop in time: exit 1, nothing new loaded for it, said after the status table" \
         eval '[ "$rc" != 0 ] && grep -q "the earlier local.canon.otel-collector was still stopping after 1 s" "$TMP/install.out" && ! grep -q "bootstrap .*otel-collector.plist" "$STUB/launchctl.log" && grep -q "still stopping" <<<"$(tail -n 3 "$TMP/install.out")" && grep -q "^install: FAILED (exit 1):" "$TMP/install.out"'
-  check "... the other five loaded meanwhile"        test "$(grep -c "^  loaded     local.canon" "$TMP/install.out")" = 5
+  check "... the other six loaded meanwhile"         test "$(grep -c "^  loaded     local.canon" "$TMP/install.out")" = 6
   # the paper agent alone does not stop: said once, nothing booted over it, and (claim of a second reader) its
   # runner, clone and plist not replaced under it, where a firing of the old job would run the new runner
   rm -f "$STUB/stopping-"* "$STUB/launchctl-print-local.canon."*; printf '\tstate = running\n' > "$STUB/launchctl-print-local.canon.paper-session"
