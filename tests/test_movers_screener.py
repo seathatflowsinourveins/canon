@@ -45,6 +45,12 @@ ANSWERS = {
 }
 
 
+@pytest.fixture(autouse=True)
+def board_home(monkeypatch, tmp_path) -> None:
+    """A default board write stays in this test's temporary home, never the recorder's watch folder."""
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path / "home"))
+
+
 @pytest.fixture
 def sent(monkeypatch) -> list[tuple[str, str]]:
     """Data-only mode with placeholder keys; every request that reaches requests' transport is recorded

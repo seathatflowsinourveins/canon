@@ -134,3 +134,29 @@ ten fields as list lines, in this order, each with a value:
 * status: adopted
 * supersedes: none
 * source: lead
+
+### L0008: A display shared the record's process and could have ended it
+
+* area: data
+* session: 2026-11-13
+* result: The screener board was built to write from inside the recorder's own screener poll, and its first version let a failed board write raise out of the poll loop, which would have ended a recorder batch of up to 80 polls for a file only a person reads; the review also found the reader crashed on a malformed board with Stale's exit code
+* evidence: tests/test_movers_screener_board.py, the cases a replace failure preserves the previous board and is not silent and any failure of the board write leaves the polling going; tests/test_screener_board.py, the case a malformed board is named on the first line with its own exit
+* lesson: A display added to a recording process is held to the record's terms: it may fail, by name, but never stop or change what is recorded; and the vendor's lists it shows are labelled as the vendor's and kept out of every trading input by a test
+* change: a board write failure of any kind is named on stderr and the poll goes on; the reader names a malformed board with exit 3; the board says it is display only, and a test holds that no ranking, entry, re-entry or protection module loads it (src/canon_trading/screener_board.py)
+* next: The lead's ruling on session_window's fallback to Alpaca's gainers for a mover window (ADR 0083), which the display-only term reaches and this unit does not change
+* status: open
+* supersedes: none
+* source: lead
+
+### L0009: A position had no exit in five different ways in one day
+
+* area: exits
+* session: 2026-11-13
+* result: Across the day a long was left with no working exit by an entry cap applied to a found holding, by a start margin before the close, by a distance over the sizing ceiling, and by entry paths the Mover leaves unchecked; each was found case by case, after the fact, with no standing check that every shape still has its exit
+* evidence: the pytest mark no_position_without_its_exit (pytest.toml), its cases in tests/test_protect.py and tests/test_mover.py
+* lesson: The rule that every position has its exit is held by a set of cases, one per shape seen, that every protection unit runs green; a gap not yet closed is a strict expected failure, so its fix shows up as the set turning red until the mark is lifted
+* change: the set's first version, the found-holding shapes green and the open gaps strict expected failures; a review that finds a new way a position had no exit adds its case to the set in the same pull request
+* next: Each open gap's own unit, which lifts its case's expected failure when it lands
+* status: open
+* supersedes: none
+* source: lead
