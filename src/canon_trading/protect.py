@@ -33,8 +33,11 @@ Contracts, read 2026-11-12:
   the entry under the named row of `session_window.TRAIL_ARMS`: F2 the fixed trail, OWN1 and OWN3 the
   symbol's own ATR (`atr_k` ATRs of one-minute bars) over the spread floor (`spread_floor_m` quoted
   spreads, `quoted_spread`), which is held for the fixed row here too. The ATR rows carry the cap arm
-  `own`, which the Mover lets stand only for an entry it sizes: nothing is sized here, so a distance over
-  the 0.02 cap is refused by name. The ATR rows were built for a fresh entry; no row is calibrated for a
+  `own`: a found holding has no entry size left to choose, so its ATR or spread-floor distance stands
+  up to `sizing.DISTANCE_CEILING`, including the stepped and venue-minimum distance; one over it is
+  refused as `distance_over_ceiling` (the lead, 2026-11-13; ADR 0142). `_entry_trail(found_holding=True)`
+  shares that planning without changing the Mover's entry sizing. The ATR rows were built for a fresh
+  entry; no row is calibrated for a
   standing holding (all UNCALIBRATED, ADR 0088, ADR 0142); then the sizing unit's
   `sizing.sized_stop`, the one computation of the stop a long at `entry` is sized
   against at that fraction, so the distance is entry less that stop, as `Mover._buy` takes L. The entry is
@@ -180,8 +183,8 @@ default."""
 
 def planner_config(row: str) -> mover.MoverConfig:
     """The Mover's config for `row`, as registered. `max_notional` and `max_move` have no default and the
-    planning reads neither; nothing here sizes or enters, so the ATR rows' cap arm `own`, which the Mover
-    lets stand only for an entry it sizes, refuses a distance over the cap by name."""
+    planning reads neither. Nothing here sizes or enters: `row_distance` names a found holding to the
+    shared planner and enforces the sizing ceiling for the ATR rows' cap arm `own`."""
     return mover.MoverConfig(max_notional=Decimal(1), max_move=Decimal(1), **ROWS[row])
 
 
@@ -386,7 +389,8 @@ def row_distance(
 ) -> tuple[Decimal, Distance]:
     """`symbol`'s trailing distance in dollars under `row`, by the Mover's planning (module header),
     never under the spread floor or Alpaca's smallest trail (`venue_smallest`): `ValueError` naming why
-    there is none, the Mover's own refusal of a distance its cap forbids included."""
+    there is none. An own-cap holding keeps its distance up to `sizing.DISTANCE_CEILING`; the entry
+    cap still applies to the other cap arms."""
     bid, ask = book.bid, book.ask
     instrument_id = InstrumentId.from_str(f"{symbol}.ALPACA")
     slot = mover.Slot(
@@ -398,13 +402,19 @@ def row_distance(
     )
     price = entry_price(ask, PLANNER.entry_ticks)
     touch = SimpleNamespace(bid_price=Price.from_str(str(bid)), ask_price=Price.from_str(str(ask)))
-    plan = planner._entry_trail(slot, price, touch)  # ValueError: a floor or distance over the cap
+    plan = planner._entry_trail(slot, price, touch, found_holding=True)
     if plan.spread is None:
         raise ValueError(
             f"no usable {FEED.value} spread (bid {bid}, ask {ask}), so the spread floor is not known"
         )
     # the fixed row carries no floor of its own; the spread floor is held for every row here
     floor = PLANNER.spread_floor_m * plan.spread / price if plan.floor is None else plan.floor
+    own = planner.settings.trail_cap == "own"
+    if own and plan.trail > sizing.DISTANCE_CEILING:
+        raise ValueError(
+            f"distance_over_ceiling: the trail {plan.trail} ({plan.bound}) is over the "
+            f"{sizing.DISTANCE_CEILING} ceiling for a found holding"
+        )
     distance = price - sizing.sized_stop(price, plan.trail)
     if distance <= 0:
         raise ValueError(f"the distance {distance} at {price} leaves no room for a trail")
@@ -413,6 +423,11 @@ def row_distance(
     if distance / price < floor:
         raise ValueError(f"the distance {distance} is under the spread floor at {price}")
     sent = max(distance, venue_smallest(price))
+    if own and sent > price * sizing.DISTANCE_CEILING:
+        raise ValueError(
+            f"distance_over_ceiling: the distance {sent} ({plan.bound}, after the price step and "
+            f"Alpaca's smallest trail) is over the {sizing.DISTANCE_CEILING} ceiling at {price}"
+        )
     return sent, Distance(
         price, plan, PLANNER.spread_floor_m * plan.spread, book.age, sent, distance, row, bid
     )

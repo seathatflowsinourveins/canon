@@ -99,6 +99,20 @@ lineage, its trail 2.0083% of Alpaca's own mark; while it rested Alpaca showed n
 second run sent nothing and named the long as covered by that stop; the stop was then canceled unfilled,
 the setting read back on, the share sold and the account read flat.
 
+**Amendment, 2026-11-13 — the own cap for a found holding (the lead's ruling).** This replaces the
+own-cap refusal above: a holding found in the account has no entry size left to choose, so under an
+`own` cap arm its per-symbol distance stands, whether selected from ATR or raised to the spread floor,
+up to the inclusive `sizing.DISTANCE_CEILING` the handbook names (`src/canon_trading/sizing.py:45`;
+`docs/handbook/practices.md:38`). A distance over that ceiling, before or after the price step and
+Alpaca's smallest trail, is refused by name and gets no stop; no fixed fraction is substituted.
+The spread floor and Alpaca's smallest trail still hold (`src/canon_trading/protect.py:387`).
+`Mover._entry_trail` takes a default-off `found_holding` parameter for this task alone, covering both
+own-cap branches (`src/canon_trading/mover.py:5506`, `:5541`, `:5610`); the Mover's entry still sizes
+through `size_from_budget`, with its callers unchanged. F2 keeps its existing planning; OWN3 has the
+same own-cap arm as OWN1 and retains its registered ATR multiple. Offline tests reproduce both former
+refusals, the ceiling and price-step boundaries, the plan-only source line, and the entry guards
+(`tests/test_protect.py:574`, `:592`, `:623`); no paper acceptance of this amendment is claimed.
+
 ## Evidence
 
 Read 2026-11-13.
