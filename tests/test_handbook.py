@@ -5,14 +5,16 @@ The contract is the pages' own: the rows table's columns and its two states, one
 `practices/` holding one line that names a record that exists or says "not yet built" with a roadmap
 step, with `practices.md` only the introduction and the index of move folders, the
 journal's ten fields and the nightly study's six (`journal.md`, `nights.md`), and both of those
-append-only, so the entries already on `main` stay as they were. No upstream reads these pages, so the
-parsing is the standard library's `re`; what is on `main` is asked of git through its own plumbing,
+append-only, so the entries already on `main` stay as they were, and the named limits' one table
+(`limits.md`), each line a case, its reader, a reproducing test that exists or `none`, and a date. No
+upstream reads these pages, so the parsing is the standard library's `re` and `ast`; what is on `main` is asked of git through its own plumbing,
 `git rev-parse --verify`, `git merge-base` and `git show <rev>:<path>` (all in `git help`). No test here
 touches the network.
 """
 
 from __future__ import annotations
 
+import ast
 import datetime
 import re
 import shutil
@@ -653,13 +655,33 @@ def test_practices_check_refuses_an_unsourced_line() -> None:
 
 LIMITS_HEADER = "| Case | Reader | Reproducing test | Received |"
 LIMIT_SEPARATOR = re.compile(r"\|(?:\s*:?-+:?\s*\|){4}")
-LIMIT_TEST = re.compile(r"`(tests/[\w/]+\.py)::(\w+)`")
+LIMIT_TEST = re.compile(r"`([\w./-]+\.py)::(\w+)(?:::(\w+))?(?:\[[^\]`]*\])?`")
+CELL_BAR = re.compile(r"(?<!\\)\|")
 
 
-def check_limits(text: str) -> list[str]:
-    """The named limits table: one header, its separator, then rows of a case, the reader that found it,
-    the test that reproduces it (`tests/<file>.py::<function>`, which must exist) or `none`, and the ISO
-    date it was received. An empty table is a list with nothing on it; a `|` line outside it is refused."""
+def defined_tests(path: Path) -> set[str]:
+    """The test functions a file defines, by pytest's node id: `name` at module level and
+    `Class::name` in a class, read with the standard library's `ast`, so a name only quoted is none."""
+    names: set[str] = set()
+    for node in ast.parse(path.read_text()).body:
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+            names.add(node.name)
+        elif isinstance(node, ast.ClassDef):
+            names |= {
+                f"{node.name}::{item.name}"
+                for item in node.body
+                if isinstance(item, ast.FunctionDef | ast.AsyncFunctionDef)
+            }
+    return names
+
+
+def check_limits(text: str, root: Path = ROOT, today: datetime.date | None = None) -> list[str]:
+    """The named limits table: one header, its separator, then rows of a case named once, the reader
+    that found it, the test that reproduces it as a pytest node id in this repository (a file and a
+    function, a class's method, or one parametrized case; the function must be defined there) or
+    `none`, and the ISO date it was received, never after today. An empty table is a list with nothing
+    on it; a `|` line outside it, indented or not, is refused. A `\\|` in a cell is its text."""
+    today = today or datetime.date.today()
     lines = text.splitlines()
     if lines.count(LIMITS_HEADER) != 1:
         return ["the page needs exactly one limits table header"]
@@ -672,29 +694,37 @@ def check_limits(text: str) -> list[str]:
     errors = [
         f"a table line outside the limits table: {line[:60]!r}"
         for index, line in enumerate(lines)
-        if line.startswith("|") and not start <= index < end
+        if line.lstrip().startswith("|") and not start <= index < end
     ]
+    cases: set[str] = set()
     for line in lines[start + 2 : end]:
-        cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+        cells = [cell.strip() for cell in CELL_BAR.split(line.strip().strip("|"))]
         if len(cells) != 4:
             errors.append(f"{line[:60]!r}: {len(cells)} cells, not 4")
             continue
         case, reader, test, received = cells
         if not case:
             errors.append(f"{line[:60]!r}: no case")
+        elif case in cases:
+            errors.append(f"{case[:40]!r}: the case is listed twice")
+        cases.add(case)
         if not reader:
             errors.append(f"{case[:40]!r}: no reader")
         if test != "none":
             named = LIMIT_TEST.fullmatch(test)
-            path = ROOT / named.group(1) if named else None
-            if named is None or path is None:
+            if named is None:
                 errors.append(
-                    f"{case[:40]!r}: test {test!r} is not `tests/<file>.py::<function>` or none"
+                    f"{case[:40]!r}: test {test!r} is not a `<file>.py::<test>` node id or none"
                 )
-            elif not path.is_file() or f"def {named.group(2)}(" not in path.read_text():
-                errors.append(f"{case[:40]!r}: test {test!r} does not exist")
+            else:
+                path = root / named.group(1)
+                function = "::".join(part for part in named.group(2, 3) if part)
+                if not path.is_file() or function not in defined_tests(path):
+                    errors.append(f"{case[:40]!r}: test {test!r} does not exist")
         if not iso_date(received):
             errors.append(f"{case[:40]!r}: received {received!r} is not an ISO date")
+        elif datetime.date.fromisoformat(received) > today:
+            errors.append(f"{case[:40]!r}: received {received!r} is after today")
     return errors
 
 
@@ -718,7 +748,7 @@ def test_limits_check_takes_an_empty_list_and_a_well_formed_line() -> None:
     [
         ("A case", "", "no case"),
         ("a reader", "", "no reader"),
-        ("`tests/test_handbook.py::test_limits_page_form`", "a test", "is not `tests/"),
+        ("`tests/test_handbook.py::test_limits_page_form`", "a test", "is not a `"),
         ("test_limits_page_form`", "test_no_such_function`", "does not exist"),
         ("2026-11-13", "today", "not an ISO date"),
         (" 2026-11-13 |", " 2026-11-13 | extra |", "5 cells"),
@@ -736,3 +766,62 @@ def test_limits_check_refuses_a_page_without_its_table_or_a_stray_line() -> None
     ]
     stray = LIMITS_PAGE + A_LIMIT + "\n\nText.\n\n| A stray | line | none | 2026-11-13 |\n"
     assert any("outside the limits table" in error for error in check_limits(stray))
+
+
+# Code review of the limits check (fbad5890): what a reproducing test may be, and what a line may hold.
+ADAPTER_TEST = (
+    "`packages/canon-alpaca/tests/test_data_client.py::"
+    "test_bars_quotes_and_trades_reach_strategy_and_cache`"
+)
+
+
+@pytest.mark.parametrize(
+    "test",
+    [
+        ADAPTER_TEST,
+        "`tests/test_handbook.py::test_limits_check_refuses_a_malformed_line[no case]`",
+    ],
+)
+def test_limits_check_takes_any_test_of_the_repository_by_its_node_id(test: str) -> None:
+    line = f"| A case | a reader | {test} | 2026-11-13 |\n"
+    assert check_limits(LIMITS_PAGE + line) == []
+
+
+def test_limits_check_takes_a_class_method_and_refuses_a_name_only_quoted(tmp_path: Path) -> None:
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_x.py").write_text(
+        'class TestX:\n    def test_a(self):\n        pass\n\n\nNOTE = "def test_quoted("\n'
+    )
+    page = LIMITS_PAGE + "| A case | a reader | `tests/test_x.py::TestX::test_a` | 2026-11-13 |\n"
+    assert check_limits(page, root=tmp_path) == []
+    quoted = LIMITS_PAGE + "| A case | a reader | `tests/test_x.py::test_quoted` | 2026-11-13 |\n"
+    assert any("does not exist" in error for error in check_limits(quoted, root=tmp_path))
+
+
+@pytest.mark.parametrize(
+    ("lines", "complaint"),
+    [
+        (
+            A_LIMIT
+            + "\n"
+            + A_LIMIT.replace("`tests/test_handbook.py::test_limits_page_form`", "none"),
+            "twice",
+        ),
+        ("| A case | a reader | none | 2999-01-01 |", "after today"),
+        (
+            A_LIMIT + "\n\nText.\n\n  | Indented | a reader | none | someday |",
+            "outside the limits table",
+        ),
+    ],
+)
+def test_limits_check_refuses_a_repeated_case_a_future_date_and_an_indented_row(
+    lines: str, complaint: str
+) -> None:
+    errors = check_limits(LIMITS_PAGE + lines + "\n")
+    assert any(complaint in error for error in errors), errors
+
+
+def test_limits_check_reads_an_escaped_bar_as_text() -> None:
+    assert (
+        check_limits(LIMITS_PAGE + "| bid \\| ask crossed | a reader | none | 2026-11-13 |\n") == []
+    )
