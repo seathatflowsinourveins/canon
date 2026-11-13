@@ -2354,7 +2354,8 @@ class Mover(Strategy):
         if print_time(trade) is None:
             self.prints_ahead[name] = self.prints_ahead.get(name, 0) + 1
             return
-        if kept is not None and event < kept.event_ns:
+        late_print = kept is not None and event < kept.event_ns
+        if late_print:
             late = self.late_prints.setdefault(name, {"count": 0, "most_late_ms": 0})
             late["count"] += 1
             late["most_late_ms"] = max(
@@ -2366,9 +2367,11 @@ class Mover(Strategy):
             # the hold's low is the lowest print of this holding (`_holding_since`, as
             # `_holding_trade`) while its stop is held, whatever order the prints arrive in: one set
             # aside as late counts, though it is never the newest price nor prices a sale (the lead's
-            # ruling of 2026-11-13, F1 (b)); one with no usable time has no place in that order
+            # ruling of 2026-11-13, F1 (b)); one with no usable time has no place in that order. With
+            # no entry fill on record when the holding began cannot be read: a late print, which may
+            # be from before it, counts toward nothing, and the newest counts, as on main
             since = self._holding_since(slot)
-            if since is None or event >= since:
+            if (since is None and not late_print) or (since is not None and event >= since):
                 slot.held_low = price if slot.held_low is None else min(slot.held_low, price)
 
     def record(self) -> dict[str, Any]:

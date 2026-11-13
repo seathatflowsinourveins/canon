@@ -419,6 +419,34 @@ def test_a_late_print_from_before_the_holding_began_counts_toward_no_low() -> No
     assert [o.kind for o in seam.sent] == ["TRAILING"] and not slot.exiting
 
 
+def test_with_no_entry_fill_on_record_a_late_print_counts_toward_no_low() -> None:
+    """The same ruling: a print from before the holding began never counts. With no entry fill on
+    record, as for a holding adopted after a restart, when the holding began cannot be read, so a print
+    set aside as late counts toward no low; a print kept as the newest still does, as on main
+    (code-review-high-host-clock-v5/4)."""
+    seam, slot, filled, last = holding(TriggerType.LAST_PRICE, bid="9.89", ask="9.91")
+    seam.slots, seam.trades = {slot.instrument_id: slot}, 0
+    last.append(stamped("10.0000", filled - SECOND, filled - SECOND))
+    seam._protect(slot, D(3), filled + SECOND)
+    assert slot.held_stop is not None
+    seam.fills = []
+    assert seam._holding_since(slot) is None
+    for price, at, received in (
+        ("9.9000", filled + 3 * SECOND, filled + 3 * SECOND),
+        ("9.7000", filled - 600 * SECOND, filled + 3 * SECOND + 1),
+    ):
+        trade = SimpleNamespace(
+            instrument_id=slot.instrument_id,
+            price=Price.from_str(price),
+            ts_event=at,
+            ts_init=received,
+        )
+        last.append(trade)
+        seam.on_trade(trade)
+    assert seam.late_prints[str(slot.instrument_id)]["count"] == 1
+    assert slot.held_low == D("9.9000")
+
+
 @pytest.mark.parametrize(
     ("trigger", "anchor"), [(TriggerType.LAST_PRICE, None), (TriggerType.BID_ASK, D("9.50"))]
 )
