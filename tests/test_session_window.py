@@ -8775,6 +8775,7 @@ def test_the_window_supplies_every_roster_context_and_checks_every_symbol_after_
         strategy.live_bars = 1
         strategy.ranking_records.append({"published": True})
         strategy.opened_slots.add(InstrumentId.from_str("EEE.ALPACA"))
+        seen["strategy"] = strategy
         return (
             SimpleNamespace(cache=SimpleNamespace(orders=lambda **_: []), dispose=lambda: None),
             strategy,
@@ -8816,6 +8817,9 @@ def test_the_window_supplies_every_roster_context_and_checks_every_symbol_after_
     assert report.cap_checks == 5
     assert set(report.mover["position_caps"]) == {"AAA.ALPACA", "BBB.ALPACA"}
     assert report.mover["entry_arm"] == "registered" and report.result == "ok"
+    assert callable(seen["strategy"].context_reader)
+    assert callable(seen["strategy"].context_stop)
+    assert report.mover["run"]["context_request_budget"]["limit_per_minute"] == 150
 
 
 def test_the_outside_scope_bridge_is_named_in_the_window_record(monkeypatch, tmp_path) -> None:

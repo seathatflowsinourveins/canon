@@ -7,6 +7,8 @@ review-by: 2026-12-10
 
 # Alpaca's historical quotes into the catalog: write-back through the data client, IEX only, a window of weeks
 
+*Amended in part 2026-11-12 by ADR 0151 (proposed): a quote load may name `sip`, into its own root.*
+
 ## Context and Problem Statement
 
 Roadmap step 7 still has to rank a strategy upstream ships. Upstream's built-in `EmaCross` keeps its

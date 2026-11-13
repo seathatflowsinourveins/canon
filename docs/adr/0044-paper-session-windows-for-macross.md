@@ -69,6 +69,18 @@ paper, pre-market and after-hours so far (Sessions, feeds and what paper has sho
 window's length and schedule": such a node runs its feed's whole span, 04:00-20:00 on `sip` and
 20:00-04:00 on `boats`, not at most 60 minutes. Every other window keeps the bound.
 
+Amended later on 2026-11-13, narrowing the line above. The owner's requirement of that day, as ADR 0146's Context records it, is a long
+protected around the clock on weekdays with no seam between session parts; ADR 0146's per-feed node
+("for a node that carries a long this amends ADR 0044's bound of 60 minutes a window") is how it is
+met. A node that carries a long runs past 60 minutes, at most to the end of its feed's span, only as a
+by-hand paper run that asks for it with a flag of its own; nothing else lifts the bound. Every other
+window, and every window the schedule starts (ADR 0050), keeps `minutes` at most 60 and
+`LONGEST_WINDOW_SECS`. The code lifts the cap only under that flag, only once this line is on `main`,
+and the change that adds the flag names it here. No node has run past a window's bound; ADR 0146
+records the sixteen-hour soak (memory, the stream across hours, reconnects) as `UNVERIFIED`, and so is
+any run past 60 minutes. Until a scheduled window may run such a node, the requirement is met only
+while a by-hand run is going.
+
 **Sessions, feeds and what paper has shown** (`session_window.SESSION_FEEDS`), and what each firing of the
 schedule (ADR 0050, `--session auto`) does in each, New York time. A part where the feeds were probed on
 paper and none delivered has no feed and is skipped, naming the probe and its date, as the lead decided on
