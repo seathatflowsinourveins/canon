@@ -506,6 +506,8 @@ def test_cli_requires_row_and_controls_and_refuses_iex(controls, capsys):
         str(controls[0]),
         "--inbox",
         str(controls[1]),
+        "--symbol-holds-dir",
+        str(controls[0]),
     ]
     args = module.parse_args(argv)
     assert args.levels == {} and args.row == "OWN1"
@@ -932,7 +934,7 @@ def test_lock_wait_is_bounded(controls, value):
     with pytest.raises(SystemExit):
         subject().parse_args(
             ["windows", "--row", "OWN1", "--holds-dir", str(controls[0]), "--inbox"]
-            + [str(controls[1]), "--lock-wait", value]
+            + [str(controls[1]), "--symbol-holds-dir", str(controls[0]), "--lock-wait", value]
         )
 
 
@@ -945,6 +947,8 @@ def test_lock_wait_defaults_to_none_and_parses(controls):
         str(controls[0]),
         "--inbox",
         str(controls[1]),
+        "--symbol-holds-dir",
+        str(controls[0]),
     ]
     assert subject().parse_args(base).lock_wait == 0
     assert subject().parse_args([*base, "--lock-wait", "90"]).lock_wait == 90
