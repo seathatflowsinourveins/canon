@@ -108,3 +108,45 @@ def test_another_runs_higher_level_for_the_same_holding_is_never_lowered(tmp_pat
     path.write_text(book(successor))
     strategy.on_stop()
     assert rows(path)["shape"]["last_level"] == "1.03", path.read_text()
+
+
+def test_a_rejected_row_keyed_by_no_text_does_not_stop_this_runs_writes(tmp_path: Path) -> None:
+    """Review F1 (land-sameclock, 2026-11-13): a rejected row whose instrument is a list made its
+    key unhashable, so every write of the run failed and this run's own entry was never saved."""
+    path = tmp_path / "levels.json"
+    odd = other("5.00", instrument_id=["BBB"])
+    path.write_text(book(odd))
+    strategy = started(path)
+    strategy.on_stop()
+    entries = json.loads(path.read_text())["entries"]
+    assert [row.get("account_label") for row in entries] == ["shape", "other"], strategy.said
+    assert entries[1] == odd
+
+
+def test_a_rejected_schema_1_row_is_carried_through_a_write(tmp_path: Path) -> None:
+    """Review F7 (land-sameclock): a schema 1 row this build rejects, for a holding this run never
+    writes, was removed at the first save; it is carried unchanged, like any other schema's."""
+    path = tmp_path / "levels.json"
+    row = other("5.00", state="parked")
+    path.write_text(json.dumps({"schema": 1, "entries": [row]}) + "\n")
+    strategy = started(path)
+    strategy.on_stop()
+    book_now = json.loads(path.read_text())
+    assert book_now["schema"] == start_level.SCHEMA
+    assert row in book_now["entries"], (book_now, strategy.said)
+
+
+def test_a_superseded_schema_1_row_is_not_carried_beside_its_newer_entry(tmp_path: Path) -> None:
+    """The schema 1 row a newer row of the same holding supersedes is not written back, so the
+    next read finds one entry for that holding, not a duplicate that would cost its level."""
+    path = tmp_path / "levels.json"
+    older = other("5.00", written_ns=T0 + SECOND)
+    newer = other("6.00", written_ns=T0 + 2 * SECOND)
+    path.write_text(json.dumps({"schema": 1, "entries": [older, newer]}) + "\n")
+    strategy = started(path)
+    strategy.on_stop()
+    notes: list[str] = []
+    read = start_level.LevelBook.read(path, report=notes.append)
+    (entry,) = [e for (account, _), e in read.items() if account == "other"]
+    assert str(entry.last_level) == "6.00", notes
+    assert not any("duplicate" in note for note in notes), notes

@@ -79,11 +79,21 @@ class Unread:
     book: str | None = None
 
 
-def raw_key(row: Any) -> tuple[Any, Any] | None:
-    """A rejected row's (account label, instrument id) as text, or None when it has neither."""
+def raw_key(row: Any) -> tuple[str, str] | None:
+    """A rejected row's (account label, instrument id) as text, or None when either is not text.
+    A row keyed by anything else (a list, say) names no holding this run can write, and its key
+    must still hash, so one such row cannot stop every later write (land-sameclock review F1)."""
     if not isinstance(row, dict):
         return None
-    return (row.get("account_label"), row.get("instrument_id"))
+    account, instrument = row.get("account_label"), row.get("instrument_id")
+    if not isinstance(account, str) or not isinstance(instrument, str):
+        return None
+    return (account, instrument)
+
+
+class _Superseded(ValueError):
+    """A schema 1 row dropped because a newer row names the same holding: never carried, since
+    written back beside that newer entry it would make both a duplicate."""
 
 
 def _positive(value: Decimal, name: str) -> None:
@@ -359,8 +369,9 @@ class LevelBook:
         def rejected(index: int, row: Any, why: object) -> None:
             # The lead's ruling on land-composed's F4 (2026-11-13 20:45): every row this read
             # rejects costs that holding its carried level only, with an ALERT carrying the row.
-            # A schema 1 row is replaced in schema 3 at the next save, so it is not carried.
-            if unread is not None and not old:
+            # F13: a rejected row is carried through a write unchanged, a schema 1 row too
+            # (land-sameclock review F7), except one a newer row of the same holding superseded.
+            if unread is not None and not isinstance(why, _Superseded):
                 unread.rows.append(row)
             label = (
                 row.get("instrument_id", "unknown holding")
@@ -380,7 +391,7 @@ class LevelBook:
                     # Schema 1 could hold one name under two starts; the newest write is kept.
                     newer, older = sorted((entries[key], entry), key=lambda e: -e.written_ns)
                     entries[key] = newer
-                    raise ValueError(
+                    raise _Superseded(
                         f"schema 1 entry with protection start {older.protection_start_ns} "
                         "dropped: a newer entry names the same holding"
                     )
