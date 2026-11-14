@@ -1,0 +1,124 @@
+#!/bin/bash
+# account-lock — run one command while holding one Alpaca account's lock, and that account's market-data stream
+# lock when asked, to a deadline (docs/adr/0110, change (g): "the live account's own account lock and stream
+# lock"; the paper accounts' locks are docs/adr/0069's, clause 3).
+#
+# Usage: scripts/account-lock <account> [--stream] --wait <secs> --deadline <secs> [--grace <secs>] -- <command...>
+#   <account>   live: the owner's live account, canon-live.lock and canon-alpaca-stream-live.lock, which nothing
+#               else in this repository names; or a paper account, by the name and the lock files mise.toml's
+#               paper tasks use, so the same task shape can be proven on paper first and excludes a paper run
+#               there: tests (account A), windows (account B) or protect (account C, ADR 0114, which has an
+#               account lock and no stream lock, so --stream is refused for it)
+#   --stream    also take the account's stream lock, after the account's lock, so no run waits for an account's
+#               lock while it holds a stream (ADR 0069)
+#   --wait      seconds to wait for the lock, or for both; when it runs out nothing is run, exit 1
+#   --deadline  seconds the command may run; then it is stopped, its whole process group with it
+#   --grace     0, the default: SIGKILL at the deadline. Above 0: SIGTERM at the deadline, or when this script
+#               is told to stop, then SIGKILL that many seconds later, for a command that cancels what it sent
+#               when it is told to end (as paper:close's uv runs under `timeout -s TERM -k 30`)
+# Exit: the command's own status; 1 when a lock stayed held or the temporary folder is not known; 3 for a wrong
+# call; timeout(1)'s status when the deadline stopped the command (124, or 137 for a SIGKILL).
+#
+# How the lock is held, as in mise.toml's paper tasks (the note above paper:test): the lock file is opened on
+# descriptor 9 (the stream lock on 7) and that descriptor is locked (lockf(1): "Protect a section of a shell
+# script with a lock"; BSD-style, flock(2)), so every process the command starts inherits the lock and it is
+# free only once the last of them has ended. The command then runs under timeout(1), which "makes itself the
+# leader of a process group that the command inherits", and once timeout has ended, or this script is told to
+# stop, the whole group is killed, so a child that ignores SIGTERM cannot keep the lock. From a person's
+# terminal (stdin a terminal) the command is exec'd in the terminal's process group instead, bounded by the
+# caller's own limit (a mise task's `timeout`), so one Ctrl-C reaches it once and its cleanup runs. The lock
+# files are in the per-user temporary folder, the same for every process of the user whatever TMPDIR a session
+# sets, and are kept, as a descriptor implies and lockf(1) advises when processes contend.
+# No option or variable moves the lock folder: two runs that named different folders would not exclude each
+# other. scripts/test-account-lock runs a copy with getconf swapped for a stand-in.
+set -uo pipefail
+usage() {
+  echo "account-lock: usage: scripts/account-lock <live|tests|windows|protect> [--stream] --wait <secs> --deadline <secs> [--grace <secs>] -- <command...>" >&2
+  exit 3
+}
+[ $# -ge 1 ] || usage
+account=$1; shift
+case "$account" in
+  live) alock=canon-live.lock; slock=canon-alpaca-stream-live.lock ;;
+  tests) alock=canon-paper-test.lock; slock=canon-alpaca-stream-tests.lock ;;
+  windows) alock=canon-paper-windows.lock; slock=canon-alpaca-stream-windows.lock ;;
+  protect) alock=canon-paper-protect.lock; slock= ;;
+  *) echo "account-lock: no account named '$account'; the names are live, tests, windows and protect; nothing was run" >&2; exit 3 ;;
+esac
+stream=0; lockwait=""; deadline=""; grace=0; sep=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --stream) stream=1; shift ;;
+    --wait) [ $# -ge 2 ] || usage; lockwait=$2; shift 2 ;;
+    --deadline) [ $# -ge 2 ] || usage; deadline=$2; shift 2 ;;
+    --grace) [ $# -ge 2 ] || usage; grace=$2; shift 2 ;;
+    --) sep=1; shift; break ;;
+    *) usage ;;
+  esac
+done
+# whole <value>: a whole number of seconds, digits only and at most six of them
+whole() { case "$1" in ''|*[!0-9]*|???????*) return 1 ;; esac; }
+if ! whole "$lockwait" || ! whole "$deadline" || ! whole "$grace"; then usage; fi
+if [ "$deadline" -le 0 ] || [ "$sep" != 1 ] || [ $# -eq 0 ]; then usage; fi
+if [ "$stream" = 1 ] && [ -z "$slock" ]; then
+  echo "account-lock: account $account has no market-data stream lock (none is defined for it in mise.toml); nothing was run" >&2; exit 3
+fi
+start=$(/bin/date +%s)
+# the folder's name, or a stop: none would leave a lock file of this run's own, beside no other run's
+tmp="$(/usr/bin/getconf DARWIN_USER_TEMP_DIR)" || tmp=""
+case "$tmp" in /*/) ;; *) echo "account-lock: the per-user temporary folder is not known (DARWIN_USER_TEMP_DIR gave '$tmp'), so there is no lock to take; nothing was run" >&2; exit 1 ;; esac
+# lock_wait <fd> <secs>: the exclusive lock on an open descriptor, waiting at most <secs>; 0 when held, 1 when the
+# bound ran out (a bound can run over by up to a second), or at once when lockf fails for any reason but the
+# lock being held (exit 75, EX_TEMPFAIL). lockf(1)'s descriptor form (`lockf -t <secs> <fd>`, man lockf) busy-loops
+# while it waits (measured; ADR 0065), so this polls `lockf -t 0 <fd>` with a one-second sleep. The text is
+# paper:test's own in mise.toml (scripts/test-account-lock compares them).
+lock_wait() {
+  lw_end=$(( $(/bin/date +%s) + $2 ))
+  while :; do
+    /usr/bin/lockf -t 0 "$1" 2>/dev/null; lw_rc=$?
+    [ "$lw_rc" = 0 ] && return 0
+    [ "$lw_rc" = 75 ] || return 1
+    [ "$(/bin/date +%s)" -lt "$lw_end" ] || return 1
+    sleep 1
+  done
+}
+exec 9>>"${tmp}${alock}"
+lock_wait 9 "$lockwait" || { echo "account-lock: account ${account}'s lock stayed held for $lockwait s; nothing was run" >&2; exit 1; }
+if [ "$stream" = 1 ]; then
+  left=$(( lockwait - ($(/bin/date +%s) - start) )); [ "$left" -ge 0 ] || left=0
+  exec 7>>"${tmp}${slock}"
+  lock_wait 7 "$left" || { echo "account-lock: account ${account}'s market-data stream lock stayed held ($lockwait s for both locks); nothing was run" >&2; exit 1; }
+fi
+# from a person's terminal: in the terminal's process group, the locks inherited (the note at the top)
+[ ! -t 0 ] || exec "$@"
+# bounded <command...>: the command under timeout(1), in the process group timeout leads, with its whole group
+# killed once it ends and on a stop. `g` is timeout's pid, and its group's.
+bounded() {
+  g=""
+  # stop <status>: with a grace, SIGTERM to the group and up to `grace` seconds for timeout, its leader, to end;
+  # then, and with none at once, SIGKILL to what is left of the group
+  stop() {
+    if [ -n "$g" ]; then
+      if [ "$grace" -gt 0 ]; then
+        kill -TERM -- "-$g" 2>/dev/null
+        s_end=$(( $(/bin/date +%s) + grace ))
+        while kill -0 "$g" 2>/dev/null && [ "$(/bin/date +%s)" -lt "$s_end" ]; do sleep 0.2; done
+      fi
+      kill -KILL -- "-$g" 2>/dev/null || kill -KILL "$g" 2>/dev/null
+    fi
+    exit "$1"
+  }
+  # traps first, so a stop at any point after this ends what has started
+  trap 'stop 143' TERM; trap 'stop 129' HUP; trap 'stop 130' INT
+  if [ "$grace" -gt 0 ]; then /usr/bin/timeout -s TERM -k "$grace" "$deadline" "$@" & g=$!
+  else /usr/bin/timeout -s KILL "$deadline" "$@" & g=$!; fi
+  # a trapped signal ends `wait` early with a status above 128 and runs its trap, which exits; so past this
+  # line timeout itself has ended
+  rc=0; wait "$g" || rc=$?
+  # what of the group outlived timeout: the group's id is timeout's pid, which the system does not hand out
+  # again at once (a group left empty is gone, and the kill finds nothing)
+  kill -KILL -- "-$g" 2>/dev/null || :
+  trap - TERM HUP INT
+  return "$rc"
+}
+bounded "$@"
