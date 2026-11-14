@@ -258,6 +258,7 @@ from nautilus_trader.trading import Strategy
 from . import gain_lock
 from . import protect
 from . import session_window
+from . import symbol_hold
 from .custody import OURS
 from .custody import PROTECT
 from .custody import PROTECT_PREFIX
@@ -270,6 +271,7 @@ from .mover import offsets
 from .price_step import exit_price
 from .price_step import up_on_step
 from .start_level import LABEL
+from .start_level import NEEDS_REASON
 from .start_level import NEW
 from .start_level import SAME
 from .start_level import Entry
@@ -325,6 +327,8 @@ class OwnerProtectorConfig(StrategyConfig):
         *,
         row: str,
         levels: dict[InstrumentId, Price] | None = None,
+        symbol_holds_dir: Path | str | None = None,
+        symbol_holds: frozenset[str] | None = None,
         feed: str = "sip",
         extended_hours: bool = True,
         account_label: str | None = None,
@@ -337,6 +341,8 @@ class OwnerProtectorConfig(StrategyConfig):
         super().__init__()
         refuse_unknown_keywords(self, _kwargs)
         self.levels = dict(levels or {})
+        self.symbol_holds_dir = None if symbol_holds_dir is None else Path(symbol_holds_dir)
+        self.symbol_holds = None if symbol_holds is None else frozenset(symbol_holds)
         self.feed = feed
         self.row = row
         self.extended_hours = extended_hours
@@ -617,6 +623,9 @@ class Holding:
     # newer maximum held when it returned. A read requested before the holding opened sets neither.
     seed_requested_at: int | None = None
     current_from: int | None = None
+    # Set when the owner's word held this holding after its sell was placed: its release re-places
+    # the sell at the next step while the bid is above the level, with no new observation.
+    rearm_at_step: bool = False
 
 
 STREAM_LOGGER = "alpaca.data.live.websocket"
@@ -666,6 +675,12 @@ class OwnerProtector(Strategy):
         self.levels = dict(config.levels)
         self.slots: dict[InstrumentId, Holding] = {}
         self.frozen: dict[InstrumentId, str] = {}
+        # The owner's word for one symbol (symbol_hold): held now, how many holds each symbol had
+        # this run, and the kind of the last read's failure while the last holds read stand.
+        self.held: set[InstrumentId] = set()
+        self.hold_counts: dict[InstrumentId, int] = {}
+        self.holds_unread: str | None = None
+        self.holds_made = False  # A folder read once: from then on its absence is a failed read.
         self.sent_ids: set[ClientOrderId] = set()
         self.cancel_requested: set[ClientOrderId] = set()
         # An order event our own submit, cancel or modify publishes reaches its handler while the
@@ -1238,6 +1253,13 @@ class OwnerProtector(Strategy):
             self._say(f"level book enabled for account {self.settings.account_label}")
         else:
             self._say("level book disabled: no account label supplied; no level is carried")
+        if self.settings.symbol_holds_dir is None:
+            self._say("no symbol-holds folder supplied: no per-symbol hold is read this run")
+        for name in sorted(self.settings.symbol_holds or ()):
+            # The node's start read under the locks stands if this strategy's own read fails.
+            self.holds_made = True
+            self._hold_begins(InstrumentId.from_str(f"{name}.ALPACA"))
+        self._read_symbol_holds()
         for instrument_id, level in list(self.levels.items()):
             self.adopt_holding(instrument_id, level)
         self._discover_holdings()
@@ -1485,6 +1507,7 @@ class OwnerProtector(Strategy):
         self._say_deferred()
         if self.stopping:
             return
+        self._read_symbol_holds()  # The owner's word, read at every step before any holding.
         lost = len(self.stream_errors.lines)
         if lost > self.stream_errors_said:
             # Said once per new stream error, for each holding: its quotes may be among those lost.
@@ -1544,6 +1567,101 @@ class OwnerProtector(Strategy):
         reason = f"unprotected: supplied level refused: {reason}"
         self.frozen[instrument_id] = reason
         self._say(f"{instrument_id}: {reason}; no new sell")
+
+    def _read_symbol_holds(self) -> None:
+        """Read the owner's per-symbol holds (symbol_hold.read_holds) and name each change.
+
+        A new hold takes effect in this step's `_manage` (`_hold`); a removed one re-arms there.
+        A folder that cannot be read leaves the last holds read standing, named at every read;
+        a stray entry holds nothing and is named at every read too.
+        """
+        folder = self.settings.symbol_holds_dir
+        if folder is None:
+            return
+        try:
+            names, strays, made = symbol_hold.read_holds_if_made(folder)
+            if not made and self.holds_made:
+                raise FileNotFoundError(folder)
+        except (OSError, ValueError) as exc:
+            self.holds_unread = type(exc).__name__
+            standing = ", ".join(sorted(str(i) for i in self.held)) or "none"
+            self._say(
+                f"ALERT: symbol-holds folder {folder} unread ({type(exc).__name__}): the last "
+                f"holds read stand ({standing}); read again at the next step"
+            )
+            return
+        if not made:
+            if not self.holds_unread:
+                self.holds_unread = ""  # Said once: no folder was ever made, so none is held.
+                self._say(
+                    f"no {symbol_hold.FOLDER} folder made at {folder}: none held; read at every step"
+                )
+            return
+        self.holds_made = True
+        if self.holds_unread:
+            self._say(f"symbol-holds folder {folder} read again after {self.holds_unread}")
+        self.holds_unread = None
+        if strays:
+            self._say(f"ALERT: {symbol_hold.strays_named(strays)}; named at every step")
+        now = {InstrumentId.from_str(f"{name}.ALPACA") for name in names}
+        for instrument_id in sorted(now - self.held, key=str):
+            self._hold_begins(instrument_id)
+        for instrument_id in sorted(self.held - now, key=str):
+            self.held.discard(instrument_id)
+            slot = self.slots.get(instrument_id)
+            level = None if slot is None else slot.level
+            self._say(
+                f"{instrument_id}: hold removed: re-armed "
+                + (
+                    f"at {level}, never lowered"
+                    if level is not None
+                    else "as at a start, at its book level if it has one"
+                )
+                + (
+                    "; its sell was placed before the hold, so while the bid is above the level "
+                    "it is placed at this step, and otherwise"
+                    if slot is not None and slot.rearm_at_step
+                    else "; it is placed"
+                )
+                + " under the count rule (two new observations)"
+            )
+
+    def _hold_begins(self, instrument_id: InstrumentId) -> None:
+        if instrument_id in self.held:
+            return
+        self.held.add(instrument_id)
+        self.hold_counts[instrument_id] = self.hold_counts.get(instrument_id, 0) + 1
+        self._say(
+            f"{instrument_id}: {symbol_hold.HELD}: not armed; only our own sell of it is "
+            "canceled, nothing is sold, and every other holding stays protected"
+        )
+
+    def _hold(self, instrument_id: InstrumentId, slot: Holding, order: Any) -> None:
+        """The owner's word for this symbol: our own sell of it is canceled, nothing is sent,
+        modified or chased for it, and the slot keeps its level (raised to our sell's trigger in
+        `_manage` before this) and its venue clock, so the release re-arms from it, never lower.
+        A sale in progress ends with its cancel; the release re-arms the trail, not the chase."""
+        if slot.placed:
+            slot.rearm_at_step = True
+        # The guard is reset, a counting observation included (review F5), so a breach during the
+        # hold needs the count rule's two new observations after it.
+        slot.placed, slot.last_observation = False, None
+        if self.frozen.get(instrument_id, "").startswith(WAITING):
+            self.frozen.pop(instrument_id)
+        if order is not None:
+            self._cancel_own(
+                slot,
+                reason=f"{instrument_id}: {symbol_hold.HELD}: canceling our own sell only "
+                "(nothing is sold)",
+            )
+            return
+        if slot.sale is not None:
+            self._log_sale(instrument_id, slot.sale)
+            self._say(
+                f"{instrument_id}: {symbol_hold.HELD}: our sale ended with its cancel; the "
+                f"release re-arms the trail at {slot.level}"
+            )
+            slot.sale = None
 
     def _gain_lock(
         self,
@@ -2018,6 +2136,9 @@ class OwnerProtector(Strategy):
             # observation above the level ends this breach, frozen or not. A quote main's guard
             # skips (no usable two-sided prices and sizes) neither counts nor clears.
             slot.breach_observation = None
+        if instrument_id in self.held:
+            self._hold(instrument_id, slot, order)
+            return
         if slot.sale is None:
             # The lock moves the trigger of a trail not yet released; the exit beats the lock (R3).
             self._gain_lock(instrument_id, slot, position, quote, advanced=advanced)
@@ -2103,11 +2224,21 @@ class OwnerProtector(Strategy):
             self._wait(instrument_id, self.quote_refusals[instrument_id])
             return
         if not slot.placed:
+            # Released from the owner's hold above its level: re-placed at this step on the venue
+            # maximum, with no new observation, since a sell resting under the bid elects nothing.
+            newest = self.venue_quotes.get(instrument_id)
+            rearm = (
+                slot.rearm_at_step
+                and newest is not None
+                and tick.ts_event == newest.ts_event
+                and bid > slot.level.as_decimal()
+                and _usable(tick, self.clock.timestamp_ns())
+            )
             if not _sane(tick):
                 self._note(tick)
                 self._wait(instrument_id, _ahead(tick))
                 return
-            if not advanced:
+            if not advanced and not rearm:
                 self._wait(
                     instrument_id,
                     "a quote stamped after the venue maximum"
@@ -2115,7 +2246,11 @@ class OwnerProtector(Strategy):
                     else "a second observation newer than the one guarded",
                 )
                 return
-            if slot.last_observation is None and (slot.fresh or bid <= slot.level.as_decimal()):
+            if (
+                slot.last_observation is None
+                and not rearm
+                and (slot.fresh or bid <= slot.level.as_decimal())
+            ):
                 slot.last_observation = tick.ts_event
                 if bid <= slot.level.as_decimal():
                     slot.breach_observation = tick.ts_event
@@ -2182,6 +2317,7 @@ class OwnerProtector(Strategy):
             return
         slot.protect_id, slot.placed = order.client_order_id, True
         slot.breach_observation = None  # A breach after this order counts its own two.
+        slot.rearm_at_step = False
         self.sent_ids.add(order.client_order_id)
         self.submit_order(order, params={"extended_hours": True})
 
@@ -2427,7 +2563,9 @@ class OwnerProtector(Strategy):
         self._name_unapplied()
         if STEP_TIMER in self.clock.timer_names():
             self.clock.cancel_timer(STEP_TIMER)
-        for instrument_id in sorted(self.stamp_counts.keys() | self.slots.keys(), key=str):
+        for instrument_id in sorted(
+            self.stamp_counts.keys() | self.slots.keys() | self.held, key=str
+        ):
             slot = self.slots.get(instrument_id)
             ahead, not_raised, redelivered = self.stamp_counts.get(instrument_id, [0, 0, 0])
             fallbacks = self.fallbacks.get(instrument_id, 0)
@@ -2440,7 +2578,13 @@ class OwnerProtector(Strategy):
                 f"fixed fallback={fallbacks}, "
                 f"no history={fallbacks - flat}, flat session day={flat}; "
                 f"first_quote={None if slot is None else slot.first_quote}, "
-                f"last_quote={None if slot is None else slot.last_quote}"
+                f"last_quote={None if slot is None else slot.last_quote}; "
+                f"owner holds={self.hold_counts.get(instrument_id, 0)}, "
+                + (
+                    f"{symbol_hold.HELD} at end"
+                    if instrument_id in self.held
+                    else "not held at end"
+                )
             )
             self.stop_instrument(instrument_id)
 
@@ -2474,7 +2618,7 @@ class OwnerProtector(Strategy):
                 self._say(
                     f"{key[1]}: book level {entry.last_level} (protection start "
                     f"{entry.protection_start_ns}) not applied this run: "
-                    f"{self.not_carried.get(key, 'its holding was not selectable')}; "
+                    f"{symbol_hold.HELD if key[1] in self.held else self.not_carried.get(key, 'its holding was not selectable')}; "
                     f"{fate}{memory}"
                 )
 
@@ -2495,6 +2639,13 @@ class OwnerProtector(Strategy):
         freeze) is `waiting` with its reason until a level and distance are planned, and after
         that maps as the planned slot does: `guarded` or `counting`.
         """
+        if instrument_id in self.held:
+            frozen = self.frozen.get(instrument_id)
+            if frozen is not None and not frozen.startswith(WAITING):
+                return "frozen", None, f"{frozen}; {symbol_hold.HELD}"  # Review F6: kept.
+            if slot is None or slot.protect_id is None:
+                return "held", None, f"{symbol_hold.HELD}: not armed; removing the hold re-arms it"
+            # Our sell still rests, its cancel asked: told as it is until the cancel ends it.
         reason = self.frozen.get(instrument_id)
         if reason is not None and reason.startswith(WAITING):
             if slot is None or slot.level is None or slot.distance is None:
@@ -2554,7 +2705,7 @@ class OwnerProtector(Strategy):
                 else:
                     # U-e B undecided: a previous run's entry is kept as written until the venue
                     # shows whose it is; only the state is new, and only where it fits its level.
-                    if prior.last_level is not None or state in ("waiting", "frozen"):
+                    if prior.last_level is not None or state in NEEDS_REASON:
                         entries[key] = replace(prior, state=state, count=count, reason=reason)
                     continue
             level = None if prior is None else prior.last_level
@@ -2566,7 +2717,7 @@ class OwnerProtector(Strategy):
             start = slot.protection_start if slot.protection_start is not None else slot.opened_at
             if own is not None:
                 level = start_level(level, own)
-            if level is None and state not in ("waiting", "frozen"):
+            if level is None and state not in NEEDS_REASON:
                 continue
             entries[key] = Entry(
                 level,

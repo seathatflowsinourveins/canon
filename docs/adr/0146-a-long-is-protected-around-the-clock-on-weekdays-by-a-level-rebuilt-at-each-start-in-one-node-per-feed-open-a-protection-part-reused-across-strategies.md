@@ -69,6 +69,17 @@ outside this record. A broker backstop in the regular session (B2) waits for the
 measurement; a plain stop moved to the engine's level (B3) is rejected, since Alpaca's wash-trade
 protection refuses a new order while an opposite-side stop is open (ADR 0110).
 
+**The owner's word for one symbol.** A hold on the whole node is any entry in the instance's `holds/`
+or `inbox/`, read at each start; it stops the runner. A hold on one symbol is one file named for it in a
+folder beside them, `symbol-holds/`, written and removed only by `mise run paper:hold-symbol` (on C the
+owner's word alone, no lane's) and only where a runner's instance was installed, and read by the node at
+its start, where a folder never made holds none and an unreadable one refuses the start (a refused start,
+never a hold of the runner), and by the protector at every step (`src/canon_trading/symbol_hold.py`). A held symbol is not armed; a new
+hold cancels our own sell of it within one step and sells nothing; its level is kept, written to the book
+as `held`, and never lowered; its release re-arms it at that level at the next step, and a breach during
+the hold is sold then under the count rule. Every other holding keeps its stop throughout. On the engine
+this is shown on recorded quotes; on paper it is `UNVERIFIED` until a run on A shows it.
+
 **The gap (rule 3).** Upstream does show a strategy arming its own trailing stop when its entry fills:
 NautilusTrader v1's example `ema_cross_trailing_stop.py` and an acceptance strategy at the pin. The lead's
 plan said no upstream example pairs a strategy with an automatic trailing stop; that is corrected here.

@@ -332,3 +332,53 @@ def test_two_observations_at_or_below_the_level_sell_whether_or_not_through_the_
     strategy.observe("0.35", START + 2 * h.SECOND)  # through the offset: the second observation
     (sale,) = strategy.sent
     assert sale.order_type == OrderType.LIMIT, sale
+
+
+def test_a_recovery_during_the_owners_hold_clears_the_breach_count(tmp_path, monkeypatch) -> None:
+    """The merge with the owner's symbol hold (the deputy's ruling, 2026-11-14 03:37): a two-sided
+    quote above the level is a fact about the market whether or not the symbol is held, so it ends
+    the breach count before the hold returns. The hold resets the guard as well, so after a release
+    under the level one quote at or below it does not sell and the next one does."""
+    from canon_trading import symbol_hold
+
+    folder = tmp_path / symbol_hold.FOLDER
+    folder.mkdir()
+    path = tmp_path / "levels.json"
+    record = h.restart_record(last_level="2.00", distance="0.30", limit_offset="0.38")
+    path.write_text(json.dumps({"schema": 2, "entries": [record]}))
+    strategy = Recording(
+        account_label="shape",
+        level_book_path=path,
+        run="shape-next",
+        session_part="regular",
+        trading=h.VenueOrders(),
+        symbol_holds_dir=folder,
+    )
+    monkeypatch.setattr(strategy.cached, "instrument", lambda iid: h.equity(iid, precision=4))
+    strategy.cached.latest = h.quote("2.50", START)
+    strategy.test_clock.set_time(START)
+    strategy.on_start()
+    step(strategy)
+    strategy.observe("2.50", START + h.SECOND)
+    strategy.observe("2.50", START + 2 * h.SECOND)
+    (trailing,) = strategy.sent
+    accepted(trailing, START + 2 * h.SECOND)
+    terminal(trailing, START + 3 * h.SECOND, expired=True)
+    strategy.observe("0.35", START + 4 * h.SECOND)  # the breach's first observation
+    slot = strategy.slots[h.AAA]
+    assert slot.breach_observation == START + 4 * h.SECOND and len(strategy.sent) == 1
+    symbol_hold.write_hold(folder, "AAA")
+    step(strategy)
+    assert h.AAA in strategy.held, strategy.said
+    strategy.observe("2.50", START + 5 * h.SECOND)  # two-sided, above the level, while held
+    assert slot.breach_observation is None, "a recovery during the hold ends the breach count"
+    strategy.observe("0.35", START + 6 * h.SECOND)  # held: neither counted nor sold
+    assert len(strategy.sent) == 1, "nothing is sent while held"
+    symbol_hold.remove_hold(folder, "AAA")
+    step(strategy)
+    assert h.AAA not in strategy.held, strategy.said
+    assert len(strategy.sent) == 1, "released under the level: no re-placing at the step"
+    strategy.observe("0.35", START + 7 * h.SECOND)  # the first observation after the release
+    assert len(strategy.sent) == 1, ("a sale on one observation after the hold", strategy.said)
+    strategy.observe("0.35", START + 8 * h.SECOND)
+    assert len(strategy.sent) == 2 and strategy.sent[-1].order_type == OrderType.LIMIT

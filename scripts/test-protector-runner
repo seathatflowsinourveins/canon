@@ -456,5 +456,14 @@ check "a killed runner leaves its status running" st '.outcome == "running"'
 runner
 check "the next start's seam is named after a kill" st '.last_seam.kind == "seam" and .last_seam.after == "kill" and (.last_seam.end_note | test("without naming its end"))'
 
+echo "case 21: every start is handed the instance's symbol-holds folder, and an entry there holds one symbol, never the runner"
+fresh windows
+mkdir -p "$INST/symbol-holds"; : > "$INST/symbol-holds/AAA"
+printf '%s\n' "2 0 0" "2 0 0" "refuse no starting holding" > "$STUB/plan"
+runner
+check "an entry in symbol-holds/ stops no start: three starts" [ "$(calls)" = 3 ]
+check "each start carries --symbol-holds-dir of the instance" eval '[ "$(grep -c -- "--symbol-holds-dir $INST/symbol-holds" "$STUB/calls")" = 3 ]'
+check "the runner never reads it as a hold" eval '! st ".outcome == \"held\""'
+
 echo "test-protector-runner: $pass passed, $fail failed"
 [ "$fail" = 0 ]
