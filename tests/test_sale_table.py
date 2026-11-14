@@ -21,7 +21,7 @@ from canon_trading import sale_table as sale
 DATA_PATH = Path(__file__).resolve().parents[1] / "src/canon_trading/sale_table.json"
 DATA = json.loads(DATA_PATH.read_text())
 HISTORIES = json.loads(Path(__file__).with_name("sale_table_histories.json").read_text())
-CELLS_HASH = "37c87d8ab087b05a84d67ea18e118ca4b15a8c449f360d7b3bdd697f431653b6"
+CELLS_HASH = "62cbf127b4557660a3e00e6e2e36938f1d1dbc4803cd21d2dfe0e66dd0d6a158"
 CELLS = [(r, e, c) for r, row in DATA["cells"].items() for e, c in row.items()]
 BRANCHES = [(r, e, b) for r, e, c in CELLS for b in c["branches"]]
 
@@ -111,9 +111,9 @@ def test_tracked_table_has_exact_contract_and_cells():
     }
     encoded = json.dumps(DATA["cells"], sort_keys=True, separators=(",", ":")).encode()
     assert hashlib.sha256(encoded).hexdigest() == CELLS_HASH
-    assert len(DATA["rows"]) == 16
+    assert len(DATA["rows"]) == 17
     assert len(DATA["events"]) == 26
-    assert len(CELLS) == 416
+    assert len(CELLS) == 442
     assert set(sale.TABLE.rows) == set(DATA["rows"])
     assert set(sale.TABLE.events) == set(DATA["events"])
 
@@ -128,15 +128,55 @@ def test_quantity_and_cover_properties_are_in_the_contract():
     )
 
 
+def test_refusal_and_silence_properties_are_in_the_contract():
+    assert {
+        "one_alert_per_holding_until_accepted",
+        "resend_no_sooner_than_the_interval",
+        "resend_never_more_than_held",
+        "a_silent_leg_is_told_once_and_never_resent",
+    } <= set(DATA["properties_for_step_d"])
+
+
+def test_refusal_cells_and_waiting_row_obey_ruling_fifteen():
+    for row, event, branch in BRANCHES:
+        if branch["next"] == "RW" and row != "RW":
+            assert event == "oREJ" and row in {"FL", "WK", "PF"}
+        if row in {"FL", "WK", "PF"} and event == "oREJ":
+            assert branch["next"] == "RW"
+            assert branch["alert"] == (branch["when"] == "not refusal_told")
+        if row == "RW" and branch["alert"]:
+            assert branch["next"] == "FZ"
+        if row in {"RW", "G"} and branch["send"]:
+            assert event == "QU" and "resend_due" in branch["when"].split(" and ")
+        if row == "RW" and event in {"QA", "NQ"}:
+            assert not branch["send"]
+
+
+@pytest.mark.parametrize("event", ["QU", "QA"])
+def test_silent_flight_alert_is_the_only_change(event):
+    for due in (False, True):
+        result = sale.transition(sale.State("FL"), 2, event, {"flight_alert_due": due})
+        assert result.state == sale.State("FL")
+        assert result.actions == ((sale.Action.ALERT,) if due else ())
+
+
+def test_complete_count_waits_for_interval_without_counting_past_n():
+    facts = {"resend_due": False, "leg_positive": True, "whole_cover": False, "formable": True}
+    for n in (2, 3):
+        result = sale.transition(sale.State("G", n - 1), n, "QU", facts)
+        assert result.state == sale.State("G", n - 1) and not result.actions
+
+
 def test_first_send_branches_use_the_modules_count():
     cell = DATA["cells"]["G"]["QU"]
-    # The frozen JSON has five branches over four predicates, including whole_cover.
-    assert len(cell["branches"]) == 5
+    # A complete count stands while the refusal interval has not passed.
+    assert len(cell["branches"]) == 6
     assert set().union(*(names(b["when"]) for b in cell["branches"])) == {
         "count_complete",
         "leg_positive",
         "formable",
         "whole_cover",
+        "resend_due",
     }
     for n in (2, 3):
         for count in range(n):
@@ -149,7 +189,7 @@ def test_first_send_branches_use_the_modules_count():
                 assert result.state == sale.State(
                     branch["next"], expected_count(sale.State("G", count), branch)
                 )
-                if count == n - 1 and not supplied["leg_positive"]:
+                if count == n - 1 and supplied["resend_due"] and not supplied["leg_positive"]:
                     assert result.actions == ()
                     assert result.state.row == ("GC" if supplied["whole_cover"] else "G")
 
@@ -217,7 +257,7 @@ def test_transition_and_step_do_not_read_resources(monkeypatch):
         raise AssertionError("transition read a resource")
 
     monkeypatch.setattr(Path, "read_text", refused)
-    facts = {"formable": True, "leg_positive": True, "whole_cover": False}
+    facts = {"formable": True, "leg_positive": True, "whole_cover": False, "resend_due": True}
     state = sale.State("G", 0)
     events = (sale.Event("QU", facts), sale.Event("oOTH", {}))
     before = deepcopy(facts)
@@ -225,10 +265,14 @@ def test_transition_and_step_do_not_read_resources(monkeypatch):
     assert facts == before
 
 
-def test_exactly_two_sending_transitions_into_flight():
+def test_exactly_three_sending_transitions_into_flight():
     actual = [{"row": r, "event": e, "when": b["when"]} for r, e, b in BRANCHES if b["send"]]
     assert actual == DATA["sending_transitions"]
-    assert [(s["row"], s["event"]) for s in actual] == [("G", "QU"), ("PCR", "oCXL")]
+    assert [(s["row"], s["event"]) for s in actual] == [
+        ("G", "QU"),
+        ("RW", "QU"),
+        ("PCR", "oCXL"),
+    ]
     assert all(b["next"] == "FL" for _, _, b in BRANCHES if b["send"])
     assert all("leg_positive" in b["when"].split(" and ") for _, _, b in BRANCHES if b["send"])
 
@@ -245,10 +289,11 @@ def test_timer_event_changes_nothing(row):
     )
 
 
-def test_open_sale_entered_only_by_first_send():
+def test_open_sale_entered_only_by_first_send_or_resend():
     for row, event, branch in BRANCHES:
         if DATA["rows"][row]["phase"] == "none" and DATA["rows"][branch["next"]]["phase"] != "none":
-            assert (row, event, branch["next"], branch["send"]) == ("G", "QU", "FL", True)
+            assert row in {"G", "RW"}
+            assert (event, branch["next"], branch["send"]) == ("QU", "FL", True)
 
 
 def test_reprice_cancel_entry_only_under_level():
@@ -343,7 +388,7 @@ def test_recorded_history(group, name, history):
 
 
 def test_all_histories_are_present_with_public_names():
-    assert len(HISTORIES["named_paths"]) == 17
+    assert len(HISTORIES["named_paths"]) == 22
     assert len(HISTORIES["histories_walked"]) == 10
     for group in HISTORIES.values():
         for name in group:

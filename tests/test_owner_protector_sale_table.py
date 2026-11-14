@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import gc
 import json
+import re
 from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
@@ -20,10 +21,13 @@ from typing import Self
 
 import pytest
 from nautilus_trader.common import TimeEvent
+from nautilus_trader.common import logging_sync_to_disk
 from nautilus_trader.model import OrderPendingCancel
 from nautilus_trader.model import OrderUpdated
 
 from canon_trading import sale_table
+from canon_trading.owner_protector import FLIGHT_SECS
+from canon_trading.owner_protector import RESEND_SECS
 from canon_trading.owner_protector import Sale
 from canon_trading.start_level import LevelBook
 from tests import test_owner_protector as h
@@ -38,6 +42,53 @@ def alpaca_stream_lock() -> None:
 def isolated_level_books(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
     monkeypatch.delenv("CANON_HOME", raising=False)
+
+
+def check_engine_log(text):
+    """Pin python/strategy.rs:1138-1235; logger.rs:1136-1148 syncs the writer first."""
+    errors = [
+        line
+        for line in text.splitlines()
+        if re.search(r"Python \w+ failed|Already mutably borrowed", line)
+    ]
+    if errors:
+        raise AssertionError("engine handler errors:\n" + "\n".join(errors))
+
+
+def assert_sale_below_level(strategy, order):
+    if strategy.settings.breach_count > 1:
+        slot = (
+            strategy.slots.get(order.instrument_id) or strategy.stopped_sales[order.instrument_id]
+        )
+        assert order.price.as_decimal() <= slot.level.as_decimal(), (
+            "sale limit exceeds its holding's level"
+        )
+
+
+@pytest.fixture(autouse=True)
+def engine_checks(capfd, monkeypatch):
+    """Shared by every engine case here and in the refusal file, including native histories."""
+    native = h.OwnerProtector.submit_order
+    harness = h.Harness.submit_order
+
+    def submit(strategy, order, *args, **kwargs):
+        assert_sale_below_level(strategy, order)
+        return native(strategy, order, *args, **kwargs)
+
+    def command(strategy, order, *args, **kwargs):
+        assert_sale_below_level(strategy, order)
+        return harness(strategy, order, *args, **kwargs)
+
+    monkeypatch.setattr(h.OwnerProtector, "submit_order", submit)
+    monkeypatch.setattr(h.Harness, "submit_order", command)
+
+    def check():
+        logging_sync_to_disk()
+        captured = capfd.readouterr()
+        check_engine_log(captured.out + captured.err)
+
+    yield check
+    check()
 
 
 def plain_limit_callbacks() -> list[str]:
@@ -198,9 +249,13 @@ def test_count_one_default_and_unknown_span():
 def test_count_too_large_for_level_book_is_refused(tmp_path):
     with pytest.raises((TypeError, ValueError), match="breach_count.*level book"):
         h.OwnerProtectorConfig(
-            row="OWN1", breach_count=3, account_label="example", level_book_path=tmp_path / "book"
+            row="OWN1",
+            breach_count=3,
+            confirm_gap_ms=0,
+            account_label="example",
+            level_book_path=tmp_path / "book",
         )
-    assert h.OwnerProtectorConfig(row="OWN1", breach_count=3).breach_count == 3
+    assert h.OwnerProtectorConfig(row="OWN1", breach_count=3, confirm_gap_ms=0).breach_count == 3
 
 
 def event(kind, order, **values):
@@ -288,6 +343,7 @@ class Counted(h.Harness):
 
 
 def counted(**settings):
+    settings.setdefault("confirm_gap_ms", 0)
     strategy = Counted(breach_count=2, **settings)
     strategy.adopt_holding(h.AAA, h.Price.from_str("9.90"))
     return strategy
@@ -453,13 +509,15 @@ def test_every_row_round_trips_real_level_book(target, tmp_path):
         entry = read["example", h.AAA]
         if target == "G":
             assert (entry.state, entry.count) == ("counting", 1)
+        elif target == "RW":
+            assert (entry.state, entry.count) == ("counting", 0)
         elif target in {"FL", "WK", "PF", "GC"}:
             assert entry.state == "armed"
         else:
             assert entry.state in {"waiting", "frozen"} and entry.reason
 
 
-@pytest.mark.parametrize("target", ["G", "WK", "PCR", "FZ"])
+@pytest.mark.parametrize("target", ["G", "WK", "PCR", "FZ", "RW"])
 def test_real_start_keeps_saved_level_and_resets_count(target, tmp_path):
     path = tmp_path / "book"
     previous = counted(account_label="example", level_book_path=path)
@@ -469,10 +527,19 @@ def test_real_start_keeps_saved_level_and_resets_count(target, tmp_path):
     slot.sale_state = sale_table.State(target, 1 if target == "G" else None)
     previous._save_levels()
     saved = LevelBook.read(path)["example", h.AAA]
-    assert saved.state == {"G": "counting", "WK": "armed", "PCR": "waiting", "FZ": "frozen"}[target]
-    assert saved.count == (1 if target == "G" else None)
+    assert (
+        saved.state
+        == {"G": "counting", "WK": "armed", "PCR": "waiting", "FZ": "frozen", "RW": "counting"}[
+            target
+        ]
+    )
+    assert saved.count == {"G": 1, "RW": 0}.get(target)
     strategy = Counted(
-        breach_count=2, account_label="example", level_book_path=path, trading=h.VenueOrders()
+        breach_count=2,
+        confirm_gap_ms=0,
+        account_label="example",
+        level_book_path=path,
+        trading=h.VenueOrders(),
     )
     strategy.test_clock.set_time(h.T0 + 180 * h.SECOND)
     strategy.cached.latest = h.quote("10.00", h.T0 + 180 * h.SECOND)
@@ -495,12 +562,24 @@ CASES = [
 TABLE_DATA = json.loads(Path(sale_table.__file__).with_suffix(".json").read_text())
 
 
+def history_time(now, slot, when):
+    """Supply the history's elapsed time, never a replacement predicate."""
+    at = now + h.SECOND
+    if when == "reprice_due":
+        at += 60 * h.SECOND
+    if "resend_due" in when and "not resend_due" not in when and slot.refusal_last_ns is not None:
+        at = max(at, slot.refusal_last_ns + RESEND_SECS * h.SECOND)
+    if when == "flight_alert_due":
+        at = max(at, slot.flight_sent_ns + FLIGHT_SECS * h.SECOND)
+    return at
+
+
 def history_observation(strategy, step):
     """Synthetic cache observations, never replacement transition logic."""
     code, when = step["event"], step["when"]
     slot = strategy.slots.get(h.AAA) or strategy.stopped_sales.get(h.AAA)
     assert slot is not None
-    at = strategy.clock.timestamp_ns() + 60 * h.SECOND
+    at = history_time(strategy.clock.timestamp_ns(), slot, when)
     strategy.test_clock.set_time(at)
     held = strategy.cached.held[0]
     if code in {"QU", "QA"}:
@@ -570,8 +649,10 @@ def history_observation(strategy, step):
 @pytest.mark.parametrize("group,name,history", CASES, ids=[name for _, name, _ in CASES])
 def test_tracked_history_through_glue(group, name, history, monkeypatch):
     strategy = counted()
-    if name == "expired-late-fill-covered":
-        strategy.cached.working.append(h.working_sell(qty="1", filled="0"))
+    if name in {"expired-late-fill-covered", "refused-then-covered"}:
+        strategy.cached.working.append(
+            h.working_sell(qty="9" if name == "refused-then-covered" else "1", filled="0")
+        )
         strategy._sale_step(h.AAA, [])
     stack = []
     transitions = []
@@ -660,8 +741,10 @@ def test_no_action_transition_cannot_send_or_cancel_in_any_history(
     strategy = counted()
     original = sale_table.transition
     observed = []
-    if name == "expired-late-fill-covered":
-        strategy.cached.working.append(h.working_sell(qty="1", filled="0"))
+    if name in {"expired-late-fill-covered", "refused-then-covered"}:
+        strategy.cached.working.append(
+            h.working_sell(qty="9" if name == "refused-then-covered" else "1", filled="0")
+        )
         strategy._sale_step(h.AAA, [])
 
     def no_actions(state, n, code, facts):
@@ -689,8 +772,8 @@ def test_no_action_transition_cannot_send_or_cancel_in_any_history(
                 supplied += 1
                 slot = strategy.slots[h.AAA]
                 quantity = strategy.cached.held[0].signed_qty
-                if name == "expired-late-fill-covered":
-                    quantity -= 1
+                if name in {"expired-late-fill-covered", "refused-then-covered"}:
+                    quantity -= 9 if name == "refused-then-covered" else 1
                 if state.row == "G":
                     slot.opening_quantity = quantity
                     price = slot.counted_quote.bid_price.as_decimal()
@@ -702,6 +785,8 @@ def test_no_action_transition_cannot_send_or_cancel_in_any_history(
                     )
                 cid = h.ClientOrderId(f"canon-protect-20260101T000000Z-{supplied}-12345678")
                 slot.protect_id = cid
+                slot.flight_sent_ns = strategy.clock.timestamp_ns()
+                slot.flight_told = slot.flight_answered = False
                 slot.sale.order_ids.add(cid)
                 strategy.sent_ids.add(cid)
                 strategy.cached.working.append(
@@ -719,6 +804,12 @@ def test_no_action_transition_cannot_send_or_cancel_in_any_history(
                         events=list,
                     )
                 )
+            elif sale_table.Action.ALERT in result.actions:
+                slot = strategy.slots.get(h.AAA) or strategy.stopped_sales.get(h.AAA)
+                if result.state.row == "RW":
+                    slot.refusal_told = True
+                elif state.row == "FL" and code in {"QU", "QA"}:
+                    slot.flight_told = True
             elif sale_table.Action.CANCEL in result.actions:
                 leg = strategy.cache.order(
                     strategy.slots.get(h.AAA, strategy.stopped_sales.get(h.AAA)).protect_id
@@ -757,12 +848,16 @@ def test_sale_through_real_engine(scenario, monkeypatch):
 
     class Probe(h.EngineProtector):
         def __new__(cls) -> Self:
-            config = h.OwnerProtectorConfig(strategy_id=h.PROTECTOR, row="OWN1", breach_count=2)
+            config = h.OwnerProtectorConfig(
+                strategy_id=h.PROTECTOR, row="OWN1", breach_count=2, confirm_gap_ms=0
+            )
             return super().__new__(cls, config)  # ty: ignore[too-many-positional-arguments]
 
         def __init__(self):
             super().__init__(
-                h.OwnerProtectorConfig(strategy_id=h.PROTECTOR, row="OWN1", breach_count=2)
+                h.OwnerProtectorConfig(
+                    strategy_id=h.PROTECTOR, row="OWN1", breach_count=2, confirm_gap_ms=0
+                )
             )
             self.notes = []
             self.callbacks = []
@@ -982,6 +1077,7 @@ ENGINE_TIMERS = set()
 
 @pytest.mark.parametrize("group,name,history", ENGINE_CASES, ids=[c[1] for c in ENGINE_CASES])
 def test_tracked_history_through_native_cache_and_dispatch(group, name, history, monkeypatch):
+    """Gain lock ON; logical clock drives the history's minute intervals, native events do the rest."""
     gc.collect()
     monkeypatch.setattr(h.protect.PLANNER, "chase_secs", 0)
     transitions, effects, stack = [], [], []
@@ -1000,20 +1096,30 @@ def test_tracked_history_through_native_cache_and_dispatch(group, name, history,
 
     class Probe(h.EngineProtector):
         def __new__(cls) -> Self:
-            config = h.OwnerProtectorConfig(strategy_id=h.PROTECTOR, row="OWN1", breach_count=2)
+            config = h.OwnerProtectorConfig(
+                strategy_id=h.PROTECTOR, row="OWN1", breach_count=2, confirm_gap_ms=0
+            )
             return super().__new__(cls, config)  # ty: ignore[too-many-positional-arguments]
 
         def __init__(self):
             super().__init__(
-                h.OwnerProtectorConfig(strategy_id=h.PROTECTOR, row="OWN1", breach_count=2)
+                h.OwnerProtectorConfig(
+                    strategy_id=h.PROTECTOR, row="OWN1", breach_count=2, confirm_gap_ms=0
+                )
             )
             self.notes = []
             self.legs = []
+            self.history_clock = h.Clock.new_test()
+
+        @property
+        def clock(self):
+            return self.history_clock
 
         def _say(self, text):
             self.notes.append(text)
 
         def on_start(self):
+            self.history_clock.set_time(super().clock.timestamp_ns())
             self.subscribe_quotes(h.AAA)
 
         def _sale_action(self, instrument_id, slot, action, candidate, before, reason):
@@ -1126,7 +1232,8 @@ def test_tracked_history_through_native_cache_and_dispatch(group, name, history,
             slot = probe.slots.get(h.AAA) or probe.stopped_sales.get(h.AAA)
             assert slot is not None
             client = clients[0]
-            now = self.clock.timestamp_ns()
+            now = history_time(probe.clock.timestamp_ns(), slot, when)
+            probe.history_clock.set_time(now)
             if code in {"QU", "QA"}:
                 assert slot.level is not None
                 bid = slot.level.as_decimal() + (Decimal(1) if code == "QA" else Decimal("-0.10"))
@@ -1187,6 +1294,8 @@ def test_tracked_history_through_native_cache_and_dispatch(group, name, history,
                     client.generate_order_cancel_rejected(order, venue, "synthetic refusal", now)
                 elif code == "oREJ":
                     client.generate_order_rejected(order, "synthetic refusal", now, False)
+                elif code == "oDEN":
+                    client.generate_order_denied(order, "synthetic engine denial")
                 elif code == "oUPD":
                     # Only reconciliation can mark an updated quantity as filled
                     # (orders/mod.rs:1322-1325); ordinary updates preserve its status.
@@ -1231,8 +1340,8 @@ def test_tracked_history_through_native_cache_and_dispatch(group, name, history,
             self.covers = []
             self._handle_data(h.quote("10.00", self.clock.timestamp_ns()))
             await self.pause()
-            if name == "expired-late-fill-covered":
-                await self.cover(1)
+            if name in {"expired-late-fill-covered", "refused-then-covered"}:
+                await self.cover(9 if name == "refused-then-covered" else 1)
             probe.adopt_holding(h.AAA, h.Price.from_str("9.90"))
             await self.pause()
             index = 0
@@ -1501,7 +1610,7 @@ def test_episode_floor_wait_is_judged_only_by_counted_stream_quotes():
 
 
 def test_predecessor_cover_never_becomes_this_instances_chased_or_canceled_leg():
-    strategy = Counted(breach_count=2)
+    strategy = Counted(breach_count=2, confirm_gap_ms=0)
     predecessor = h.working_sell(qty="10", filled="0")
     strategy.cached.working.append(predecessor)
     strategy.adopt_holding(h.AAA, h.Price.from_str("9.90"))

@@ -25,7 +25,7 @@ import pytest
 from canon_trading import sale_table as sale
 
 DATA = json.loads(Path(sale.__file__).with_suffix(".json").read_text())
-NO_SALE = {"G", "GC", "FZ", "T0", "X"}
+NO_SALE = {"G", "GC", "RW", "FZ", "T0", "X"}
 CANCEL_ASKED = {"PCR", "PCO", "PCX", "FZP", "PCT"}
 INVALIDATES = {"ST", "HE", "HS", "CP", "FRZ"}
 MAX_QUANTITY = 3
@@ -38,6 +38,7 @@ class Leg:
     filled: int = 0
     status: str = "flight"
     pending: bool = False
+    silent_told: bool = False
 
     @property
     def remaining(self):
@@ -58,6 +59,8 @@ class Account:
     owed: int = 0
     older_owed: int = 0
     total_sold: int = 0
+    told: bool = False
+    young: bool = False
 
     @property
     def uncovered(self):
@@ -88,6 +91,7 @@ class Seen:
     reprice_due: bool = False
     ends_filled: bool = False
     earlier_episode: bool = False
+    overdue: bool = False
 
 
 def facts(account, seen, row):
@@ -101,6 +105,11 @@ def facts(account, seen, row):
         "formable": seen.formable,
         "reprice_due": seen.reprice_due,
         "ends_filled": seen.ends_filled,
+        "refusal_told": account.told,
+        "resend_due": not account.young,
+        "flight_alert_due": bool(
+            seen.overdue and leg and leg.status == "flight" and not leg.silent_told
+        ),
     }
 
 
@@ -150,6 +159,7 @@ def account_event(account, seen):
         leg = replace(leg, filled=leg.filled + quantity, status="partial")
         return replace(
             account,
+            told=False,
             long=account.long - quantity,
             sold=account.sold + quantity,
             total_sold=account.total_sold + quantity,
@@ -157,13 +167,17 @@ def account_event(account, seen):
         )
     if event in {"oCXL", "oEXP", "oREJ", "oDEN"}:
         owed = leg.remaining if event in {"oCXL", "oEXP"} else 0
-        return replace(account, legs=(), owed=account.owed + owed)
+        # A venue's refusal starts the interval; time passing (the "~" step) ends it.
+        return replace(
+            account, legs=(), owed=account.owed + owed, young=account.young or event == "oREJ"
+        )
     if event == "oUPD" and seen.ends_filled:
         # Reconciliation sets quantity to the ALREADY filled quantity, not a new fill.
         return replace(account, legs=())
     if event in {"oACC", "oCRJ", "oUPD"}:
         status = "working" if event == "oACC" else leg.status
-        return replace(account, legs=(replace(leg, pending=False, status=status),))
+        told = account.told and event != "oACC"
+        return replace(account, told=told, legs=(replace(leg, pending=False, status=status),))
     return account
 
 
@@ -182,7 +196,10 @@ def assert_agreement(world):
         assert world.state.count is None, "count_exists_only_in_counting"
 
 
-def advance(world, seen, n, table, echoes=None):
+ECHOES: dict[str, int] = {}
+
+
+def advance(world, seen, n, table):
     before = world.account
     account = account_event(before, seen)
     event = seen.code
@@ -198,12 +215,33 @@ def advance(world, seen, n, table, echoes=None):
         world.state, n, event, facts(account, seen, world.state.row), table=table
     )
     count = world.counted
+    if event == "oREJ" and result.state.row == "RW":
+        assert (sale.Action.ALERT in result.actions) == (not before.told), (
+            "one_alert_per_holding_until_accepted"
+        )
+        account = replace(account, told=True)
+    elif result.state.row == "RW" and world.state.row != "RW":
+        raise AssertionError("waiting_only_after_a_venue_refusal")
+    if world.state.row == "RW":
+        assert sale.Action.ALERT not in result.actions or result.state.row == "FZ", (
+            "one_alert_per_holding_until_accepted"
+        )
+    if world.state.row == "FL" and event in {"QU", "QA"}:
+        due = facts(account, seen, "FL")["flight_alert_due"]
+        assert (sale.Action.ALERT in result.actions) == due, "a_silent_leg_is_told_once"
+        assert result.state == world.state, "a_silent_leg_is_never_resent"
+        assert not {sale.Action.SEND, sale.Action.CANCEL} & set(result.actions), (
+            "a_silent_leg_is_never_resent"
+        )
+        if due:
+            account = replace(account, legs=(replace(account.legs[0], silent_told=True),))
     if world.state.row == "G" and event == "QU":
         count += 1
     elif event in {"QA", "HG", "HS", "CP", "CL", "oLF"} or world.state.row != "G":
         count = 0
     if sale.Action.SEND in result.actions:
         quantity = account.uncovered if world.state.row == "G" else account.next_quantity
+        assert not account.young, "resend_no_sooner_than_the_interval"
         assert quantity > 0, "send_quantity_positive"
         assert quantity <= account.uncovered, "send_within_uncovered"
         if world.state.row != "G":
@@ -211,9 +249,10 @@ def advance(world, seen, n, table, echoes=None):
         assert event != "NQ", "no_timer_send"
         assert not any(leg.pending for leg in account.legs), "no_send_until_cancel_ack"
         assert not account.legs, "one_open_leg"
-        assert (world.state.row, event) == ("G", "QU") or (world.state.row, event) == (
-            "PCR",
-            "oCXL",
+        assert (world.state.row, event) in (
+            ("G", "QU"),
+            ("RW", "QU"),
+            ("PCR", "oCXL"),
         ), "send_requires_counted_quote_or_reprice_ack"
         if world.state.row == "G":
             assert count == n, "first_leg_requires_fresh_count"
@@ -226,22 +265,12 @@ def advance(world, seen, n, table, echoes=None):
             )
         account = replace(account, legs=account.legs + (Leg(quantity),))
         assert len(account.legs) <= 1, "one_open_leg"
-        echo = sale.transition(result.state, n, "oINI", {}, table=table)
-        assert echo.state == result.state and not echo.actions and not echo.named, "send_echo_inert"
-        if echoes is not None:
-            echoes["send"] += 1
     if world.state.row == "TW" and event in {"oACC", "oPF"}:
         assert sale.Action.CANCEL in result.actions, "stopped_sale_owes_cancel"
         assert result.state.row == "PCT", "stopped_sale_cancel_row"
     if sale.Action.CANCEL in result.actions:
         assert account.legs and account.legs[0].cancelable, "cancel_requires_our_cancelable_leg"
         account = replace(account, legs=(replace(account.legs[0], pending=True),))
-        echo = sale.transition(result.state, n, "oPCN", {}, table=table)
-        assert echo.state == result.state and not echo.actions and not echo.named, (
-            "cancel_echo_inert"
-        )
-        if echoes is not None:
-            echoes["cancel"] += 1
     if event == "MO":
         assert sale.Action.CANCEL in result.actions, "mismatch_cancels_in_same_step"
         assert sale.Action.SEND not in result.actions, "mismatch_never_sends"
@@ -253,7 +282,19 @@ def advance(world, seen, n, table, echoes=None):
         assert result.state.count == 0, "count_reentry_is_zero"
     if result.state.row != "G":
         count = 0
+    elif world.state.row == "G" and event == "QU" and count == n:
+        # Complete, and held by the interval: the count stands; the next counted quote is judged again.
+        assert account.young, "a_complete_count_is_held_only_by_the_interval"
+        count = n - 1
     after = World(result.state, account, count)
+    for action, echo in ((sale.Action.SEND, "oINI"), (sale.Action.CANCEL, "oPCN")):
+        if action in result.actions:
+            ECHOES[echo] = ECHOES.get(echo, 0) + 1
+            heard = sale.transition(
+                after.state, n, echo, facts(account, Seen(echo), after.state.row), table=table
+            )
+            assert heard.state == after.state and not heard.actions, "echo_is_inert_where_caused"
+            assert heard.named is None, "echo_is_expected_where_caused"
     # A late fill's post-fill holding and cover determine the row immediately.
     if event == "oLF" and world.state.row in {"G", "GC"}:
         expected = "X" if account.long <= 0 else ("GC" if account.foreign >= account.long else "G")
@@ -262,8 +303,10 @@ def advance(world, seen, n, table, echoes=None):
     return after, result.actions
 
 
-def step(world, observations, n=2, table=sale.TABLE, *, sends=None, echoes=None):
+def step(world, observations, n=2, table=sale.TABLE, *, sends=None):
     """Use the table's ordering; derive each event's facts from the evolving account."""
+    if observations == (Seen("~"),):
+        return replace(world, account=replace(world.account, young=False))
     indexed = {str(i): seen for i, seen in enumerate(observations)}
     tagged = [sale.Event(seen.code, {str(i): True}) for i, seen in enumerate(observations)]
     ordered = sale.order_step(tagged, table=table)
@@ -272,16 +315,16 @@ def step(world, observations, n=2, table=sale.TABLE, *, sends=None, echoes=None)
     for event in ordered:
         seen = indexed[next(iter(event.facts))]
         if event.code in {"QU", "QA", "NQ"} and world.account.mismatch:
-            world, asked = advance(world, Seen("MO"), n, table, echoes)
+            world, asked = advance(world, Seen("MO"), n, table)
             actions.extend(asked)
             mismatch_checked = True
         source_row = world.state.row
-        world, emitted = advance(world, seen, n, table, echoes)
+        world, emitted = advance(world, seen, n, table)
         if sends is not None and sale.Action.SEND in emitted:
             sends.append(f"{source_row} x {seen.code}")
         actions.extend(emitted)
     if not mismatch_checked and world.account.mismatch:
-        world, asked = advance(world, Seen("MO"), n, table, echoes)
+        world, asked = advance(world, Seen("MO"), n, table)
         actions.extend(asked)
     if any(seen.code in INVALIDATES for seen in observations):
         assert sale.Action.SEND not in actions, "invalidation_first"
@@ -291,6 +334,8 @@ def step(world, observations, n=2, table=sale.TABLE, *, sends=None, echoes=None)
 def alternatives(world):
     """All feasible single-event callbacks, and invalidation/trigger coincidences."""
     account = world.account
+    if account.young:
+        yield (Seen("~"),)
     codes = ["QU", "QA", "NQ", "ST", "FRZ"]
     if 0 < account.long < MAX_QUANTITY:
         codes.append("HG")
@@ -328,6 +373,8 @@ def alternatives(world):
                 if code == "oLF" and not (account.older_owed if earlier else account.owed):
                     continue
                 seen = Seen(code, formable, reprice_due, ends_filled, earlier)
+                if code in {"QU", "QA"} and leg and leg.status == "flight" and not leg.pending:
+                    yield (replace(seen, overdue=True),)
                 yield (seen,)
                 if code == "QU" or (code == "oCXL" and leg and leg.pending):
                     for invalidation in sorted(INVALIDATES.intersection(codes)):
@@ -346,7 +393,6 @@ def enumerate_sequences(depth=DEPTH, table=sale.TABLE):
     transitions = 0
     layers = {0: len(visited)}
     sending_transitions = Counter()
-    echoes = Counter()
     while queue:
         world, n, history = queue.popleft()
         if len(history) == depth:
@@ -355,7 +401,7 @@ def enumerate_sequences(depth=DEPTH, table=sale.TABLE):
             trace = history + (observations,)
             try:
                 sends = []
-                after = step(world, observations, n, table, sends=sends, echoes=echoes)
+                after = step(world, observations, n, table, sends=sends)
             except AssertionError as error:
                 raise AssertionError(
                     f"{error}\nN={n}; before={world}; sequence={trace}; "
@@ -374,7 +420,6 @@ def enumerate_sequences(depth=DEPTH, table=sale.TABLE):
         "transitions": transitions,
         "layers": layers,
         "sending_transitions": dict(sending_transitions),
-        "echoes": dict(echoes),
     }
 
 
@@ -386,7 +431,7 @@ def test_bounded_account_enumeration(record_property, tmp_path):
     assert stats["transitions"] > stats["states"]
     assert stats["sending_transitions"]["G x QU"] > 0
     assert stats["sending_transitions"]["PCR x oCXL"] > 0
-    assert stats["echoes"]["send"] > 0 and stats["echoes"]["cancel"] > 0
+    assert stats["sending_transitions"]["RW x QU"] > 0
 
 
 def test_enumeration_reaches_first_and_next_leg_sends():
@@ -529,7 +574,7 @@ def test_one_open_leg_assertion_has_teeth():
 def test_zero_size_first_leg_mutation_has_teeth():
     data = deepcopy(DATA)
     for branch in data["cells"]["G"]["QU"]["branches"]:
-        if branch["when"] == "count_complete and not leg_positive and whole_cover":
+        if branch["when"] == "count_complete and resend_due and not leg_positive and whole_cover":
             branch.update(next="FL", send=True)
     # A defensive input boundary: the guard still refuses zero when a caller's
     # count precedes its cover observation. Normal enumeration re-reads the cover.
@@ -599,15 +644,198 @@ def test_quantity_upper_bound_oracles_have_teeth(bound, monkeypatch):
         step(world, (Seen("oCXL"),))
 
 
+REFUSED = (Seen("QU"), Seen("QU"), Seen("oREJ"))
+
+
+def mutated_branch(row, event, when, **changes):
+    data = deepcopy(DATA)
+    hit = [b for b in data["cells"][row][event]["branches"] if b["when"] == when]
+    assert len(hit) == 1
+    hit[0].update(changes)
+    return sale.table_from_data(data)
+
+
 @pytest.mark.parametrize(
-    "row,echo,history,property_name",
+    "row,event,when,changes,history,property_name",
     [
-        ("FL", "oINI", WORKING, "send_echo_inert"),
-        ("PCR", "oPCN", REPRICING, "cancel_echo_inert"),
+        # A completed count may stand only while a refusal is still young.
+        (
+            "G",
+            "QU",
+            "count_complete and resend_due and leg_positive and formable",
+            {"next": "G", "send": False, "count": "="},
+            (Seen("QU"), Seen("QU")),
+            "a_complete_count_is_held_only_by_the_interval",
+        ),
+        # A resend before the interval has passed.
+        (
+            "RW",
+            "QU",
+            "not resend_due",
+            {"next": "FL", "send": True},
+            REFUSED + (Seen("QU"),),
+            "resend_no_sooner_than_the_interval",
+        ),
+        # A first leg two quotes after the price crossed back, inside the interval.
+        (
+            "G",
+            "QU",
+            "count_complete and not resend_due",
+            {"next": "FL", "send": True},
+            REFUSED + (Seen("QA"), Seen("QU"), Seen("QU")),
+            "resend_no_sooner_than_the_interval",
+        ),
+        # A second ALERT for a holding no sale of which was accepted since the first.
+        (
+            "FL",
+            "oREJ",
+            "refusal_told",
+            {"alert": True},
+            REFUSED + (Seen("~"), Seen("QU"), Seen("oREJ")),
+            "one_alert_per_holding_until_accepted",
+        ),
+        # No ALERT at the first refusal.
+        (
+            "FL",
+            "oREJ",
+            "not refusal_told",
+            {"alert": False},
+            REFUSED,
+            "one_alert_per_holding_until_accepted",
+        ),
+        # An ALERT said by the waiting row itself.
+        (
+            "RW",
+            "QU",
+            "not resend_due",
+            {"alert": True},
+            REFUSED + (Seen("QU"),),
+            "one_alert_per_holding_until_accepted",
+        ),
+        # A resend on a timer.
+        (
+            "RW",
+            "NQ",
+            "always",
+            {"next": "FL", "send": True},
+            REFUSED + (Seen("~"), Seen("NQ")),
+            "no_timer_send",
+        ),
+        # A resend on a quote over the level.
+        (
+            "RW",
+            "QA",
+            "not whole_cover",
+            {"next": "FL", "send": True},
+            REFUSED + (Seen("~"), Seen("QA")),
+            "send_requires_counted_quote_or_reprice_ack",
+        ),
+        # A row with no sale of ours that the table says holds one.
+        ("FL", "oREJ", "not refusal_told", {"next": "WK"}, REFUSED, "row_account_agree"),
     ],
 )
-def test_echo_cell_mutation_has_teeth(row, echo, history, property_name):
-    data = deepcopy(DATA)
-    data["cells"][row][echo] = deepcopy(data["cells"][row]["oOTH"])
+def test_refusal_mutations_have_teeth(row, event, when, changes, history, property_name):
     with pytest.raises(AssertionError, match=property_name):
-        walk(history, table=sale.table_from_data(data))
+        walk(history, table=mutated_branch(row, event, when, **changes))
+
+
+def test_resend_of_nothing_mutation_has_teeth():
+    # The holding is wholly covered while waiting; a table that sends anyway sends a size of zero.
+    table = mutated_branch(
+        "RW", "QU", "resend_due and not leg_positive and whole_cover", next="FL", send=True
+    )
+    world = World(sale.State("RW"), Account(long=1, foreign=1, opening=1, told=True))
+    with pytest.raises(AssertionError, match="send_quantity_positive"):
+        step(world, (Seen("QU"),), table=table)
+
+
+def test_resend_is_the_episode_remainder_within_what_is_uncovered():
+    # Two of three sold, then refused: the resend is one share, and none when a foreign sell covers it.
+    world = walk(
+        (
+            Seen("QU"),
+            Seen("QU"),
+            Seen("oACC"),
+            Seen("oPF"),
+            Seen("oPF"),
+            Seen("oACC"),
+            Seen("oREJ"),
+        )
+    )
+    assert world.state.row == "RW" and world.account.long == 1 and world.account.told
+    world = step(world, (Seen("~"),))
+    sent = step(world, (Seen("QU"),))
+    assert sent.state.row == "FL" and sent.account.legs == (Leg(1),)
+    covered = step(step(world, (Seen("CP"),)), (Seen("QU"),))
+    assert covered.state.row == "GC" and not covered.account.legs
+
+
+def test_one_alert_across_refusals_and_a_new_one_after_an_acceptance():
+    world = walk(REFUSED)
+    assert world.account.told and world.account.young
+    for _ in range(3):
+        world = step(world, (Seen("~"),))
+        world = step(world, (Seen("QU"),))
+        assert world.state.row == "FL"
+        world = step(world, (Seen("oREJ"),))
+        assert world.state.row == "RW" and world.account.told
+    world = step(step(world, (Seen("~"),)), (Seen("QU"),))
+    world = step(world, (Seen("oACC"),))
+    assert world.state.row == "WK" and not world.account.told
+    world = step(world, (Seen("oREJ"),))
+    assert world.state.row == "RW" and world.account.told
+
+
+IN_FLIGHT = (Seen("QU"), Seen("QU"))
+
+
+@pytest.mark.parametrize(
+    "event,when,changes,history,property_name",
+    [
+        # A silent leg that is never told.
+        (
+            "QU",
+            "flight_alert_due",
+            {"alert": False},
+            IN_FLIGHT + (Seen("QU", overdue=True),),
+            "a_silent_leg_is_told_once",
+        ),
+        # An ALERT on every quote.
+        (
+            "QA",
+            "not flight_alert_due",
+            {"alert": True},
+            IN_FLIGHT + (Seen("QA"),),
+            "a_silent_leg_is_told_once",
+        ),
+        # A second sell beside a leg whose outcome is unknown.
+        (
+            "QU",
+            "flight_alert_due",
+            {"send": True},
+            IN_FLIGHT + (Seen("QU", overdue=True),),
+            "a_silent_leg_is_never_resent",
+        ),
+        # The silent leg given up as refused.
+        (
+            "QU",
+            "flight_alert_due",
+            {"next": "RW"},
+            IN_FLIGHT + (Seen("QU", overdue=True),),
+            "waiting_only_after_a_venue_refusal|a_silent_leg_is_never_resent",
+        ),
+    ],
+)
+def test_silent_leg_mutations_have_teeth(event, when, changes, history, property_name):
+    with pytest.raises(AssertionError, match=property_name):
+        walk(history, table=mutated_branch("FL", event, when, **changes))
+
+
+def test_a_silent_leg_is_told_once_and_works_when_its_answer_comes():
+    world = walk(IN_FLIGHT + (Seen("QU", overdue=True),))
+    assert world.state.row == "FL" and world.account.legs[0].silent_told
+    again = step(world, (Seen("QU", overdue=True),))
+    assert again == world
+    assert step(world, (Seen("oACC"),)).state.row == "WK"
+    refused = step(world, (Seen("oREJ"),))
+    assert refused.state.row == "RW" and refused.account.told

@@ -16,6 +16,11 @@
       "engine_status": "no open sale",
       "meaning": "COVERED. No sale of ours; foreign sells cover the whole long; no count accrues."
     },
+    "RW": {
+      "phase": "none",
+      "engine_status": "no open sale",
+      "meaning": "REFUSED, WAITING. The venue refused a leg of ours; nothing of ours is open. The leg is sent again on a counted quote under the level once RESEND_SECS have passed since the refusal (ruling 15)."
+    },
     "FL": {
       "phase": "fl",
       "engine_status": "INITIALIZED or SUBMITTED",
@@ -200,7 +205,10 @@
     "filled_part": "the engine reads our sale with a filled quantity above zero",
     "cancelable": "the engine reads our sale ACCEPTED or PARTIALLY_FILLED",
     "reprice_due": "the chase function, called in this counted quote's handler, gives a price under our working leg's limit: the chase interval has passed since this leg's price was set, and the price a tick through this quote's bid, held at the episode's floor until the floor's wait has run, is lower than the leg's limit",
-    "leg_positive": "the leg's quantity is above zero. For the first leg it is the uncovered quantity read in this step; for the next leg it is the quantity at the episode's opening less the shares sold, and never more than the uncovered quantity read in this step",
+    "leg_positive": "the leg's quantity is above zero. For the first leg it is the uncovered quantity read in this step; for the next leg, and for a leg sent again after a refusal, it is the quantity at the episode's opening less the shares sold, and never more than the uncovered quantity read in this step",
+    "refusal_told": "an ALERT for a refusal of this holding's sale has been written and no leg of it has been ACCEPTED or filled since (held by the glue for the holding; a new run starts with none told)",
+    "resend_due": "the venue has refused no leg of this holding's sale in the last RESEND_SECS (60 s, a named constant); true when none was refused in this run; judged in this counted quote's handler and never on a timer",
+    "flight_alert_due": "our leg has had no answer of any kind (no Accepted, Rejected, Denied, fill, cancel or expiry) for FLIGHT_SECS (60 s, a named constant) since it was sent, and no ALERT has been written for this leg's silence; judged in a quote's handler and never on a timer",
     "long_remains": "a long of this holding is still held after the fill",
     "ends_filled": "after this Updated the engine reads our sale FILLED: a reconciliation update whose quantity equals a filled quantity above zero (M:1322-1324)"
   },
@@ -375,13 +383,22 @@
     "invalidation_first": "what a step sees is applied in step_order; no leg is sent in a step that also saw a stop, the holding's end, a shrink, a foreign sell placed or a freeze",
     "no_timer_transition": "a timer step changes no row, asks no cancel and sends nothing; the floor's wait is started and judged only in the handler of a counted quote under the level",
     "row_stored_before_actions": "the row a transition leads to is stored BEFORE its actions are carried out: the engine publishes Initialized inside our submit and PendingCancel inside our cancel, so the echo of a send meets the in-flight row and the echo of a cancel meets its cancel-asked row, and each does nothing",
+    "one_alert_per_holding_until_accepted": "a venue's refusal of a leg writes ONE ALERT for the holding; no second ALERT for a refusal of it is written until a leg of it has been accepted, however often the price crosses the level or the leg is refused again; each further refusal is a counted line",
+    "resend_no_sooner_than_the_interval": "a leg is sent again only on a counted quote under the level and only when RESEND_SECS have passed since the last refusal, so a standing refusal costs at most about sixty refused orders an hour; never on a timer step and never on a quote above the level",
+    "resend_never_more_than_held": "the leg sent again is sized like any leg: the episode's remainder, never more than the uncovered quantity read in that step, and nothing when that is zero",
+    "a_silent_leg_is_told_once_and_never_resent": "a leg with no answer of any kind for FLIGHT_SECS writes ONE ALERT, on a quote; nothing is sent, canceled or changed for it, and no second sell is ever sent beside it",
     "every_kind_has_a_column": "each kind of order event the pin can deliver to a strategy is named to a column by order_event_inventory and by nothing else; a kind the inventory does not know answers as the catch-all"
   },
   "sending_transitions": [
     {
       "row": "G",
       "event": "QU",
-      "when": "count_complete and leg_positive and formable"
+      "when": "count_complete and resend_due and leg_positive and formable"
+    },
+    {
+      "row": "RW",
+      "event": "QU",
+      "when": "resend_due and leg_positive and formable"
     },
     {
       "row": "PCR",
@@ -403,28 +420,36 @@
             "count": "+1"
           },
           {
-            "when": "count_complete and leg_positive and formable",
+            "when": "count_complete and not resend_due",
+            "next": "G",
+            "send": false,
+            "cancel": false,
+            "alert": false,
+            "count": "="
+          },
+          {
+            "when": "count_complete and resend_due and leg_positive and formable",
             "next": "FL",
             "send": true,
             "cancel": false,
             "alert": false
           },
           {
-            "when": "count_complete and leg_positive and not formable",
+            "when": "count_complete and resend_due and leg_positive and not formable",
             "next": "FZ",
             "send": false,
             "cancel": false,
             "alert": true
           },
           {
-            "when": "count_complete and not leg_positive and whole_cover",
+            "when": "count_complete and resend_due and not leg_positive and whole_cover",
             "next": "GC",
             "send": false,
             "cancel": false,
             "alert": false
           },
           {
-            "when": "count_complete and not leg_positive and not whole_cover",
+            "when": "count_complete and resend_due and not leg_positive and not whole_cover",
             "next": "G",
             "send": false,
             "cancel": false,
@@ -432,7 +457,7 @@
             "count": "0"
           }
         ],
-        "note": "S1, THE FIRST LEG: the episode opens; a plain LIMIT straight to the venue for the uncovered quantity read in this step. THE SEND GUARD: a size of zero or less sends nothing, with no freeze and no alert, and the row is the one the cover gives"
+        "note": "S1, THE FIRST LEG: the episode opens; a plain LIMIT straight to the venue for the uncovered quantity read in this step. THE SEND GUARD: a size of zero or less sends nothing, with no freeze and no alert, and the row is the one the cover gives. THE INTERVAL (ruling 15): while a venue's refusal of this holding's sale is younger than RESEND_SECS nothing is sent and the count stands as it is, so every later counted quote is judged again; with no refusal in this run the interval has passed"
       },
       "QA": {
         "occurs": "yes",
@@ -1217,32 +1242,482 @@
         "note": "an event the table has no column for (none is produced for a plain limit we never modify): named once, nothing else"
       }
     },
-    "FL": {
+    "RW": {
       "QU": {
         "occurs": "yes",
         "branches": [
           {
-            "when": "always",
-            "next": "FL",
+            "when": "not resend_due",
+            "next": "RW",
             "send": false,
             "cancel": false,
             "alert": false
+          },
+          {
+            "when": "resend_due and leg_positive and formable",
+            "next": "FL",
+            "send": true,
+            "cancel": false,
+            "alert": false
+          },
+          {
+            "when": "resend_due and leg_positive and not formable",
+            "next": "FZ",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          },
+          {
+            "when": "resend_due and not leg_positive and whole_cover",
+            "next": "GC",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          },
+          {
+            "when": "resend_due and not leg_positive and not whole_cover",
+            "next": "G",
+            "send": false,
+            "cancel": false,
+            "alert": false,
+            "count": "0"
           }
         ],
-        "note": "NOTHING CAN BE ASKED before the venue's acknowledgement (a named limit; the proof on A measures it); no re-price before it"
+        "note": "S3, THE LEG SENT AGAIN: a plain LIMIT straight to the venue, priced at this counted quote, for the episode's remainder and never more than the uncovered quantity read in this step; no new count is needed, the episode's count stands. Before the interval has passed: nothing"
       },
       "QA": {
         "occurs": "yes",
         "branches": [
           {
+            "when": "whole_cover",
+            "next": "GC",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          },
+          {
+            "when": "not whole_cover",
+            "next": "G",
+            "send": false,
+            "cancel": false,
+            "alert": false,
+            "count": "0"
+          }
+        ],
+        "note": "the price is back over the level: the waiting ends and the count starts again at zero (or, where foreign sells came to cover the whole long while the refused leg was open, the covered row); the ALERT is NOT said again for this holding until a sale of it has been accepted or filled"
+      },
+      "NQ": {
+        "occurs": "yes",
+        "branches": [
+          {
             "when": "always",
+            "next": "RW",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "note": "never a send: the resend is judged in a counted quote's handler"
+      },
+      "HG": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "whole_cover",
+            "next": "GC",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          },
+          {
+            "when": "not whole_cover",
+            "next": "G",
+            "send": false,
+            "cancel": false,
+            "alert": false,
+            "count": "0"
+          }
+        ],
+        "note": "the size or the cover changed while waiting: the waiting ends and a sale needs a new count"
+      },
+      "HS": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "whole_cover",
+            "next": "GC",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          },
+          {
+            "when": "not whole_cover",
+            "next": "G",
+            "send": false,
+            "cancel": false,
+            "alert": false,
+            "count": "0"
+          }
+        ],
+        "note": "the size or the cover changed while waiting: the waiting ends and a sale needs a new count"
+      },
+      "CP": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "whole_cover",
+            "next": "GC",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          },
+          {
+            "when": "not whole_cover",
+            "next": "G",
+            "send": false,
+            "cancel": false,
+            "alert": false,
+            "count": "0"
+          }
+        ],
+        "note": "the size or the cover changed while waiting: the waiting ends and a sale needs a new count"
+      },
+      "CL": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "whole_cover",
+            "next": "GC",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          },
+          {
+            "when": "not whole_cover",
+            "next": "G",
+            "send": false,
+            "cancel": false,
+            "alert": false,
+            "count": "0"
+          }
+        ],
+        "note": "the size or the cover changed while waiting: the waiting ends and a sale needs a new count"
+      },
+      "MO": {
+        "occurs": "n/a",
+        "branches": [
+          {
+            "when": "always",
+            "next": "RW",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "note": "emitted only for a cancelable sale of ours with no cancel pending"
+      },
+      "HE": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "X",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "ST": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "T0",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "FRZ": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZ",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          }
+        ]
+      },
+      "oUPD": {
+        "occurs": "unexpected",
+        "branches": [
+          {
+            "when": "always",
+            "next": "RW",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:249, 294, 297",
+        "note": "allowed on a closed order; no effect"
+      },
+      "oSUB": {
+        "occurs": "no",
+        "branches": [
+          {
+            "when": "always",
+            "next": "RW",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:247-249, 293-299",
+        "note": "a closed order takes only a fill, a void or an update; or no order exists"
+      },
+      "oACC": {
+        "occurs": "no",
+        "branches": [
+          {
+            "when": "always",
+            "next": "RW",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:247-249, 293-299",
+        "note": "a closed order takes only a fill, a void or an update; or no order exists"
+      },
+      "oREJ": {
+        "occurs": "no",
+        "branches": [
+          {
+            "when": "always",
+            "next": "RW",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:247-249, 293-299",
+        "note": "a closed order takes only a fill, a void or an update; or no order exists"
+      },
+      "oDEN": {
+        "occurs": "no",
+        "branches": [
+          {
+            "when": "always",
+            "next": "RW",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:247-249, 293-299",
+        "note": "a closed order takes only a fill, a void or an update; or no order exists"
+      },
+      "oCXL": {
+        "occurs": "no",
+        "branches": [
+          {
+            "when": "always",
+            "next": "RW",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:247-249, 293-299",
+        "note": "a closed order takes only a fill, a void or an update; or no order exists"
+      },
+      "oCRJ": {
+        "occurs": "no",
+        "branches": [
+          {
+            "when": "always",
+            "next": "RW",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:247-249, 293-299",
+        "note": "a closed order takes only a fill, a void or an update; or no order exists"
+      },
+      "oEXP": {
+        "occurs": "no",
+        "branches": [
+          {
+            "when": "always",
+            "next": "RW",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:247-249, 293-299",
+        "note": "a closed order takes only a fill, a void or an update; or no order exists"
+      },
+      "oPF": {
+        "occurs": "no",
+        "branches": [
+          {
+            "when": "always",
+            "next": "RW",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:247, 295; a part leaves the status ended, model/src/orders/mod.rs:1375-1376",
+        "note": "no leg of ours is open to fill; a fill of an ended leg is the event oLF"
+      },
+      "oFF": {
+        "occurs": "no",
+        "branches": [
+          {
+            "when": "always",
+            "next": "RW",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:247, 295; a part leaves the status ended, model/src/orders/mod.rs:1375-1376",
+        "note": "no leg of ours is open to fill; a fill of an ended leg is the event oLF"
+      },
+      "oVOID": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZ",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:248, 293, 296, 298",
+        "note": "a voided fill of our ended sale: the held quantity is no longer what we read"
+      },
+      "oLF": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "not long_remains",
+            "next": "X",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          },
+          {
+            "when": "long_remains and whole_cover",
+            "next": "GC",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          },
+          {
+            "when": "long_remains and not whole_cover",
+            "next": "G",
+            "send": false,
+            "cancel": false,
+            "alert": false,
+            "count": "0"
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:247, 295, 1375-1376",
+        "note": "quantities re-read from every leg of ours; the fill is ours, not a shrink; the cover is read again"
+      },
+      "oINI": {
+        "occurs": "unexpected",
+        "branches": [
+          {
+            "when": "always",
+            "next": "RW",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:227, 229, 237, 239, 242, 283, 285",
+        "note": "an event the table has no column for (none is produced for a plain limit we never modify): named once, nothing else; an echo not expected in this row answers as the catch-all does"
+      },
+      "oPCN": {
+        "occurs": "unexpected",
+        "branches": [
+          {
+            "when": "always",
+            "next": "RW",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:227, 229, 237, 239, 242, 283, 285",
+        "note": "an event the table has no column for (none is produced for a plain limit we never modify): named once, nothing else; an echo not expected in this row answers as the catch-all does"
+      },
+      "oOTH": {
+        "occurs": "unexpected",
+        "branches": [
+          {
+            "when": "always",
+            "next": "RW",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:227, 229, 237, 239, 242, 283, 285",
+        "note": "an event the table has no column for (none is produced for a plain limit we never modify): named once, nothing else"
+      }
+    },
+    "FL": {
+      "QU": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "flight_alert_due",
+            "next": "FL",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          },
+          {
+            "when": "not flight_alert_due",
             "next": "FL",
             "send": false,
             "cancel": false,
             "alert": false
           }
         ],
-        "note": "a confirmed sale is committed, as a triggered stop is: nothing changes"
+        "note": "NOTHING CAN BE ASKED before the venue's acknowledgement (a named limit; the proof on A measures it); no re-price before it; a leg with no answer of any kind for FLIGHT_SECS is told ONCE with an ALERT and is NEVER sent again: its outcome is unknown, and a second sell beside it could sell more than is held"
+      },
+      "QA": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "flight_alert_due",
+            "next": "FL",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          },
+          {
+            "when": "not flight_alert_due",
+            "next": "FL",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "note": "a confirmed sale is committed, as a triggered stop is: nothing changes; a leg with no answer of any kind for FLIGHT_SECS is told ONCE with an ALERT and is NEVER sent again: its outcome is unknown, and a second sell beside it could sell more than is held"
       },
       "NQ": {
         "occurs": "yes",
@@ -1403,15 +1878,22 @@
         "occurs": "yes",
         "branches": [
           {
-            "when": "always",
-            "next": "FZ",
+            "when": "not refusal_told",
+            "next": "RW",
             "send": false,
             "cancel": false,
             "alert": true
+          },
+          {
+            "when": "refusal_told",
+            "next": "RW",
+            "send": false,
+            "cancel": false,
+            "alert": false
           }
         ],
         "pin": "model/src/orders/mod.rs:231",
-        "note": "frozen with the alert: a definitive refusal is not cured by sending again"
+        "note": "THE VENUE'S REFUSAL is not definitive (ruling 15: a wash-trade refusal lasts only as long as the resting order): ONE ALERT per holding until a sale of it is accepted, then the leg is sent again from the waiting row"
       },
       "oDEN": {
         "occurs": "yes",
@@ -1789,15 +2271,22 @@
         "occurs": "yes",
         "branches": [
           {
-            "when": "always",
-            "next": "FZ",
+            "when": "not refusal_told",
+            "next": "RW",
             "send": false,
             "cancel": false,
             "alert": true
+          },
+          {
+            "when": "refusal_told",
+            "next": "RW",
+            "send": false,
+            "cancel": false,
+            "alert": false
           }
         ],
         "pin": "model/src/orders/mod.rs:236",
-        "note": "frozen with the alert: a definitive refusal is not cured by sending again"
+        "note": "THE VENUE'S REFUSAL is not definitive (ruling 15: a wash-trade refusal lasts only as long as the resting order): ONE ALERT per holding until a sale of it is accepted, then the leg is sent again from the waiting row"
       },
       "oDEN": {
         "occurs": "no",
@@ -2197,15 +2686,22 @@
         "occurs": "unexpected",
         "branches": [
           {
-            "when": "always",
-            "next": "FZ",
+            "when": "not refusal_told",
+            "next": "RW",
             "send": false,
             "cancel": false,
             "alert": true
+          },
+          {
+            "when": "refusal_told",
+            "next": "RW",
+            "send": false,
+            "cancel": false,
+            "alert": false
           }
         ],
         "pin": "model/src/orders/mod.rs:290, then 236",
-        "note": "reachable once an Accepted has put the engine's status back to ACCEPTED; frozen with the alert: a definitive refusal is not cured by sending again"
+        "note": "reachable once an Accepted has put the engine's status back to ACCEPTED; THE VENUE'S REFUSAL is not definitive (ruling 15: a wash-trade refusal lasts only as long as the resting order): ONE ALERT per holding until a sale of it is accepted, then the leg is sent again from the waiting row"
       },
       "oDEN": {
         "occurs": "no",

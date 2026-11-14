@@ -53,8 +53,8 @@
         {
           "row": "G",
           "event": "QU",
-          "when": "count_complete and leg_positive and formable",
-          "does": "IF count_complete and leg_positive and formable: SEND a leg; -> FL",
+          "when": "count_complete and resend_due and leg_positive and formable",
+          "does": "IF count_complete and resend_due and leg_positive and formable: SEND a leg; -> FL",
           "occurs": "yes"
         },
         {
@@ -129,8 +129,8 @@
         {
           "row": "G",
           "event": "QU",
-          "when": "count_complete and leg_positive and formable",
-          "does": "IF count_complete and leg_positive and formable: SEND a leg; -> FL",
+          "when": "count_complete and resend_due and leg_positive and formable",
+          "does": "IF count_complete and resend_due and leg_positive and formable: SEND a leg; -> FL",
           "occurs": "yes"
         },
         {
@@ -198,8 +198,8 @@
         {
           "row": "G",
           "event": "QU",
-          "when": "count_complete and leg_positive and formable",
-          "does": "IF count_complete and leg_positive and formable: SEND a leg; -> FL",
+          "when": "count_complete and resend_due and leg_positive and formable",
+          "does": "IF count_complete and resend_due and leg_positive and formable: SEND a leg; -> FL",
           "occurs": "yes"
         },
         {
@@ -267,8 +267,8 @@
         {
           "row": "G",
           "event": "QU",
-          "when": "count_complete and leg_positive and formable",
-          "does": "IF count_complete and leg_positive and formable: SEND a leg; -> FL",
+          "when": "count_complete and resend_due and leg_positive and formable",
+          "does": "IF count_complete and resend_due and leg_positive and formable: SEND a leg; -> FL",
           "occurs": "yes"
         },
         {
@@ -322,8 +322,8 @@
         {
           "row": "G",
           "event": "QU",
-          "when": "count_complete and leg_positive and formable",
-          "does": "IF count_complete and leg_positive and formable: SEND a leg; -> FL",
+          "when": "count_complete and resend_due and leg_positive and formable",
+          "does": "IF count_complete and resend_due and leg_positive and formable: SEND a leg; -> FL",
           "occurs": "yes"
         },
         {
@@ -377,8 +377,8 @@
         {
           "row": "G",
           "event": "QU",
-          "when": "count_complete and leg_positive and formable",
-          "does": "IF count_complete and leg_positive and formable: SEND a leg; -> FL",
+          "when": "count_complete and resend_due and leg_positive and formable",
+          "does": "IF count_complete and resend_due and leg_positive and formable: SEND a leg; -> FL",
           "occurs": "yes"
         },
         {
@@ -432,8 +432,8 @@
         {
           "row": "G",
           "event": "QU",
-          "when": "count_complete and leg_positive and formable",
-          "does": "IF count_complete and leg_positive and formable: SEND a leg; -> FL",
+          "when": "count_complete and resend_due and leg_positive and formable",
+          "does": "IF count_complete and resend_due and leg_positive and formable: SEND a leg; -> FL",
           "occurs": "yes"
         },
         {
@@ -467,12 +467,12 @@
         {
           "row": "PF",
           "event": "oREJ",
-          "when": "always",
-          "does": "ALERT; -> FZ",
+          "when": "not refusal_told",
+          "does": "IF not refusal_told: ALERT; -> RW",
           "occurs": "unexpected"
         }
       ],
-      "ends_in": "FZ",
+      "ends_in": "RW",
       "sends": 1
     },
     "update-ends-pending-leg": {
@@ -487,8 +487,8 @@
         {
           "row": "G",
           "event": "QU",
-          "when": "count_complete and leg_positive and formable",
-          "does": "IF count_complete and leg_positive and formable: SEND a leg; -> FL",
+          "when": "count_complete and resend_due and leg_positive and formable",
+          "does": "IF count_complete and resend_due and leg_positive and formable: SEND a leg; -> FL",
           "occurs": "yes"
         },
         {
@@ -542,8 +542,8 @@
         {
           "row": "G",
           "event": "QU",
-          "when": "count_complete and leg_positive and formable",
-          "does": "IF count_complete and leg_positive and formable: SEND a leg; -> FL",
+          "when": "count_complete and resend_due and leg_positive and formable",
+          "does": "IF count_complete and resend_due and leg_positive and formable: SEND a leg; -> FL",
           "occurs": "yes"
         },
         {
@@ -590,8 +590,8 @@
         {
           "row": "G",
           "event": "QU",
-          "when": "count_complete and leg_positive and formable",
-          "does": "IF count_complete and leg_positive and formable: SEND a leg; -> FL",
+          "when": "count_complete and resend_due and leg_positive and formable",
+          "does": "IF count_complete and resend_due and leg_positive and formable: SEND a leg; -> FL",
           "occurs": "yes"
         },
         {
@@ -673,8 +673,8 @@
         {
           "row": "G",
           "event": "QU",
-          "when": "count_complete and leg_positive and formable",
-          "does": "IF count_complete and leg_positive and formable: SEND a leg; -> FL",
+          "when": "count_complete and resend_due and leg_positive and formable",
+          "does": "IF count_complete and resend_due and leg_positive and formable: SEND a leg; -> FL",
           "occurs": "yes"
         },
         {
@@ -728,8 +728,8 @@
         {
           "row": "G",
           "event": "QU",
-          "when": "count_complete and leg_positive and formable",
-          "does": "IF count_complete and leg_positive and formable: SEND a leg; -> FL",
+          "when": "count_complete and resend_due and leg_positive and formable",
+          "does": "IF count_complete and resend_due and leg_positive and formable: SEND a leg; -> FL",
           "occurs": "yes"
         },
         {
@@ -824,8 +824,8 @@
         {
           "row": "G",
           "event": "QU",
-          "when": "count_complete and leg_positive and formable",
-          "does": "IF count_complete and leg_positive and formable: SEND a leg; -> FL",
+          "when": "count_complete and resend_due and leg_positive and formable",
+          "does": "IF count_complete and resend_due and leg_positive and formable: SEND a leg; -> FL",
           "occurs": "yes"
         },
         {
@@ -900,8 +900,8 @@
         {
           "row": "G",
           "event": "QU",
-          "when": "count_complete and leg_positive and formable",
-          "does": "IF count_complete and leg_positive and formable: SEND a leg; -> FL",
+          "when": "count_complete and resend_due and leg_positive and formable",
+          "does": "IF count_complete and resend_due and leg_positive and formable: SEND a leg; -> FL",
           "occurs": "yes"
         },
         {
@@ -983,8 +983,8 @@
         {
           "row": "G",
           "event": "QU",
-          "when": "count_complete and leg_positive and formable",
-          "does": "IF count_complete and leg_positive and formable: SEND a leg; -> FL",
+          "when": "count_complete and resend_due and leg_positive and formable",
+          "does": "IF count_complete and resend_due and leg_positive and formable: SEND a leg; -> FL",
           "occurs": "yes"
         },
         {
@@ -1024,6 +1024,379 @@
         }
       ],
       "ends_in": "FZW",
+      "sends": 1
+    },
+    "refused-twice-then-accepted": {
+      "steps": [
+        {
+          "row": "G",
+          "event": "QU",
+          "when": "not count_complete",
+          "does": "IF not count_complete: nothing sent; -> G, count + 1",
+          "occurs": "yes"
+        },
+        {
+          "row": "G",
+          "event": "QU",
+          "when": "count_complete and resend_due and leg_positive and formable",
+          "does": "IF count_complete and resend_due and leg_positive and formable: SEND a leg; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "oINI",
+          "when": "always",
+          "does": "nothing sent; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "oSUB",
+          "when": "always",
+          "does": "nothing sent; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "oREJ",
+          "when": "not refusal_told",
+          "does": "IF not refusal_told: ALERT; -> RW",
+          "occurs": "yes"
+        },
+        {
+          "row": "RW",
+          "event": "QU",
+          "when": "not resend_due",
+          "does": "IF not resend_due: nothing sent; -> RW",
+          "occurs": "yes"
+        },
+        {
+          "row": "RW",
+          "event": "NQ",
+          "when": "always",
+          "does": "nothing sent; -> RW",
+          "occurs": "yes"
+        },
+        {
+          "row": "RW",
+          "event": "QU",
+          "when": "resend_due and leg_positive and formable",
+          "does": "IF resend_due and leg_positive and formable: SEND a leg; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "oINI",
+          "when": "always",
+          "does": "nothing sent; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "oSUB",
+          "when": "always",
+          "does": "nothing sent; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "oREJ",
+          "when": "refusal_told",
+          "does": "IF refusal_told: nothing sent; -> RW",
+          "occurs": "yes"
+        },
+        {
+          "row": "RW",
+          "event": "QU",
+          "when": "not resend_due",
+          "does": "IF not resend_due: nothing sent; -> RW",
+          "occurs": "yes"
+        },
+        {
+          "row": "RW",
+          "event": "QU",
+          "when": "resend_due and leg_positive and formable",
+          "does": "IF resend_due and leg_positive and formable: SEND a leg; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "oSUB",
+          "when": "always",
+          "does": "nothing sent; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "oACC",
+          "when": "always",
+          "does": "nothing sent; -> WK",
+          "occurs": "yes"
+        }
+      ],
+      "ends_in": "WK",
+      "sends": 3
+    },
+    "refused-crosses-level-and-recounts": {
+      "steps": [
+        {
+          "row": "G",
+          "event": "QU",
+          "when": "not count_complete",
+          "does": "IF not count_complete: nothing sent; -> G, count + 1",
+          "occurs": "yes"
+        },
+        {
+          "row": "G",
+          "event": "QU",
+          "when": "count_complete and resend_due and leg_positive and formable",
+          "does": "IF count_complete and resend_due and leg_positive and formable: SEND a leg; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "oSUB",
+          "when": "always",
+          "does": "nothing sent; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "oREJ",
+          "when": "not refusal_told",
+          "does": "IF not refusal_told: ALERT; -> RW",
+          "occurs": "yes"
+        },
+        {
+          "row": "RW",
+          "event": "QA",
+          "when": "not whole_cover",
+          "does": "IF not whole_cover: nothing sent; -> G, count 0",
+          "occurs": "yes"
+        },
+        {
+          "row": "G",
+          "event": "QU",
+          "when": "not count_complete",
+          "does": "IF not count_complete: nothing sent; -> G, count + 1",
+          "occurs": "yes"
+        },
+        {
+          "row": "G",
+          "event": "QU",
+          "when": "count_complete and not resend_due",
+          "does": "IF count_complete and not resend_due: nothing sent; -> G, count unchanged",
+          "occurs": "yes"
+        },
+        {
+          "row": "G",
+          "event": "QU",
+          "when": "count_complete and not resend_due",
+          "does": "IF count_complete and not resend_due: nothing sent; -> G, count unchanged",
+          "occurs": "yes"
+        },
+        {
+          "row": "G",
+          "event": "QU",
+          "when": "count_complete and resend_due and leg_positive and formable",
+          "does": "IF count_complete and resend_due and leg_positive and formable: SEND a leg; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "oSUB",
+          "when": "always",
+          "does": "nothing sent; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "oREJ",
+          "when": "refusal_told",
+          "does": "IF refusal_told: nothing sent; -> RW",
+          "occurs": "yes"
+        }
+      ],
+      "ends_in": "RW",
+      "sends": 2
+    },
+    "refused-then-covered": {
+      "steps": [
+        {
+          "row": "G",
+          "event": "QU",
+          "when": "not count_complete",
+          "does": "IF not count_complete: nothing sent; -> G, count + 1",
+          "occurs": "yes"
+        },
+        {
+          "row": "G",
+          "event": "QU",
+          "when": "count_complete and resend_due and leg_positive and formable",
+          "does": "IF count_complete and resend_due and leg_positive and formable: SEND a leg; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "oSUB",
+          "when": "always",
+          "does": "nothing sent; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "oREJ",
+          "when": "not refusal_told",
+          "does": "IF not refusal_told: ALERT; -> RW",
+          "occurs": "yes"
+        },
+        {
+          "row": "RW",
+          "event": "HS",
+          "when": "whole_cover",
+          "does": "IF whole_cover: nothing sent; -> GC",
+          "occurs": "yes"
+        },
+        {
+          "row": "GC",
+          "event": "QU",
+          "when": "always",
+          "does": "nothing sent; -> GC",
+          "occurs": "yes"
+        },
+        {
+          "row": "GC",
+          "event": "NQ",
+          "when": "always",
+          "does": "nothing sent; -> GC",
+          "occurs": "yes"
+        }
+      ],
+      "ends_in": "GC",
+      "sends": 1
+    },
+    "engine-denied": {
+      "steps": [
+        {
+          "row": "G",
+          "event": "QU",
+          "when": "not count_complete",
+          "does": "IF not count_complete: nothing sent; -> G, count + 1",
+          "occurs": "yes"
+        },
+        {
+          "row": "G",
+          "event": "QU",
+          "when": "count_complete and resend_due and leg_positive and formable",
+          "does": "IF count_complete and resend_due and leg_positive and formable: SEND a leg; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "oINI",
+          "when": "always",
+          "does": "nothing sent; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "oDEN",
+          "when": "always",
+          "does": "ALERT; -> FZ",
+          "occurs": "yes"
+        },
+        {
+          "row": "FZ",
+          "event": "QU",
+          "when": "always",
+          "does": "nothing sent; -> FZ",
+          "occurs": "yes"
+        },
+        {
+          "row": "FZ",
+          "event": "NQ",
+          "when": "always",
+          "does": "nothing sent; -> FZ",
+          "occurs": "yes"
+        }
+      ],
+      "ends_in": "FZ",
+      "sends": 1
+    },
+    "silent-leg-answered-late": {
+      "steps": [
+        {
+          "row": "G",
+          "event": "QU",
+          "when": "not count_complete",
+          "does": "IF not count_complete: nothing sent; -> G, count + 1",
+          "occurs": "yes"
+        },
+        {
+          "row": "G",
+          "event": "QU",
+          "when": "count_complete and resend_due and leg_positive and formable",
+          "does": "IF count_complete and resend_due and leg_positive and formable: SEND a leg; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "oINI",
+          "when": "always",
+          "does": "nothing sent; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "oSUB",
+          "when": "always",
+          "does": "nothing sent; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "QU",
+          "when": "not flight_alert_due",
+          "does": "IF not flight_alert_due: nothing sent; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "QU",
+          "when": "flight_alert_due",
+          "does": "IF flight_alert_due: ALERT; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "QU",
+          "when": "not flight_alert_due",
+          "does": "IF not flight_alert_due: nothing sent; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "QA",
+          "when": "not flight_alert_due",
+          "does": "IF not flight_alert_due: nothing sent; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "NQ",
+          "when": "always",
+          "does": "nothing sent; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "oACC",
+          "when": "always",
+          "does": "nothing sent; -> WK",
+          "occurs": "yes"
+        }
+      ],
+      "ends_in": "WK",
       "sends": 1
     }
   },
@@ -1081,8 +1454,8 @@
         {
           "row": "G",
           "event": "QU",
-          "when": "count_complete and leg_positive and formable",
-          "does": "IF count_complete and leg_positive and formable: SEND a leg; -> FL",
+          "when": "count_complete and resend_due and leg_positive and formable",
+          "does": "IF count_complete and resend_due and leg_positive and formable: SEND a leg; -> FL",
           "occurs": "yes"
         },
         {
@@ -1157,8 +1530,8 @@
         {
           "row": "G",
           "event": "QU",
-          "when": "count_complete and leg_positive and formable",
-          "does": "IF count_complete and leg_positive and formable: SEND a leg; -> FL",
+          "when": "count_complete and resend_due and leg_positive and formable",
+          "does": "IF count_complete and resend_due and leg_positive and formable: SEND a leg; -> FL",
           "occurs": "yes"
         },
         {
@@ -1226,8 +1599,8 @@
         {
           "row": "G",
           "event": "QU",
-          "when": "count_complete and leg_positive and formable",
-          "does": "IF count_complete and leg_positive and formable: SEND a leg; -> FL",
+          "when": "count_complete and resend_due and leg_positive and formable",
+          "does": "IF count_complete and resend_due and leg_positive and formable: SEND a leg; -> FL",
           "occurs": "yes"
         },
         {
@@ -1309,8 +1682,8 @@
         {
           "row": "G",
           "event": "QU",
-          "when": "count_complete and leg_positive and formable",
-          "does": "IF count_complete and leg_positive and formable: SEND a leg; -> FL",
+          "when": "count_complete and resend_due and leg_positive and formable",
+          "does": "IF count_complete and resend_due and leg_positive and formable: SEND a leg; -> FL",
           "occurs": "yes"
         },
         {
@@ -1371,8 +1744,8 @@
         {
           "row": "G",
           "event": "QU",
-          "when": "count_complete and leg_positive and formable",
-          "does": "IF count_complete and leg_positive and formable: SEND a leg; -> FL",
+          "when": "count_complete and resend_due and leg_positive and formable",
+          "does": "IF count_complete and resend_due and leg_positive and formable: SEND a leg; -> FL",
           "occurs": "yes"
         },
         {
@@ -1426,8 +1799,8 @@
         {
           "row": "G",
           "event": "QU",
-          "when": "count_complete and leg_positive and formable",
-          "does": "IF count_complete and leg_positive and formable: SEND a leg; -> FL",
+          "when": "count_complete and resend_due and leg_positive and formable",
+          "does": "IF count_complete and resend_due and leg_positive and formable: SEND a leg; -> FL",
           "occurs": "yes"
         },
         {
@@ -1468,8 +1841,8 @@
         {
           "row": "G",
           "event": "QU",
-          "when": "count_complete and leg_positive and formable",
-          "does": "IF count_complete and leg_positive and formable: SEND a leg; -> FL",
+          "when": "count_complete and resend_due and leg_positive and formable",
+          "does": "IF count_complete and resend_due and leg_positive and formable: SEND a leg; -> FL",
           "occurs": "yes"
         }
       ],
@@ -1488,8 +1861,8 @@
         {
           "row": "G",
           "event": "QU",
-          "when": "count_complete and leg_positive and formable",
-          "does": "IF count_complete and leg_positive and formable: SEND a leg; -> FL",
+          "when": "count_complete and resend_due and leg_positive and formable",
+          "does": "IF count_complete and resend_due and leg_positive and formable: SEND a leg; -> FL",
           "occurs": "yes"
         },
         {
@@ -1564,8 +1937,8 @@
         {
           "row": "G",
           "event": "QU",
-          "when": "count_complete and leg_positive and formable",
-          "does": "IF count_complete and leg_positive and formable: SEND a leg; -> FL",
+          "when": "count_complete and resend_due and leg_positive and formable",
+          "does": "IF count_complete and resend_due and leg_positive and formable: SEND a leg; -> FL",
           "occurs": "yes"
         },
         {
@@ -1612,8 +1985,8 @@
         {
           "row": "G",
           "event": "QU",
-          "when": "count_complete and leg_positive and formable",
-          "does": "IF count_complete and leg_positive and formable: SEND a leg; -> FL",
+          "when": "count_complete and resend_due and leg_positive and formable",
+          "does": "IF count_complete and resend_due and leg_positive and formable: SEND a leg; -> FL",
           "occurs": "yes"
         },
         {
@@ -1654,19 +2027,19 @@
         {
           "row": "FL",
           "event": "oREJ",
-          "when": "always",
-          "does": "ALERT; -> FZ",
+          "when": "not refusal_told",
+          "does": "IF not refusal_told: ALERT; -> RW",
           "occurs": "yes"
         },
         {
-          "row": "FZ",
+          "row": "RW",
           "event": "NQ",
           "when": "always",
-          "does": "nothing sent; -> FZ",
+          "does": "nothing sent; -> RW",
           "occurs": "yes"
         }
       ],
-      "ends_in": "FZ",
+      "ends_in": "RW",
       "sends": 2
     }
   }
