@@ -801,20 +801,36 @@ def offsets(
     *,
     distance: Decimal | None = None,
     least: Decimal | None = None,
+    chase_cap: Decimal | None = None,
 ) -> tuple[Decimal, Decimal]:
     """The trailing offset and the limit offset, as prices. The trailing offset is `distance` when the
     entry was sized for one (S2's L, already on the step), else `trail` of the entry up to the entry's
-    step: it places the trigger, which the emulator keeps to itself. The limit offset
-    is that plus `exit_through` of the entry, up to a whole cent and a cent over the trailing offset at
-    least: it places the released limit, the one price that reaches the venue. This preserves cents
-    when the highest bid is in cents, including across a dollar between steps. A fractional-cent
-    basis retains its residue: the native calculation uses the instrument's fixed 0.0001 increment
-    (`crates/execution/src/trailing.rs:182-220`), not PRICES. That observed invalid release above $1 is
-    handed off to the lead's Claude lane; these offsets do not fix it. The cost under a dollar is a
-    release up to a cent lower than `exit_through` asks, included in `planned_stop` for legacy sizing.
+    step: it places the trigger, which the emulator keeps to itself. The limit offset is on
+    `tick(entry)`, with spacing below the trigger of at least one step and at most CHASE_CAP times
+    `entry - trailing`, rounded down to that step. CHASE_CAP is `chase_cap`, the plan's own where the
+    caller has one (`ratchet_trail`, `_cold_plan` and the own-cap plan widen it), else the
+    registered row. The old cent-rounded result is kept to the digit wherever it meets both bounds;
+    otherwise the requested give is rounded to the entry's step and bounded there. Where the cap,
+    rounded down, is under one step, the spacing is exactly one step (the lead's ruling of
+    2026-11-13, 17:27): the old cent pair is never kept over the cap, and a trigger or limit at or
+    under zero is left to `_trail`/`_hold`'s no-room guards, which read `max(trailing, limit)`, and
+    to the entry's planned-stop refusal. An off-step `distance` (S2's L) can leave no on-step limit
+    between one step and the cap: the limit is then the largest on-step one within the cap, a
+    positive spacing under one step, a named limit. Under a dollar the limit offset is on 0.0001, so
+    a release after the bid crosses $1 can be sub-cent; the adapter floors a sell's limit onto the
+    cent there (`venue_limit_price`). Legacy sizing's `planned_stop` includes the first-sale price.
+
+    NautilusTrader d53849b216e2 (`crates/execution/src/trailing.rs:104-148,176-221`) applies one
+    offset type to both distances: PRICE keeps S2/ATR distances fixed, whereas BASIS_POINTS would
+    scale both. A fractional-cent basis still retains its residue above $1: the native calculation
+    uses the instrument's fixed increment, not PRICES; the adapter owns that venue-price correction.
     `least`, a price, bounds the trailing offset from below, up to the step: the floor a plan took at
     its own step, which a lower average must not cut (`offsets_in_force`); `distance` is not bounded.
     """
+    # Import after this module is initialized: protect's planner uses MoverConfig's registered
+    # chase_cap default, and protect itself imports mover. No second copy of the row's number.
+    from .protect import PLANNER
+
     step = tick(entry)
     trailing = (
         max((entry * trail).quantize(step, rounding=ROUND_CEILING), step)
@@ -824,7 +840,19 @@ def offsets(
     if distance is None and least is not None:
         trailing = max(trailing, least.quantize(step, rounding=ROUND_CEILING))
     limit = (trailing + entry * exit_through).quantize(CENT, rounding=ROUND_CEILING)
-    return trailing, max(limit, (trailing + SUB_DOLLAR).quantize(CENT, rounding=ROUND_CEILING))
+    limit = max(limit, (trailing + SUB_DOLLAR).quantize(CENT, rounding=ROUND_CEILING))
+    cap = PLANNER.chase_cap if chase_cap is None else chase_cap
+    bound = ((entry - trailing) * cap).quantize(step, rounding=ROUND_FLOOR)
+    if limit % step == 0 and step <= limit - trailing <= bound:
+        return trailing, limit
+    lower = (trailing + step).quantize(step, rounding=ROUND_CEILING)
+    upper = (trailing + bound).quantize(step, rounding=ROUND_FLOOR)
+    if bound < step:
+        return trailing, trailing + step
+    if lower > upper:
+        return trailing, upper
+    limit = (trailing + entry * exit_through).quantize(step, rounding=ROUND_CEILING)
+    return trailing, min(max(limit, lower), upper)
 
 
 def fill_trigger(fill: Decimal, distance: Decimal | None) -> Decimal | None:
@@ -855,7 +883,7 @@ def planned_stop(
     """The lowest price the first sale is planned at, which the size is risked against: the first
     trigger less what the released limit may give (`offsets`), less the chase's cap under that."""
     step = tick(entry)
-    _, limit = offsets(entry, trail, exit_through)
+    _, limit = offsets(entry, trail, exit_through, chase_cap=chase_cap)
     return ((entry - limit) * (1 - chase_cap)).quantize(step, rounding=ROUND_FLOOR)
 
 
@@ -2118,7 +2146,14 @@ def offsets_in_force(
             distance = loss
         elif own is not None:
             distance = planned
-    return offsets(bought, trail, exit_through, distance=distance, least=least)
+    return offsets(
+        bought,
+        trail,
+        exit_through,
+        distance=distance,
+        least=least,
+        chase_cap=None if plan is None else plan.chase_cap,
+    )
 
 
 class Mover(Strategy):
@@ -6414,7 +6449,7 @@ class Mover(Strategy):
             )
             return False
         in_force = offsets_in_force(slot, bought, plan.trail, plan.exit_through, self._floor_m())
-        candidate = offsets(bought, warmed.trail, warmed.exit_through)
+        candidate = offsets(bought, warmed.trail, warmed.exit_through, chase_cap=warmed.chase_cap)
         if l_in_force(slot, bought) is not None and not candidate < in_force:
             # narrower than the plan but not closer than L in force: taking it would loosen the sale
             # (the lead's ruling of 2026-11-12, 21:01)
@@ -6463,7 +6498,7 @@ class Mover(Strategy):
         in_force = offsets_in_force(
             slot, bought, current.trail, current.exit_through, self._floor_m()
         )
-        if not offsets(bought, plan.trail, plan.exit_through) < in_force:
+        if not offsets(bought, plan.trail, plan.exit_through, chase_cap=plan.chase_cap) < in_force:
             # Rounded, the candidate's trigger and then its limit are no closer than those in force:
             # the one ratchet is kept for a later step that can tighten (Astra second read of #316,
             # finding 2).
