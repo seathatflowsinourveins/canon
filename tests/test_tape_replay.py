@@ -510,3 +510,27 @@ def test_a_line_is_filed_under_the_instrument_it_names_wherever_it_names_it(text
     )
     module._RecordedProtector._say(observer, text)
     assert observer.trace.lines == [{"at": 7, "symbol": "LLL", "text": text}]
+
+
+@pytest.mark.parametrize(
+    ("held", "text"),
+    [
+        (["LL.ALPACA"], "ALERT: LLL.ALPACA: our protective sell was refused by the venue"),
+        (["LL.ALPACA"], "LLL.ALPACA: armed distance 0.1600"),
+        (["MMM.ALPACA"], "level book write failed: OSError: MMM.ALPACA: denied"),
+        (["MMM.ALPACA"], "ALERT: previous level book unreadable: ValueError: bad"),
+    ],
+)
+def test_a_line_naming_no_held_instrument_at_its_start_is_filed_under_none(held, text):
+    from types import SimpleNamespace
+
+    from nautilus_trader.model import InstrumentId
+
+    module = runner()
+    observer = SimpleNamespace(
+        trace=SimpleNamespace(ids=[InstrumentId.from_str(i) for i in held], lines=[]),
+        clock=SimpleNamespace(timestamp_ns=lambda: 7),
+    )
+    module._RecordedProtector._say(observer, text)
+    assert observer.trace.lines == [{"at": 7, "symbol": None, "text": text}]
+    assert module._unfiled_alerts(observer.trace.lines) == ("ALERT" in text)

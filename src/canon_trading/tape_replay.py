@@ -54,7 +54,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
 from collections import Counter
 from datetime import UTC
 from datetime import datetime
@@ -317,6 +316,11 @@ def _load(spec: dict[str, Any]) -> tuple[list[Any], list[dict[str, Any]]]:
     return list(definitions.values()), batches
 
 
+def _unfiled_alerts(lines: list[dict[str, Any]]) -> int:
+    """Count the ALERT lines filed under no holding, such as a book-wide one."""
+    return sum(1 for line in lines if line["symbol"] is None and "ALERT" in line["text"])
+
+
 class _Trace:
     """Read the protector's table after callbacks; do not derive a substitute state machine."""
 
@@ -453,7 +457,11 @@ class _Trace:
                 for event in self.protector.gain_lock_events
                 if event["instrument_id"] == f"{symbol}.ALPACA"
             ]
-        return {"holdings": self.rows, "lines": self.lines}
+        return {
+            "holdings": self.rows,
+            "lines": self.lines,
+            "unfiled_alert_count": _unfiled_alerts(self.lines),
+        }
 
 
 class _TapeOwner(Strategy):
@@ -502,14 +510,14 @@ class _RecordedProtector(OwnerProtector):
         return self._observed_clock
 
     def _say(self, text: str) -> None:
-        # A line names its instrument at its start or after a prefix ("ALERT: <instrument>: ..."),
-        # so it is filed under the earliest instrument it names on a boundary, anywhere in it.
-        named = []
-        for iid in self.trace.ids:
-            found = re.search(rf"(?<![\w.]){re.escape(str(iid))}:", text)
-            if found is not None:
-                named.append((found.start(), iid.symbol.value))
-        symbol = min(named)[1] if named else None
+        # A holding's line starts with "<instrument>: ", or, for an ALERT written as
+        # "ALERT: <instrument>: ...", has the instrument right after that prefix. A line that
+        # names no instrument there is filed under no symbol and counted in the segment's
+        # unfiled_alert_count when it is an ALERT, never matched in its body.
+        head = text.removeprefix("ALERT: ")
+        symbol = next(
+            (iid.symbol.value for iid in self.trace.ids if head.startswith(f"{iid}:")), None
+        )
         self.trace.lines.append({"at": self.clock.timestamp_ns(), "symbol": symbol, "text": text})
 
     def request_bars(
@@ -825,6 +833,7 @@ def render_markdown(report: dict[str, Any]) -> str:
             [
                 f"## Segment {segment['index']}: [{segment['start']}, {segment['end']})",
                 f"Data counts: {json.dumps(segment['data_counts'], sort_keys=True)}",
+                f"ALERT lines naming no holding: {segment['unfiled_alert_count']}",
             ]
         )
         parts.append("### Native engine reports")
