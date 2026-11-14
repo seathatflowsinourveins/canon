@@ -476,20 +476,35 @@ def new_york_regular_hours(monkeypatch: pytest.MonkeyPatch) -> datetime:
     return now.astimezone(zone)
 
 
+FAILED_SINCE_COLLECTION: list[bool] = [False]
+"""Set by `pytest_runtest_logreport` when a setup, call or teardown fails; read and cleared by
+`no_live_node_kept_by_the_last_failure`."""
+
+
+def pytest_runtest_logreport(report: pytest.TestReport) -> None:
+    """Note a failed phase of a case for `no_live_node_kept_by_the_last_failure`."""
+    if report.failed:
+        FAILED_SINCE_COLLECTION[0] = True
+
+
 @pytest.fixture(autouse=True)
 def no_live_node_kept_by_the_last_failure() -> None:
     """A case that failed with a LiveNode in its frame does not fail the next case that builds one.
 
-    pytest keeps the last failure for postmortem debugging in `sys.last_exc` and `sys.last_traceback`,
-    and deletes them only when the next case is called, with no collection (`_pytest/runner.py:173-193`
-    at pytest 9.2.0). The failed frame holds its node in a reference cycle, and at the NautilusTrader pin
-    a thread holds one LiveNode until it is dropped (`crates/live/src/node/mod.rs:344-354`). The next
-    case that builds one without collecting first then fails with "A LiveNode already exists", which
-    hides the case that really failed. This drops the kept failure and collects, before the next case,
-    only after a failure: upstream's `collect_node_cycles` (`python/tests/conftest.py:148-155`) is the
-    collection alone, which this kept failure outlives. `tests/test_live_node_cascade.py` shows both.
+    At the NautilusTrader pin a thread holds one LiveNode until it is dropped
+    (`crates/live/src/node/mod.rs:344-354`). A failed case's frame holds its node in a reference cycle
+    with the exception, and pytest keeps the last call-phase exception for postmortem debugging in
+    `sys.last_*`, deleting it only when the next case is called, with no collection
+    (`_pytest/runner.py:173-193` at pytest 9.2.0). The next case that builds a node without collecting
+    first then failed with "A LiveNode already exists", which hid the case that really failed. After
+    any failed phase (`pytest.fail`, a setup or teardown error, or an exception in the call), this drops
+    the kept exception and collects before the next case. Upstream's `collect_node_cycles`
+    (`python/tests/conftest.py:148-155`) is the collection alone, which `sys.last_*` outlives.
+    `tests/test_live_node_cascade.py` shows both. It covers `tests/` only; `packages/canon-alpaca/tests`
+    has a conftest of its own.
     """
-    if hasattr(sys, "last_traceback") or hasattr(sys, "last_exc"):
+    if FAILED_SINCE_COLLECTION[0] or hasattr(sys, "last_traceback") or hasattr(sys, "last_exc"):
+        FAILED_SINCE_COLLECTION[0] = False
         for name in ("last_type", "last_value", "last_traceback", "last_exc"):
             if hasattr(sys, name):
                 delattr(sys, name)
