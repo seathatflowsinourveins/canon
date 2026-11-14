@@ -86,7 +86,9 @@ settings OFF and failing, one in the environment OFF and not failing), the CLI a
 UNVERIFIED: whether Antigravity's background updater, installed through mise, replaces the binary mise
 runs; whether Codex's startup check installs or only reports (Orca's code says its "Update now" choice
 "installs and exits"; OpenAI's docs do not say); whether `DISABLE_AUTOUPDATER=0` counts as off (the check
-counts any non-empty value).
+counts any non-empty value). (2026-11-13: the copy mise runs, still in mise's `1.5.3` install folder, was
+rewritten on 2026-11-13 and reports 1.5.8, so Antigravity's background updater or the daily `agy update`
+replaces it in place. Which of the two did it is still UNVERIFIED.)
 
 Applied on 2026-11-11, at the owner's request, from the main checkout at commit 229110a, together with ADR
 0059's settings: `scripts/bootstrap --user-config` set the `latest` channel and `scripts/bootstrap

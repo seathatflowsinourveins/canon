@@ -14,6 +14,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 import tomllib
 from dataclasses import asdict
@@ -977,6 +978,9 @@ def test_the_records_folder_is_refused_on_macos_when_getconf_does_not_give_it(
     """On macOS the records go to the per-user folder `getconf DARWIN_USER_TEMP_DIR` names, whatever
     `$TMPDIR` says; one `getconf` does not give is refused by name, not swapped for `$TMPDIR`'s, where the
     gap marker and `scripts/automation status` would not look. Sweep reading by DeepSeek Harness."""
+    monkeypatch.delenv(
+        session_window.PAPER_DIR_ENV
+    )  # the suite's own folder; read the lookup itself
     monkeypatch.setattr(session_window.sys, "platform", "darwin")
     monkeypatch.setenv("TMPDIR", str(tmp_path))
     session_window.tempfile.tempdir = None  # `gettempdir` caches; read `$TMPDIR` again
@@ -988,9 +992,44 @@ def test_the_records_folder_is_refused_on_macos_when_getconf_does_not_give_it(
         session_window.tempfile.tempdir = None
 
 
+def _real_paper_records() -> Path:
+    """The real per-user records folder, read the way the runner and `scripts/automation` find it,
+    without `session_window`."""
+    if sys.platform != "darwin":
+        return Path(tempfile.gettempdir()) / "canon-paper-session"
+    found = subprocess.run(
+        ["/usr/bin/getconf", "DARWIN_USER_TEMP_DIR"], capture_output=True, text=True, check=True
+    ).stdout.strip()
+    return Path(found) / "canon-paper-session"
+
+
+def test_no_test_resolves_the_real_paper_records_folder() -> None:
+    """With nothing set by the test, the records folder a window would default to is the suite's own,
+    not the real one: a test that forgets `--log-dir` cannot write the real heartbeat or record."""
+    assert os.environ.get(session_window.PAPER_DIR_ENV), (
+        "the suite's guard sets no folder of its own"
+    )
+    real = _real_paper_records().resolve()
+    used = session_window.default_log_dir().resolve()
+    assert used != real and real not in used.parents, used
+    args = session_window._args(["--session", "extended", "--mover"])
+    assert args.log_dir.resolve() != real and real not in args.log_dir.resolve().parents
+
+
+def test_the_records_folder_is_the_one_the_status_reader_is_given(monkeypatch, tmp_path) -> None:
+    """`CANON_PAPER_SESSION_DIR`, which `scripts/automation status` reads for the records folder, names
+    the folder a window writes in too; a relative one is refused by name."""
+    monkeypatch.setenv(session_window.PAPER_DIR_ENV, str(tmp_path / "records"))
+    assert session_window.default_log_dir() == tmp_path / "records"
+    monkeypatch.setenv(session_window.PAPER_DIR_ENV, "relative/records")
+    with pytest.raises(RuntimeError, match=session_window.PAPER_DIR_ENV):
+        session_window.default_log_dir()
+
+
 def test_elsewhere_than_macos_the_records_folder_is_the_systems_temporary_one(
     monkeypatch, tmp_path
 ) -> None:
+    monkeypatch.delenv(session_window.PAPER_DIR_ENV)
     monkeypatch.setattr(session_window.sys, "platform", "linux")
     monkeypatch.setenv("TMPDIR", str(tmp_path))
     session_window.tempfile.tempdir = None
@@ -1021,6 +1060,7 @@ def test_a_run_whose_records_folder_cannot_be_found_says_so_and_exits_1(
     monkeypatch, tmp_path, capsys
 ) -> None:
     """Refused before anything reads Alpaca or writes a record."""
+    monkeypatch.delenv(session_window.PAPER_DIR_ENV)
     monkeypatch.setattr(session_window.sys, "platform", "darwin")
     monkeypatch.setenv("TMPDIR", str(tmp_path))
     monkeypatch.setenv(session_window.COMMIT_ENV, "test")
@@ -7635,15 +7675,17 @@ def test_a_refused_mover_window_record_names_its_arm(
 def test_a_profile_flag_is_a_named_trail_and_not_the_default_arm(flags, named, tmp_path) -> None:
     """/code-review high on F-1 rebased onto the ported profile, finding 2, and the Codex range-diff
     reader's P1: a Mover window that named only a profile flag ran OWN1 labelled the default, the
-    named row dropped unsaid, where before it ran the fixed rows. A profile flag given, at its row or
-    away from it, is a named trail: the default arm is not taken, and without Mover the flag is
-    refused like any other trail flag."""
+    named row dropped unsaid. A profile flag given, at its row or away from it, opts out of the
+    default arm; without profile mode it is refused by name, as P9 requires."""
     args = session_window._args(
         ["--session", "extended", "--mover", *flags, "--log-dir", str(tmp_path)]
     )
     assert named in session_window._trail_flags_given(args)
     trail = session_window._mover_trail(args)
     assert (trail["arm"], trail["arm_default"], trail["trail_mode"]) == (None, False, "fixed")
+    args.strategy = "Mover"  # the extended --mover part selected by _main
+    with pytest.raises(ValueError, match=named.split()[0]):
+        session_window.window_config(args, "extended")
     with pytest.raises(SystemExit):
         session_window._args(["--session", "regular", *flags, "--log-dir", str(tmp_path)])
 
@@ -11238,7 +11280,8 @@ def test_main_records_window_signalled_in_latest_and_heartbeat_before_and_during
     latest = json.loads((rec_dir / "latest.json").read_text())
     heartbeat = json.loads((rec_dir / "last-firing.json").read_text())
     assert latest["result"] == "failed: WindowSignalled: stopped by SIGTERM"
-    assert heartbeat["outcome"] == "failed: WindowSignalled: stopped by SIGTERM"
+    # the arm follows the stop (ADR 0106's follow-up)
+    assert heartbeat["outcome"].startswith("failed: WindowSignalled: stopped by SIGTERM")
 
     sub = tmp_path / "during-node"
     sub.mkdir()
@@ -11265,7 +11308,7 @@ def test_main_records_window_signalled_in_latest_and_heartbeat_before_and_during
     code2 = session_window.main(["--session", "regular", "--log-dir", str(sub)])
     assert code2 == 128 + signal_module.SIGTERM
     heartbeat2 = json.loads((sub_rec / "last-firing.json").read_text())
-    assert heartbeat2["outcome"] == "failed: WindowSignalled: stopped by SIGTERM"
+    assert heartbeat2["outcome"].startswith("failed: WindowSignalled: stopped by SIGTERM")
     # the record is the final one, not the handler's stopping mark (review of the #323 fixes, finding 10)
     latest2 = json.loads((sub_rec / "latest.json").read_text())
     assert latest2["result"].startswith("failed: WindowSignalled")
