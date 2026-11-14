@@ -1075,46 +1075,60 @@ class OwnerProtector(Strategy):
         for instrument_id in sorted(instruments, key=str):
             if instrument_id in self.slots or instrument_id in self.stopped_instruments:
                 continue
-            position = self._external_long(instrument_id)
-            if position is None:
-                continue
-            kept = self.kept_at.get(instrument_id)
-            if (
-                kept is not None
-                and instrument_id in self.levels
-                and instrument_id not in self.kept_passed
-            ):
-                # U-e B: decided once, by the venue's fills, not by ts_opened (the reconciliation
-                # clock at the pin; see the module header).
-                self.kept_passed.add(instrument_id)
-                try:
-                    bought = bought_since(self.settings.trading, instrument_id.symbol.value, kept)
-                    reason = (
-                        None
-                        if bought == 0
-                        else f"a buy of {bought} filled after it was kept, so it is a new holding"
-                    )
-                except Exception as exc:  # noqa: BLE001 - an unread venue never binds a level.
-                    reason = f"venue orders unread ({type(exc).__name__}: {exc})"
-                if reason is None:
-                    # P11: held all along and reconciled late; the kept level arms it now.
-                    self.adopt_holding(instrument_id, self.levels[instrument_id])
-                    continue
+            try:
+                self._discover_holding(instrument_id)
+            except Exception as exc:  # noqa: BLE001 - one holding never costs another discovery.
+                # Codex's P1-b on 62941f39: at the start, a raise here failed on_start, so no other
+                # holding was found and the timer never ran (strategy.rs:1122-1126 at the pin).
+                # A slot made before the raise is kept, so the step manages it and no second sell
+                # is ever made for it; with none, the next step's discovery tries again.
                 self._say(
-                    f"{instrument_id}: kept level {self.levels[instrument_id]} not applied: "
-                    f"{reason}; self-arming"
+                    f"{instrument_id}: ALERT: unprotected: discovery failed: "
+                    f"{type(exc).__name__}: {exc}; tried again at the next step"
                 )
-            if not self._overnight_allowed(instrument_id):
-                continue
-            if self.refused.get(instrument_id) == (position.ts_opened, position.ts_init):
-                # The holding whose supplied level was refused is not re-armed from the row.
-                self._name_refused(instrument_id, "its supplied level was refused")
-                continue
-            self.refused.pop(instrument_id, None)
-            self.slots[instrument_id] = self._new_holding(instrument_id, position)
-            self._subscribe_holding(instrument_id)
-            self._request_seed(instrument_id)
-            self._manage(instrument_id)
+
+    def _discover_holding(self, instrument_id: InstrumentId) -> None:
+        """One holding's discovery: the kept level's venue check, eligibility, then its slot."""
+        position = self._external_long(instrument_id)
+        if position is None:
+            return
+        kept = self.kept_at.get(instrument_id)
+        if (
+            kept is not None
+            and instrument_id in self.levels
+            and instrument_id not in self.kept_passed
+        ):
+            # U-e B: decided once, by the venue's fills, not by ts_opened (the reconciliation
+            # clock at the pin; see the module header).
+            self.kept_passed.add(instrument_id)
+            try:
+                bought = bought_since(self.settings.trading, instrument_id.symbol.value, kept)
+                reason = (
+                    None
+                    if bought == 0
+                    else f"a buy of {bought} filled after it was kept, so it is a new holding"
+                )
+            except Exception as exc:  # noqa: BLE001 - an unread venue never binds a level.
+                reason = f"venue orders unread ({type(exc).__name__}: {exc})"
+            if reason is None:
+                # P11: held all along and reconciled late; the kept level arms it now.
+                self.adopt_holding(instrument_id, self.levels[instrument_id])
+                return
+            self._say(
+                f"{instrument_id}: kept level {self.levels[instrument_id]} not applied: "
+                f"{reason}; self-arming"
+            )
+        if not self._overnight_allowed(instrument_id):
+            return
+        if self.refused.get(instrument_id) == (position.ts_opened, position.ts_init):
+            # The holding whose supplied level was refused is not re-armed from the row.
+            self._name_refused(instrument_id, "its supplied level was refused")
+            return
+        self.refused.pop(instrument_id, None)
+        self.slots[instrument_id] = self._new_holding(instrument_id, position)
+        self._subscribe_holding(instrument_id)
+        self._request_seed(instrument_id)
+        self._manage(instrument_id)
 
     def on_start(self) -> None:
         if self.started_once:

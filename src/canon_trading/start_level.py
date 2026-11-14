@@ -153,9 +153,14 @@ def _text(value: Any, name: str) -> str:
     return value
 
 
+NS_MAX = 2**63 - 1
+"""The greatest nanosecond stamp a book entry may carry, the int64 range Nautilus stamps fit
+(UnixNanos); a larger one overflows `_moment`'s datetime (Codex's P1-b on 62941f39)."""
+
+
 def _ns(value: Any, name: str) -> int:
-    if type(value) is not int or value < 0:
-        raise ValueError(f"{name} must be nonnegative integer nanoseconds")
+    if type(value) is not int or not 0 <= value <= NS_MAX:
+        raise ValueError(f"{name} must be integer nanoseconds from 0 to {NS_MAX}")
     return value
 
 
@@ -256,7 +261,7 @@ class LevelBook:
                     if isinstance(row, dict)
                     else "unknown holding"
                 )
-                report(f"{label}: previous level unavailable: entry {index}: {exc}")
+                report(f"{label}: ALERT: previous level unavailable: entry {index}: {exc}")
         return entries
 
     @staticmethod

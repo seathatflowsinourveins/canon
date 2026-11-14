@@ -12,10 +12,12 @@ from typing import cast
 import pytest
 from nautilus_trader.model import InstrumentId
 
+from canon_trading.owner_protector import STEP_TIMER
 from tests.test_owner_protector import AAA
 from tests.test_owner_protector import SECOND
 from tests.test_owner_protector import T0
 from tests.test_owner_protector import Harness
+from tests.test_owner_protector import position
 from tests.test_owner_protector import quote
 
 BBB = InstrumentId.from_str("BBB.ALPACA")
@@ -95,3 +97,31 @@ def test_a_second_start_of_the_same_protector_is_refused_by_name() -> None:
 def alpaca_stream_lock() -> None:
     """Synthetic only, as the sibling owner-protector files: never inspect a credential environment
     or a paper lock (tests/conftest.py's autouse fixture reads the key variables)."""
+
+
+def test_one_holding_whose_discovery_raises_leaves_the_others_found_and_the_timer_set(
+    monkeypatch,
+):
+    """Codex's P1-b on 62941f39, by any route: discovery at the start had no per-holding boundary,
+    so one holding's raise failed on_start, no other holding was found and no timer was set."""
+    strategy = Harness()
+    second = position()
+    second.instrument_id = BBB
+    strategy.cached.held.append(second)
+    allowed = strategy._overnight_allowed
+
+    def broken(instrument_id: InstrumentId) -> bool:
+        if instrument_id == AAA:
+            raise OverflowError("Python int too large to convert to C int")
+        return allowed(instrument_id)
+
+    monkeypatch.setattr(strategy, "_overnight_allowed", broken)
+    strategy.on_start()
+    assert BBB in strategy.slots and AAA not in strategy.slots
+    assert f"{AAA}: ALERT: unprotected: discovery failed: OverflowError: " in "\n".join(
+        strategy.said
+    )
+    assert STEP_TIMER in strategy.clock.timer_names(), "the start set no step timer"
+    monkeypatch.setattr(strategy, "_overnight_allowed", allowed)
+    strategy._on_step(cast(Any, SimpleNamespace(ts_event=strategy.clock.timestamp_ns())))
+    assert AAA in strategy.slots, "the next step's discovery tries the holding again"

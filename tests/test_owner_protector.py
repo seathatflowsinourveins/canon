@@ -3342,3 +3342,39 @@ def test_each_start_names_the_level_book_state_for_its_account(tmp_path: Path) -
     bare = Harness()
     bare.on_start()
     assert any(note.startswith("level book disabled") for note in bare.said), bare.said
+
+
+def test_one_bad_book_clock_does_not_abort_other_holdings(tmp_path):
+    """Codex's P1-b on 62941f39 (its drop-in, verbatim but for the book's making): one entry's
+    stamp past the nanosecond range. The writer now refuses such a stamp itself, so the bad entry
+    is written to disk as a damaged or hand-edited book would hold it."""
+    path = tmp_path / "levels.json"
+    LevelBook.write(
+        path,
+        {
+            ("shape", AAA): start_level_entry(
+                Decimal("1.10"),
+                T0,
+                Decimal(10),
+                T0,
+                "bad-clock",
+                distance=Decimal("0.04"),
+            )
+        },
+    )
+    book = json.loads(path.read_text())
+    book["entries"][0]["written_ns"] = 10**30
+    path.write_text(json.dumps(book))
+    strategy = restart_harness(path)
+    strategy.cached.latest = None
+    second = position()
+    second.instrument_id = BBB
+    strategy.cached.held.append(second)
+    strategy.on_start()
+    assert BBB in strategy.slots
+    # The lead's property (2026-11-13 20:31): the bad entry costs its own holding only, named
+    # with an ALERT; that holding is found and armed cold like any long with no entry.
+    assert AAA in strategy.slots
+    assert any(
+        line.startswith(f"{AAA}: ALERT: previous level unavailable") for line in strategy.said
+    ), strategy.said
