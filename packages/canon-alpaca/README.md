@@ -285,7 +285,8 @@ Each is stated where it is implemented, with its source.
   A latest snapshot uses `request_quotes(id, limit=1, params={"feed": feed, "latest": True,
   "skip_catalog_data": True, "update_catalog": False})` on a named non-IEX feed matching the
   established live stream, returns at most one receipt-stamped quote without catalog reads or writes,
-  and makes one SDK call in the historical executor (alpaca-py may retry 429/504 three times, 3 s apart).
+  and makes one SDK call under the client's historical lock (alpaca-py may retry 429/504 three times,
+  3 s apart). Its sizes are in shares, not the stream's round lots (ADR 0066's amendment of 2026-11-13).
 * **Historical bars:** `LAST`, `EXTERNAL`, MINUTE, HOUR, DAY or WEEK (DAY and WEEK at step 1 only);
   stamped at the open by Alpaca, so `ts_event` is the open and `ts_init = ts_event + interval`, per
   NautilusTrader's bar execution-simulation convention, where `interval` is the bar's fixed length:

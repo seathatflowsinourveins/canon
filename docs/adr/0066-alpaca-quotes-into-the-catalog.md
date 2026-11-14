@@ -242,10 +242,11 @@ The request is `request_quotes(id, limit=1, params={"feed": <feed>, "latest": Tr
 "skip_catalog_data": True, "update_catalog": False})`, with `limit` 1 or absent, for one instrument. It
 sends one call to alpaca-py's `get_stock_latest_quote`, which reads `/v2/stocks/quotes/latest`. It answers
 0 or 1 quote, stamped as a stream quote is: Alpaca's timestamp as `ts_event`, and the node's clock at
-receipt as `ts_init`. The feed must be named and equal the client's live stream feed, so a request before
-the stream has started is refused, IEX is refused, and a seed never mixes feeds with the quotes it is
-compared against. Each refusal and each failed call completes the request through `request_failed` with
-its reason, and none raises into the node. History requests without `latest` are unchanged: IEX only,
+receipt as `ts_init`. The feed must be named and equal the client's live stream feed, so a seed never
+mixes feeds with the quotes it is compared against, and a request before the stream exists is refused.
+IEX is refused separately, even when the stream reads IEX. Each refusal and each failed SDK call
+completes the request through `request_failed` with its reason; no refusal or SDK failure raises into the
+node. History requests without `latest` are unchanged: IEX only,
 and written back as above.
 
 The request sets `skip_catalog_data` and `update_catalog: False`, and the adapter answers it with no
@@ -254,13 +255,27 @@ quotes. It also trims each answer by `ts_init`, which would drop a quote stamped
 
 Named limit: "one call" is one alpaca-py call. On a 429 or 504, alpaca-py retries inside that call up to 3
 times, 3 s apart. Its `retry_attempts` cannot be set to 0, and nothing here patches it. One seed can
-therefore make up to four HTTP requests and hold the historical lock for about 9 s. ADR 0093's pacing
-counts them. The call runs in the historical executor, so the node's loop is not blocked while it waits.
+therefore make up to four HTTP requests and hold the client's historical lock for at least 9 s of waits
+plus the four requests, each bounded by the (3.05, 27) s HTTP timeout. The adapter's request counter
+counts each attempt; no pace applies to this call. The call runs in the loop's default executor under
+the historical lock, so the node's loop is not blocked while it waits.
+
+Further named limits, none of which this record decides for a strategy:
+
+* The seed's sizes are in shares, as the REST quote references give them, while the stream's are in
+  round lots (this record's size evidence, 2026-11-11). Only the stamps are a stream quote's.
+* A seed waits behind any history request already holding the historical lock, so its answer can come
+  later than the call's own bound.
+* The stream check is that the client has started a stream on that feed. A stream that has since gone
+  mute or ended still gets a seed answered, and nothing follows it.
+* A seed is answered even when a newer stream quote has arrived while it waited; see the next
+  paragraph.
 
 This does not change the IEX-only rule for history. The catalog keys a quote by instrument, not by feed,
 and the latest quote is never written to it.
 
-NautilusTrader writes a response's quotes into the cache before the strategy sees them. So a seed that
+NautilusTrader writes a response's quotes into the cache before the strategy sees them
+(`crates/data/src/engine/mod.rs:1946-1952`). So a seed that
 arrives after a newer stream quote becomes the cache's latest quote, whatever its stamp. What a strategy
 does with that is the strategy's own record, not this adapter's.
 
@@ -317,14 +332,13 @@ Read 2026-11-10. Fetched means read as raw text; run means executed here.
   the paper test now has the HTTP timeout and reports a refusal's status; requests an hour long for
   memory; a load in pieces under `paper:test`'s deadline; the page rate stated unambiguously.
 * Amendment 2026-11-13, read that day: https://docs.alpaca.markets/us/reference/stocklatestquotes-1.md
-  (`/v2/stocks/quotes/latest`) and https://docs.alpaca.markets/us/reference/stocklatestquotesingle-1.md
-  (`feed`: `delayed_sip`, `iex`, `otc`, `sip`, `boats`, `overnight`; the default is `sip` with the
-  unlimited subscription, otherwise `iex`), fetched. alpaca-py at its pin (c42add7c0a70):
+  (`/v2/stocks/quotes/latest`; `feed`: `delayed_sip`, `iex`, `otc`, `sip`, `boats`, `overnight`; the
+  default is `sip` with the unlimited subscription, otherwise `iex`), fetched. alpaca-py at its pin (c42add7c0a70):
   `alpaca/data/historical/stock.py:163-182` (`get_stock_latest_quote(StockLatestQuoteRequest)` reads
   `/stocks/quotes/latest` and returns `Dict[str, Quote]`), `alpaca/common/constants.py:11-13` and
-  `alpaca/common/rest.py:72-83` (3 retries, 3 s apart, on 429 and 504; a retry count of 0 is not
-  taken), bundled (`scripts/canon src alpaca-py`). NautilusTrader at d53849b216e2:
-  `crates/data/src/engine/mod.rs:1965-1972`, `dispatch.rs:387-390` and
+  `alpaca/common/rest.py:72-83`, `:127-135` and `:204-205` (3 retries, 3 s apart, on 429 and 504; a
+  retry count of 0 is not taken), `providers.py:321` here (the (3.05, 27) s timeout), bundled (`scripts/canon src alpaca-py`). NautilusTrader at d53849b216e2:
+  `crates/data/src/engine/mod.rs:1946-1952`, `:1965-1972`, `dispatch.rs:387-390` and
   `crates/common/src/cache/mod.rs:2379-2402` (a quotes response is added to the cache before it is
   dispatched); `crates/common/src/python/response.rs:409` (delivered to `on_historical_quotes`);
   `crates/live/src/python/client/mod.rs:504-527` and `crates/data/src/engine/mod.rs:1827-1844`
