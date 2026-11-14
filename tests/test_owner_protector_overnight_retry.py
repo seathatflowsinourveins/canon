@@ -7,6 +7,7 @@ Contract: OwnerProtector discovery and start_level.overnight_answer's unread res
 
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from typing import cast
@@ -15,6 +16,7 @@ import pytest
 from nautilus_trader.model import InstrumentId
 from nautilus_trader.model import Price
 
+from canon_trading import symbol_hold
 from tests.test_owner_protector import AAA
 from tests.test_owner_protector import BBB
 from tests.test_owner_protector import SECOND
@@ -205,3 +207,27 @@ def test_a_supplied_level_never_binds_the_next_holding_after_an_unread_read() ->
     step(strategy, reader.reads[-1][2] + 60 * SECOND)
     assert strategy.slots[AAA].level != Price.from_str("9.90")
     assert any("supplied level 9.90 not applied" in note for note in strategy.said), strategy.said
+
+
+def test_a_held_symbol_takes_its_supplied_level_at_the_retry_and_is_not_armed(
+    tmp_path: Path,
+) -> None:
+    """F7 meets #461's hold: a held symbol whose first read was unread takes its supplied level
+    when the retry answers, and stays unarmed: no order of ours, and the hold is said."""
+    symbol_hold.write_hold(tmp_path, "AAA")
+    strategy = Harness(session_part="overnight", symbol_holds_dir=tmp_path)
+    reader = SlowAssets(strategy)
+    strategy.settings.trading = reader
+    strategy.levels[AAA] = Price.from_str("9.90")
+    strategy.on_start()
+    assert AAA in strategy.held and not strategy.slots
+    reader.answers["/assets/AAA"] = {"overnight_tradable": True}
+    retry = reader.reads[-1][2] + 60 * SECOND
+    step(strategy, retry)
+    for n in range(1, 4):
+        at = retry + n * SECOND
+        strategy.observe("10.00", at)
+        step(strategy, at)
+    assert strategy.slots[AAA].level == Price.from_str("9.90"), strategy.said
+    assert [o for o in strategy.sent if o.instrument_id == AAA] == [], "a held symbol is not armed"
+    assert any(f"{AAA}: {symbol_hold.HELD}" in line for line in strategy.said), strategy.said

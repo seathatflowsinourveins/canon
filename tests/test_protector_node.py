@@ -506,6 +506,8 @@ def test_cli_requires_row_and_controls_and_refuses_iex(controls, capsys):
         str(controls[0]),
         "--inbox",
         str(controls[1]),
+        "--symbol-holds-dir",
+        str(controls[0]),
     ]
     args = module.parse_args(argv)
     assert args.levels == {} and args.row == "OWN1"
@@ -932,7 +934,7 @@ def test_lock_wait_is_bounded(controls, value):
     with pytest.raises(SystemExit):
         subject().parse_args(
             ["windows", "--row", "OWN1", "--holds-dir", str(controls[0]), "--inbox"]
-            + [str(controls[1]), "--lock-wait", value]
+            + [str(controls[1]), "--symbol-holds-dir", str(controls[0]), "--lock-wait", value]
         )
 
 
@@ -945,6 +947,8 @@ def test_lock_wait_defaults_to_none_and_parses(controls):
         str(controls[0]),
         "--inbox",
         str(controls[1]),
+        "--symbol-holds-dir",
+        str(controls[0]),
     ]
     assert subject().parse_args(base).lock_wait == 0
     assert subject().parse_args([*base, "--lock-wait", "90"]).lock_wait == 90
@@ -1184,7 +1188,7 @@ def test_this_trees_protector_reads_the_book():
     assert subject()._protector_takes_book() is True
 
 
-@pytest.mark.parametrize("text", [None, "not json", '{"schema": 3, "entries": []}'])
+@pytest.mark.parametrize("text", [None, "not json", '{"schema": 4, "entries": []}'])
 def test_an_unreadable_book_refuses_the_start_by_name(controls, tmp_path, monkeypatch, text):
     module, settings, _strategy, _foreign, _reads, built = booked(monkeypatch, controls)
     book = tmp_path / "owner-levels.json"
@@ -1360,6 +1364,7 @@ def test_the_runner_accepts_the_schema_the_composed_strategy_writes(
     assert module._book_levels(path, "windows") == {AAA: Price.from_str("9.75")}
 
 
+@pytest.mark.usefixtures("new_york_regular_hours")
 def test_two_builder_segments_carry_the_level_distance_and_offset(controls, tmp_path, monkeypatch):
     """Real LiveNodes with synthetic client factories; the builder and strategy stay intact.
 
@@ -1485,9 +1490,17 @@ def test_two_builder_segments_carry_the_level_distance_and_offset(controls, tmp_
         for kind, params in requests
         if kind == "quotes"
     )
+    # DeepSeek P2-2: segment 1 reads the found holding's fills (clock, both sides, position);
+    # segment 2's same-holding verdict reads both sides and carries that reading on.
     assert [query["side"] for path, query in venue.reads if path == "/orders" and query] == [
         "sell",
         "buy",
+        "sell",
+        "buy",
+    ]
+    assert [path for path, _query in venue.reads if path in ("/clock", "/positions/AAA")] == [
+        "/clock",
+        "/positions/AAA",
     ]
 
 

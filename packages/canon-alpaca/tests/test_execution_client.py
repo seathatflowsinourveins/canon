@@ -4652,6 +4652,128 @@ def test_a_position_in_an_instrument_not_loaded_does_not_fail_startup(venue, alp
 
 
 @pytest.mark.parametrize(
+    ("qty", "side", "odd"),
+    [
+        pytest.param("5", "long", False, id="long"),
+        pytest.param("-5", "short", False, id="short-below-zero"),
+        pytest.param("5", "short", False, id="short-above-zero"),
+        pytest.param("-5", "long", True, id="below-zero-labelled-long"),
+    ],
+)
+def test_a_position_report_reads_a_short_by_its_label_or_its_sign(alpaca, qty, side, odd) -> None:
+    """Custody's one quantity rule (`custody._listed`): the quantity is read as a finite number before
+    its sign is taken off, and a position is a short by its `side` or by a quantity below zero, so a
+    short is never reported LONG. A pair that disagrees (labelled long, below zero) is reported a short
+    and named once with both fields; a short's sign is not documented, so a short shown above zero is
+    no disagreement."""
+    from alpaca.trading.models import Position as AlpacaPosition
+    from canon_alpaca.execution import position_status_report
+    from nautilus_trader.model import PositionSide
+
+    position = AlpacaPosition.model_validate(
+        {**alpaca.POSITION_AAPL, "qty": qty, "qty_available": qty, "side": side}
+    )
+    named: list[str] = []
+    report = position_status_report(position, 0, odd=named.append)
+    assert report.position_side == (
+        PositionSide.LONG if side == "long" and not odd else PositionSide.SHORT
+    )
+    assert report.quantity == Quantity.from_int(5)
+    if odd:
+        (line,) = named
+        assert "AAPL" in line and "labelled long" in line and "-5" in line, line
+    else:
+        assert named == []
+
+
+@pytest.mark.parametrize("qty", ["NaN", "Infinity", "-Infinity", "many"])
+def test_a_position_report_refuses_a_quantity_that_is_no_finite_number(alpaca, qty) -> None:
+    """What is no finite number is not known (custody's rule): it is refused by name, never read as zero
+    or as a long."""
+    from alpaca.trading.models import Position as AlpacaPosition
+    from canon_alpaca.execution import position_status_report
+
+    position = AlpacaPosition.model_validate(
+        {**alpaca.POSITION_AAPL, "qty": qty, "qty_available": None}
+    )
+    with pytest.raises(ValueError, match="AAPL position quantity"):
+        position_status_report(position, 0, odd=pytest.fail)
+
+
+@pytest.mark.parametrize(
+    "change",
+    [{"qty": "-2.5", "qty_available": "-2.5"}, {"avg_entry_price": "n/a"}],
+    ids=["fractional", "price"],
+)
+def test_a_refused_below_zero_long_is_not_named_as_reported(alpaca, change) -> None:
+    """A below-zero long that a later check refuses is not named as "reported as a short": the
+    disagreement is named only for a report that is made, and the refusal names the symbol."""
+    from alpaca.trading.models import Position as AlpacaPosition
+    from canon_alpaca.execution import position_status_report
+
+    position = AlpacaPosition.model_validate(
+        {**alpaca.POSITION_AAPL, "qty": "-5", "qty_available": "-5", "side": "long", **change}
+    )
+    with pytest.raises(ValueError, match="AAPL"):
+        position_status_report(position, 0, odd=pytest.fail)
+
+
+def test_the_client_reports_a_below_zero_position_labelled_long_as_a_short(venue, alpaca) -> None:
+    """Through the client's report: the disagreeing pair reaches NautilusTrader as a short of 5."""
+    from nautilus_trader.model import PositionSide
+
+    venue.trading.positions = [
+        {**alpaca.POSITION_AAPL, "qty": "-5", "qty_available": "-5", "side": "long"}
+    ]
+    reports: list = []
+
+    async def body(client) -> None:
+        reports.extend(
+            await client._generate_position_status_reports(SimpleNamespace(instrument_id=AAPL))
+        )
+
+    run_with_client(body)
+
+    assert [(r.instrument_id, r.position_side, r.quantity) for r in reports] == [
+        (AAPL, PositionSide.SHORT, Quantity.from_int(5))
+    ]
+
+
+def test_the_client_names_a_below_zero_long_once_however_often_it_reports(
+    venue, alpaca, monkeypatch
+) -> None:
+    """The client reports positions at start-up, at each mass status and at each position check (60 s on
+    the paper node), so the disagreeing pair is named once per symbol for the client's life, and every
+    report still carries the short."""
+    from nautilus_trader.model import PositionSide
+
+    from .test_adapter_held_report_blind import LogProbe
+
+    venue.trading.positions = []
+    sides: list = []
+    named: list[str] = []
+
+    async def body(client) -> None:
+        # The pair appears after start-up, so every warning it gets is seen here.
+        log = LogProbe(client._log)
+        monkeypatch.setattr(client, "_log", log)
+        venue.trading.positions = [
+            {**alpaca.POSITION_AAPL, "qty": "-5", "qty_available": "-5", "side": "long"}
+        ]
+        for _ in range(3):
+            reports = await client._generate_position_status_reports(
+                SimpleNamespace(instrument_id=AAPL)
+            )
+            sides.extend(r.position_side for r in reports)
+        named.extend(line for line in log.lines if "labelled long" in line)
+
+    run_with_client(body)
+
+    assert sides == [PositionSide.SHORT] * 3
+    assert len(named) == 1, named
+
+
+@pytest.mark.parametrize(
     "change",
     [{"filled_avg_price": "n/a"}, {"qty": "two"}, {"filled_qty": "1e"}],
     ids=["price", "quantity", "filled"],

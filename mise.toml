@@ -902,7 +902,7 @@ exec /usr/bin/timeout -s KILL 300 uv run --locked python -c 'from canon_trading.
 [tasks."paper:exit-monitor"]
 description = "Write one paper account's exit status, record and alert outbox (GET only; no orders)"
 shell = "bash -c"
-timeout = "2m"
+timeout = "3m"  # keychain 2 x 10 s, the pass 50 s, the carrier 30 + 5 s, with room; its lock goes stale at 3 min
 usage = '''
 arg "<account>" help="tests: account A; windows: account B; C has no standing authorization" {
   choices "tests" "windows"
@@ -920,7 +920,13 @@ if [ -z "$ALPACA_API_KEY" ] || [ -z "$ALPACA_SECRET_KEY" ]; then
   unset ALPACA_API_KEY ALPACA_SECRET_KEY
 fi
 export ALPACA_API_KEY ALPACA_SECRET_KEY CANON_PAPER_ACCOUNT="$usage_account" CANON_ALPACA_DATA_ONLY=1
-exec /usr/bin/timeout -s KILL 50 uv run --locked python -m canon_trading.exit_monitor "$label"
+pass_rc=0
+/usr/bin/timeout -s KILL 50 uv run --locked python -m canon_trading.exit_monitor "$label" || pass_rc=$?
+unset ALPACA_API_KEY ALPACA_SECRET_KEY
+if ! "$MISE_PROJECT_ROOT/scripts/exit-monitor-notify" "$label"; then
+  echo "paper:exit-monitor: carrier failed for account $label" >&2
+fi
+exit "$pass_rc"
 '''
 
 [tasks."paper:close"]
@@ -979,6 +985,9 @@ exec /usr/bin/timeout -s TERM -k 30 600 uv run --locked python -c 'from canon_tr
 # lineage and nothing else, asks for no session, and sends no order. It reads one account's pair and takes that
 # account's lock without waiting: a lock held refuses the run, so the go it was started on is not spent later. Exit
 # 0 each long covered (or planned), 1 a read or send failed, 2 a long left uncovered by name, 3 refused by name. With
+# --only the 0 and the 2 speak of the named symbols alone (a long not named is left as found and is no failure; a
+# named symbol with no long is a 2; a position that cannot be read is an ALERT and a 2, named or not), and an
+# --only given with no symbol is refused here, never read as no list. With
 # --cancel: 0 each protect stop named ended canceled with nothing filled, or none was open; 1 a cancel or a read
 # failed, or a stop ended another way; 2 --symbol named a symbol the open listing showed no protect stop in; 3 refused.
 [tasks."paper:protect"]
@@ -995,6 +1004,7 @@ flag "--row <row>" help="the registered trail row a sending run plans on: F2 the
 }
 flag "--cancel" help="cancel the open stops of the protect lineage, and nothing else, then exit; sends no order; with --plan-only it names them and cancels nothing"
 flag "--symbol <symbol>" help="with --cancel: only this symbol's protect stops; exit 2 when it has none open"
+flag "--only <symbols>" help="send only for these comma-separated symbols, each plain capital letters and named once; plan-only still shows every long; cannot accompany --cancel or --symbol"
 '''
 run = '''
 case "${usage_account:-}" in
@@ -1006,6 +1016,11 @@ case "${usage_account:-}" in
   protect) svc=canon-alpaca-paper-protect; lock=canon-paper-protect.lock ;;
   *) echo "paper:protect: no paper account named '${usage_account:-}'; the names are tests and protect; nothing was read" >&2; exit 3 ;;
 esac
+# An --only that was passed and is empty (a variable that expanded to nothing) would reach the module as the
+# same empty text an absent flag does, and so as a send for every long: refused here, before any pair is read.
+if [ -n "${usage_only+passed}" ] && [ -z "${usage_only}" ]; then
+  echo "paper:protect: refused: --only was given with no symbol; nothing was read or sent" >&2; exit 3
+fi
 ALPACA_API_KEY="$(/usr/bin/timeout 30 /usr/bin/security find-generic-password -s "$svc" -a ALPACA_API_KEY -w)" || ALPACA_API_KEY=""
 ALPACA_SECRET_KEY="$(/usr/bin/timeout 30 /usr/bin/security find-generic-password -s "$svc" -a ALPACA_SECRET_KEY -w)" || ALPACA_SECRET_KEY=""
 [ -n "$ALPACA_API_KEY" ] && [ -n "$ALPACA_SECRET_KEY" ] || { echo "paper:protect: account ${usage_account}'s pair is not in the login keychain (mise run paper:check ${usage_account}); nothing was read" >&2; exit 1; }
@@ -1020,7 +1035,7 @@ case "$held" in
   *) echo "paper:protect: account ${usage_account}'s lock could not be taken (lockf exit $held); nothing was sent" >&2; exit 1 ;;
 esac
 echo "account: $usage_account"
-exec /usr/bin/timeout -s TERM -k 30 300 uv run --locked python -c 'import sys; from canon_trading.protect import task_from_flags; raise SystemExit(task_from_flags(*sys.argv[1:5]))' "${usage_plan_only:-false}" "${usage_row:-}" "${usage_cancel:-false}" "${usage_symbol:-}"
+exec /usr/bin/timeout -s TERM -k 30 300 uv run --locked python -c 'import sys; from canon_trading.protect import task_from_flags; raise SystemExit(task_from_flags(*sys.argv[1:6]))' "${usage_plan_only:-false}" "${usage_row:-}" "${usage_cancel:-false}" "${usage_symbol:-}" "${usage_only:-}"
 '''
 
 # Contract: ADR 0146's carrying node, ADR 0142's named row and C's lead go, ADR 0069's account/stream
@@ -1049,6 +1064,7 @@ flag "--minutes <minutes>" help="1-960, default 30; shortened to the current fee
 flag "--feed <feed>" help="sip or boats; otherwise selected from Alpaca's clock/calendar; IEX refused"
 flag "--holds-dir <holds_dir>" required=#true help="absolute holds folder; any entry refuses the start"
 flag "--inbox <inbox>" required=#true help="absolute inbox file or folder; unread or nonempty refuses the start"
+flag "--symbol-holds-dir <symbol_holds_dir>" help="absolute folder of the owner's per-symbol holds (paper:hold-symbol), default this account's protector instance's; read at the start (never made: none held; unreadable: refused) and at every step; a held symbol is not armed and only our own sell of it is canceled"
 flag "--lead-go <lead_go>" help="on C: carry the lead's start instruction exactly as 'protect OWN1' or 'protect OWN3'"
 flag "--lock-wait <lock_wait>" help="0-300, default 0: wait this long for the account's locks, then refuse (the protector runner's successor)"
 '''
@@ -1075,6 +1091,7 @@ ALPACA_SECRET_KEY="$(/usr/bin/timeout 30 /usr/bin/security find-generic-password
 [ -n "$ALPACA_API_KEY" ] && [ -n "$ALPACA_SECRET_KEY" ] || { echo "paper:protector: the named account's pair is not in the login keychain; nothing was sent" >&2; exit 1; }
 export ALPACA_API_KEY ALPACA_SECRET_KEY CANON_PAPER_ACCOUNT="$usage_account"
 args=("$usage_account" --row "$usage_row" --holds-dir "$usage_holds_dir" --inbox "$usage_inbox")
+[ -z "${usage_symbol_holds_dir:-}" ] || args+=(--symbol-holds-dir "$usage_symbol_holds_dir")
 [ -z "${usage_levels:-}" ] || args+=(--levels "$usage_levels")
 [ -z "${usage_minutes:-}" ] || args+=(--minutes "$usage_minutes")
 [ -z "${usage_feed:-}" ] || args+=(--feed "$usage_feed")
@@ -1085,6 +1102,25 @@ args=("$usage_account" --row "$usage_row" --holds-dir "$usage_holds_dir" --inbox
 # clock/stop bounds. Nothing invokes the session window's flattening step.
 exec /usr/bin/timeout -s TERM -k 785 58800 uv run --locked python -m canon_trading.protector_node "${args[@]}"
 '''
+
+# The owner's word for one symbol (src/canon_trading/symbol_hold.py): one file named for the symbol in the
+# protector instance's symbol-holds/ folder, beside holds/ and inbox/, whose any entry stops the whole node.
+# `on` writes it, `off` removes it, and nothing else: no credential, account, order or node is read or
+# touched. A running protector reads it at every step: a new hold cancels only our own sell of that symbol
+# within one step and sells nothing; removing it re-arms the symbol at its level, never lowered. On C
+# (protect) the word is the owner's alone: no lane, coordinator or automation runs this task there.
+[tasks."paper:hold-symbol"]
+description = "Write (on) or remove (off) the owner's hold on one symbol for one protector instance; on protect (C) the word is the owner's alone and no lane runs it there; reads no credential and sends nothing"
+usage = '''
+arg "<account>" help="the protector instance: tests (A), windows (B) or protect (C, the owner's alone)" {
+  choices "tests" "windows" "protect"
+}
+arg "<symbol>" help="the symbol as the account lists it, for example ABC; a '/' is refused"
+arg "<action>" help="on writes the hold; off removes it" {
+  choices "on" "off"
+}
+'''
+run = 'uv run --locked python -m canon_trading.symbol_hold "$usage_account" "$usage_symbol" "$usage_action"'
 
 # The nightly study (docs/adr/0089-the-nightly-study-loop.md): one firing of canon_trading.nightly_study in
 # this checkout, which studies the latest recorded night once and does nothing when there is none: the

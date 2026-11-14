@@ -160,6 +160,8 @@ def test_lock_wait_reaches_the_task_arguments(controls: tuple[Path, Path]) -> No
             str(controls[0]),
             "--inbox",
             str(controls[1]),
+            "--symbol-holds-dir",
+            str(controls[0]),
             "--lock-wait",
             "30",
         ]

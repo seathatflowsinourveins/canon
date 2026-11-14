@@ -690,7 +690,10 @@ def test_measure1_a_sale_the_lock_protected_records_its_result_and_spread() -> N
     released = cast(
         Any,
         SimpleNamespace(
-            strategy_id=PROTECTOR, client_order_id=sale.client_order_id, instrument_id=AAA
+            strategy_id=PROTECTOR,
+            client_order_id=sale.client_order_id,
+            instrument_id=AAA,
+            ts_event=T0 + 2 * SECOND,
         ),
     )
     strategy.observe("10.04", T0 + 2 * SECOND)
