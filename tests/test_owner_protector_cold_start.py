@@ -541,8 +541,11 @@ def test_a_seed_from_before_this_part_waits_named(now, feed, stamp) -> None:
     assert not strategy.sent
 
 
-@pytest.mark.parametrize("kind", ["quotes", "bars"])
+@pytest.mark.parametrize("kind", ["quotes"])
 def test_a_failed_seed_or_history_request_waits_named_without_retry(kind) -> None:
+    """A failed seed waits named. Its `bars` case left a holding with no level for the run; since
+    the lead's ruling on land-composed's F1 (2026-11-13 20:45) a failed bars read arms on the
+    fixed fallback instead (the next test)."""
     strategy = Cold()
     strategy.on_start()
     if kind == "bars":
@@ -883,3 +886,112 @@ def test_once_the_old_request_lands_the_present_holdings_own_seed_certifies():
     strategy.answer("quotes", [quote("10.00", AFTER_HOURS - 10 * SECOND)], index=1)
     assert strategy.slots[AAA].level is not None, strategy.said
     assert strategy.seeds_in_flight[AAA] == []
+
+
+def test_review1_a_failed_bars_read_is_not_the_end_of_protection_for_the_run():
+    """Landing lane's /code-review high finding 1: the bars request is never retried."""
+    strategy = Cold()
+    strategy.on_start()
+    strategy.seed()
+    strategy.answer("bars", [], "feed refused")
+    for n in range(1, 31):
+        strategy.step(60)
+        strategy.observe("10.00", strategy.test_clock.timestamp_ns())
+    assert strategy.slots[AAA].level is not None or len(strategy.bar_requests) > 1, strategy.said[
+        -3:
+    ]
+
+
+def test_review2_a_same_stamp_redelivery_of_a_preopening_quote_does_not_plan():
+    """Landing lane's /code-review high finding 2 (the lead's question (a))."""
+    strategy = Harness()
+    strategy.cached.latest = None
+    strategy.cached.held = []
+    strategy.on_start()
+    strategy.on_quote(quote("10.00", T0))  # held before the holding opens
+    later = position("10")
+    later.ts_opened = later.ts_init = OPENED
+    strategy.cached.held = [later]
+    strategy.test_clock.set_time(OPENED)
+    strategy._on_step(cast(Any, SimpleNamespace()))
+    assert strategy.slots[AAA].level is None
+    again = QuoteTick(
+        AAA,
+        Price.from_str("10.00"),
+        Price.from_str("10.02"),
+        Quantity.from_int(100),
+        Quantity.from_int(100),
+        T0,
+        OPENED + SECOND,
+    )
+    strategy.test_clock.set_time(OPENED + SECOND)
+    strategy.on_quote(again)
+    assert strategy.slots[AAA].level is None, [s for s in strategy.said if "receipt" in s]
+
+
+def test_a_failed_bars_read_arms_on_the_fixed_fallback_with_one_alert() -> None:
+    """The lead's ruling on land-composed's F1 (2026-11-13 20:45): a failed session-day bars read
+    never leaves a holding without a level for the run. It arms on the fallback zero bars takes,
+    named with an ALERT; the retry is the follow-up's, so there is still one bars request."""
+    strategy = Cold()
+    strategy.on_start()
+    strategy.seed()
+    strategy.answer("bars", [], "feed refused")
+    strategy.step()
+    slot = strategy.slots[AAA]
+    assert slot.level == Price.from_str(str(up_on_step(Decimal("10.00") - fixed_distance())))
+    for _ in range(3):
+        strategy.step(60)
+    alerts = said(strategy, "AAA.ALPACA: ALERT: the session day's bars read failed (feed refused)")
+    assert len(alerts) == 1, strategy.said
+    assert "fixed fallback" in alerts[0]
+    assert len(strategy.bar_requests) == 1
+    # Enforced: the quotes after the arming pass the first-observation guard and the sell is sent.
+    for n in (1, 2):
+        strategy.observe("10.00", strategy.test_clock.timestamp_ns() + n * SECOND)
+    assert strategy.sent, strategy.said[-3:]
+
+
+def test_a_same_stamp_redelivery_is_named_once_and_a_new_quote_then_plans() -> None:
+    """The lead's ruling on land-composed's F2 (2026-11-13 20:45): clause (iii) needs a quote new
+    to the node, its stamp above the maximum held when it arrived. A re-delivery of a stamp held
+    from before the opening is named once and waits; the next quote that raises the maximum,
+    received after the node knew of the holding, plans under (iii)."""
+    strategy = Harness()
+    strategy.cached.latest = None
+    strategy.cached.held = []
+    strategy.on_start()
+    strategy.on_quote(quote("10.00", T0))
+    later = position("10")
+    later.ts_opened = later.ts_init = OPENED
+    strategy.cached.held = [later]
+    strategy.test_clock.set_time(OPENED)
+    strategy._on_step(cast(Any, SimpleNamespace()))
+    for n in (1, 2):
+        again = QuoteTick(
+            AAA,
+            Price.from_str("10.00"),
+            Price.from_str("10.02"),
+            Quantity.from_int(100),
+            Quantity.from_int(100),
+            T0,
+            OPENED + n * SECOND,
+        )
+        strategy.test_clock.set_time(OPENED + n * SECOND)
+        strategy.on_quote(again)
+        strategy._on_step(cast(Any, SimpleNamespace()))
+    assert strategy.slots[AAA].level is None
+    assert len(said(strategy, "re-delivered", "plans nothing", "new quote or the seed")) == 1
+    newer = QuoteTick(
+        AAA,
+        Price.from_str("10.00"),
+        Price.from_str("10.02"),
+        Quantity.from_int(100),
+        Quantity.from_int(100),
+        T0 + SECOND,
+        OPENED + 3 * SECOND,
+    )
+    strategy.test_clock.set_time(OPENED + 3 * SECOND)
+    strategy.on_quote(newer)
+    assert strategy.slots[AAA].level is not None, strategy.said
+    assert len(said(strategy, "planned on its receipt alone")) == 1

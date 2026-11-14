@@ -3378,3 +3378,50 @@ def test_one_bad_book_clock_does_not_abort_other_holdings(tmp_path):
     assert any(
         line.startswith(f"{AAA}: ALERT: previous level unavailable") for line in strategy.said
     ), strategy.said
+
+
+def test_review4_a_row_the_book_rejects_costs_its_holding_the_carried_level_with_an_alert(
+    tmp_path,
+):
+    """Landing lane's /code-review high finding 4: the node counts a row LevelBook.read rejects
+    (a counting entry's count of 2). The lead's ruling (2026-11-13 20:45): every rejected row
+    costs that holding its carried level only, with an ALERT carrying the row's fields, and it
+    arms cold; the two parsers' disagreement is F10's follow-up."""
+    from canon_trading.protector_node import _book_levels
+
+    path = tmp_path / "levels.json"
+    row = restart_record(state="counting", count=2)
+    path.write_text(json.dumps({"schema": 2, "entries": [row]}))
+    assert _book_levels(path, "shape") == {AAA: Price.from_str("1.10")}  # the node hands 1 level
+    strategy = restart_harness(path)
+    strategy.on_start()
+    alerts = [line for line in strategy.said if line.startswith(f"{AAA}: ALERT: previous level")]
+    assert len(alerts) == 1, strategy.said
+    assert '"count": 2' in alerts[0] and '"last_level": "1.10"' in alerts[0], alerts[0]
+    assert "armed as a holding with no carried level" in alerts[0]
+    assert strategy.slots[AAA].level is not None, strategy.said
+
+
+def test_both_rows_of_a_duplicate_holding_are_named_with_an_alert(tmp_path):
+    """F4's property: no rejected row is dropped silently, the earlier of a duplicate pair too."""
+    path = tmp_path / "levels.json"
+    rows = [restart_record(), restart_record(last_level="1.20")]
+    path.write_text(json.dumps({"schema": 2, "entries": rows}))
+    notes: list[str] = []
+    assert LevelBook.read(path, report=notes.append) == {}
+    assert [note.split(":")[0] for note in notes] == [str(AAA), str(AAA)], notes
+    assert all("ALERT: previous level unavailable" in note for note in notes)
+    assert '"last_level": "1.10"' in notes[0] and '"last_level": "1.20"' in notes[1], notes
+
+
+def test_an_alert_line_is_logged_as_an_error_and_any_other_at_info():
+    """The lead's addendum on land-composed's F6 (2026-11-13 20:46): an ALERT must reach a person."""
+    logged: list[tuple[str, str]] = []
+    log = SimpleNamespace(
+        info=lambda text: logged.append(("info", text)),
+        error=lambda text: logged.append(("error", text)),
+    )
+    speaker = cast(Any, SimpleNamespace(log=log))
+    OwnerProtector._say(speaker, f"{AAA}: ALERT: our protective sell was refused by the venue")
+    OwnerProtector._say(speaker, f"{AAA}: armed distance 0.04")
+    assert [level for level, _ in logged] == ["error", "info"]

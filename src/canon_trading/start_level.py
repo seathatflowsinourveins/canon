@@ -228,8 +228,12 @@ class LevelBook:
                 or not isinstance(data.get("entries"), list)
             ):
                 raise ValueError(f"expected level book schema 1 or {SCHEMA} and an entries array")
-        except (OSError, ValueError) as exc:
+        except FileNotFoundError as exc:
             report(f"previous level book unavailable: {type(exc).__name__}: {exc}")
+            return {}
+        except (OSError, ValueError) as exc:
+            # A book that exists but cannot be read costs every carried level: never at INFO.
+            report(f"ALERT: previous level book unreadable: {type(exc).__name__}: {exc}")
             return {}
         old = data["schema"] == 1
         if old and data["entries"]:
@@ -239,6 +243,22 @@ class LevelBook:
             )
         entries: dict[Key, Entry] = {}
         duplicates: set[Key] = set()
+        first: dict[Key, tuple[int, Any]] = {}
+
+        def rejected(index: int, row: Any, why: object) -> None:
+            # The lead's ruling on land-composed's F4 (2026-11-13 20:45): every row this read
+            # rejects costs that holding its carried level only, with an ALERT carrying the row.
+            label = (
+                row.get("instrument_id", "unknown holding")
+                if isinstance(row, dict)
+                else "unknown holding"
+            )
+            fields = json.dumps(row, sort_keys=True, default=str)
+            report(
+                f"{label}: ALERT: previous level unavailable: entry {index}: {why}; "
+                f"rejected row {fields[:400]}; armed as a holding with no carried level"
+            )
+
         for index, row in enumerate(data["entries"]):
             try:
                 key, entry = _entry(row)
@@ -251,17 +271,14 @@ class LevelBook:
                         "dropped: a newer entry names the same holding"
                     )
                 if key in entries or key in duplicates:
-                    entries.pop(key, None)
+                    if entries.pop(key, None) is not None:
+                        rejected(*first[key], f"duplicate holding {key}")
                     duplicates.add(key)
                     raise ValueError(f"duplicate holding {key}")
                 entries[key] = entry
+                first[key] = (index, row)
             except (ValueError, TypeError, ArithmeticError) as exc:
-                label = (
-                    row.get("instrument_id", "unknown holding")
-                    if isinstance(row, dict)
-                    else "unknown holding"
-                )
-                report(f"{label}: ALERT: previous level unavailable: entry {index}: {exc}")
+                rejected(index, row, exc)
         return entries
 
     @staticmethod

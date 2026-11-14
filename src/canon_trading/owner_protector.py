@@ -615,7 +615,7 @@ class _StreamErrors(logging.Handler):
             self.lines.append(message)
 
 
-def _known_current(slot: Holding, tick: QuoteTick, streamed: bool) -> bool:
+def _known_current(slot: Holding, tick: QuoteTick, streamed: bool, received: int) -> bool:
     """The lead's ruling, 2026-11-13 19:23: a holding with no level plans only from a quote known
     current for it: (i) stamped at or after the holding opened, or (ii) at or after the stamp its own
     seed read, requested at or after the holding opened, made current (`current_from`); or (iii)
@@ -623,10 +623,11 @@ def _known_current(slot: Holding, tick: QuoteTick, streamed: bool) -> bool:
     of (ii): `ts_opened` is the venue's fill time for a streamed fill but the host's for a position
     reconciled at start, so (i) alone would hold a self-arm for as long as the host runs ahead).
     (iii) holds for a stream quote only (`streamed`): a seed answer's receipt is the response's, so it
-    is judged by when its read was requested, under (ii)."""
+    is judged by when its read was requested, under (ii). `received` is when the maximum's stamp
+    first reached the node, so a re-delivery of a quote held before the opening is not new."""
     return (
         tick.ts_event >= slot.opened_at
-        or (streamed and tick.ts_init >= slot.initialized_at)
+        or (streamed and received >= slot.initialized_at)
         or (slot.current_from is not None and tick.ts_event >= slot.current_from)
     )
 
@@ -661,6 +662,11 @@ class OwnerProtector(Strategy):
         self.level_book_path: Path | None = None
         self.started_once = False
         self.streamed_max: dict[InstrumentId, bool] = {}
+        # When the maximum's stamp first reached the node (host clock): clause (iii) needs a quote
+        # NEW to the node, its stamp above the maximum held when it arrived. A later arrival with
+        # an equal stamp keeps the first receipt (the lead's ruling on land-composed's F2, 20:45).
+        self.max_received_at: dict[InstrumentId, int] = {}
+        self.redelivery_named: set[tuple[InstrumentId, int]] = set()
         self.receipt_plans: dict[InstrumentId, int] = {}
         self.alerted: set[InstrumentId] = set()
         self.stream_errors = _StreamErrors()
@@ -766,8 +772,11 @@ class OwnerProtector(Strategy):
             and tick.ts_event == previous.ts_event
         ):
             self.venue_quotes[instrument_id] = tick
-        if self.venue_quotes.get(instrument_id) is tick:
+        if self.venue_quotes.get(instrument_id) is tick and (
+            previous is None or tick.ts_event > previous.ts_event
+        ):
             self.streamed_max[instrument_id] = source == "stream"  # (iii) is the stream's alone.
+            self.max_received_at[instrument_id] = tick.ts_init
         slot = self.slots.get(instrument_id)
         if slot is not None:
             if slot.first_quote is None:
@@ -801,6 +810,23 @@ class OwnerProtector(Strategy):
                 self._plan_from_maximum(instrument_id, slot)
             return
         self._manage(instrument_id, tick, advanced=advanced)
+
+    def _current_for(self, instrument_id: InstrumentId, slot: Holding, tick: QuoteTick) -> bool:
+        """The known-current rule for this instrument's maximum, naming once per opening a
+        re-delivery that is all that stands between it and clause (iii)."""
+        streamed = self.streamed_max.get(instrument_id, False)
+        received = self.max_received_at.get(instrument_id, 0)
+        if _known_current(slot, tick, streamed, received):
+            return True
+        key = (instrument_id, slot.opened_at)
+        if streamed and tick.ts_init >= slot.initialized_at and key not in self.redelivery_named:
+            self.redelivery_named.add(key)
+            self._say(
+                f"{instrument_id}: a quote stamped {tick.ts_event} re-delivered at {tick.ts_init}; "
+                f"the node held that stamp since {received}, before it knew of the holding "
+                f"({slot.initialized_at}), so it plans nothing; waiting for a new quote or the seed"
+            )
+        return False
 
     def _plan_from_maximum(self, instrument_id: InstrumentId, slot: Holding) -> None:
         tick = self.venue_quotes.get(instrument_id)
@@ -888,7 +914,12 @@ class OwnerProtector(Strategy):
             raise ValueError("OwnerProtector must never claim external orders or their instrument")
 
     def _say(self, text: str) -> None:
-        self.log.info(text)
+        # An ALERT must reach a person, so it is logged as an error, never at INFO (the lead's
+        # addendum on land-composed's F6, 2026-11-13 20:46).
+        if ": ALERT: " in text:
+            self.log.error(text)
+        else:
+            self.log.info(text)
 
     def _freeze(self, instrument_id: InstrumentId, reason: str) -> None:
         if self.frozen.get(instrument_id) != reason:
@@ -1732,7 +1763,7 @@ class OwnerProtector(Strategy):
                     raise ValueError(
                         "quote stamped before the open session part; wait for its first quote"
                     )
-                if not _known_current(slot, tick, self.streamed_max.get(instrument_id, False)):
+                if not self._current_for(instrument_id, slot, tick):
                     raise ValueError(
                         "quote stamped before the holding opened and no seed read since confirms "
                         "it; wait for its first quote"
@@ -1759,6 +1790,7 @@ class OwnerProtector(Strategy):
                 else None
             )
             bid = tick.bid_price.as_decimal()
+            bars_failed = None
             if carried is not None and carried.distance is not None:
                 distance = carried.distance
                 share = distance / bid
@@ -1771,16 +1803,18 @@ class OwnerProtector(Strategy):
                 source = f"carried from run {carried.run}"
             else:
                 # A carried distance needs no bars; a planned one waits for the day's (U-h).
-                if slot.history_error is not None:
-                    raise ValueError(f"bars failed: {slot.history_error}; wait")
-                if not slot.history_ready:
+                # A failed read is not a wait for the run: it plans on no bars, the fixed
+                # fallback that a day with none takes, named with an ALERT (the lead's ruling on
+                # land-composed's F1, 2026-11-13 20:45). Its retry is the follow-up's.
+                bars_failed = slot.history_error
+                if bars_failed is None and not slot.history_ready:
                     raise ValueError("waiting for the session day's bars answer")
                 distance, plan = protect.distance_for(
                     instrument_id.symbol.value,
                     self.settings.row,
                     bid,
                     tick.ask_price.as_decimal(),
-                    complete[-protect.ATR_BARS :],
+                    [] if bars_failed is not None else complete[-protect.ATR_BARS :],
                 )
                 plan = replace(plan, quote_age=age)
                 if carried is not None and plan.fallback:
@@ -1841,6 +1875,11 @@ class OwnerProtector(Strategy):
                 f"{instrument_id}: armed distance {distance}; {source}; "
                 f"quote age {age.total_seconds():.0f} s"
             )
+            if bars_failed is not None:
+                self._say(
+                    f"{instrument_id}: ALERT: the session day's bars read failed ({bars_failed}); "
+                    f"armed on the fixed fallback distance {distance}, which stands for this run"
+                )
         except ValueError as exc:
             self._record_unprotected(instrument_id, str(exc))
             return False
@@ -1955,7 +1994,7 @@ class OwnerProtector(Strategy):
             return
         if tick is None or (
             slot.level is None
-            and not _known_current(slot, tick, self.streamed_max.get(instrument_id, False))
+            and not self._current_for(instrument_id, slot, tick)
             and instrument_id in self.quote_refusals
         ):
             # No quote, or none known current while every newer one is refused: the refusal is
