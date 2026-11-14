@@ -19,14 +19,17 @@ What is measured, on a long of one share opened by a plain order of foreign line
 
 For each change, the first read after Alpaca answers the submit or the cancel is printed with its time,
 then the seconds until the figure shows the change, reading every `STEP_SECS` for at most `WITHIN_SECS`.
-A field Alpaca leaves out is printed as UNKNOWN.
+A field Alpaca leaves out is printed as UNKNOWN. A figure that has not come back within that time ends
+the measuring: no second sell is sent for a share the venue still holds. A step that fails is raised
+as masked text alone, with what was read until then printed.
 
 It asserts only what the docs state: with one share held and a sell for it open, `qty_available` is 0, and it
 is 1 again once the sell is canceled, each within `WITHIN_SECS`. Everything else is printed for the
 record. Bracket, OCO and OTO legs are not placed here: Alpaca takes them only in the regular session
 (orders-at-alpaca.md, "Bracket Orders": "Extended hours are not supported"), which is Monday's cell on B.
 
-Run under `mise run paper:test -k qty_available`, which holds account A's lock, in any of Alpaca's sessions
+Run under `mise run paper:test -k qty_available -rA` (`-rA` shows a passing run's lines), which holds
+account A's lock, in any of Alpaca's sessions
 (`open_part`). It places nothing while the account holds an open order or a position in the symbol, and
 cancels and closes what it opened (`left_as_found`). It opens no market-data stream.
 """
@@ -46,6 +49,8 @@ from alpaca.trading.models import Position as AlpacaPosition
 from alpaca.trading.requests import LimitOrderRequest
 
 from tests import test_paper_protect_seam as seam
+from tests.test_paper_trailing_stop_outside_session import ProbeFailed
+from tests.test_paper_trailing_stop_outside_session import named
 
 pytestmark = seam.pytestmark
 
@@ -101,29 +106,53 @@ def resting_sell(
     return order
 
 
+def measure(
+    trading: seam.TradingClient,
+    price: str,
+    part: str,
+    reads: dict[str, tuple[str, str, str]],
+    changes: dict[str, tuple[str, float | None]],
+) -> None:
+    """Rest each sell, read the figure, cancel it and read the figure again, into `reads` and
+    `changes` as each is learned. The clock for a change starts when Alpaca answers the submit or the
+    cancel. A sell Alpaca refuses, or a figure that has not come back, ends the measuring there: the
+    next sell is not sent for a share the venue still holds."""
+    reads["held, no open order"] = figures(trading)
+    for name, close_only in (("plain sell", False), ("sell_to_close sell", True)):
+        order = resting_sell(trading, price, part, close_only)
+        changes[f"{name} open (first read, secs to 0)"] = until_available(trading, "0")
+        reads[f"{name} open"] = figures(trading)
+        trading.cancel_order_by_id(order.id)
+        back = until_available(trading, "1")
+        changes[f"{name} canceled (first read, secs to 1)"] = back
+        seam.wait_until(lambda: not seam.open_orders(trading), f"the {name} to close", WITHIN_SECS)
+        if back[1] is None:
+            return
+
+
 def test_paper_qty_available_subtracts_a_resting_sell_and_a_close_only_sell() -> None:
     trading, data = seam.paper_trading(), seam.paper_data()
     part = seam.open_part(trading)
     reads: dict[str, tuple[str, str, str]] = {}
     changes: dict[str, tuple[str, float | None]] = {}
-    with seam.left_as_found(part) as cleaned:
-        seam.buy_foreign(trading, data, part)
-        reads["held, no open order"] = figures(trading)
-        price = seam.resting_price(data, part)
-        for name, close_only in (("plain sell", False), ("sell_to_close sell", True)):
-            order = resting_sell(trading, price, part, close_only)
-            changes[f"{name} open (first read, secs to 0)"] = until_available(trading, "0")
-            reads[f"{name} open"] = figures(trading)
-            trading.cancel_order_by_id(order.id)
-            seam.wait_until(
-                lambda: not seam.open_orders(trading), f"the {name} to close", WITHIN_SECS
+    failure = None
+    try:
+        with seam.left_as_found(part) as cleaned:
+            seam.buy_foreign(trading, data, part)
+            try:
+                measure(trading, seam.resting_price(data, part), part, reads, changes)
+            except Exception as e:  # noqa: BLE001 - named masked below; the cleaning still runs
+                failure = named(e)
+    finally:
+        print(f"\n[{part}] qty_available on a long of 1 {SYMBOL}")
+        for name, (qty, available, read_at) in reads.items():
+            print(f"  {name}: qty {qty}, qty_available {available}, read at {read_at}")
+        for name, (first, secs) in changes.items():
+            print(
+                f"  {name}: {first}, {'not within ' + str(WITHIN_SECS) if secs is None else secs}"
             )
-            changes[f"{name} canceled (first read, secs to 1)"] = until_available(trading, "1")
-    print(f"\n[{part}] qty_available on a long of 1 {SYMBOL}")
-    for name, (qty, available, read_at) in reads.items():
-        print(f"  {name}: qty {qty}, qty_available {available}, read at {read_at}")
-    for name, (first, secs) in changes.items():
-        print(f"  {name}: {first}, {'not within ' + str(WITHIN_SECS) if secs is None else secs}")
+    if failure is not None:
+        raise ProbeFailed(f"a step failed: {failure}") from None
     assert shows(reads["held, no open order"][1], "1"), reads
-    assert all(secs is not None for _, secs in changes.values()), changes
+    assert len(changes) == 4 and all(secs is not None for _, secs in changes.values()), changes
     assert (cleaned["orders"], cleaned["positions"]) == (0, 1), cleaned
