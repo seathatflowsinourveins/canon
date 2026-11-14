@@ -28,7 +28,8 @@ from nautilus_trader.model import OrderUpdated
 
 from canon_trading import sale_table
 from canon_trading.owner_protector import FLIGHT_SECS
-from canon_trading.owner_protector import RESEND_SECS
+from canon_trading.owner_protector import OUTSIDE_CANCEL_WAIT_SECS
+from canon_trading.owner_protector import REFUSAL_RETRY_MOST_SECS
 from canon_trading.owner_protector import Sale
 from canon_trading.price_step import exit_price
 from canon_trading.start_level import LevelBook
@@ -314,7 +315,7 @@ def event(kind, order, **values):
             "client_order_id": order.client_order_id,
             "event_id": h.UUID4(),
             "ts_event": at,
-            "ts_init": at,
+            "ts_init": values.pop("ts_init", at),
         }
         if kind != "Denied":
             kwargs["account_id"] = h.AccountId("ALPACA-001")
@@ -684,13 +685,13 @@ def history_time(now, slot, when):
     if when == "reprice_due":
         at += 60 * h.SECOND
     if "resend_due" in when and "not resend_due" not in when and slot.refusal_last_ns is not None:
-        at = max(at, slot.refusal_last_ns + RESEND_SECS * h.SECOND)
+        at = max(at, slot.refusal_last_ns + REFUSAL_RETRY_MOST_SECS * h.SECOND)
     if (
         "resend_due" in when
         and "not resend_due" not in when
         and getattr(slot, "external_cancel_ns", None) is not None
     ):
-        at = max(at, slot.external_cancel_ns + RESEND_SECS * h.SECOND)
+        at = max(at, slot.external_cancel_ns + OUTSIDE_CANCEL_WAIT_SECS * h.SECOND)
     if when == "flight_alert_due":
         at = max(at, slot.flight_sent_ns + FLIGHT_SECS * h.SECOND)
     return at
@@ -1300,7 +1301,6 @@ ENGINE_TIMERS = set()
 def test_tracked_history_through_native_cache_and_dispatch(group, name, history, monkeypatch):
     """Gain lock ON; logical clock drives the history's minute intervals, native events do the rest."""
     gc.collect()
-    monkeypatch.setattr(h.protect.PLANNER, "chase_secs", 0)
     transitions, effects, stack = [], [], []
     clients = []
     failures = []

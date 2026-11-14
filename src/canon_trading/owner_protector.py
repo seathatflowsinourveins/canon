@@ -220,7 +220,7 @@ count short by the fills lost there.
 Named limit: a configured confirm span is refused at a count above one.
 At a count above one confirm_gap_ms is required, including an explicit zero. Its value has
 no measured source (UNCALIBRATED); 1000 ms is the node configuration's starting value.
-U-c2 ruling 15/16: a venue refusal waits for a counted quote after RESEND_SECS; an unanswered
+U-c2 ruling 15/16: a venue refusal waits for a counted quote after its backoff wait; an unanswered
 leg is told once after FLIGHT_SECS and never duplicated. Refusal data lives on the holding,
 not the sale or level book. Native statuses follow model/src/orders/mod.rs:207-302.
 Named limits at a count above one: added shares wait for the next leg; while the chase floor
@@ -233,6 +233,8 @@ is already frozen and a subsequent fill is read as its last. The adapter builds 
 Order handlers only enqueue event payloads. Steps replay them on independent native LimitOrders,
 in arrival order (python/orders/limit.rs:463-466, 470-572), so a later cached state cannot supply
 an earlier event's facts. Local echoes produced by a step wait for the following step too.
+Named limit: every wait after a refusal or an outside cancel is counted from the event's own
+stamp, so a stamp ahead of the node's clock lengthens the wait by the difference.
 """
 
 from __future__ import annotations
@@ -317,9 +319,17 @@ REFUSED_KEPT = 64
 WAITING = "unprotected: waiting"
 STEP_NS = 1_000_000_000  # The step timer's interval (on_start), the floor between step writes.
 OVERNIGHT_RETRY_NS = 60 * STEP_NS  # Review F7: an unread eligibility is read again after a minute.
-# UNCALIBRATED: the count-one refusal path's largest interval, and the lead's
-# 2026-11-13 bound of about sixty refused orders an hour (U-c2 ruling 15).
-RESEND_SECS = 60
+# A refused sale is sent again at a growing wait: the chase interval, doubled for each refusal in a
+# row, held at this cap, and started again by a leg the venue accepts or fills: 5, 10, 20, 40, then
+# 60 s. The form is NautilusTrader's ExponentialBackoff (nt@d53849b216e2
+# crates/network/src/backoff.rs:95-208: an initial delay, a factor, a maximum, a reset), which is
+# Rust and not reachable from a strategy, so this is glue in its form; no jitter, one client per
+# account. UNCALIBRATED: the cap is the bound of about sixty refused orders an hour (U-c2 ruling
+# 15), which this pace keeps: about 63 in an hour of standing refusal.
+REFUSAL_RETRY_MOST_SECS = 60
+# After a cancel of our leg that we did not ask, no leg of that holding leaves for this long. It is
+# its own constant: that minute is the owner's hand, not a refusal by the venue. UNCALIBRATED.
+OUTSIDE_CANCEL_WAIT_SECS = 60
 # Replaced by the per-symbol control unit when that control exists.
 HOLD_ONE_SYMBOL = "hold this symbol: stop the node"
 SALE_FAULT_ROWS = frozenset({"FZ", "FZW", "FZP"})
@@ -484,6 +494,14 @@ def _quantity(value: Any) -> Decimal | None:
     except ValueError, ArithmeticError:
         return None
     return result if result.is_finite() else None
+
+
+def refusal_wait_secs(refusals: int) -> int:
+    """The wait before a sale refused `refusals` times in a row is sent again: the chase interval,
+    doubled for each refusal after the first, held at `REFUSAL_RETRY_MOST_SECS`; never under a
+    second, so a chase interval of zero cannot make it zero."""
+    first = max(1, protect.PLANNER.chase_secs)
+    return min(REFUSAL_RETRY_MOST_SECS, first * 2 ** max(0, min(refusals, 16) - 1))
 
 
 def _remaining(order: Any) -> Decimal | None:
@@ -678,6 +696,10 @@ class Holding:
     refusal_reason: str | None = None
     refusal_first: str | None = None
     refusals: int = 0
+    # Refusals in a row for the PACE alone: started again only by a fill or by a leg that ends
+    # without a refusal. An acceptance alone does not: a venue that accepts and then rejects every
+    # leg would otherwise hold the wait at its first step.
+    refusal_streak: int = 0
     flight_sent_ns: int | None = None
     flight_told: bool = False
     flight_answered: bool = False
@@ -2318,8 +2340,11 @@ class OwnerProtector(Strategy):
             "refusal_told": slot.refusal_told,
             "resend_due": code == "QU"
             and all(
-                at is None or self.clock.timestamp_ns() - at >= RESEND_SECS * SECOND_NS
-                for at in (slot.refusal_last_ns, slot.external_cancel_ns)
+                at is None or self.clock.timestamp_ns() - at >= wait * SECOND_NS
+                for at, wait in (
+                    (slot.refusal_last_ns, refusal_wait_secs(slot.refusal_streak)),
+                    (slot.external_cancel_ns, OUTSIDE_CANCEL_WAIT_SECS),
+                )
             ),
             "flight_alert_due": code in {"QU", "QA", "NQ"}
             and slot.sale_state.row in SALE_CANCEL_ROWS | {"FL"}
@@ -2410,6 +2435,13 @@ class OwnerProtector(Strategy):
                     code = self._judge_sale_event(slot, item)
                     current_reason = str(getattr(item, "reason", None) or "")
                     current_ns = item.ts_event
+                    # Each order event of ours, with the node's own lag from its receipt to this
+                    # step: the cost of judging in a step, measured on every event.
+                    lag = self.clock.timestamp_ns() - getattr(item, "ts_init", current_ns)
+                    self._say(
+                        f"{instrument_id}: sale event {code} in {slot.sale_state.row}; "
+                        f"judged_after_ms={lag / 1_000_000:g}"
+                    )
                     if type(item).__name__ == "OrderFilled":
                         event_held -= item.last_qty.as_decimal()
                 if code == "MO" and derive_mismatch:
@@ -2470,6 +2502,7 @@ class OwnerProtector(Strategy):
                 unformed = "not formable" in result.when
                 external_cancel = event.code == "oCXL" and before.row in {"FL", "WK", "PF"}
                 if refusal:
+                    # A wait is a pace toward the venue, counted from the event's own time.
                     now = self.clock.timestamp_ns() if current_ns is None else current_ns
                     slot.refusal_last_ns = now
                     if slot.refusal_first is None:
@@ -2478,14 +2511,16 @@ class OwnerProtector(Strategy):
                         ).isoformat()
                     slot.refusal_reason = self._sale_reason(instrument_id, current_reason)
                     slot.refusals += 1
+                    slot.refusal_streak += 1
+                    wait = refusal_wait_secs(slot.refusal_streak)
                     action_reason = (
                         f"{cell}: venue refused our sale (REJECTED); sent again on a counted quote "
-                        f"under the level after {RESEND_SECS} s; {current_reason}"
+                        f"under the level after {wait} s; {current_reason}"
                     )
                     if slot.refusal_told:
                         self._say(
                             f"{instrument_id}: our sale refusal {slot.refusals} "
-                            f"since {slot.refusal_first}; REJECTED"
+                            f"since {slot.refusal_first}; REJECTED; sent again after {wait} s"
                         )
                 elif silence:
                     action_reason = (
@@ -2502,7 +2537,7 @@ class OwnerProtector(Strategy):
                     )
                     action_reason = (
                         f"{cell}: our sale canceled, and not by us (the venue or another hand); no sale for "
-                        f"{RESEND_SECS} s; then a full new count; {HOLD_ONE_SYMBOL}"
+                        f"{OUTSIDE_CANCEL_WAIT_SECS} s; then a full new count; {HOLD_ONE_SYMBOL}"
                     )
                 if result.state.row in SALE_FAULT_ROWS and before.row not in SALE_FAULT_ROWS:
                     self.frozen[instrument_id] = action_reason
@@ -2670,6 +2705,7 @@ class OwnerProtector(Strategy):
             slot.protect_id = candidate.client_order_id
             slot.flight_sent_ns, slot.flight_told, slot.flight_answered = now, False, False
             ack_ns = slot.flight_answer_ns if before.row == "PCR" else None
+            refused_ns = slot.refusal_last_ns if before.row == "RW" else None
             slot.flight_command, slot.flight_answer_ns = "submit", None
             self.sent_ids.add(candidate.client_order_id)
             self._sale_orders[candidate.client_order_id] = LimitOrder.from_dict(candidate.to_dict())
@@ -2678,6 +2714,11 @@ class OwnerProtector(Strategy):
                 f"{instrument_id}: sale send limit={price} level={slot.level} "
                 f"previous={previous} floor={floor}"
                 + ("" if ack_ns is None else f" ack_to_send_ms={(now - ack_ns) / 1_000_000:g}")
+                + (
+                    ""
+                    if refused_ns is None
+                    else f" refusal_to_send_ms={(now - refused_ns) / 1_000_000:g}"
+                )
             )
             self._log_sale(instrument_id, slot.sale)
             self.submit_order(candidate, params={"extended_hours": True})
@@ -2720,7 +2761,10 @@ class OwnerProtector(Strategy):
             )
             if event.client_order_id == slot.protect_id and answers:
                 slot.flight_answered = True
-                slot.flight_answer_ns = event.ts_event
+                # A lag is the node's own, counted from its receipt of the answer.
+                slot.flight_answer_ns = getattr(event, "ts_init", event.ts_event)
+            if code in {"oPF", "oFF", "oLF", "oCXL", "oEXP"}:
+                slot.refusal_streak = 0  # a fill, or a leg that ended without a refusal
             if code in {"oACC", "oPF", "oFF", "oLF"}:
                 if slot.refusals and code == "oACC":
                     self._say(

@@ -470,6 +470,7 @@ def test_unplanned_cover_and_fault_book_round_trip(target, tmp_path):
 def test_both_refusal_and_external_cancel_clocks_guard_a_send(later):
     strategy = counted()
     slot = strategy.slots[h.AAA]
+    slot.refusal_streak = 5  # refusals in a row whose wait has reached the cap
     slot.refusal_last_ns = h.T0 + (30 if later == "refusal" else 1) * h.SECOND
     slot.external_cancel_ns = h.T0 + (30 if later == "cancel" else 1) * h.SECOND
     strategy.observe("9.89", h.T0 + 62 * h.SECOND)

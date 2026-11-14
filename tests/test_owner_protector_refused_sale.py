@@ -18,6 +18,7 @@ import pytest
 from nautilus_trader.model import OrderReleased
 from nautilus_trader.risk import RiskEngineConfig
 
+from canon_trading import owner_protector
 from canon_trading import sale_table
 from canon_trading.mover import chase_floor
 from canon_trading.start_level import LevelBook
@@ -75,7 +76,8 @@ def test_t1_refusal_told_survives_a_new_first_leg_then_acceptance_resets_it():
     assert len(alerts(strategy)) == 1
     assert "venue refused our sale" in alerts(strategy)[0]
     assert "REJECTED" in alerts(strategy)[0]
-    assert "counted quote under the level after 60 s" in alerts(strategy)[0]
+    first_wait = owner_protector.refusal_wait_secs(1)
+    assert f"counted quote under the level after {first_wait} s" in alerts(strategy)[0]
     assert str(strategy.sent[0].client_order_id) not in alerts(strategy)[0]
     strategy.observe("10.00", h.T0 + 3 * h.SECOND)
     assert c.row(strategy) == sale_table.State("G", 0)
@@ -114,16 +116,18 @@ def test_t2_interval_guards_waiting_and_a_recount_not_timers(crosses):
     sent(strategy)
     refuse(strategy)
     assert c.row(strategy).row == "RW"
+    # Refused at T0 + 2 s; the first refusal's wait is the chase interval.
+    due = 2 + owner_protector.refusal_wait_secs(1)
     if crosses:
         strategy.observe("10.00", h.T0 + 3 * h.SECOND)
         strategy.observe("9.89", h.T0 + 4 * h.SECOND)
-    strategy.observe("9.88", h.T0 + 61 * h.SECOND)
+    strategy.observe("9.88", h.T0 + (due - 1) * h.SECOND)
     assert len(strategy.sent) == 1
     before = c.row(strategy)
-    strategy.test_clock.set_time(h.T0 + 62 * h.SECOND)
+    strategy.test_clock.set_time(h.T0 + due * h.SECOND)
     strategy._on_step(SimpleNamespace(ts_event=strategy.clock.timestamp_ns()))
     assert c.row(strategy) == before and len(strategy.sent) == 1
-    strategy.observe("9.87", h.T0 + 62 * h.SECOND)
+    strategy.observe("9.87", h.T0 + due * h.SECOND)
     assert len(strategy.sent) == 2
     assert strategy.sent[-1].price.as_decimal() <= Decimal("9.87")
 
@@ -439,9 +443,10 @@ def test_t5_real_engine_unanswered_submit_then_late_answer(answer):
                 assert c.row(probe).row == "FL"
                 c.flush_events(probe)
                 assert c.row(probe).row == "RW" and len(alerts(probe)) == 2
-                await self.publish("9.87", at + 59 * h.SECOND)
+                wait = owner_protector.refusal_wait_secs(1)
+                await self.publish("9.87", at + (wait - 1) * h.SECOND)
                 assert len(self.cache.orders(strategy_id=h.PROTECTOR)) == 1
-                await self.publish("9.86", at + 60 * h.SECOND)
+                await self.publish("9.86", at + wait * h.SECOND)
                 assert len(self.cache.orders(strategy_id=h.PROTECTOR)) == 2
             completed.append(answer)
 
@@ -654,3 +659,123 @@ def test_t7_count_one_carried_sale_floor_uses_its_plan_cap(tmp_path):
     strategy.on_order_released(released)
     assert slot.sale is not None
     assert slot.sale.floor == chase_floor(first, cap)
+
+
+def waits_after_refusals(strategy, count):
+    """Refuse each leg at once; the whole seconds from each refusal to the next leg's send, with a
+    counted quote under the level every second."""
+    waits = []
+    for _ in range(count):
+        refuse(strategy)
+        refused_at = strategy.clock.timestamp_ns()
+        legs = len(strategy.sent)
+        for _ in range(200):
+            strategy.observe("9.80", strategy.clock.timestamp_ns() + h.SECOND)
+            if len(strategy.sent) > legs:
+                break
+        assert len(strategy.sent) > legs, ("no leg sent again", c.row(strategy))
+        waits.append((strategy.clock.timestamp_ns() - refused_at) // h.SECOND)
+    return waits
+
+
+def test_refusals_in_a_row_wait_the_chase_interval_doubled_up_to_the_cap():
+    """The pace of a refused leg: the chase interval, doubled for each refusal in a row, held at
+    the cap. One ALERT, at the first, and it names the first wait."""
+    strategy = counted()
+    sent(strategy)
+    first = h.protect.PLANNER.chase_secs
+    cap = owner_protector.REFUSAL_RETRY_MOST_SECS
+    assert (first, cap) == (5, 60)
+    assert waits_after_refusals(strategy, 6) == [5, 10, 20, 40, 60, 60]
+    assert len(alerts(strategy)) == 1 and f"after {first} s" in alerts(strategy)[0]
+    assert not hasattr(owner_protector, "RESEND_SECS")
+
+
+def test_an_acceptance_alone_does_not_start_the_refusals_wait_again():
+    """A venue that accepts a leg and then rejects it keeps the pace: only a fill, or a leg that
+    ends without a refusal, starts the wait again. The acceptance still ends the ALERT's episode."""
+    strategy = counted()
+    sent(strategy)
+    assert waits_after_refusals(strategy, 3) == [5, 10, 20]
+    strategy.deliver_then_step("Accepted")
+    assert c.row(strategy).row == "WK"
+    assert waits_after_refusals(strategy, 2) == [40, 60]
+    assert len(alerts(strategy)) == 2
+
+
+def test_a_fill_starts_the_refusals_wait_again():
+    strategy = counted()
+    sent(strategy)
+    assert waits_after_refusals(strategy, 3) == [5, 10, 20]
+    strategy.deliver_then_step("Accepted")
+    strategy.deliver_then_step("Filled", quantity=1)
+    assert c.row(strategy).row == "PF"
+    strategy.deliver_then_step("Accepted")  # the pin takes a refusal of a part-filled leg only then
+    assert waits_after_refusals(strategy, 2) == [5, 10]
+
+
+def test_a_leg_that_ends_without_a_refusal_starts_the_refusals_wait_again():
+    """Accepted, then replaced by our own re-price: the venue took that leg, so the pace starts again."""
+    strategy = counted()
+    sent(strategy)
+    assert waits_after_refusals(strategy, 3) == [5, 10, 20]
+    strategy.deliver_then_step("Accepted")
+    strategy.observe("9.70", strategy.clock.timestamp_ns() + 6 * h.SECOND)
+    assert c.row(strategy).row == "PCR", c.row(strategy)
+    strategy.deliver_then_step("Canceled", ts_event=strategy.clock.timestamp_ns())
+    assert c.row(strategy).row == "FL", c.row(strategy)
+    assert waits_after_refusals(strategy, 2) == [5, 10]
+
+
+def test_a_chase_interval_of_zero_still_waits_a_second(monkeypatch):
+    monkeypatch.setattr(h.protect.PLANNER, "chase_secs", 0)
+    assert [owner_protector.refusal_wait_secs(n) for n in (1, 2, 3, 7, 8)] == [1, 2, 4, 60, 60]
+
+
+def test_an_hour_of_standing_refusal_sends_about_sixty_legs():
+    strategy = counted()
+    sent(strategy)
+    end = strategy.clock.timestamp_ns() + 3600 * h.SECOND
+    refuse(strategy)
+    legs = len(strategy.sent)
+    while strategy.clock.timestamp_ns() < end:
+        strategy.observe("9.80", strategy.clock.timestamp_ns() + h.SECOND)
+        if len(strategy.sent) > legs:
+            legs = len(strategy.sent)
+            refuse(strategy)
+    assert 60 <= legs <= 64, legs
+    assert len(alerts(strategy)) == 1
+
+
+def test_a_cancel_we_did_not_ask_waits_its_own_fixed_minute():
+    """That minute is the owner's hand, not a refusal: its own constant, never the backoff."""
+    strategy = counted()
+    c.first_leg(strategy)
+    assert owner_protector.OUTSIDE_CANCEL_WAIT_SECS == 60
+    strategy.deliver_then_step("Canceled", ts_event=strategy.clock.timestamp_ns())
+    canceled_at = strategy.clock.timestamp_ns()
+    assert c.row(strategy).row == "G" and len(strategy.sent) == 1
+    for _ in range(200):
+        strategy.observe("9.80", strategy.clock.timestamp_ns() + h.SECOND)
+        if len(strategy.sent) > 1:
+            break
+    assert (strategy.clock.timestamp_ns() - canceled_at) // h.SECOND == 60
+    assert f"{owner_protector.OUTSIDE_CANCEL_WAIT_SECS} s" in alerts(strategy)[0]
+
+
+def test_each_order_event_and_each_leg_sent_again_write_their_own_times():
+    """What a run's log must carry: for every order event of ours the node's lag from its receipt
+    to the step that judged it, and on a leg sent again the time since the refusal."""
+    strategy = counted()
+    sent(strategy)
+    strategy.deliver("Rejected", ts_event=strategy.clock.timestamp_ns())
+    strategy.test_clock.set_time(strategy.clock.timestamp_ns() + h.SECOND // 2)
+    strategy._on_step(SimpleNamespace(ts_event=strategy.clock.timestamp_ns()))
+    judged = [line for line in strategy.said if "sale event oREJ" in line]
+    assert len(judged) == 1 and judged[0].endswith("judged_after_ms=500"), judged
+    for _ in range(10):
+        strategy.observe("9.80", strategy.clock.timestamp_ns() + h.SECOND)
+        if len(strategy.sent) == 2:
+            break
+    line = next(line for line in reversed(strategy.said) if ": sale send " in line)
+    assert "refusal_to_send_ms=5500" in line, line

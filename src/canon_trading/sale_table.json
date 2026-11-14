@@ -19,7 +19,7 @@
     "RW": {
       "phase": "none",
       "engine_status": "no open sale",
-      "meaning": "REFUSED, WAITING. The venue refused a leg of ours; nothing of ours is open. The leg is sent again on a counted quote under the level once RESEND_SECS have passed since the refusal (ruling 15)."
+      "meaning": "REFUSED, WAITING. The venue refused a leg of ours; nothing of ours is open. The leg is sent again on a counted quote under the level once the refusal's wait has passed (ruling 15)."
     },
     "FL": {
       "phase": "fl",
@@ -226,7 +226,7 @@
     "reprice_due": "the chase function, called in this counted quote's handler, gives a price under our working leg's limit: the chase interval has passed since this leg's price was set and since a cancel of it was last asked, and the price a tick through this quote's bid, held at the episode's floor until the floor's wait has run, is lower than the leg's limit",
     "leg_positive": "the leg's quantity is above zero. For EVERY leg it is the uncovered quantity read in this step: the long held less every foreign working sell (ruling 19; shares the owner adds while our leg works join at the next leg sent)",
     "refusal_told": "an ALERT that a sale of this holding could not be placed (the venue refused a leg, or a leg could not be formed) has been written and no leg of it has been ACCEPTED or filled since (held by the glue for the holding; a new run starts with none told)",
-    "resend_due": "in the last RESEND_SECS (60 s, a named constant) the venue has refused no leg of this holding's sale and no leg of it was canceled by another hand; true when neither happened in this run; judged in this counted quote's handler and never on a timer",
+    "resend_due": "the refusal's wait has passed. After the nth venue's refusal in a row of this holding's sale (since a leg of it last filled, in part or whole, or ended without a refusal: canceled by us, expired or replaced; an acceptance alone starts nothing again) the wait is the chase interval doubled n-1 times and held at REFUSAL_RETRY_MOST_SECS (60 s, a named constant): 5, 10, 20, 40, then 60 s. After a cancel of a leg of it by another hand the wait is OUTSIDE_CANCEL_WAIT_SECS (60 s, a constant of its own: that minute is the owner's hand, not a refusal). True when neither happened in this run; judged in this counted quote's handler and never on a timer",
     "flight_alert_due": "our last command for this leg (its submit, or our cancel of it) has had no answer of any kind for FLIGHT_SECS (60 s, a named constant), and no ALERT has been written for that command's silence; judged in every step of a row that waits for an answer: a counted quote's, or the timer's (ruling 24: a stream of quotes that are not counted must not keep it silent)",
     "long_remains": "a long of this holding is still held after the fill",
     "ends_filled": "after this Updated the engine reads our sale FILLED: a reconciliation update whose quantity equals a filled quantity above zero (M:1322-1324)"
@@ -404,7 +404,7 @@
     "no_timer_transition": "a timer step changes no row, asks no cancel and sends nothing; the one line it may order is the ALERT for a command of ours left without an answer; the floor's wait is started and judged only in the handler of a counted quote under the level",
     "row_stored_before_actions": "the row a transition leads to is stored BEFORE its actions are carried out: the engine publishes Initialized inside our submit and PendingCancel inside our cancel, so the echo of a send meets the in-flight row and the echo of a cancel meets its cancel-asked row, and each does nothing",
     "one_alert_per_holding_until_accepted": "a venue's refusal of a leg writes ONE ALERT for the holding; no second ALERT for a refusal of it is written until a leg of it has been accepted, however often the price crosses the level or the leg is refused again; each further refusal is a counted line",
-    "resend_no_sooner_than_the_interval": "no leg of a holding's sale leaves within RESEND_SECS of a venue's refusal of one or of a cancel of one by another hand, from any row; a leg is sent again only on a counted quote under the level, so a standing refusal costs at most about sixty refused orders an hour; never on a timer step and never on a quote above the level",
+    "resend_no_sooner_than_the_interval": "no leg of a holding's sale leaves inside the wait that follows a venue's refusal of one (5, 10, 20, 40, then 60 s for refusals in a row) or a cancel of one by another hand (OUTSIDE_CANCEL_WAIT_SECS, 60 s), from any row; a leg is sent again only on a counted quote under the level, so an hour of standing refusal costs about 63 refused orders; never on a timer step and never on a quote above the level",
     "resend_never_more_than_held": "the leg sent again is sized like any leg: the episode's remainder, never more than the uncovered quantity read in that step, and nothing when that is zero",
     "every_leg_steps_down_and_stays_under_the_level": "at every send the leg's limit is at or under the level the holding holds and at or under the limit of the leg it replaces or is sent again for, and never under the chase floor; it is priced from the newest usable quote stored at the send, counted or not",
     "no_leg_rests_above_a_falling_market_in_silence": "in every reachable state where our working leg's limit is above the newest usable bid, either a re-price becomes due at a counted quote once the chase interval has passed, or the floor's wait is running and will release, or ONE ALERT has said why neither can happen",
@@ -630,7 +630,7 @@
             "count": "0"
           }
         ],
-        "note": "S1, THE FIRST LEG: the episode opens; a plain LIMIT straight to the venue for the uncovered quantity read in this step. THE SEND GUARD: a size of zero or less sends nothing, with no freeze and no alert, and the row is the one the cover gives. THE INTERVAL (ruling 15): while a venue's refusal of this holding's sale is younger than RESEND_SECS nothing is sent and the count stands as it is, so every later counted quote is judged again; with no refusal in this run the interval has passed; a leg that cannot be formed at this quote is NOT a freeze (ruling 17): nothing is sent, ONE ALERT per holding until a sale of it is accepted, and the next counted quote under the level is judged again"
+        "note": "S1, THE FIRST LEG: the episode opens; a plain LIMIT straight to the venue for the uncovered quantity read in this step. THE SEND GUARD: a size of zero or less sends nothing, with no freeze and no alert, and the row is the one the cover gives. THE INTERVAL (ruling 15): while a venue's refusal of this holding's sale is younger than its wait nothing is sent and the count stands as it is, so every later counted quote is judged again; with no refusal in this run the interval has passed; a leg that cannot be formed at this quote is NOT a freeze (ruling 17): nothing is sent, ONE ALERT per holding until a sale of it is accepted, and the next counted quote under the level is judged again"
       },
       "QA": {
         "occurs": "yes",
@@ -2173,7 +2173,7 @@
           }
         ],
         "pin": "model/src/orders/mod.rs:232",
-        "note": "canceled when we asked for no cancel (the venue's act, or the owner's own hand: the protector cannot tell them apart): neither a latch nor an instant re-sell (ruling 17). With the alert, which says what happened and how the owner holds this one symbol; no leg of this holding leaves within RESEND_SECS of it (`resend_due`), and a sale then needs the full new count"
+        "note": "canceled when we asked for no cancel (the venue's act, or the owner's own hand: the protector cannot tell them apart): neither a latch nor an instant re-sell (ruling 17). With the alert, which says what happened and how the owner holds this one symbol; no leg of this holding leaves within OUTSIDE_CANCEL_WAIT_SECS of it (`resend_due`), and a sale then needs the full new count"
       },
       "oCRJ": {
         "occurs": "unexpected",
@@ -2586,7 +2586,7 @@
           }
         ],
         "pin": "model/src/orders/mod.rs:241",
-        "note": "canceled when we asked for no cancel (the venue's act, or the owner's own hand: the protector cannot tell them apart): neither a latch nor an instant re-sell (ruling 17). With the alert, which says what happened and how the owner holds this one symbol; no leg of this holding leaves within RESEND_SECS of it (`resend_due`), and a sale then needs the full new count"
+        "note": "canceled when we asked for no cancel (the venue's act, or the owner's own hand: the protector cannot tell them apart): neither a latch nor an instant re-sell (ruling 17). With the alert, which says what happened and how the owner holds this one symbol; no leg of this holding leaves within OUTSIDE_CANCEL_WAIT_SECS of it (`resend_due`), and a sale then needs the full new count"
       },
       "oCRJ": {
         "occurs": "unexpected",
@@ -3022,7 +3022,7 @@
           }
         ],
         "pin": "model/src/orders/mod.rs:287",
-        "note": "canceled when we asked for no cancel (the venue's act, or the owner's own hand: the protector cannot tell them apart): neither a latch nor an instant re-sell (ruling 17). With the alert, which says what happened and how the owner holds this one symbol; no leg of this holding leaves within RESEND_SECS of it (`resend_due`), and a sale then needs the full new count"
+        "note": "canceled when we asked for no cancel (the venue's act, or the owner's own hand: the protector cannot tell them apart): neither a latch nor an instant re-sell (ruling 17). With the alert, which says what happened and how the owner holds this one symbol; no leg of this holding leaves within OUTSIDE_CANCEL_WAIT_SECS of it (`resend_due`), and a sale then needs the full new count"
       },
       "oCRJ": {
         "occurs": "unexpected",
