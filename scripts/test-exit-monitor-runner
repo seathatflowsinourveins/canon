@@ -29,21 +29,25 @@ check()  { local label="$1"; shift; if "$@"; then t_pass "$label"; else t_fail "
 H="$TMP/home"; AH="$H/.claude"; C="$AH/canon"; B="$TMP/bin"; STUB="$TMP/stub"; LA="$TMP/LaunchAgents"
 mkdir -p "$C/watch" "$B" "$STUB" "$LA"
 export STUB
-# the checkout the agent runs in: a repository on main, and one on another branch
-CO="$TMP/checkout"; WB="$TMP/worker"
+# the tree install runs from (on main, and a worker's tree on another branch), and the origin a firing's own
+# clone follows: a bare repository whose main has one commit, cloned by the installed copy of
+# home/.claude/canon/paper-session.sh (--recorder-checkout), as the protector runner's self-test does
+CO="$TMP/checkout"; WB="$TMP/worker"; O="$TMP/origin.git"
 if ! { git init -q -b main "$CO" && echo '[tools]' > "$CO/mise.toml" && git -C "$CO" add -A \
        && git -C "$CO" -c user.name=t -c user.email=t@example.com commit -qm one \
-       && git clone -q "$CO" "$WB" && git -C "$WB" switch -q -c worker; }; then
+       && git clone -q "$CO" "$WB" && git -C "$WB" switch -q -c worker \
+       && git init -q --bare "$O" && git -C "$CO" push -q "$O" HEAD:main; }; then
   echo "test-exit-monitor-runner: could not make the checkouts" >&2; exit 1
 fi
-HEAD=$(git -C "$CO" rev-parse HEAD)
+HEAD=$(git -C "$O" rev-parse main)
+clone() { printf '%s/exit-monitor-%s-checkout' "$C" "$1"; }
 # mise: `mise run paper:exit-monitor <account> [--lead-go <word>]`; records one line per call and exits with
 # $STUB/rc (default 0); with $STUB/hold it holds that many seconds first
 cat > "$B/mise" <<'EOF'
 #!/bin/bash
 [ "$1 $2" = "run paper:exit-monitor" ] || { echo "stand-in mise: unexpected $*" >&2; exit 99; }
 shift 2
-printf 'call cwd=%s args=%s\n' "$PWD" "$*" >> "$STUB/calls"
+printf 'call cwd=%s head=%s args=%s\n' "$PWD" "$(git rev-parse HEAD 2>/dev/null)" "$*" >> "$STUB/calls"
 compgen -e | sort > "$STUB/env-names"
 [ ! -f "$STUB/hold" ] || sleep "$(cat "$STUB/hold")"
 exit "$(cat "$STUB/rc" 2>/dev/null || echo 0)"
@@ -55,8 +59,9 @@ auto() { env -i HOME="$H" PATH="$B:/usr/bin:/bin:/usr/sbin:/sbin" STUB="$STUB" C
            /usr/bin/timeout 120 /bin/bash "$ROOT/scripts/automation" "$@" > "$TMP/auto.out" 2>&1; }
 # one firing, as launchd starts it: the installed runner's run-exit-monitor with the plist's arguments
 runner() { : > "$STUB/calls"; env -i HOME="$H" PATH="/usr/bin:/bin" STUB="$STUB" CLAUDE_CONFIG_DIR="$AH" ALPACA_API_KEY=fixture-only \
-             ALPACA_SECRET_KEY=fixture-only ALPACA_EXTRA=fixture-only /usr/bin/timeout 60 /bin/bash "$C/exit-monitor-runner.sh" \
-             run-exit-monitor "$B/mise" "$CO" "$1" > "$TMP/runner.out" 2>&1; RC=$?; }
+             ALPACA_SECRET_KEY=fixture-only ALPACA_EXTRA=fixture-only ${REFRESH:+CANON_EXITMON_REFRESH_SECS=$REFRESH} \
+             /usr/bin/timeout 60 /bin/bash "$C/exit-monitor-runner.sh" \
+             run-exit-monitor "$B/mise" "$(clone "$1")" "$O" "$1" > "$TMP/runner.out" 2>&1; RC=$?; }
 calls() { if [ -s "$STUB/calls" ]; then wc -l < "$STUB/calls" | tr -d ' '; else echo 0; fi; }
 st() { jq -r "$2" "$C/watch/exit-monitor-$1.json" 2>/dev/null; }
 
@@ -73,23 +78,24 @@ auto status
 check "status prints no exit monitor row while none is installed" eval '! grep -q "exit monitor" "$TMP/auto.out"'
 auto install-exit-monitor protect
 P="$LA/local.canon.exit-monitor-protect.plist"
-check "the plist runs the installed runner's run-exit-monitor on the checkout for this account" eval '[ "$(plutil -extract ProgramArguments.1 raw -o - "$P")" = "$C/exit-monitor-runner.sh" ] && [ "$(plutil -extract ProgramArguments.2 raw -o - "$P")" = run-exit-monitor ] && [ "$(plutil -extract ProgramArguments.4 raw -o - "$P")" = "$CO" ] && [ "$(plutil -extract ProgramArguments.5 raw -o - "$P")" = protect ]'
+check "the plist runs the installed runner's run-exit-monitor on this account's own clone, never a person's checkout" eval '[ "$(plutil -extract ProgramArguments.1 raw -o - "$P")" = "$C/exit-monitor-runner.sh" ] && [ "$(plutil -extract ProgramArguments.2 raw -o - "$P")" = run-exit-monitor ] && [ "$(plutil -extract ProgramArguments.4 raw -o - "$P")" = "$(clone protect)" ] && [ "$(plutil -extract ProgramArguments.6 raw -o - "$P")" = protect ] && [ "$(plutil -extract WorkingDirectory raw -o - "$P")" = "$C" ]'
+check "the plist follows the origin's main, a URL with no credentials" eval 'case "$(plutil -extract ProgramArguments.5 raw -o - "$P")" in https://*@*) false ;; https://*|/*) true ;; *) false ;; esac'
 check "every 60 s, not at load, as a background job, with its log under watch/" eval '[ "$(plutil -extract StartInterval raw -o - "$P")" = 60 ] && [ "$(plutil -extract RunAtLoad raw -o - "$P")" = false ] && [ "$(plutil -extract StandardOutPath raw -o - "$P")" = "$C/watch/exit-monitor-protect.log" ] && [ "$(plutil -extract EnvironmentVariables.CLAUDE_CONFIG_DIR raw -o - "$P")" = "$AH" ]'
-check "the runner is an installed copy of this tree" cmp -s "$ROOT/scripts/automation" "$C/exit-monitor-runner.sh"
+check "the runner and its checkout helper are installed copies of this tree" eval 'cmp -s "$ROOT/scripts/automation" "$C/exit-monitor-runner.sh" && cmp -s "$ROOT/home/.claude/canon/paper-session.sh" "$C/exit-monitor-checkout.sh"'
 check "C's folder is made and no go is written; install names where the lead's word goes" eval '[ -d "$C/exit-monitor/C" ] && [ ! -e "$C/exit-monitor/C/go" ] && grep -q "exit-monitor/C/go" "$TMP/auto.out"'
 check "no other account's agent is written" eval '[ "$(ls "$LA")" = local.canon.exit-monitor-protect.plist ]'
 
 echo "case 2: C runs nothing without the lead's standing word, read at every firing"
 runner protect
-check "no go: refused by name, nothing run, exit 0" eval '[ "$RC" = 0 ] && [ "$(calls)" = 0 ] && [ "$(st protect .outcome)" = refused ] && st protect .note | grep -q no_go'
+check "no go: refused by name, nothing run or fetched, exit 0" eval '[ "$RC" = 0 ] && [ "$(calls)" = 0 ] && [ "$(st protect .outcome)" = refused ] && grep -q no_go <<<"$(st protect .note)" && [ ! -e "$(clone protect)" ]'
 for word in 'exit-monitor C' 'protect OWN1' 'exit-monitor protect '; do
   printf '%s' "$word" > "$C/exit-monitor/C/go"
   runner protect
-  check "a go reading '$word' is refused and runs nothing" eval '[ "$(calls)" = 0 ] && [ "$(st protect .outcome)" = refused ] && st protect .note | grep -q go_mismatch'
+  check "a go reading '$word' is refused and runs nothing" eval '[ "$(calls)" = 0 ] && [ "$(st protect .outcome)" = refused ] && grep -q go_mismatch <<<"$(st protect .note)"'
 done
 printf 'exit-monitor protect\n' > "$C/exit-monitor/C/go"
 runner protect
-check "with the word: one pass for protect, from the checkout, carrying the word" eval '[ "$RC" = 0 ] && [ "$(calls)" = 1 ] && grep -qx "call cwd=$CO args=protect --lead-go exit-monitor protect" "$STUB/calls"'
+check "with the word: one pass for protect, from its own clone at origin's main, carrying the word" eval '[ "$RC" = 0 ] && [ "$(calls)" = 1 ] && grep -qx "call cwd=$(clone protect) head=$HEAD args=protect --lead-go exit-monitor protect" "$STUB/calls"'
 check "no ALPACA_ name reaches the task from the agent's environment" eval '! grep -q "^ALPACA_" "$STUB/env-names"'
 check "the status records ok, the exit code and the checkout's commit" eval '[ "$(st protect .outcome)" = ok ] && [ "$(st protect .exit_code)" = 0 ] && [ "$(st protect .commit)" = "$HEAD" ] && [ "$(st protect .account)" = protect ]'
 rm -f "$C/exit-monitor/C/go"
@@ -98,10 +104,10 @@ check "the word removed: the next firing is refused again" eval '[ "$(calls)" = 
 
 echo "case 3: A and B need no word and never carry one; a failed pass is recorded as failed"
 runner tests
-check "A: one pass for tests with no word" eval '[ "$(calls)" = 1 ] && grep -qx "call cwd=$CO args=tests" "$STUB/calls" && [ "$(st tests .outcome)" = ok ]'
+check "A: one pass for tests with no word, from A's own clone" eval '[ "$(calls)" = 1 ] && grep -qx "call cwd=$(clone tests) head=$HEAD args=tests" "$STUB/calls" && [ "$(st tests .outcome)" = ok ]'
 printf 'exit-monitor protect\n' > "$C/exit-monitor/C/go"
 runner windows
-check "B: one pass for windows with no word, even while C has one" eval '[ "$(calls)" = 1 ] && grep -qx "call cwd=$CO args=windows" "$STUB/calls"'
+check "B: one pass for windows with no word, even while C has one" eval '[ "$(calls)" = 1 ] && grep -qx "call cwd=$(clone windows) head=$HEAD args=windows" "$STUB/calls"'
 echo 1 > "$STUB/rc"; runner tests
 check "a pass that exits 1 is recorded as failed, with its exit code" eval '[ "$(st tests .outcome)" = failed ] && [ "$(st tests .exit_code)" = 1 ] && [ "$RC" = 1 ]'
 echo 3 > "$STUB/rc"; runner tests
@@ -110,12 +116,35 @@ rm -f "$STUB/rc"
 runner other
 check "the runner refuses any other account and runs nothing" eval '[ "$RC" = 2 ] && [ "$(calls)" = 0 ]'
 
+echo "case 3b: from main at every firing, from a clone refreshed at most every 30 minutes"
+printf 'two\n' > "$CO/two.txt" && git -C "$CO" add two.txt && git -C "$CO" -c user.name=t -c user.email=t@example.com commit -qm two && git -C "$CO" push -q "$O" HEAD:main
+NEXT=$(git -C "$O" rev-parse main)
+runner tests
+check "within 30 minutes of its last refresh a firing fetches nothing and runs the main it has" eval '[ "$(calls)" = 1 ] && grep -q "head=$HEAD " "$STUB/calls"'
+REFRESH=0 runner tests
+check "once the refresh is due the firing fetches and runs origin's new main" eval '[ "$(calls)" = 1 ] && grep -q "head=$NEXT " "$STUB/calls" && [ "$(st tests .commit)" = "$NEXT" ]'
+git -C "$(clone tests)" -c user.name=t -c user.email=t@example.com commit -q --allow-empty -m local
+runner tests
+check "a clone whose HEAD is not its origin/main runs nothing and is refused by name" eval '[ "$(calls)" = 0 ] && [ "$(st tests .outcome)" = refused ] && grep -q not_main <<<"$(st tests .note)"'
+REFRESH=0 runner tests
+check "the next refresh restores main and the firing runs again" eval '[ "$(calls)" = 1 ] && grep -q "head=$NEXT " "$STUB/calls"'
+echo changed >> "$(clone tests)/two.txt"
+runner tests
+check "a tracked file changed in the clone runs nothing and is refused by name" eval '[ "$(calls)" = 0 ] && [ "$(st tests .outcome)" = refused ] && grep -q not_main <<<"$(st tests .note)"'
+REFRESH=0 runner tests
+check "and the refresh restores it" eval '[ "$(calls)" = 1 ]'
+mv "$O" "$O.away"
+REFRESH=0 runner tests
+check "an origin that cannot be reached keeps the last good main, said in the log" eval '[ "$(calls)" = 1 ] && grep -q "head=$NEXT " "$STUB/calls"'
+mv "$O.away" "$O"
+HEAD=$NEXT
+
 echo "case 4: one firing per account at a time"
 echo 3 > "$STUB/hold"
 ( runner tests ) &
 held=$!
 sleep 1
-env -i HOME="$H" PATH="/usr/bin:/bin" STUB="$STUB" CLAUDE_CONFIG_DIR="$AH" /bin/bash "$C/exit-monitor-runner.sh" run-exit-monitor "$B/mise" "$CO" tests > "$TMP/second.out" 2>&1
+env -i HOME="$H" PATH="/usr/bin:/bin" STUB="$STUB" CLAUDE_CONFIG_DIR="$AH" /bin/bash "$C/exit-monitor-runner.sh" run-exit-monitor "$B/mise" "$(clone tests)" "$O" tests > "$TMP/second.out" 2>&1
 second=$?
 wait "$held"
 rm -f "$STUB/hold"

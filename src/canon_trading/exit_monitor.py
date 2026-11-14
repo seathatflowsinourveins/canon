@@ -52,11 +52,15 @@ is per kind, account, holding and boundary, never by their joined message.
 Node-report contract (the lead's 2026-11-13 R7 level-book ruling), for its later
 writer: reports.json contains version=1, account=A|B|C, last_step_at (aware ISO),
 step_seconds (positive), and holdings=[{symbol, quantity, state, level,
-armed_at, count, required_count, reason, sessions, client_order_id?, result?}].
-Each holding names armed at its level, guarded, counting n of N, waiting with
-its reason, or frozen with its reason and result=denied|rejected. Only armed
-and counting cover; freshness is at most three steps since last_step_at, not
-since armed_at. The monitor uses the state/quantity; the level, countdown and
+armed_at, count, required_count, reason, sessions, client_order_id?, result?,
+source?}]. Each holding names armed at its level, guarded, counting n of N,
+cold (armed on the fixed fallback distance before a full ATR window; ADR 0158),
+waiting with its reason, held with source=word|order (the owner's word or the
+owner's order), or frozen with its reason and result=denied|rejected. Armed,
+counting and cold cover; held reads held, never uncovered. Any other state, a
+held without a known source or a missing state costs that holding the report's
+cover, named, and never the pass. Freshness is at most three steps since
+last_step_at, not since armed_at. The monitor uses the state/quantity; the level, countdown and
 free-text reason stay in the book (raw text could contain a venue identifier).
 Only our node's holdings belong there. The default session list is regular.
 An optional client_order_id identifies ONE stop whose quantity is its open
@@ -125,6 +129,10 @@ GO_ACCOUNTS = ("C",)
 LEAD_GO = "exit-monitor protect"
 """The lead's word for C, exactly: the agent reads it from canon/exit-monitor/C/go at every firing."""
 REFUSED = "account refused; C needs the lead's named word; nothing read"
+COVER_STATES = ("armed", "counting", "cold")
+"""Report states that cover (ADR 0158): cold is a stop on the node's fixed fallback distance."""
+HELD_SOURCES = ("word", "order")
+"""A held report's source: the owner's word or the owner's order (ADR 0158)."""
 INTERVAL_SECONDS = 60  # UNCALIBRATED: P19's schedule contract; installed by unit two.
 REPORT_FRESH_SECONDS = 150  # UNCALIBRATED: original injected armed-stop shorthand only.
 REPORT_FRESH_STEPS = 3  # UNCALIBRATED (P2/R7); the level book supplies the node's step duration.
@@ -261,6 +269,7 @@ def _cover(symbol: str, orders: Sequence[Any], reports: Sequence[Any], now: date
     if not current_reports:
         report_notes.add("no protector running")
     armed_reports = []
+    held = ""
     for report in current_reports:
         state = report.get("state", "armed" if "last_step_at" not in report else None)
         if state == "frozen":
@@ -269,12 +278,27 @@ def _cover(symbol: str, orders: Sequence[Any], reports: Sequence[Any], now: date
                 raise ReadFailed("frozen node report names no denied or rejected sell")
             frozen = result
             continue
-        if state in ("guarded", "waiting", "held"):
+        if state == "held":
+            # ADR 0158: a hold names its source, the owner's word or the owner's order.
+            source = report.get("source")
+            if source in HELD_SOURCES:
+                held = held or str(source)
+            else:
+                report_notes.add("a held report names no known source; it adds no cover")
             continue
-        if state not in ("armed", "counting"):
-            raise ReadFailed("node report state is not a level-book state")
+        if state in ("guarded", "waiting"):
+            continue
+        if state not in COVER_STATES:
+            # ADR 0158: a state this monitor does not know costs this holding the report's cover,
+            # by name, and never the pass: nodes and the monitor change at different times.
+            report_notes.add(
+                f"node report state {str(state)[:40]!r} is not known to this monitor; "
+                "it adds no cover"
+            )
+            continue
         armed_reports.append(report)
     seen_stops: set[str] = set()
+    cold = False
     for report in armed_reports:
         qty = _decimal(report.get("quantity"))
         sessions = report.get("sessions", ["regular"])
@@ -297,6 +321,9 @@ def _cover(symbol: str, orders: Sequence[Any], reports: Sequence[Any], now: date
             continue
         cover += qty
         kinds.add(NODE_STOP)
+        if report.get("state") == "cold":
+            cold = True
+            report_notes.add("cold: the node's stop is on its fixed fallback distance")
         if part in sessions:
             active += qty
     return (
@@ -306,7 +333,59 @@ def _cover(symbol: str, orders: Sequence[Any], reports: Sequence[Any], now: date
         ", ".join(sorted(kinds)) or "no armed exit",
         frozen,
         "; ".join(sorted(report_notes)),
+        held,
+        cold,
     )
+
+
+REASON_KINDS = (
+    "short",
+    "frozen",
+    "inactive in this session",
+    "partial cover",
+    "no protector running",
+    "node guarded",
+    "node waiting",
+    "report state not known",
+    "held with no known source",
+    "no armed exit",
+)
+"""Uncovered reason kinds the status counts (ADR 0158); never a report's free text."""
+
+
+def _reason_kind(
+    symbol: str,
+    short: bool,
+    frozen: str,
+    cover: Decimal,
+    quantity: Decimal,
+    note: str,
+    reports: Sequence[Any],
+    now: datetime,
+) -> str:
+    if short:
+        return "short"
+    if frozen:
+        return "frozen"
+    if cover >= quantity:
+        return "inactive in this session"
+    if cover:
+        return "partial cover"
+    if "no protector running" in note:
+        return "no protector running"
+    states = {
+        report.get("state")
+        for report in reports
+        if isinstance(report, Mapping) and report.get("symbol") == symbol and _fresh(report, now)
+    }
+    for state in ("waiting", "guarded"):
+        if state in states:
+            return f"node {state}"
+    if "not known to this monitor" in note:
+        return "report state not known"
+    if "names no known source" in note:
+        return "held with no known source"
+    return "no armed exit"
 
 
 def assess(
@@ -353,12 +432,13 @@ def assess(
         quantity = abs(quantity)
         cover = active = foreign = Decimal(0)
         exit_kind, frozen, frozen_source = "no armed exit", "", ""
-        report_note = ""
+        report_note = report_held = ""
+        cold = False
         reason = ""
         state = "uncovered"
         try:
-            cover, active, foreign, exit_kind, report_frozen, report_note = _cover(
-                symbol, orders, reports, now, part
+            cover, active, foreign, exit_kind, report_frozen, report_note, report_held, cold = (
+                _cover(symbol, orders, reports, now, part)
             )
             if short:
                 cover = active = Decimal(0)
@@ -402,6 +482,13 @@ def assess(
                 f"{symbol_hold.HELD}: the protector sells none of it; removing the hold re-arms it"
                 + (f"; {reason}" if frozen or cover else "")
             )
+        elif state == "uncovered" and report_held and not short and not frozen:
+            # ADR 0158: a node's report of a hold is a fact apart from coverage, as the owner's
+            # word read from the folder is. One notice when a hold by order begins: not built.
+            state = "held"
+            reason = f"held by the owner's {report_held} (node report)" + (
+                f"; {reason}" if cover else ""
+            )
         elif state == "uncovered" and holds_error and not frozen:
             # A hold that cannot be read is unknown; a freeze still shows as one (review F8).
             state, reason = "unknown", holds_error
@@ -426,10 +513,14 @@ def assess(
                 source = "since the owner's hold was removed"
             elif symbol in (fills or {}):
                 since, source = _stamp((fills or {})[symbol]), "since fill"
+        kind = ""
+        if state == "uncovered":
+            kind = _reason_kind(symbol, short, frozen, cover, quantity, report_note, reports, now)
         findings.append(
             {
                 "account": account,
                 "symbol": symbol,
+                "reason_kind": kind,
                 "quantity": "not shown" if invalid and not quantity else str(quantity),
                 "side": "short" if short else "long",
                 "state": state,
@@ -454,6 +545,7 @@ def assess(
                 "frozen_source": frozen_source,
                 "invalid": bool(invalid),
                 "held_by_owner": symbol in held,
+                "cold": cold,
             }
         )
     return findings
@@ -1084,7 +1176,7 @@ def _boundary_warnings(account, now, clock, days, positions, orders, reports, me
             gain_key = f"P20:{key}"
             gain = _field(position, "unrealized_pl")
             if gain_key not in cache and gain is not None and _decimal(gain, signed=True) > 0:
-                _, active, _, kind, _, _ = _cover(symbol, orders, reports, now, edge["part"])
+                _, active, _, kind, *_ = _cover(symbol, orders, reports, now, edge["part"])
                 if active < quantity:
                     next_act = edge["next_open"] or clock.next_open
                     text = f"exit cannot act next: {symbol} quantity {quantity}, unrealized result {gain}, {kind}; next act {next_act.isoformat() if kind != 'no armed exit' else 'no armed exit'}"
@@ -1327,6 +1419,12 @@ def _finish(
             "longs": sum(f["side"] == "long" for f in findings),
             **counts,
             "oldest_uncovered_age": oldest,
+            "cold": sum(bool(f.get("cold")) for f in findings),
+            "uncovered_by_reason": {
+                kind: n
+                for kind in REASON_KINDS
+                if (n := sum(f.get("reason_kind") == kind for f in findings))
+            },
             "boundary_warnings": boundary_warnings,
             "exit_blocked": None if error else _blocks_kept(memory),
             "exit_blocks_observed": not bool(error),

@@ -288,7 +288,12 @@ def test_level_book_stop_identity_must_be_of_our_node_lineage(em):
 def test_level_book_missing_state_cannot_imply_armed(em):
     report = level_report(quantity="100")
     del report["state"]
-    assert assess(em, reports=[report])[0]["state"] == "unknown"
+    found = assess(em, reports=[report])[0]
+    # ADR 0158: a state the monitor does not know, a missing one included, costs this holding the
+    # report's cover by name (it was "unknown" before, which raised no notice at all).
+    assert found["state"] == "uncovered"
+    assert found["cover"] == "0"
+    assert "is not known to this monitor" in found["reason"]
 
 
 @pytest.mark.parametrize(
@@ -1339,9 +1344,7 @@ def test_the_go_never_admits_a_or_b_differently_and_a_pass_on_c_needs_it_too(em,
     )["ok"]
 
 
-def test_the_entry_point_takes_c_and_its_word_and_refuses_c_without_it(
-    em, tmp_path, monkeypatch, capsys
-):
+def test_the_entry_point_passes_c_and_its_word_to_the_task(em, monkeypatch):
     seen = []
     monkeypatch.setattr(
         em, "monitor_task", lambda account, **kw: seen.append((account, kw)) or {"ok": True}
@@ -1349,14 +1352,105 @@ def test_the_entry_point_takes_c_and_its_word_and_refuses_c_without_it(
     monkeypatch.setattr("sys.argv", ["exit_monitor", "C", "--lead-go", C_GO])
     assert em.main() == 0
     assert seen == [("C", {"lead_go": C_GO})]
-    monkeypatch.undo()
-    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+
+
+def test_the_entry_point_refuses_c_without_its_word_and_reads_nothing(
+    em, tmp_path, monkeypatch, capsys
+):
     monkeypatch.setattr("sys.argv", ["exit_monitor", "C"])
     assert em.main() == 1
     assert "lead's named word" in capsys.readouterr().out
+    assert not (tmp_path / "canon/exit-monitor/C").exists()
 
 
 def test_the_symbol_holds_map_names_c_as_the_protect_instance():
     from canon_trading import symbol_hold
 
     assert symbol_hold.MONITOR_ACCOUNTS == {"A": "tests", "B": "windows", "C": "protect"}
+
+
+# The lead's terms (2026-11-14, ADR 0158): cold and held are node-report states the monitor knows; a
+# state it does not know costs that holding its report's cover, named, and never the pass.
+def test_a_cold_report_is_cover_and_is_named_cold(em):
+    found = assess(em, reports=[level_report(quantity="100", state="cold")])[0]
+    assert found["state"] == "covered"
+    assert found["cover"] == "100"
+    assert found["cold"] is True
+    assert "cold" in found["reason"]
+
+
+def test_a_cold_holding_is_counted_in_status_and_raises_no_notice(em, tmp_path):
+    paper = Paper(positions=[position()])
+    result = run(em, tmp_path, paper, reports=[level_report(quantity="100", state="cold")])
+    assert result["ok"]
+    assert result["status"]["cold"] == 1
+    assert result["status"]["covered"] == 1
+    assert result["alerts"] == []
+
+
+@pytest.mark.parametrize("source", ["word", "order"])
+def test_a_held_report_names_its_source_and_is_never_uncovered(em, source):
+    found = assess(em, reports=[level_report(quantity="100", state="held", source=source)])[0]
+    assert found["state"] == "held"
+    assert f"owner's {source}" in found["reason"]
+    assert found["age_seconds"] == 0
+
+
+@pytest.mark.parametrize("source", [None, "", "lane", 3])
+def test_a_held_report_without_a_known_source_costs_its_cover_by_name(em, source):
+    found = assess(em, reports=[level_report(quantity="100", state="held", source=source)])[0]
+    assert found["state"] == "uncovered"
+    assert "names no known source" in found["reason"]
+
+
+def test_an_unknown_state_costs_only_its_own_holding_and_never_the_pass(em, tmp_path):
+    other = position(symbol="OTH")
+    paper = Paper(positions=[position(), other])
+    reports = [
+        level_report(quantity="100", state="quiescent"),
+        level_report(symbol="OTH", quantity="100", state="armed"),
+    ]
+    result = run(em, tmp_path, paper, reports=reports)
+    assert result["ok"]
+    states = {f["symbol"]: f for f in result["findings"]}
+    assert states["OTH"]["state"] == "covered"
+    assert states["SYN"]["state"] == "uncovered"
+    assert "'quiescent'" in states["SYN"]["reason"]
+    assert "not known to this monitor" in states["SYN"]["reason"]
+
+
+# The lead's line (2026-11-14 04:30, ADR 0158): the status counts uncovered holdings by reason, from a fixed
+# set of kinds, never the free text, so the first nights' counts can decide which reason keeps the repeat.
+def test_the_status_counts_uncovered_holdings_by_a_fixed_reason_kind(em, tmp_path):
+    paper = Paper(
+        positions=[
+            position(),
+            position(symbol="WAI"),
+            position(symbol="ODD"),
+            position(symbol="PAR"),
+        ]
+    )
+    reports = [
+        level_report(symbol="WAI", quantity="100", state="waiting", reason="no quote overnight"),
+        level_report(symbol="ODD", quantity="100", state="quiescent"),
+        level_report(symbol="PAR", quantity="40", state="armed"),
+    ]
+    result = run(em, tmp_path, paper, reports=reports)
+    assert result["ok"]
+    by_reason = result["status"]["uncovered_by_reason"]
+    assert by_reason == {
+        "no protector running": 1,
+        "node waiting": 1,
+        "report state not known": 1,
+        "partial cover": 1,
+    }
+    assert sum(by_reason.values()) == result["status"]["uncovered"]
+    kinds = {f["symbol"]: f.get("reason_kind") for f in result["findings"]}
+    assert kinds["WAI"] == "node waiting"
+    assert "no quote overnight" not in json.dumps(result["status"])
+
+
+def test_a_pass_with_nothing_uncovered_counts_no_reason(em, tmp_path):
+    paper = Paper(positions=[position()])
+    result = run(em, tmp_path, paper, reports=[level_report(quantity="100")])
+    assert result["status"]["uncovered_by_reason"] == {}
