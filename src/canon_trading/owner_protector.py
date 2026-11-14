@@ -196,6 +196,10 @@ limit offset beside level and distance; an entry with none takes today's quarter
 (ruling (c)). The runner supplies session_part and a raw asset reader for overnight runs; an
 answered eligibility is kept for the run, an unread one retried at most once a minute (review F7),
 with refusals named and old entries untouched.
+A carried long breached through its limit offset is named once at ERROR and keeps its level and
+distances. Once the observation guard confirms the breach, it starts a DAY limit sale using the
+same exit_price and chase_floor rules as a released sale, including the lowest positive venue tick;
+it never submits a trailing order whose bid-derived limit would be nonpositive (F15).
 The book is also the node report (the lead, 2026-11-13 17:13): each entry carries its holding's
 state (_holding_state maps this strategy's records to armed, guarded, counting, waiting, frozen),
 written when it changes, and the file carries last_step_ns per account label, written at most
@@ -556,6 +560,7 @@ class Holding:
     last_observation: int | None = None
     distance: protect.Distance | None = None
     limit_offset: Decimal | None = None
+    offset_breach_named: bool = False
     fresh: bool = False
     ended: bool = False
     # The host clock when the level was fixed; it never orders venue observations.
@@ -1836,7 +1841,7 @@ class OwnerProtector(Strategy):
                 _, limit = offsets(
                     plan.price, plan.plan.trail, plan.plan.exit_through, distance=distance
                 )
-            if bid - limit <= 0:
+            if bid - limit <= 0 and carried is None:
                 raise ValueError("no positive protective limit at this bid and distance")
             supplied = None if slot.level is None else slot.level.as_decimal()
             if carried is not None:
@@ -2037,6 +2042,17 @@ class OwnerProtector(Strategy):
         assert (
             slot.level is not None and slot.distance is not None and slot.limit_offset is not None
         )
+        offset_breached = (
+            bid <= slot.limit_offset
+            and (self.settings.account_label or "", instrument_id) in self.carried
+        )
+        if offset_breached and not slot.offset_breach_named:
+            slot.offset_breach_named = True
+            self._say(
+                f"{instrument_id}: ALERT: carried long breached through its offset "
+                f"{slot.limit_offset} at bid {bid}; level {slot.level} kept; "
+                "sale follows the observation count and existing chase price rules"
+            )
         if not slot.placed and not advanced and instrument_id in self.quote_refusals:
             self._wait(instrument_id, self.quote_refusals[instrument_id])
             return
@@ -2064,6 +2080,17 @@ class OwnerProtector(Strategy):
             slot.last_observation = tick.ts_event
         trailing, limit = slot.distance.distance, slot.limit_offset
         if bid - limit <= 0:
+            if offset_breached and bid <= slot.level.as_decimal():
+                # The guard above confirmed the carried breach. A fresh trailing order would
+                # derive a nonpositive limit from this bid; start the existing sale path instead.
+                first = exit_price(bid, protect.PLANNER.exit_ticks, None)
+                now = self.clock.timestamp_ns()
+                slot.sale = Sale(
+                    now, first, chase_floor(first, protect.PLANNER.chase_cap), now, first
+                )
+                self._send_sale(instrument_id, slot, uncovered, tick)
+                slot.placed = slot.protect_id is not None
+                return
             self._freeze(instrument_id, "no positive protective limit at this bid and trail")
             return
         instrument = self.cache.instrument(instrument_id)
