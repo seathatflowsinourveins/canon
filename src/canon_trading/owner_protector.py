@@ -246,8 +246,9 @@ is already frozen and a subsequent fill is read as its last. The adapter builds 
 Order handlers only enqueue event payloads. Steps replay them on independent native LimitOrders,
 in arrival order (python/orders/limit.rs:463-466, 470-572), so a later cached state cannot supply
 an earlier event's facts. Local echoes produced by a step wait for the following step too.
-Named limit: every wait after a refusal or an outside cancel is counted from the event's own
-stamp, so a stamp ahead of the node's clock lengthens the wait by the difference.
+Every wait after a refusal or an outside cancel is counted from the later of the event's own
+stamp and its receipt here. Named limit: a stamp ahead of the node's clock lengthens the wait
+by the difference.
 
 Review F1 of #443's max review (the lead's ruling, 2026-11-13 22:47 and 22:52): a holding first bought
 after the start, in a symbol the node did not load, is named at once and has its exit within a bound.
@@ -2857,10 +2858,14 @@ class OwnerProtector(Strategy):
             ):
                 code, item = entries[int(next(iter(tagged.facts)))]
                 current_reason, current_ns = reason, order_event_ns
+                wait_from_ns = order_event_ns
                 if item is not None:
                     code = self._judge_sale_event(slot, item)
                     current_reason = str(getattr(item, "reason", None) or "")
                     current_ns = item.ts_event
+                    # A wait is a pace toward the venue as the node can keep it: counted from
+                    # the later of the event's own time and its receipt here.
+                    wait_from_ns = max(current_ns, getattr(item, "ts_init", current_ns))
                     # Each order event of ours, with the node's own lag from its receipt to this
                     # step: the cost of judging in a step, measured on every event.
                     lag = self.clock.timestamp_ns() - getattr(item, "ts_init", current_ns)
@@ -2932,9 +2937,8 @@ class OwnerProtector(Strategy):
                 if event.code == "oREJ" and before.row not in SALE_NOTHING_OPEN_ROWS:
                     # EVERY rejection of an open sale of ours is recorded, whatever the row that
                     # judges it (stopped, held, cover unread), so the pace guards the next leg.
-                    # A wait is a pace toward the venue, counted from the event's own time.
                     now = self.clock.timestamp_ns() if current_ns is None else current_ns
-                    slot.refusal_last_ns = now
+                    slot.refusal_last_ns = now if wait_from_ns is None else wait_from_ns
                     if slot.refusal_first is None:
                         slot.refusal_first = datetime.fromtimestamp(
                             now / SECOND_NS, UTC
@@ -2964,7 +2968,7 @@ class OwnerProtector(Strategy):
                     )
                 elif external_cancel:
                     slot.external_cancel_ns = (
-                        self.clock.timestamp_ns() if current_ns is None else current_ns
+                        self.clock.timestamp_ns() if wait_from_ns is None else wait_from_ns
                     )
                     action_reason = (
                         f"{cell}: our sale canceled, and not by us (the venue or another hand); no sale for "

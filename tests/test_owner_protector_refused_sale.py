@@ -782,3 +782,38 @@ def test_each_order_event_and_each_leg_sent_again_write_their_own_times():
             break
     line = next(line for line in reversed(strategy.said) if ": sale send " in line)
     assert "refusal_to_send_ms=5500" in line, line
+
+
+def seconds_to_the_next_leg(strategy, since):
+    """Whole seconds from `since` to the next leg's send, a counted quote under the level each second."""
+    legs = len(strategy.sent)
+    for _ in range(200):
+        strategy.observe("9.80", strategy.clock.timestamp_ns() + h.SECOND)
+        if len(strategy.sent) > legs:
+            return (strategy.clock.timestamp_ns() - since) // h.SECOND
+    raise AssertionError(("no leg sent again", c.row(strategy)))
+
+
+@pytest.mark.parametrize(("kind", "wait"), [("Rejected", 5), ("Canceled", 60)])
+def test_a_wait_runs_from_the_receipt_of_an_event_stamped_earlier(kind, wait):
+    """Each wait is counted from the later of the event's own time and its receipt. An answer the
+    venue stamped ten seconds before the node received it (a reconnect, a slow stream) still waits
+    its whole interval from the receipt: the pace is toward the venue, as the node can keep it."""
+    strategy = counted()
+    if kind == "Rejected":
+        sent(strategy)
+    else:
+        c.first_leg(strategy)
+    received = strategy.clock.timestamp_ns() + 20 * h.SECOND
+    strategy.test_clock.set_time(received)
+    strategy.deliver_then_step(kind, ts_event=received - 10 * h.SECOND, ts_init=received)
+    assert seconds_to_the_next_leg(strategy, received) == wait
+
+
+def test_a_wait_after_an_event_stamped_ahead_is_longer_by_the_difference():
+    """The named limit: a stamp ahead of the node's clock lengthens the wait by the difference."""
+    strategy = counted()
+    sent(strategy)
+    received = strategy.clock.timestamp_ns()
+    strategy.deliver_then_step("Rejected", ts_event=received + 3 * h.SECOND, ts_init=received)
+    assert seconds_to_the_next_leg(strategy, received) == 5 + 3
