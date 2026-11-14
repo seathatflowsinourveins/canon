@@ -56,7 +56,9 @@ Trades: `--data trades` uses the adapter's `fetch_trades` and `parse_trade`, on 
 GET /v2/stocks/{symbol}/trades (https://docs.alpaca.markets/us/reference/stocktradesingle-1, read
 2026-11-11), through alpaca-py 0.45.0's public `RESTClient.get`. Each symbol and missing interval is
 fetched in ascending pages, retaining exact raw nanoseconds and excluding canceled/incorrect prints
-as the adapter does. Trades at one timestamp keep their separate IDs; none are aggregated into bars.
+as the adapter does. A print of size 0, which the pinned TradeTick refuses, is skipped and counted
+in the done line, never fatal; the adapter's own request path does not skip it. A span of size-0
+prints alone writes nothing, so no coverage, and a rerun asks for it again. Trades at one timestamp keep their separate IDs; none are aggregated into bars.
 The `TradeTick` representation drops Alpaca's conditions (`c`), exchange (`x`) and tape (`z`), without
 filtering by those condition flags. It sets `aggressor_side` to `NO_AGGRESSOR`; it does not infer a side
 (`parse_trade` and `crates/model/src/data/trade.rs` at d53849b216e2).
@@ -797,7 +799,7 @@ def load_trades(
                         )
                         written += loaded
                         if unsized and skipped is not None:
-                            skipped["size 0"] = skipped.get("size 0", 0) + unsized
+                            skipped["size-0 prints"] = skipped.get("size-0 prints", 0) + unsized
         return written
     except HistoryStopped:
         raise
@@ -820,9 +822,10 @@ def _load_trade_part(
     out: Callable[[str], None],
 ) -> tuple[int, int | None, int]:
     """Fetch and write one part of a missing interval, from `lo` to `hi`: the trades written,
-    where the next part starts, or `None` once the interval is done, and the size-0 prints skipped. An answer over `max_rows` valid
-    prints is cut before its last timestamp, so no timestamp is split across parts, the coverage
-    written ends one nanosecond before it, and the next part starts there."""
+    where the next part starts, or `None` once the interval is done, and the size-0 prints skipped.
+    An answer over `max_rows` valid prints, size-0 prints counted, is cut before its last
+    timestamp, so no timestamp is split across parts, the coverage written ends one nanosecond
+    before it, and the next part starts there."""
     symbol = instrument.id.symbol.value
     what = f"trades of {symbol}, feed {FEED.value}, interval [{lo}, {hi}]"
     before = _sent()
@@ -856,25 +859,23 @@ def _load_trade_part(
     # timestamp keep the answer's order.
     answered = sorted(history.trades, key=lambda row: row[1])
     covered_to, following = hi, None
-    truncated = len(answered) > max_rows
-    # A print of size 0 (an after-hours print seen 2026-11-13) cannot be a TradeTick at the pin:
-    # Quantity refuses a size that is not positive. It is skipped and counted, never fatal; any
-    # other unusable size still reaches parse_trade and stops by name. The cut below is judged on
-    # the whole answer, so skipping never hides a truncated one.
-    kept, unsized = [], []
-    for row in answered:
-        (unsized if row[0].size == 0 else kept).append(row)
-    if truncated:
+    if len(answered) > max_rows:
         last = answered[-1][1]
         answered = [row for row in answered if row[1] < last]
-        kept = [row for row in kept if row[1] < last]
-        unsized = [row for row in unsized if row[1] < last]
         if not answered:
             raise HistoryStopped(
                 f"the {what} request has more than {max_rows} trades at one timestamp, "
                 f"{last}; none of this interval was written"
             )
         covered_to, following = last - 1, last
+    # A print of size 0 (an after-hours print seen 2026-11-13) cannot be a TradeTick at the pin:
+    # TradeTick's check_positive_quantity refuses it (crates/model/src/data/trade.rs:80 at
+    # d53849b216e2). It is skipped and counted, never fatal; any other unusable size still reaches
+    # parse_trade and stops by name. The cut above is judged on the whole answer, size-0 prints
+    # included, so skipping never hides a truncated answer.
+    kept, unsized = [], []
+    for row in answered:
+        (unsized if row[0].size == 0 else kept).append(row)
     if dropped := history.canceled + history.incorrect:
         out(
             f"paper:history: Dropped {dropped} invalid {what}: "

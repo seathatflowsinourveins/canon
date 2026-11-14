@@ -351,8 +351,18 @@ def test_a_cut_part_of_only_size_zero_prints_does_not_end_the_interval(venue, ca
     skipped: dict[str, int] = {}
     assert run(catalog, symbols=["AAPL"], max_rows=2, out=lines.append, skipped=skipped) == 1
     assert [str(t.trade_id) for t in ticks_in(catalog)] == ["3"]
-    assert skipped == {"size 0": 2}, (skipped, lines)
+    assert skipped == {"size-0 prints": 2}, (skipped, lines)
     assert any("coverage not recorded" in line for line in lines), lines
+
+
+def test_size_zero_prints_at_a_cut_are_counted_once_across_parts(venue, catalog) -> None:
+    """A cut part with written prints and size-0 prints before and at the cut: the ones at the cut
+    are fetched again by the next part and counted there, not twice."""
+    venue.rows = [trade(1, FIRST), trade(2, FIRST, s=0), trade(3, LAST, s=0), trade(4, LAST)]
+    skipped: dict[str, int] = {}
+    assert run(catalog, symbols=["AAPL"], max_rows=3, out=lambda _: None, skipped=skipped) == 2
+    assert sorted(str(t.trade_id) for t in ticks_in(catalog)) == ["1", "4"]
+    assert skipped == {"size-0 prints": 2}, skipped
 
 
 def test_a_print_with_another_unusable_size_still_stops_by_name(venue, catalog) -> None:
@@ -367,7 +377,7 @@ def test_the_done_line_counts_the_size_zero_prints_skipped(venue, catalog, monke
     monkeypatch.setattr(history_load, "utc_now", lambda: NOW)
     assert history_load.main([*cli(catalog), "--symbols", "AAPL"]) == 0
     out = capsys.readouterr().out
-    assert "done, 1 trades written" in out and ", 1 size 0 skipped" in out, out
+    assert "done, 1 trades written" in out and ", 1 size-0 prints skipped" in out, out
 
 
 def test_rounding_is_named_once_per_symbol_with_the_first_example(venue, catalog) -> None:
