@@ -7,7 +7,7 @@ review-by: 2027-02-10
 
 # A third paper pair, account C (`protect`), is stored, checked, removed and read on ADR 0069's pattern; nothing trades on it yet
 
-*Amended in part 2026-11-14 by ADR 0158 (proposed): its closing sentence admits one more task on C's pair, `paper:exit-monitor protect`, GET only, on the lead's standing word; no task reads two pairs still holds.*
+*Amended in part 2026-11-14 by ADR 0158 (proposed): its closing sentence, which gave C's pair to no other task, is amended to admit one more, `paper:exit-monitor protect`, GET only, on the lead's standing word; no task reads two pairs still holds.*
 
 ## Context and Problem Statement
 

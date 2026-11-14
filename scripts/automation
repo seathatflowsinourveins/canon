@@ -1477,7 +1477,7 @@ PLIST
 # run-exit-monitor <mise> <clone> <origin> <tests|windows|protect>: one firing
 do_run_exit_monitor() {
   [ "$#" = 4 ] || { echo "usage: automation run-exit-monitor <mise> <clone> <origin> <tests|windows|protect>" >&2; return 2; }
-  local m=$1 dir=$2 url=$3 account=$4 letter folder status go="" word rc=0 commit outcome note out stamp age ceiling
+  local m=$1 dir=$2 url=$3 account=$4 letter folder status go="" word rc=0 commit outcome note out stamp age ceiling last
   local name
   for name in "${!ALPACA_@}"; do unset "$name"; done
   export PATH=/usr/bin:/bin:/usr/sbin:/sbin
@@ -1513,7 +1513,11 @@ do_run_exit_monitor() {
   fi
   stamp="$folder/clone-refreshed"
   age=$EXITMON_REFRESH_SECS
-  if [ -d "$dir/.git" ] && [ -f "$stamp" ]; then age=$(( $(/bin/date +%s) - $(cat "$stamp" 2>/dev/null || echo 0) )); fi
+  if [ -d "$dir/.git" ] && [ -f "$stamp" ]; then
+    # a stamp that is empty or not a number (a firing killed while writing it) refreshes now
+    last=$(cat "$stamp" 2>/dev/null) || last=""
+    case "$last" in ''|*[!0-9]*) ;; *) age=$(( $(/bin/date +%s) - last )) ;; esac
+  fi
   if [ "$age" -ge "$EXITMON_REFRESH_SECS" ]; then
     if ! out=$(/bin/bash "$EXITMON_HELPER" --recorder-checkout "$m" "$dir" "$url" 6>&- 2>&1); then
       note="checkout_failed: ${out//$'\n'/; }"; em_say "$note"; em_record failed 1 "$note"; exec 6>&-; return 1
@@ -1521,15 +1525,22 @@ do_run_exit_monitor() {
     em_say "${out//$'\n'/; }"
     /bin/date +%s > "$stamp" || em_say "could not write $stamp"
   fi
-  # from main at every firing: HEAD is the clone's origin/main and no tracked file differs
+  # from main at every firing: HEAD is the clone's origin/main and no file differs or was added
+  # (untracked included, as protector_node._clean_on_main has it: a mise.local.toml would redefine the task)
   commit=$(git -C "$dir" -c core.hooksPath=/dev/null rev-parse --verify -q HEAD 2>/dev/null) || commit="unknown"
   word=$(git -C "$dir" -c core.hooksPath=/dev/null rev-parse --verify -q refs/remotes/origin/main 2>/dev/null) || word=""
-  out=$(git -C "$dir" -c core.hooksPath=/dev/null status --porcelain --untracked-files=no 2>&1) || out="status failed"
+  out=$(git -C "$dir" -c core.hooksPath=/dev/null status --porcelain --untracked-files=normal 2>&1) || out="status failed"
   if [ -z "$word" ] || [ "$commit" != "$word" ] || [ -n "$out" ]; then
-    note="not_main: $dir is not at its origin/main with no tracked change; nothing run; the next refresh restores it"
+    note="not_main: $dir is not at its origin/main with no change or added file; nothing run; the next refresh restores it"
     rm -f "$stamp"; em_say "$note"; em_record refused 0 "$note"; exec 6>&-; return 0
   fi
-  ceiling=$(cd "$(dirname "$dir")" && pwd -P) || ceiling=""
+  # the clone's parent bounds mise's config search, as the recorder's does; unresolved or split: nothing runs
+  if ! ceiling=$(cd "$(dirname "$dir")" && pwd -P); then
+    note="ceiling_failed: could not resolve the clone's parent; nothing run"; em_say "$note"; em_record failed 1 "$note"; exec 6>&-; return 1
+  fi
+  case "$ceiling" in *:*|*,*)
+    note="ceiling_failed: the clone's parent holds a mise ceiling list separator; nothing run"; em_say "$note"; em_record failed 1 "$note"; exec 6>&-; return 1 ;;
+  esac
   rc=0
   if [ -n "$go" ]; then
     (cd "$dir" && MISE_CEILING_PATHS="$ceiling" CANON_COMMIT="$commit" /usr/bin/timeout -k 10 "$EXITMON_RUN_SECS" "$m" run paper:exit-monitor "$account" --lead-go "$EXITMON_GO" < /dev/null 6>&-) || rc=$?
@@ -1609,7 +1620,7 @@ show_exit_monitor_status() {
         | (if $run.outcome == "failed" then "FAILED" elif $run.outcome == "refused" then "REFUSED"
            elif $now - $run.at_epoch > $silent then "STALE"
            elif ($s.unhealthy_reasons // []) | index("uncovered at or over alert age") then "UNCOVERED"
-           elif ($s.healthy // true) == false then "FAILED" else "ok" end)
+           elif $s.healthy == false then "FAILED" else "ok" end)
           + "\t" + $run.outcome + "; " + ($run.note // "")
           + (if $s.longs == null then "; no pass status yet"
              else "; " + ($s.longs | tostring) + " longs, " + (($s.covered // 0) | tostring) + " covered, "

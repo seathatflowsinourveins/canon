@@ -36,21 +36,16 @@ an account or stream lock. It writes only `canon/exit-monitor/<A|B|C>/`: the pas
 `memory.json`, `memory.running`, `records/` and outbox `alerts.jsonl`; the carrier's `delivered.json`,
 `notify-status.json` and `.notify.lock`; the agent's `runner.lock` and `clone-refreshed`; and on C, `go`.
 
-**The node-report contract** (`reports.json`, the module's docstring). Cover is an acknowledged stop-kind
-sell of ours at the venue, or a report fresh within three node steps whose state covers:
-
-| State | The monitor |
-|---|---|
-| `armed`, `counting` | cover |
-| `cold` | cover, named: the stop is on the node's fixed fallback distance before a full ATR window of sound bars; counted in `status.json`, no notice |
-| `guarded`, `waiting` | no cover |
-| `held`, `source` `word` or `order` | reads `held`, never uncovered; another source adds no cover, named |
-| `frozen`, `result` `denied` or `rejected` | reads frozen |
-
-A state it does not know, missing or not text included, costs that holding the report's cover, named, and
-never the pass. An optional `client_order_id` names one stop of our lineage: not added where the venue
-shows the same stop, counted once if repeated; a report without one adds nothing where another exit could
-be the same. A missing or stale report reads "no protector running". The nodes report; the monitor judges.
+**The node-report contract** (`reports.json`). Its one home is `REPORT_STATES` in
+`src/canon_trading/exit_monitor.py`, which the parser and the tests read; this record states the property,
+not the rows. Cover is an acknowledged stop-kind sell of ours at the venue; a working sale of ours or the
+protect lineage the venue acknowledges and a fresh report names, up to what the venue shows left; or a
+report fresh within three node steps whose state covers, `cold` among them, counted in `status.json` with
+no notice. A known no-cover state is no cover; a hold reads `held`, never uncovered; a freeze reads frozen
+with any result. A state it does not know, missing or not text included, costs that holding the report's
+cover, named without its text, and never the pass. An optional `client_order_id` names one stop or sale
+of our lineage: not added where the venue shows the same stop, counted once if repeated; a report without
+one adds nothing where another exit could be the same. A missing or stale report reads "no protector running". The nodes report; the monitor judges.
 **Not built:** a writer of `reports.json`; the warming bound (the node reports `full_window_at`; a holding
 still `cold` after it raises one notice per holding and node run; one with too few bars, overnight say,
 stays cold and quiet); one notice when a hold by the owner's order begins with shares uncovered.
@@ -60,16 +55,16 @@ as `install-protector` is: no session runs it or its uninstall, whatever a permi
 tree on `main` it writes `local.canon.exit-monitor-<account>`: `StartInterval` 60, not run at load. A firing
 runs `mise run paper:exit-monitor` once in `exit-monitor-<account>-checkout`, a clone of origin's main of
 its own (ADR 0050), refreshed by the recorder's `paper-session.sh --recorder-checkout` at most every 30
-minutes; HEAD must be the clone's `origin/main` with no tracked change, or nothing runs (`not_main`). One
+minutes; HEAD must be the clone's `origin/main` with no change or added file, or nothing runs (`not_main`). One
 firing per account at a time; one `scripts/automation status` row per agent; the uninstall keeps records.
 
 **C: ADR 0114 amended in part.** One more task gains C's pair: `paper:exit-monitor protect`, GET only, no
-order and no lock, behind the lead's standing word read at every firing, from main at every firing. "No
+order and no account or stream lock, behind the lead's standing word read at every firing, from main at every firing. "No
 task reads two pairs" stands: one account per run. The word is `canon/exit-monitor/C/go` reading exactly
 `exit-monitor protect`; the agent, the task and `monitor_task` each refuse C without it; only the lead
 writes it, after the staging. The undo: removing the file, which the owner or the lead may do, ends the
-reading of C at the next firing. What it reads of C stays in that folder: no symbol, price or quantity of
-C in a tracked file, a report, a pull request or a message, but for the owner's notice on this machine and
+reading of C at the next firing. What it reads of C stays in that folder (the agent's log under `watch/` carries
+states and counts only): no symbol, price or quantity of C in a tracked file, a report, a pull request or a message, but for the owner's notice on this machine and
 what goes to the lead. Enabling runs C first, then A once the protector reports, then B once the Mover
 does: without node reports, a holding protected locally reads "no protector running".
 
@@ -91,8 +86,8 @@ can fire.
 ### Consequences
 
 * Good: an independent, unattended check on C's venue stops from Monday.
-* Bad: a protector run on C stays attended until its report is shown; 1,440 passes a day per account
-  against a rate limit `UNVERIFIED` here (Evidence).
+* Bad: a protector run on C stays attended until its report is shown; 1,440 passes a day per account, at
+  most 8 GETs each, against Alpaca's 200 requests a minute per account (Evidence).
 * To review: `status.json` counts `dormant` holdings and uncovered ones by a fixed reason kind
   (`uncovered_by_reason`), never a report's free text. Whether a reason the owner cannot act on, a name with
   no quote overnight say, keeps the 15-minute repeat is decided from the first nights' counts, not now. A
@@ -100,7 +95,7 @@ can fire.
 
 ### Confirmation
 
-`scripts/test-exit-monitor-runner` (macOS only; skips without `lockf` or `plutil`): install and refusals,
+`scripts/test-exit-monitor-runner` (macOS only; skips without `lockf`, `timeout`, `jq` or `plutil`): install and refusals,
 the clone's refresh and `not_main`, one firing at a time, the row, uninstall. N9 in
 `scripts/test-exit-monitor-notify` and `tests/test_exit_monitor.py`: C behind its word, `cold`, `held`, an
 invented state costing only its holding. Staging, named in the landing: (i) the offline tests; (ii) an
@@ -121,8 +116,9 @@ Read 2026-11-14.
   — `get_orders` (:107-125), `get_all_positions` (:235-244), `get_clock` (:422-431) and `get_calendar`
   (:438-456) are each one `self.get` — `resolved` (v0.45.0, `scripts/canon src alpaca-py`).
 * https://docs.alpaca.markets/llms.txt — the parts read verbatim list no Trading API rate-limit page; about
-  100,000 characters came back summarised — `fetched`, truncated. A support page the deputy's verifier
-  cites gives 200 requests a minute per account; not read here, so `UNVERIFIED`.
+  100,000 characters came back summarised — `fetched`, truncated.
+* https://alpaca.markets/support/usage-limit-api-calls — 200 requests a minute per account; read by the
+  deputy's evidence-verifier 2026-11-14 — `fetched`.
 * `man 5 launchd.plist` on this Mac — `StartInterval` misses a firing while the job runs or the system sleeps;
   `RunAtLoad` defaults to false — `bundled`.
 * `src/canon_trading/exit_monitor.py`, `scripts/automation`, `home/.claude/canon/paper-session.sh` — the

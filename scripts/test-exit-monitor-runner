@@ -133,6 +133,18 @@ runner tests
 check "a tracked file changed in the clone runs nothing and is refused by name" eval '[ "$(calls)" = 0 ] && [ "$(st tests .outcome)" = refused ] && grep -q not_main <<<"$(st tests .note)"'
 REFRESH=0 runner tests
 check "and the refresh restores it" eval '[ "$(calls)" = 1 ]'
+printf '[tasks."paper:exit-monitor"]\nrun = "true"\n' > "$(clone tests)/mise.local.toml"
+runner tests
+check "an untracked file in the clone (a mise.local.toml) runs nothing and is refused by name" eval '[ "$(calls)" = 0 ] && [ "$(st tests .outcome)" = refused ] && grep -q not_main <<<"$(st tests .note)"'
+REFRESH=0 runner tests
+check "and the refresh removes it" eval '[ "$(calls)" = 1 ] && [ ! -e "$(clone tests)/mise.local.toml" ]'
+: > "$C/exit-monitor/A/clone-refreshed"
+runner tests
+check "an empty refresh stamp refreshes and runs, never stops every later firing" eval '[ "$RC" = 0 ] && [ "$(calls)" = 1 ] && [ "$(st tests .outcome)" = ok ] && grep -Eq "^[0-9]+$" "$C/exit-monitor/A/clone-refreshed"'
+mkdir -p "$TMP/sep,dir"
+: > "$STUB/calls"; env -i HOME="$H" PATH="/usr/bin:/bin" STUB="$STUB" CLAUDE_CONFIG_DIR="$AH" CANON_EXITMON_REFRESH_SECS=0 \
+  /usr/bin/timeout 60 /bin/bash "$C/exit-monitor-runner.sh" run-exit-monitor "$B/mise" "$TMP/sep,dir/exit-monitor-tests-checkout" "$O" tests > "$TMP/runner.out" 2>&1; RC=$?
+check "a clone whose parent holds a mise ceiling separator runs nothing and fails by name, as the recorder does" eval '[ "$(calls)" = 0 ] && [ "$(st tests .outcome)" = failed ] && grep -q "ceiling" <<<"$(st tests .note)"'
 mv "$O" "$O.away"
 REFRESH=0 runner tests
 check "an origin that cannot be reached keeps the last good main, said in the log" eval '[ "$(calls)" = 1 ] && grep -q "head=$NEXT " "$STUB/calls"'
@@ -161,6 +173,10 @@ jq -n '{account: "C", ok: true, longs: 2, covered: 2, uncovered: 0, oldest_uncov
 jq -n '{pending: 0, sent_now: 0, notified: null}' > "$C/exit-monitor/C/notify-status.json"
 auto status
 check "ok with the longs and their cover counted" eval 'grep -Eq "^  exit monitor protect +ok .*2 longs, 2 covered, 0 uncovered" "$TMP/auto.out"'
+jq '.healthy = false | .unhealthy_reasons = ["stale pass"]' "$C/exit-monitor/C/status.json" > "$TMP/s" && mv "$TMP/s" "$C/exit-monitor/C/status.json"
+auto status
+check "FAILED when the monitor's own status is unhealthy though the firing ran" eval 'grep -Eq "^  exit monitor protect +FAILED .*stale pass" "$TMP/auto.out"'
+jq '.healthy = true | .unhealthy_reasons = []' "$C/exit-monitor/C/status.json" > "$TMP/s" && mv "$TMP/s" "$C/exit-monitor/C/status.json"
 jq '.uncovered = 1 | .covered = 1 | .oldest_uncovered_age = 300 | .healthy = false | .unhealthy_reasons = ["uncovered at or over alert age"]' "$C/exit-monitor/C/status.json" > "$TMP/s" && mv "$TMP/s" "$C/exit-monitor/C/status.json"
 jq -n '{pending: 1, sent_now: 0, notified: false}' > "$C/exit-monitor/C/notify-status.json"
 auto status
