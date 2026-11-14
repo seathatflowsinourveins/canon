@@ -233,8 +233,12 @@ def test_start_line_names_gain_lock_and_its_value(
     if enabled:
         settings = replace(settings, gain_lock=True)
     module.run_protector(settings, trading=object(), lock_dir=tmp_path)
+    # The start line is the one the runner parses, ending "(epoch N)" (scripts/automation);
+    # the node prints other "paper:protector:" lines before it, such as the symbol-holds note.
     start = next(
-        line for line in capsys.readouterr().out.splitlines() if line.startswith("paper:protector:")
+        line
+        for line in capsys.readouterr().out.splitlines()
+        if line.startswith("paper:protector:") and "(epoch " in line
     )
     assert f"gain-lock={'on' if enabled else 'off'}" in start
 
