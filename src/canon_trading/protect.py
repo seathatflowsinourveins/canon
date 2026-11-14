@@ -705,7 +705,16 @@ class _Protect:
                 "account: no_shorting false, so a sell here could open a short: each stop is marked "
                 "sell_to_close and sent only for shares Alpaca shows held and free in the send step",
             )
-        held = _read("the positions", lambda: session_window.positions(self.trading), dict)
+        held, unread = _read(
+            "the positions", lambda: session_window.position_reads(self.trading), tuple
+        )
+        # One position that cannot be read is skipped by name and every other long is still covered
+        # (the lead, 2026-11-13 21:27); it is unprotected, so the run does not exit 0.
+        for symbol, why in sorted(unread.items()):
+            report.note(
+                report.unprotected,
+                f"ALERT {symbol}: {why}, so it gets no stop; skipped, nothing sent for it",
+            )
         orders = open_orders(self.trading)
         if len(orders) >= ORDERS_PAGE_LIMIT:
             report.refused = (

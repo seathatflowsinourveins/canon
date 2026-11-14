@@ -6705,6 +6705,141 @@ def held_position(symbol: str, qty: int) -> Position:
     )
 
 
+def listed_position(symbol: str, qty: str, side: str, qty_available: str | None = None) -> Position:
+    """A position as Alpaca might list it, with its quantity and side set apart (alpaca-py's `Position`
+    takes `qty` as text and `side` as its own field, so the two can disagree)."""
+    return Position(
+        asset_id=uuid4(),
+        symbol=symbol,
+        exchange="NASDAQ",
+        asset_class="us_equity",
+        avg_entry_price="100",
+        qty=qty,
+        side=side,
+        cost_basis="100",
+        qty_available=qty_available,
+    )
+
+
+class Listing(Account):
+    """An account whose positions are the ones given, as listed."""
+
+    def __init__(self, *listed: Position) -> None:
+        super().__init__()
+        self.listed = list(listed)
+
+    def get_all_positions(self) -> list:
+        return self.listed
+
+
+@pytest.mark.parametrize(
+    ("qty", "side", "held"),
+    [
+        pytest.param("5", "long", Decimal(5), id="long"),
+        pytest.param("-5", "short", Decimal(-5), id="short"),
+        pytest.param("-5", "long", Decimal(-5), id="below-zero-labelled-long"),
+        pytest.param("5", "short", Decimal(-5), id="above-zero-labelled-short"),
+    ],
+)
+def test_positions_reads_each_quantity_by_custodys_one_rule(qty, side, held) -> None:
+    """`positions` took the quantity's sign off before reading the side, so a quantity below zero labelled
+    long read as a long. Custody's rule (`custody._listed`): a short, by its label or by its sign, is
+    never read as a long."""
+    found = session_window.positions(
+        cast(TradingClient, Listing(listed_position("AAA", qty, side)))
+    )
+    assert found == {"AAA": held}
+
+
+@pytest.mark.parametrize("qty", ["NaN", "Infinity", "-Infinity", "sNaN", "many", ""])
+def test_a_position_quantity_that_is_no_finite_number_stops_the_start_by_name(
+    monkeypatch, tmp_path, qty
+) -> None:
+    """A quantity that is no finite number passed as one (NaN, Infinity), or raised a bare decimal error
+    (no number at all), where custody's rule says what is held there is not known."""
+    trading = cast(TradingClient, Listing(listed_position("AAA", qty, "long")))
+    with pytest.raises(session_window.WindowRefused, match="position in AAA.*not starting"):
+        session_window.positions(trading)
+    monkeypatch.setattr(session_window, "window_node", lambda *a, **k: pytest.fail("built"))
+    with pytest.raises(session_window.WindowRefused, match="position in AAA.*not starting"):
+        session_window.run_window(WindowConfig(log_dir=tmp_path), trading=trading)
+
+
+@pytest.mark.parametrize(
+    ("side", "qty", "available", "readable"),
+    [
+        pytest.param("long", "5", None, True, id="long-absent"),
+        pytest.param("long", "5", "3", True, id="long-count"),
+        pytest.param("long", "5", "-1", False, id="long-below-zero"),
+        pytest.param("long", "5", "many", False, id="long-no-number"),
+        pytest.param("long", "5", "NaN", False, id="long-nan"),
+        pytest.param("short", "-5", "-5", True, id="short-finite"),
+        pytest.param("short", "-5", "Infinity", False, id="short-infinite"),
+    ],
+)
+def test_a_listed_quantity_no_order_holds_is_checked_as_custody_checks_it(
+    side, qty, available, readable
+) -> None:
+    """`qty_available`, as custody reads it: left out it passes; listed it must be a count for a long and
+    a finite number for a short."""
+    trading = cast(TradingClient, Listing(listed_position("AAA", qty, side, available)))
+    if readable:
+        assert session_window.positions(trading) == {"AAA": Decimal(-5 if side == "short" else 5)}
+    else:
+        with pytest.raises(session_window.WindowRefused, match="position in AAA"):
+            session_window.positions(trading)
+
+
+def test_an_unreadable_position_after_the_stop_is_named_and_never_reported_flat(
+    fake_time, tmp_path
+) -> None:
+    """After the stop a window has run, so a quantity that cannot be read is no refusal, which would
+    record that nothing was placed: the check reads each position by itself, names this one in what is
+    left and in its errors, and sends no close on a count it cannot read."""
+    trading = Listing(listed_position("AAA", "NaN", "long"))  # no submit_order: a close would fail
+    report = session_window.WindowReport("regular", "AAA", started="t")
+    left = session_window._flatten_after_stop(
+        cast(TradingClient, trading), WindowConfig(symbol="AAA", log_dir=tmp_path), report
+    )
+    assert any(item.startswith("position in AAA not read:") for item in left), left
+    assert any("position in AAA" in error for error in report.errors)
+
+
+class ListsNoCount(Venue):
+    """The venue, its one position listed with a qty_available custody does not accept for a long."""
+
+    def get_all_positions(self) -> list[Position]:
+        return [p.model_copy(update={"qty_available": "-1"}) for p in super().get_all_positions()]
+
+
+def test_a_fill_then_an_unreadable_listing_is_never_reported_flat_while_held(fake_time) -> None:
+    """The landing review's P1 (2026-11-13): the check updated its orders and requests, then raised on
+    the position, so `held` kept the reading before the fill and the final path reported the account
+    flat while 10 were held. A failed position read never turns a held long into flat, on any path (the
+    lead, 2026-11-13 21:27)."""
+    venue = ListsNoCount(fake_time)
+    venue.order("entry-1", "buy", qty=10, fills=3.0, cancel_after=60.0)
+    left, report = check(venue, {"entry-1": "buy"})
+    assert venue.qty == 10
+    assert any("position in SPY" in error for error in report.errors)
+    assert any(item.startswith("position in SPY not read:") for item in left), left
+    assert not venue.did("close"), "no close is sent on a count that cannot be read"
+
+
+def test_what_was_last_known_held_stays_held_when_a_later_read_fails(fake_time, tmp_path) -> None:
+    """What the check last read held in a symbol stays held there until a reading says otherwise: a
+    later reading that cannot read it keeps that count and names the position."""
+    trading = Listing(listed_position("AAA", "7", "long"))
+    report = session_window.WindowReport("regular", "AAA", started="t")
+    account = session_window._AccountCheck(cast(TradingClient, trading), "AAA", report, {})
+    assert account.read() == ["position of 7 AAA"]
+    trading.listed = [listed_position("AAA", "7", "long", "-1")]
+    left = account.read()
+    assert account.held == {"AAA": Decimal(7)}
+    assert left[0] == "position of 7 AAA"
+    assert left[1].startswith("position in AAA not read:"), left
+
+
 class MultiWindowAccount(Account):
     """An account with independently held symbols and immediate, quantity-checked market fills."""
 
