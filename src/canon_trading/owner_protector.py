@@ -335,6 +335,9 @@ OUTSIDE_CANCEL_WAIT_SECS = 60
 # Replaced by the per-symbol control unit when that control exists.
 HOLD_ONE_SYMBOL = "hold this symbol: stop the node"
 SALE_FAULT_ROWS = frozenset({"FZ", "FZW", "FZP"})
+# Rows in which the owner's hold asks nothing more of the table: stopped already, ended, or
+# frozen by a fault of ours with nothing open (which sends nothing and must stay frozen).
+HOLD_SETTLED_ROWS = frozenset({"FZ", "X", "T0", "TW", "PCT"})
 SALE_COVER_ROWS = frozenset({"FC", "FCW", "FCP"})
 SALE_CANCEL_ROWS = frozenset({"PCR", "PCO", "PCX", "FZP", "FCP", "PCT"})
 # What answers a cancel of ours: its acknowledgement, its refusal, or the leg's own end.
@@ -714,6 +717,11 @@ class Holding:
     # Set when the owner's word held this holding after its sell was placed: its release re-places
     # the sell at the next step while the bid is above the level, with no new observation.
     rearm_at_step: bool = False
+    # The owner's hold at a count above one (`_hold_counted`): applied to this holding; applied
+    # while a fault of ours had frozen it with a sale still open; and its release already said.
+    hold_applied: bool = False
+    hold_frozen: bool = False
+    hold_release_said: bool = False
 
 
 STREAM_LOGGER = "alpaca.data.live.websocket"
@@ -1752,6 +1760,8 @@ class OwnerProtector(Strategy):
             self._hold_begins(instrument_id)
         for instrument_id in sorted(self.held - now, key=str):
             self.held.discard(instrument_id)
+            if self.settings.breach_count > 1:
+                continue  # Said where the release is applied, with what it finds (_hold_counted).
             slot = self.slots.get(instrument_id)
             level = None if slot is None else slot.level
             self._say(
@@ -2194,6 +2204,59 @@ class OwnerProtector(Strategy):
             return False
         return True
 
+    def _hold_counted(
+        self, instrument_id: InstrumentId, slot: Holding, quote: QuoteTick | None
+    ) -> bool:
+        """The owner's word for this symbol at a count above one; True where it governs this call.
+
+        A hold is the table's stop of the instrument (its ST column): a count is dropped, a working
+        sell of ours is asked to cancel, a leg in flight is told, and nothing is counted or sent
+        while the hold stands; quotes are not judged, so the level stays where it was. The release
+        is a start for the holding: once nothing of ours is open (row T0) the count begins again at
+        zero at the kept level. A holding frozen by a fault of ours is not un-frozen by either:
+        with nothing open its row is left as it is, and one whose open sale the hold canceled stays
+        stopped to the next start.
+        """
+        assert slot.sale_state is not None
+        row = slot.sale_state.row
+        if instrument_id in self.held:
+            if not slot.hold_applied:
+                slot.hold_applied, slot.hold_release_said = True, False
+                slot.hold_frozen = row in SALE_FAULT_ROWS and row != "FZ"
+            if row not in HOLD_SETTLED_ROWS:
+                self._sale_step(instrument_id, ["ST"])
+            elif quote is None:
+                self._sale_step(instrument_id, ["NQ"])
+            return True
+        if not slot.hold_applied:
+            return False
+        if row in SALE_FAULT_ROWS or row == "X":
+            slot.hold_applied = slot.hold_frozen = False
+            return False
+        if row == "T0" and not slot.hold_frozen:
+            slot.hold_applied = False
+            slot.sale_state = sale_table.State("G", 0)
+            slot.counted_quote = slot.usable_quote = None
+            slot.observed_quantities = None
+            self._say(
+                f"{instrument_id}: hold removed: the count starts again at zero at its level "
+                f"{slot.level}, never lowered; a sale needs {self.settings.breach_count} counted "
+                f"quotes under it; confirm_gap_ms={self.settings.confirm_gap_ms}"
+            )
+            return False
+        if not slot.hold_release_said:
+            slot.hold_release_said = True
+            self._say(
+                f"ALERT: {instrument_id}: hold removed, but it was frozen by a fault of ours "
+                "before the hold: it stays stopped until the next start"
+                if slot.hold_frozen
+                else f"{instrument_id}: hold removed: our sell of it is still open (sale row {row}); "
+                "the count starts again once it has ended"
+            )
+        if quote is None:
+            self._sale_step(instrument_id, ["NQ"])
+        return True
+
     def _manage_counted(
         self, instrument_id: InstrumentId, quote: QuoteTick | None, *, advanced: bool
     ) -> None:
@@ -2226,6 +2289,8 @@ class OwnerProtector(Strategy):
                 )
             else:
                 self._plan_holding(instrument_id, slot, tick)
+        if self._hold_counted(instrument_id, slot, quote):
+            return
         events = []
         if quote is None:
             events.append("NQ")
@@ -3524,8 +3589,26 @@ class OwnerProtector(Strategy):
         """
         if self.settings.breach_count > 1 and slot is not None:
             row = None if slot.sale_state is None else slot.sale_state.row
+            held = instrument_id in self.held
             if row in SALE_FAULT_ROWS | SALE_COVER_ROWS:
-                return "frozen", None, self.frozen.get(instrument_id, f"sale row {row}")
+                reason = self.frozen.get(instrument_id, f"sale row {row}")
+                return "frozen", None, f"{reason}; {symbol_hold.HELD}" if held else reason
+            if slot.hold_frozen:
+                return (
+                    "frozen",
+                    None,
+                    "frozen by a fault of ours before the owner's hold"
+                    + (f"; {symbol_hold.HELD}" if held else "; stopped until the next start"),
+                )
+            if held:
+                if row in {None, "G", "GC", "RW", "T0", "X"}:
+                    return (
+                        "held",
+                        None,
+                        f"{symbol_hold.HELD}: not armed; removing the hold re-arms it",
+                    )
+                # Our sell still rests, its cancel asked: told as it is until the cancel ends it.
+                return "waiting", None, f"sale row {row}; {symbol_hold.HELD}"
             if row == "GC":
                 return "waiting", None, "foreign sells cover the whole long; no count accrues"
             if slot.level is None or slot.distance is None or slot.sale_state is None:
