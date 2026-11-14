@@ -58,6 +58,10 @@ NautilusTrader d53849b216e2, v2.0.0rc8:
   string. A terminal failure can have no payload (:77-79,423-425). data/engine/mod.rs:1965-1972
   and dispatch.rs:387-390 cache response quotes first; common/cache/mod.rs:2379-2402 pushes
   them to the front regardless of venue stamp. Every fallback here reads venue_quotes instead.
+* Overnight cold start (the lead's amended ruling, 2026-11-13): use Mover's BOATS history
+  delay and protect.distance_for for the cold rule as well as the warm row. Its Distance.fallback
+  names the cold rule. trading/__init__.pyi:552-560 cannot modify a trailing offset;
+  warming therefore retains a working sell and never lowers its level.
 
 Coverage follows protect.py:514-570: sum remaining shares of simple working sells; unknown cover,
 contingencies and pending changes freeze; full cover needs no sell; partial foreign cover freezes;
@@ -77,14 +81,18 @@ acknowledgement is not a fill. Offsets use Mover's existing
 explicit-distance calculation with a dollar distance from protect.distance_for, sharing row_distance with
 protect.plan_distance (ADR 0142). The required row is OWN1 or OWN3 from protect.ROWS, without a default
 or fraction overrides; F2 is refused by name because the holding's distance must be per symbol.
-The distance and limit offset are fixed once per holding and logged with
-Distance.source(). At start and adoption, after subscribing, the protector requests the latest quote
-on its live feed and bars since the latest 04:00 New York. It waits for the bars request to complete,
-merges history and cache by event stamp, excludes an open minute, and passes the last 14 existing
-minutes to protect.distance_for. The adapter stamps bars at their open (data.py:1237-1257).
-One to thirteen bars use their own ATR period; with no spread the ATR stands alone. No history, or
-a flat day with no spread, takes the named fixed fallback, counted separately in END. Failed reads
-are named at each step and never retried. The adapter config helper enables
+The distance and limit offset are logged with Distance.source(). At start and adoption, after
+subscribing, the protector requests the latest quote on its live feed and bars since the latest
+04:00 New York; BOATS history ends the Mover's delay before now. It merges history and cache by
+event stamp, excludes an open minute, and passes the last 14 existing minutes to protect.distance_for.
+The adapter stamps bars at their open (data.py:1237-1257). Until complete bars exist, a usable quote
+arms through protect.distance_for(..., []), naming its fixed fallback as the cold rule. Bars then
+replan the distance without lowering the level or replacing a working sell. A carried distance
+stays whole; a carried level with no distance takes the higher of its level and the cold rule's
+level until bars allow a plan. One to thirteen bars use their own ATR period; with no spread the
+ATR stands alone. A flat day with no spread retains the named fixed fallback, counted separately
+in END and refused for a carried long. Failed reads are named once and never retried.
+The adapter config helper enables
 external reports and reduce-only SELL_TO_CLOSE
 (canon_alpaca/execution.py:569,614-646,1578); it constructs no client or node.
 
@@ -256,6 +264,8 @@ from .custody import PROTECT_PREFIX
 from .custody import lineage
 from .ma_cross import refuse_unknown_keywords
 from .mover import FLOOR_WAIT_SECS
+from .mover import OVERNIGHT_HISTORY_DELAY
+from .mover import OVERNIGHT_HISTORY_FEED
 from .mover import SECOND_NS
 from .mover import chase_floor
 from .mover import offsets
@@ -585,6 +595,8 @@ class Holding:
     protection_start: int | None = None
     history_ready: bool = False
     history_error: str | None = None
+    history_error_said: bool = False
+    cold: bool = False
     seed_error: str | None = None
     first_quote: int | None = None
     last_quote: int | None = None
@@ -830,7 +842,7 @@ class OwnerProtector(Strategy):
 
     def _plan_from_maximum(self, instrument_id: InstrumentId, slot: Holding) -> None:
         tick = self.venue_quotes.get(instrument_id)
-        if slot.distance is None and tick is not None:
+        if (slot.distance is None or slot.cold) and tick is not None and slot.sale is None:
             self._plan_holding(instrument_id, slot, tick)
 
     def on_historical_quotes(self, quotes: Sequence[QuoteTick]) -> None:
@@ -882,7 +894,11 @@ class OwnerProtector(Strategy):
             self.request_bars(
                 BarType.from_str(f"{instrument_id}-1-MINUTE-LAST-EXTERNAL"),
                 start=protect.session_start(now),
-                end=now,
+                end=(
+                    now - OVERNIGHT_HISTORY_DELAY
+                    if self.settings.feed == OVERNIGHT_HISTORY_FEED
+                    else now
+                ),
                 params={"feed": self.settings.feed},
                 callback=bars_done,
             )
@@ -1300,8 +1316,13 @@ class OwnerProtector(Strategy):
             kept = (
                 f"distance {distance}"
                 if carried.distance is not None
-                else "no distance (written before distances were kept); the row's distance "
-                f"{distance} used for later raises only"
+                else (
+                    f"no carried distance; covered by the cold rule at {chosen} with distance "
+                    f"{distance}, to be planned again when bars exist"
+                    if slot.cold
+                    else "no distance (written before distances were kept); the row's distance "
+                    f"{distance} used for later raises only"
+                )
             )
             offset = (
                 f", limit offset {carried.limit_offset}"
@@ -1320,6 +1341,7 @@ class OwnerProtector(Strategy):
             self._say(
                 f"{instrument_id}: carried level {carried.last_level} and {kept} from run "
                 f"{carried.run}{offset}{both}"
+                + ("; cold rule: protect.distance_for fixed fallback" if slot.cold else "")
             )
             now = self.clock.timestamp_ns()
             since, until = (
@@ -1359,7 +1381,10 @@ class OwnerProtector(Strategy):
             if supplied is None
             else f"the supplied level {chosen} arms it"
         )
-        self._say(f"{instrument_id}: no carried level ({why}); {how}")
+        self._say(
+            f"{instrument_id}: no carried level ({why}); {how}"
+            + ("; cold rule: protect.distance_for fixed fallback" if slot.cold else "")
+        )
 
     def on_quote(self, quote: QuoteTick) -> None:
         try:
@@ -1711,10 +1736,24 @@ class OwnerProtector(Strategy):
         if trigger != order.trigger_price or price != order.price:
             self.modify_order(order.client_order_id, trigger_price=trigger, price=price)
 
+    def _name_history_failure(self, instrument_id: InstrumentId, slot: Holding) -> None:
+        if slot.history_error is not None and not slot.history_error_said:
+            slot.history_error_said = True
+            self._say(
+                f"{instrument_id}: ALERT: the session day's bars read failed ({slot.history_error}); "
+                + (
+                    "cold rule (fixed fallback) protects until complete bars exist"
+                    if slot.cold
+                    else "the armed level and distance remain in force"
+                )
+            )
+
     def _plan_holding(self, instrument_id: InstrumentId, slot: Holding, tick: QuoteTick) -> bool:
-        """Fix a holding's level and distance once. A carried long (U-e B) arms at its carried
-        level and carried distance, and nothing re-derives either (the lead's ruling,
-        2026-11-13 17:43): no rebuilt level from closes, no row distance, no fallback. The trail
+        """Replan cold protection when complete bars arrive, never lowering its level.
+
+        A carried distance stays whole (U-e B). The lead's cold-start amendment allows a carried
+        level without a distance to take the shared cold rule at once, at the higher level, then
+        replan when bars exist. No level is rebuilt from closes. The trail
         is bid-triggered (crates/execution/src/trailing.rs:128-138), so after the start only bids
         raise it, through the emulator. rebuilt_level_from_bars (unit 4) is a last-price rule and
         is not called here; raising a carried level from the gap's bids is ADR 0151's SIP quotes
@@ -1778,6 +1817,11 @@ class OwnerProtector(Strategy):
             complete = [
                 b for at, b in sorted(bars.items()) if earliest <= at and at + 60 * SECOND_NS <= now
             ]
+            has_bars = any(protect._sound(bar) for bar in complete)
+            replanning = slot.cold and slot.distance is not None
+            if replanning and not has_bars:
+                self._name_history_failure(instrument_id, slot)
+                return True  # Keep the first cold plan until bars allow a new one.
             instrument = self.cache.instrument(instrument_id)
             if instrument is None:
                 raise ValueError("instrument is absent from cache")
@@ -1790,7 +1834,7 @@ class OwnerProtector(Strategy):
                 else None
             )
             bid = tick.bid_price.as_decimal()
-            bars_failed = None
+            cold = False
             if carried is not None and carried.distance is not None:
                 distance = carried.distance
                 share = distance / bid
@@ -1802,23 +1846,19 @@ class OwnerProtector(Strategy):
                 )
                 source = f"carried from run {carried.run}"
             else:
-                # A carried distance needs no bars; a planned one waits for the day's (U-h).
-                # A failed read is not a wait for the run: it plans on no bars, the fixed
-                # fallback that a day with none takes, named with an ALERT (the lead's ruling on
-                # land-composed's F1, 2026-11-13 20:45). Its retry is the follow-up's.
-                bars_failed = slot.history_error
-                if bars_failed is None and not slot.history_ready:
-                    raise ValueError("waiting for the session day's bars answer")
+                ask = tick.ask_price.as_decimal()
+                cold = not has_bars
                 distance, plan = protect.distance_for(
                     instrument_id.symbol.value,
                     self.settings.row,
                     bid,
-                    tick.ask_price.as_decimal(),
-                    [] if bars_failed is not None else complete[-protect.ATR_BARS :],
+                    ask,
+                    [] if cold else complete[-protect.ATR_BARS :],
                 )
                 plan = replace(plan, quote_age=age)
-                if carried is not None and plan.fallback:
-                    # Ruling (a), 2026-11-13 17:56: never the fixed fallback for a carried long.
+                if carried is not None and plan.fallback and not cold:
+                    # The cold-start amendment permits no-bar cover without a carried distance.
+                    # A flat day's fallback still cannot replan a carried long.
                     raise ValueError(
                         f"the row gives only the fixed fallback ({plan.source()}), never used "
                         "for a carried long"
@@ -1846,16 +1886,36 @@ class OwnerProtector(Strategy):
                     if supplied is None
                     else start_level(carried.last_level, supplied)
                 )
+                if cold and carried.distance is None:
+                    chosen = max(chosen, up_on_step(bid - distance))
             else:
                 chosen = up_on_step(bid - distance) if supplied is None else supplied
+            if replanning:
+                order = None if slot.protect_id is None else self.cache.order(slot.protect_id)
+                retained = _own_level(slot, order)
+                assert retained is not None
+                if order is not None and not order.is_closed:
+                    # The pin cannot modify a trailing offset. Keep this working sell whole;
+                    # warming is never a cancel/re-place gap or a second sell of these shares.
+                    slot.level = instrument.make_price(retained)
+                    slot.cold = False
+                    self._say(
+                        f"{instrument_id}: replanned distance {distance}; {source}; "
+                        f"working sell keeps distance {slot.distance.distance}, limit offset "
+                        f"{slot.limit_offset} and level {slot.level}"
+                    )
+                    return True
+                chosen = max(retained, up_on_step(bid - distance))
             level = instrument.make_price(chosen)
             if chosen <= 0 or level.as_decimal() != chosen:
                 raise ValueError(f"no exact positive level {chosen} at instrument precision")
             if slot.level is None and tick.ts_event in self.refused_stamps.get(instrument_id, ()):
                 raise ValueError("waiting for a newer quote: V1 refused this stamp")
-            self._name_start(
-                instrument_id, slot, previous, carried, chosen, distance, supplied, limit
-            )
+            if not replanning:
+                slot.cold = cold
+                self._name_start(
+                    instrument_id, slot, previous, carried, chosen, distance, supplied, limit
+                )
             if slot.level is None:
                 slot.armed_at, slot.armed_event = now, tick.ts_event
                 if tick.ts_event < slot.opened_at and (
@@ -1871,15 +1931,12 @@ class OwnerProtector(Strategy):
                     )
             slot.level = level
             slot.distance, slot.limit_offset = plan, limit
+            slot.cold = cold
             self._say(
-                f"{instrument_id}: armed distance {distance}; {source}; "
+                f"{instrument_id}: {'replanned' if replanning else 'armed'} distance {distance}; {source}; "
                 f"quote age {age.total_seconds():.0f} s"
             )
-            if bars_failed is not None:
-                self._say(
-                    f"{instrument_id}: ALERT: the session day's bars read failed ({bars_failed}); "
-                    f"armed on the fixed fallback distance {distance}, which stands for this run"
-                )
+            self._name_history_failure(instrument_id, slot)
         except ValueError as exc:
             self._record_unprotected(instrument_id, str(exc))
             return False
@@ -1967,6 +2024,8 @@ class OwnerProtector(Strategy):
                 self.cancel_requested.discard(order.client_order_id)
                 slot.protect_id, order = None, None
         if slot.sale is None:
+            if slot.cold:
+                self._plan_from_maximum(instrument_id, slot)
             # The lock moves the trigger of a trail not yet released; the exit beats the lock (R3).
             self._gain_lock(instrument_id, slot, position, quote, advanced=advanced)
         if order is not None and order.client_order_id in self.cancel_requested:
