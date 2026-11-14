@@ -99,33 +99,45 @@ wrapping a COPY. A file not named is refused. The working directory's `.tmp` is 
 
 ### Measured: what a root's file count costs a load (2026-11-14)
 
-The pin's catalog keeps one file per bar type per write, so a root of sampled days grows by about one file
-per name per day.
+The pin's catalog writes one file per bar type per write call (`crates/persistence/src/backend/parquet/catalog/write.rs:262-278`),
+so a root of sampled days grows by about one file per name per day.
 - One whole-market day of minute bars (about 6,000 bar types) loaded by `paper:history` into a root of
-  about 287,000 files took 195 s wall, 35 s user and 110 s system. That is 76 % of its CPU in the kernel,
-  and a `sample` of the process showed it in `lstat`, `stat` and `getdirentries` under the pin's Rust
-  catalog.
+  about 287,000 files (the lane's count before the load) took 195 s wall, 35 s user and 110 s system: 76 %
+  of its CPU in the kernel. A `sample` of the next such load showed `lstat`, `stat` and `getdirentries`
+  as its top frames, under unnamed frames of the pin's Rust library.
 - Two of its reads grow with the root:
   - `instruments(instrument_ids=...)` lists all of `data/` before it filters (`backend/parquet/catalog/query.rs:208-210`, `store.rs:400-411`).
-  - Coverage lists each bar type's folder once per load.
-- The loader's answer is `paper:history --spans-file`. It loads a run of days in one process: one catalog
-  lock, one pace schedule, and one coverage read per bar type over the run, clipped to each span. With it,
-  `--definitions` reads the instruments from a root that holds definitions alone, and a line per phase
-  gives definitions, coverage, fetch and parse, and write their wall, user and system time. On a paper
-  pair, three non-adjacent days of six names loaded once as a run and once a day apart gave equal
-  intervals, equal bars and equal file bytes.
+  - Coverage lists each bar type's folder once per load (`backend/parquet/catalog/coverage.rs:288-289`).
+- The loader's answer is `paper:history --spans-file`. It loads a run of days of minute bars in one
+  process: one catalog lock, one pace schedule, and one coverage read per bar type over the run, clipped to
+  each span. With it, `--definitions` reads the instruments from a root that holds equity definitions alone.
+  The catalog root then holds none, and a reader that takes its definitions from that root finds none
+  there. A line per phase gives checks, definitions, coverage, fetch and parse, and write their wall, user
+  and system time.
+- On a paper pair, three non-adjacent days of six names were loaded once as a run and once a day apart.
+  The two roots had equal intervals, equal bars and equal file bytes.
+- The next whole-market day was loaded into a fresh root of its own, with definitions from such a root. It
+  had about 5,900 bar types and took 87 s wall, 21.9 s user and 8.4 s system: 30 core-seconds against 145.
+  Its fetch was bound by the pace. Its largest CPU phase was the definitions read, 9 core-seconds for about
+  12,800 definitions, which a run of days pays once.
 
-Consolidating such a root is an upstream limit, not a fix. Each of the three facts below is from the pin
-(paths under `crates/persistence/src/`):
-1. **Gaps read as covered.** A merged file is named from the first file's start to the last one's end
-   (`backend/parquet/consolidation.rs:355-358`), and coverage is read from file names
-   (`backend/parquet/catalog/coverage.rs:385-394`). The days between merged files therefore read as
-   held. The default check is disjointness only (`consolidation.rs:347-349`; `backend/parquet/intervals.rs:22-36`),
-   so a gap passes it.
-2. **The merge is not atomic.** It writes the merged file, then deletes the originals one by one
-   (`backend/parquet/io.rs:375-391`).
-3. **No lock across instances or processes.** `consolidation.rs` takes none, and the docs speak of one
-   instance's calls only (`docs/concepts/data/catalog.md:153-155`).
+Consolidating such a root does not answer this, at the pin (paths under `crates/persistence/src/`):
+1. **The merge methods read gaps as covered.** `consolidate_catalog` and `consolidate_data` name a merged
+   file from the first file's start to the latest end (`backend/parquet/consolidation.rs:352-358`), and
+   coverage is read from file names (`backend/parquet/catalog/coverage.rs:385-394`). The days between
+   merged files then read as held. Their default check is disjointness only (`consolidation.rs:347-349`;
+   `backend/parquet/intervals.rs:22-36`), so a gap passes it.
+2. **The by-period methods keep the files they would merge.** With their default they refuse a range whose
+   files are not contiguous (`consolidation.rs:813, 1131-1137`), as sampled days are not. Without it they
+   merge only files less than one period apart (`consolidation.rs:1253-1268`). A load already writes one
+   file per bar type per day, so a one-day period merges little: only runs of adjacent days, across the
+   night between them. A longer period merges across the gaps and reads them as covered, as in 1.
+3. **The rewrite is not atomic.** It writes the merged file, then deletes the originals one by one
+   (`backend/parquet/io.rs:375-391`). The by-period path writes its target before it completes the
+   source files (`consolidation.rs:881-894`); what that completion removes was not read.
+4. **No lock across instances or processes.** The Python binding serializes the calls of one catalog
+   instance (`python/backend/parquet/catalog.rs:132-135`), and the docs speak of one instance's calls only
+   (`docs/concepts/data/catalog.md:153-155`). `consolidation.rs` takes no lock of its own.
 
 Whether to report these upstream is the owner's decision.
 
@@ -160,10 +172,14 @@ Read 2026-11-14.
   load range, the lock's cost and the footer-reader sentence, and added the defense-in-depth caveat.
 * The two scout reports of 2026-11-14 in the lead's archive (outside the repository) — read; their
   ClickHouse, QuestDB, Delta, Iceberg, Lance, cuDF and Sirius lines are `UNVERIFIED` here.
-* `nautilus-trader` at the pin: `consolidation.rs:313-372`, `io.rs:303-391`, `intervals.rs:22-50`,
-  `catalog/coverage.rs:380-394`, `catalog/query.rs:200-222`, `catalog/store.rs:396-411`,
+* `nautilus-trader` at the pin: `consolidation.rs:313-372, 790-894, 1090-1270`, `io.rs:303-391`,
+  `intervals.rs:22-50`, `catalog/coverage.rs:280-394`, `catalog/query.rs:200-222`, `catalog/store.rs:396-411`,
+  `catalog/write.rs:262-278`, `python/backend/parquet/catalog.rs:132-135`,
   `docs/concepts/data/catalog.md:150-155, 436-526` — resolved (`scripts/canon src nautilus-trader`) and read.
-* The load's `/usr/bin/time -l` and `sample` output, and the trial's logs and comparison, are outside the
-  repository with the data lane's ledger; the trial's tests are in `tests/test_history_load.py`.
+* The loads' `/usr/bin/time -l` and `sample` output, the trial's logs and its comparison of the two roots, are
+  outside the repository with the data lane's ledger; the trial's tests are in `tests/test_history_load.py`.
+* evidence-verifier, 2026-11-14, on this section: the measured figures and every cited line held but one; it
+  corrected the merge's naming lines, added the by-period methods and the per-instance lock, and placed the
+  `sample` on the next load.
 * The measurement, its scripts and per-run results are outside the repository with the lane's report;
   the folder's schema was probed in a scratch environment before the registry entries existed.
