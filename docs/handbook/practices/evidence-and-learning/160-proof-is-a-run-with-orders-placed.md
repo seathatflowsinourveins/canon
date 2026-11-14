@@ -1,0 +1,1 @@
+* Proof is a run with orders placed, through NautilusTrader's own engine on recorded data or on paper, with the engine's reports as its evidence and what a simulation does not show named; a test count comes after the run (ADR 0074).

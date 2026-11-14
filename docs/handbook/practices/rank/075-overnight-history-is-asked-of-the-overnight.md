@@ -1,0 +1,1 @@
+* Overnight history is asked of the overnight feed, `boats`, with an end at least 15 minutes old (the loader's `PUBLICATION_DELAY`, the Mover's warm-up `OVERNIGHT_HISTORY_DELAY`); the consolidated feed's history holds no overnight tape, and a refused feed stops the load by name (ADR 0066; pull request 449).
