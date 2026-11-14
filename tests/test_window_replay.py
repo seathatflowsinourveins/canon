@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -11,6 +13,8 @@ from datetime import UTC
 from datetime import datetime
 from datetime import timedelta
 from decimal import Decimal
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -42,6 +46,9 @@ OPEN = START.replace(hour=4, minute=0)
 END = START + timedelta(minutes=20)
 MINUTE = 60_000_000_000
 SECOND = 1_000_000_000
+HANDLER_ERROR = (
+    r"Python on_\w+ failed|Traceback \(most recent call last\)|mutably borrowed|handler .*failed"
+)
 OFFLINE_GUARDS = """
 import os
 import socket
@@ -859,3 +866,102 @@ def test_a_replay_error_before_the_log_check_is_the_one_reported(neutral_catalog
     with pytest.raises(RuntimeError) as failed:
         run_replay({**spec, **later, "trade_date": (START + timedelta(days=1)).date().isoformat()})
     assert str(failed.value).rstrip().splitlines()[-1].startswith("ValueError")
+
+
+@pytest.mark.parametrize("fill_arm", ["touch", "tape"])
+def test_recorded_rankings_match_full_replay_and_load_only_listed_names(
+    neutral_catalogs, monkeypatch, fill_arm
+):
+    from canon_trading import rank_record
+    from canon_trading import window_replay
+
+    worker = window_replay._WORKER
+    spec, *_ = neutral_catalogs
+    # The public writer refuses repository destinations; fixtures use system temp only.
+    with TemporaryDirectory(prefix="canon-rank-equivalence-") as folder:
+        snapshot = Path(folder) / "snapshot"
+        shutil.copytree(spec["bars_root"], snapshot)
+        (snapshot / "SNAPSHOT.json").write_text(json.dumps({"snapshot": str(snapshot)}))
+        spec = {**spec, "bars_root": str(snapshot), "fill_arm": fill_arm}
+        signal_file = snapshot / "rank.json"
+        monkeypatch.setattr(rank_record, "_WORKER", OFFLINE_GUARDS + rank_record._WORKER)
+        record = rank_record.record_rankings(spec, signal_file)
+        monkeypatch.setattr(window_replay, "_WORKER", OFFLINE_GUARDS + worker)
+        full = window_replay.run_replay(spec)
+        expected = [r for r in record["generations"] if r["published_ns"] <= ns(END)]
+        assert full["rank_signals"] == expected
+        # Count the catalog requests in the fresh process, without replacing their results.
+        injection = """
+from nautilus_trader.persistence import ParquetDataCatalog
+from canon_trading import window_replay, movers_rank_actor
+catalog_type = ParquetDataCatalog
+class SelectedCatalog:
+    def __init__(self, *args, **kwargs):
+        self.inner = catalog_type(*args, **kwargs)
+    def instruments(self, instrument_ids=None, **kwargs):
+        assert instrument_ids == ['LLL.ALPACA'], instrument_ids
+        return self.inner.instruments(instrument_ids=instrument_ids, **kwargs)
+    def query_bars(self, identifiers=None, **kwargs):
+        assert identifiers and all(i.startswith('LLL.ALPACA-') for i in identifiers), identifiers
+        return self.inner.query_bars(identifiers=identifiers, **kwargs)
+    def query_quote_ticks(self, identifiers=None, **kwargs):
+        assert identifiers == ['LLL.ALPACA'], identifiers
+        return self.inner.query_quote_ticks(identifiers=identifiers, **kwargs)
+    def query_trade_ticks(self, identifiers=None, **kwargs):
+        assert identifiers == ['LLL.ALPACA'], identifiers
+        return self.inner.query_trade_ticks(identifiers=identifiers, **kwargs)
+    def __getattr__(self, name):
+        return getattr(self.inner, name)
+window_replay.ParquetDataCatalog = SelectedCatalog
+def no_rank(*args, **kwargs):
+    raise AssertionError('recorded replay recomputed ranking')
+movers_rank_actor.MoversRankActor.on_start = no_rank
+"""
+        monkeypatch.setattr(window_replay, "_WORKER", injection + OFFLINE_GUARDS + worker)
+        replay = window_replay.run_replay({**spec, "rank_file": str(signal_file)})
+        assert replay["rank_signals"] == full["rank_signals"]
+        assert replay["catalog"]["instruments"] == ["LLL.ALPACA"]
+        assert replay["catalog"]["bars_read"] < full["catalog"]["bars_read"]
+        # OrderFactory creates a random init_id, and fill events a random event_id.
+        # Native venue/trade IDs also include the loaded instrument's ordinal:
+        # rc8 common/src/factories/order.rs:200; execution/src/matching_engine/
+        # ids_generator.rs:200-235,273-287. Retain client IDs and EVERY other field.
+        native_ids = {"init_id", "event_id", "venue_order_id", "trade_id"}
+        for key in ("orders", "fills"):
+            expected_rows = [{k: v for k, v in r.items() if k not in native_ids} for r in full[key]]
+            actual_rows = [{k: v for k, v in r.items() if k not in native_ids} for r in replay[key]]
+            assert actual_rows == expected_rows
+        assert replay["orders"] and replay["fills"]
+        assert replay["open_positions"] == full["open_positions"] == 0
+        assert [e["message"] for e in replay["engine_errors"]] == [
+            e["message"] for e in full["engine_errors"]
+        ]
+        assert not any(re.search(HANDLER_ERROR, e["message"]) for e in replay["engine_errors"])
+
+
+def test_empty_recorded_ranking_replays_without_loading_the_universe(neutral_catalogs):
+    from canon_trading import rank_record
+    from canon_trading import window_replay
+
+    spec, *_ = neutral_catalogs
+    with TemporaryDirectory(prefix="canon-empty-rank-") as folder:
+        snapshot = Path(folder) / "snapshot"
+        shutil.copytree(spec["bars_root"], snapshot)
+        (snapshot / "SNAPSHOT.json").write_text(json.dumps({"snapshot": str(snapshot)}))
+        spec: dict[str, Any] = {**spec, "bars_root": str(snapshot)}
+        for row in spec["reference_closes"].values():
+            row["close"] = 20.0
+        signal_file = snapshot / "rank.json"
+        rank_record.record_rankings(spec, signal_file)
+        full = window_replay.run_replay(spec)
+        replay = window_replay.run_replay({**spec, "rank_file": str(signal_file)})
+        assert full["rank_signals"] and all(r["value"] == "" for r in full["rank_signals"])
+        assert replay["rank_signals"] == full["rank_signals"]
+        assert replay["orders"] == full["orders"] == []
+        assert replay["fills"] == full["fills"] == []
+        assert replay["open_positions"] == 0
+        assert not any(re.search(HANDLER_ERROR, e["message"]) for e in replay["engine_errors"])
+        assert replay["catalog"]["instruments"] == []
+        assert replay["catalog"]["bars_read"] == 0
+        assert replay["catalog"]["quotes_read"] == 0
+        assert replay["catalog"]["trades_read"] == 0
