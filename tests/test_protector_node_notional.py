@@ -78,6 +78,8 @@ ASSET_AAA = {
     "tradable": True,
     "easy_to_borrow": False,
 }
+pytestmark = pytest.mark.usefixtures("new_york_regular_hours")
+
 QUOTE_AAA = {"T": "q", "S": "AAA", "bx": "U", "bs": 50, "ax": "Q", "as": 50, "c": ["R"], "z": "C"}
 
 
@@ -241,7 +243,6 @@ def run_large_holding(
         node.dispose()
 
 
-@pytest.mark.usefixtures("new_york_regular_hours")
 def test_one_protective_sell_of_a_300k_holding_passes_the_protector_nodes_risk_engine(
     controls, monkeypatch
 ):
@@ -256,7 +257,6 @@ def test_one_protective_sell_of_a_300k_holding_passes_the_protector_nodes_risk_e
     assert all(p.is_closed for p in external)
 
 
-@pytest.mark.usefixtures("new_york_regular_hours")
 def test_the_same_sell_under_the_paper_default_cap_is_denied(controls, monkeypatch):
     """The contrast: this harness sees a denial when a cap is there."""
     limits = protector_limits(controls, monkeypatch)
@@ -301,7 +301,6 @@ class SubDollarData(SyntheticData):
             await asyncio.sleep(0.05)
 
 
-@pytest.mark.usefixtures("new_york_regular_hours")
 def test_one_protective_sell_of_500k_sub_dollar_shares_is_on_the_step_and_passes(
     controls, monkeypatch
 ):

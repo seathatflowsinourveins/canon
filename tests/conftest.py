@@ -28,15 +28,18 @@ sqrt(T - 1).
 from __future__ import annotations
 
 import fcntl
+import gc
 import math
 import os
 import re
 import signal
 import statistics
+import sys
 import threading
 from datetime import UTC
 from datetime import datetime
 from datetime import timedelta
+from datetime import timezone
 from statistics import NormalDist
 from time import monotonic
 from time import time_ns
@@ -449,29 +452,45 @@ def references_in(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.fixture
 def new_york_regular_hours(monkeypatch: pytest.MonkeyPatch) -> datetime:
-    """The real clock read as the nearest 11:00 New York, inside the regular session, for one test.
+    """The real clock read as about 11:00 New York, inside the regular session, for one test.
 
     A LiveNode keeps the realtime clock at the pin (`crates/common/src/live/clock.rs:55-57`), so a test
     that drives one runs at the hour it is started. `OwnerProtector._plan_holding` judges a quote's open
     session part from that clock's hour and minute in `session_window.NEW_YORK`
     (`src/canon_trading/owner_protector.py:1750-1765`); on sip from 00:00 to 04:00 New York no quote can
-    pass, and the test fails by the hour. This puts a fixed UTC offset in `session_window.NEW_YORK` for
-    the test, the one at which the real clock reads the nearest 11:00 New York: every stamp stays the
-    real clock's and time runs on, and only the reading of New York wall time moves, by under 24 hours
-    (`datetime.timezone`'s bound). The judge reads no weekday. A module that holds a zone of its own
-    (`mover.NEW_YORK`, `canon_alpaca.data.NEW_YORK`) is not moved. Returns the instant pinned.
+    pass, and the test fails by the hour. This puts in `session_window.NEW_YORK`, for the test, the fixed
+    UTC offset at which the real clock reads 11:00 now: every stamp stays the real clock's and time
+    runs on. Every reader of `session_window.NEW_YORK` moves with it (the judge, `protect.session_start`,
+    custody's and protector_node's New York readings, session_window's own), by less than a day, so the
+    New York date read can be a day off the real one, a weekend day included; the judge reads no
+    weekday. A module that holds a zone of its own (`mover.NEW_YORK`, `canon_alpaca.data.NEW_YORK`,
+    `movers_rank.NEW_YORK`) is not moved. Returns the real clock's reading in the pinned zone.
     """
-    from datetime import timezone
-
     from canon_trading import session_window
 
     now = datetime.now(UTC)
-    here = now.astimezone(NEW_YORK)
-    pinned = here.replace(hour=11, minute=0, second=0, microsecond=0)
-    if pinned - here > timedelta(hours=12):
-        pinned -= timedelta(days=1)
-    elif here - pinned > timedelta(hours=12):
-        pinned += timedelta(days=1)
-    offset = pinned.replace(tzinfo=None) - now.replace(tzinfo=None)
-    monkeypatch.setattr(session_window, "NEW_YORK", timezone(offset, "New York, pinned"))
-    return pinned
+    since_midnight = now - now.replace(hour=0, minute=0, second=0, microsecond=0)
+    offset = (timedelta(hours=11) - since_midnight + timedelta(hours=12)) % timedelta(days=1)
+    zone = timezone(offset - timedelta(hours=12), "New York, pinned")
+    monkeypatch.setattr(session_window, "NEW_YORK", zone)
+    return now.astimezone(zone)
+
+
+@pytest.fixture(autouse=True)
+def no_live_node_kept_by_the_last_failure() -> None:
+    """A case that failed with a LiveNode in its frame does not fail the next case that builds one.
+
+    pytest keeps the last failure for postmortem debugging in `sys.last_exc` and `sys.last_traceback`,
+    and deletes them only when the next case is called, with no collection (`_pytest/runner.py:173-193`
+    at pytest 9.2.0). The failed frame holds its node in a reference cycle, and at the NautilusTrader pin
+    a thread holds one LiveNode until it is dropped (`crates/live/src/node/mod.rs:344-354`). The next
+    case that builds one without collecting first then fails with "A LiveNode already exists", which
+    hides the case that really failed. This drops the kept failure and collects, before the next case,
+    only after a failure: upstream's `collect_node_cycles` (`python/tests/conftest.py:148-155`) is the
+    collection alone, which this kept failure outlives. `tests/test_live_node_cascade.py` shows both.
+    """
+    if hasattr(sys, "last_traceback") or hasattr(sys, "last_exc"):
+        for name in ("last_type", "last_value", "last_traceback", "last_exc"):
+            if hasattr(sys, name):
+                delattr(sys, name)
+        gc.collect()
