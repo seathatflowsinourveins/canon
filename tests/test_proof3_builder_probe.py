@@ -48,6 +48,7 @@ def isolated(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("CANON_HOME", raising=False)
 
 
+@pytest.mark.usefixtures("new_york_regular_hours")
 def test_a_segment_through_the_builder(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     gc.collect()
     said: list[str] = []

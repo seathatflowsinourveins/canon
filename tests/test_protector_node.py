@@ -1360,6 +1360,7 @@ def test_the_runner_accepts_the_schema_the_composed_strategy_writes(
     assert module._book_levels(path, "windows") == {AAA: Price.from_str("9.75")}
 
 
+@pytest.mark.usefixtures("new_york_regular_hours")
 def test_two_builder_segments_carry_the_level_distance_and_offset(controls, tmp_path, monkeypatch):
     """Real LiveNodes with synthetic client factories; the builder and strategy stay intact.
 
