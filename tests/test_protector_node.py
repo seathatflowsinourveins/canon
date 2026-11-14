@@ -6,8 +6,10 @@ the real OwnerProtector with unit 10's synthetic cache/transport and stand-in ac
 
 from __future__ import annotations
 
+import asyncio
 import fcntl
 import fnmatch
+import gc
 import importlib
 import importlib.util
 import json
@@ -26,16 +28,33 @@ import pytest
 from alpaca.trading.models import Calendar
 from alpaca.trading.models import Clock
 from canon_alpaca.execution import AlpacaExecutionClient
+from nautilus_trader.live.clients import DataClientFactory
+from nautilus_trader.live.clients import ExecutionClientFactory
+from nautilus_trader.model import AccountId
+from nautilus_trader.model import AccountType
 from nautilus_trader.model import InstrumentId
+from nautilus_trader.model import OmsType
 from nautilus_trader.model import OrderSide
+from nautilus_trader.model import PositionSide
+from nautilus_trader.model import PositionStatusReport
 from nautilus_trader.model import Price
+from nautilus_trader.model import Quantity
+from nautilus_trader.model import Venue
 
 from canon_trading import custody
 from canon_trading import paper_node
 from canon_trading import session_window as window
 from canon_trading.owner_protector import OwnerProtector
+from canon_trading.start_level import Entry
+from canon_trading.start_level import LevelBook
+from canon_trading.start_level import book_path
+from tests.test_owner_protector import SECOND
 from tests.test_owner_protector import Harness
+from tests.test_owner_protector import SyntheticData
+from tests.test_owner_protector import SyntheticExecution
+from tests.test_owner_protector import VenueOrders
 from tests.test_owner_protector import new_quote
+from tests.test_owner_protector import quote
 from tests.test_owner_protector import working_sell
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -1160,7 +1179,7 @@ def test_this_trees_protector_reads_the_book():
     assert subject()._protector_takes_book() is True
 
 
-@pytest.mark.parametrize("text", [None, "not json", '{"schema": 2, "entries": []}'])
+@pytest.mark.parametrize("text", [None, "not json", '{"schema": 3, "entries": []}'])
 def test_an_unreadable_book_refuses_the_start_by_name(controls, tmp_path, monkeypatch, text):
     module, settings, _strategy, _foreign, _reads, built = booked(monkeypatch, controls)
     book = tmp_path / "owner-levels.json"
@@ -1217,3 +1236,251 @@ def test_the_node_builder_puts_the_part_in_the_protectors_settings(controls, mon
     with pytest.raises(Stop):
         module.protector_node(run, (AAA,), feed="boats", session_part="overnight")
     assert made[0].session_part == "overnight"
+
+
+def test_a_label_resolves_the_book_without_the_runner_environment(controls, tmp_path, monkeypatch):
+    module = subject()
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    monkeypatch.delenv(module.LEVEL_BOOK_ENV, raising=False)
+    supplied = {"account_label": "windows", "trading": VenueOrders()}
+    node, strategy = module.protector_node(config(controls), (AAA,), feed="sip", book=supplied)
+    try:
+        assert strategy.settings.level_book_path == book_path("windows")
+        assert strategy.settings.trading is supplied["trading"]
+        assert set(supplied) == {"account_label", "trading"}, "the caller's book was mutated"
+    finally:
+        node.dispose()
+        del node
+
+
+def test_each_labelled_build_has_a_distinct_run_name(controls, tmp_path, monkeypatch):
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    runs = []
+    for _ in range(2):
+        gc.collect()
+        node, strategy = subject().protector_node(
+            config(controls), (AAA,), feed="sip", book={"account_label": "windows"}
+        )
+        try:
+            runs.append(strategy.settings.run)
+        finally:
+            node.dispose()
+            del node
+    assert all(runs), "each start needs a name before it reaches the strategy"
+    assert runs[0] != runs[1]
+
+
+def test_the_identity_reader_is_injectable_at_the_builder(controls, tmp_path, monkeypatch):
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    venue = VenueOrders()
+    made = []
+
+    def reader():
+        made.append(venue)
+        return venue
+
+    node, strategy = subject().protector_node(
+        config(controls),
+        (AAA,),
+        feed="sip",
+        book={"account_label": "windows"},
+        trading_reader=reader,
+    )
+    try:
+        assert strategy.settings.trading is venue
+        assert made == [venue]
+        assert venue.reads == [], "building must not ask the venue about holdings"
+    finally:
+        node.dispose()
+
+
+def test_an_explicit_reader_is_not_replaced_by_the_factory(controls, tmp_path, monkeypatch):
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    venue = VenueOrders()
+
+    def unused():
+        pytest.fail("an explicit reader must not be replaced")
+
+    node, strategy = subject().protector_node(
+        config(controls),
+        (AAA,),
+        feed="sip",
+        book={"account_label": "windows", "trading": venue},
+        trading_reader=unused,
+    )
+    try:
+        assert strategy.settings.trading is venue
+    finally:
+        node.dispose()
+
+
+def test_an_unlabelled_build_does_not_construct_a_reader(controls):
+    def unused():
+        pytest.fail("an unlabelled build must not construct a reader")
+
+    node, strategy = subject().protector_node(
+        config(controls), (AAA,), feed="sip", trading_reader=unused
+    )
+    try:
+        assert strategy.settings.account_label is None
+        assert strategy.settings.level_book_path is None
+        assert strategy.settings.run == ""
+        assert strategy.settings.trading is None
+    finally:
+        node.dispose()
+
+
+def test_the_runner_accepts_the_schema_the_composed_strategy_writes(
+    controls, tmp_path, monkeypatch
+):
+    module, settings, _strategy, _foreign, _reads, built = booked(monkeypatch, controls)
+    path = tmp_path / "levels.json"
+    LevelBook.write(
+        path,
+        {
+            ("windows", AAA): Entry(
+                Decimal("9.75"),
+                1,
+                Decimal(10),
+                2,
+                "earlier",
+                distance=Decimal("0.20"),
+                limit_offset=Decimal("0.05"),
+            ),
+        },
+    )
+    monkeypatch.setenv(module.LEVEL_BOOK_ENV, str(path))
+    module.run_protector(settings, trading=object(), lock_dir=tmp_path)
+    assert built[0][3] == {"account_label": "windows", "level_book_path": str(path)}
+    assert module._book_levels(path, "windows") == {AAA: Price.from_str("9.75")}
+
+
+def test_two_builder_segments_carry_the_level_distance_and_offset(controls, tmp_path, monkeypatch):
+    """Real LiveNodes with synthetic client factories; the builder and strategy stay intact.
+
+    Pin: live/src/python/node.rs:846-856,1326-1370 installs Python factories and the constructed
+    strategy; execution/src/trailing.rs:61-102 keeps a sell's existing trigger unless it rises.
+    All book and lock writes use the account's book_path under this test's CLAUDE_CONFIG_DIR.
+    """
+    module = subject()
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    monkeypatch.delenv(module.LEVEL_BOOK_ENV, raising=False)
+    notes = []
+    monkeypatch.setattr(OwnerProtector, "_say", lambda self, text: notes.append(text))
+    venue = VenueOrders()
+    tapes = [("10.30", "10.50"), ("10.30",)]
+    snapshots = []
+    requests = []
+    runs = []
+    gain_events = []
+    path = book_path("windows")
+
+    class Data(SyntheticData):
+        async def _request_bars(self, request):
+            requests.append(("bars", request.params))
+            await super()._request_bars(request)
+
+        async def _request_quotes(self, request):
+            requests.append(("quotes", request.params))
+            await super()._request_quotes(request)
+
+        async def publish_tape(self):
+            for bid in tapes[len(runs) - 1]:
+                self._handle_data(quote(bid, self.clock.timestamp_ns()))
+                await asyncio.sleep(0.1)
+            published.set()
+
+    class Execution(SyntheticExecution):
+        async def _generate_position_status_reports(self, command):
+            now = self.clock.timestamp_ns()
+            return [
+                PositionStatusReport(
+                    AccountId("ALPACA-001"),
+                    AAA,
+                    PositionSide.LONG,
+                    Quantity.from_int(10),
+                    now - 3600 * SECOND,
+                    now,
+                    avg_px_open=Decimal("10.00"),
+                )
+            ]
+
+    class DataFactory(DataClientFactory):
+        @staticmethod
+        def create(**kwargs):
+            return Data(**kwargs, venue=Venue("ALPACA"))
+
+    class ExecutionFactory(ExecutionClientFactory):
+        @staticmethod
+        def create(**kwargs):
+            return Execution(
+                **kwargs,
+                venue=Venue("ALPACA"),
+                account_id=AccountId("ALPACA-001"),
+                account_type=AccountType.CASH,
+                oms_type=OmsType.NETTING,
+            )
+
+    async def stop_when_armed(strategy, published):
+        await published.wait()
+        while AAA not in strategy.slots or strategy.slots[AAA].distance is None:
+            await asyncio.sleep(0.05)
+        slot = strategy.slots[AAA]
+        snapshots.append((slot.level.as_decimal(), slot.distance.distance, slot.limit_offset))
+        gain_events.append(list(strategy.gain_lock_events))
+        strategy.shutdown_system("builder segment observed")
+
+    async def run_segment(node, strategy, published):
+        stop = asyncio.create_task(stop_when_armed(strategy, published))
+        try:
+            async with asyncio.timeout(20):
+                await node.run_async()
+            await stop
+        finally:
+            stop.cancel()
+
+    monkeypatch.setattr(paper_node, "AlpacaDataClientFactory", DataFactory)
+    monkeypatch.setattr(paper_node, "AlpacaExecutionClientFactory", ExecutionFactory)
+    for _ in range(2):
+        gc.collect()
+        published = asyncio.Event()
+        node, strategy = module.protector_node(
+            config(controls),
+            (AAA,),
+            feed="sip",
+            book={"account_label": "windows"},
+            trading_reader=lambda: venue,
+        )
+        runs.append(strategy.settings.run)
+        try:
+            asyncio.run(run_segment(node, strategy, published))
+        finally:
+            node.dispose()
+            del node
+        saved = LevelBook.read(path)[("windows", AAA)]
+        assert (saved.last_level, saved.distance, saved.limit_offset) == snapshots[-1]
+        assert saved.run == runs[-1]
+    assert snapshots[0] == snapshots[1], "a restart must carry all three exit values unchanged"
+    assert runs[0] and runs[1] and runs[0] != runs[1]
+    assert notes.count("level book enabled for account windows") == 2
+    assert not any("level book disabled" in note for note in notes)
+    assert any("carried level" in note and runs[0] in note for note in notes)
+    (armed,) = gain_events[0]
+    assert armed["event"] == "armed"
+    assert Decimal(armed["entry"]) == Decimal("10.00")
+    assert Decimal(armed["round_trip_cost"]) == 0
+    assert Decimal(armed["noise_floor"]) == Decimal("0.04")  # Two synthetic 0.02 spreads.
+    assert Decimal(armed["applied_floor"]) == Decimal("10.00")
+    assert armed["armed_at"] > armed["level_armed_at"]
+    assert [kind for kind, _params in requests].count("bars") == 2
+    assert [kind for kind, _params in requests].count("quotes") == 2
+    assert all(params["feed"] == "sip" for _kind, params in requests)
+    assert all(
+        params["latest"] and params["skip_catalog_data"] and not params["update_catalog"]
+        for kind, params in requests
+        if kind == "quotes"
+    )
+    assert [query["side"] for path, query in venue.reads if path == "/orders" and query] == [
+        "sell",
+        "buy",
+    ]

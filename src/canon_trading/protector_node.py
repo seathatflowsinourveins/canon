@@ -15,6 +15,9 @@ Read at NautilusTrader d53849b216e2, v2.0.0rc8:
   crates/execution/src/order_emulator/emulator.rs:5094: the released LIMIT keeps it. Every sell
   OwnerProtector sends is named in the protect lineage (`custody.PROTECT_CLIENT_ORDER_ID`,
   `canon-protect-`), never one of our nodes' (the lead's ruling, 2026-11-13, 16:04:49).
+* crates/live/src/python/node.rs:1326-1370: add_strategy registers the constructed strategy and
+  its config. The level-book keywords implement OwnerProtectorConfig's composed U-e contract;
+  start_level.book_path names its account file and start_level.SCHEMA names its written format.
 
 owner_execution_config enables the adapter's reduce_only_sells and external reports; execution.py
 checks the reduce-only side/type at :2542-2553 and writes SELL_TO_CLOSE at :2594-2595. The emulator
@@ -38,6 +41,7 @@ import re
 import signal
 import subprocess
 import sys
+from collections.abc import Callable
 from collections.abc import Generator
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -47,6 +51,7 @@ from datetime import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 from typing import Any
+from uuid import uuid4
 
 from canon_alpaca.providers import TimeoutAdapter
 from canon_alpaca.providers import session_of
@@ -61,6 +66,8 @@ from .owner_protector import OwnerProtector
 from .owner_protector import OwnerProtectorConfig
 from .owner_protector import owner_execution_config
 from .protect import ROWS
+from .start_level import SCHEMA
+from .start_level import book_path
 
 if TYPE_CHECKING:
     from alpaca.trading.client import TradingClient
@@ -141,20 +148,34 @@ def protector_node(
     instruments: Sequence[InstrumentId],
     *,
     feed: str,
-    book: dict[str, str] | None = None,
+    book: dict[str, Any] | None = None,
     session_part: str = "regular",
+    trading_reader: Callable[[], Any] | None = None,
 ) -> tuple[LiveNode, OwnerProtector]:
     """Build, but do not connect: one strategy, no claims and no automatic market exit.
 
     The roster is the account snapshot's whole instrument set, not just the levels' symbols.
     No notional cap can deny a protective exit; native risk checks and throttles remain enabled.
+
+    A book's account_label enables persistence without the runner's environment variable. Resolve
+    its default path and give this start its own name before handing the config to the strategy.
+    An explicit reader is kept; an injected factory can supply one for a labelled build. The task
+    supplies its GET-only reader through _book_settings under the account's locks. Bare builds
+    construct no reader and carry no level; building alone makes no account or level-book read.
     """
     missing = config.levels.keys() - set(instruments)
     if missing:
         names = ", ".join(sorted(str(instrument) for instrument in missing))
         raise ValueError(f"{names}: supplied level has no starting holding")
-    # U-e's keywords; pnode's copy refuses unknown ones (_book_settings refuses before it gets here).
     book_settings: dict[str, Any] = dict(book or {})
+    label = book_settings.get("account_label")
+    if label is not None:
+        if book_settings.get("level_book_path") is None:
+            book_settings["level_book_path"] = book_path(label)
+        if book_settings.get("run", "") == "":
+            book_settings["run"] = f"{label}:{uuid4().hex}"
+        if "trading" not in book_settings and trading_reader is not None:
+            book_settings["trading"] = trading_reader()
     settings = OwnerProtectorConfig(
         row=config.row,
         levels=config.levels,
@@ -246,24 +267,22 @@ start_level.book_path()'s file. Read only once both locks are held (the lead's r
 
 
 def _book_levels(path: Path, account: str) -> dict[InstrumentId, Price]:
-    """The one read of U-e's level book, to be replaced by `start_level.LevelBook.read` once it lands.
+    """Check the runner's supplied book and count this account's priced rows under the locks.
 
-    Its contract as built in ue-build (start_level.py, sha256 81cb6749..., 2026-11-13 16:48; UNVERIFIED
-    until it lands): JSON schema 1, `entries` rows keyed by account label, instrument id and protection
-    start, each with `last_level` as decimal text and `written_ns`. The account label is this task's
-    account name (UNVERIFIED: unit 10's caller sets it). The latest written row per instrument is taken.
-    A missing or unreadable book refuses the start; a malformed row is skipped by name, as LevelBook.read
-    skips it.
+    Accept both formats read by start_level.LevelBook: legacy schema 1 and the composed writer's
+    SCHEMA. A missing or unreadable runner-supplied book refuses the start; a malformed level is
+    skipped by name. This summary selects no carried holding: OwnerProtector reads the whole book
+    through LevelBook.read and decides identity through its venue reader.
     """
     try:
         data = json.loads(path.read_text())
         entries = data["entries"] if isinstance(data, dict) else None
         if (
             type(data.get("schema")) is not int
-            or data["schema"] != 1
+            or data["schema"] not in (1, SCHEMA)
             or not isinstance(entries, list)
         ):
-            raise ValueError("expected schema 1 and an entries array")
+            raise ValueError(f"expected schema 1 or {SCHEMA} and an entries array")
     except (OSError, ValueError, KeyError, AttributeError) as e:
         raise window.WindowRefused(
             f"level book unreadable at {path}: {type(e).__name__}; nothing started"
