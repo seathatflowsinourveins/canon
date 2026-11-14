@@ -13,17 +13,25 @@ from typing import Any
 import pytest
 from canon_alpaca.execution import SELL_TO_CLOSE_PROVEN
 from canon_alpaca.execution import AlpacaExecutionClient
+from nautilus_trader.core import UUID4
+from nautilus_trader.model import AccountId
 from nautilus_trader.model import Bar
 from nautilus_trader.model import BarType
 from nautilus_trader.model import ClientOrderId
+from nautilus_trader.model import OrderAccepted
+from nautilus_trader.model import OrderPendingCancel
 from nautilus_trader.model import OrderSide
+from nautilus_trader.model import OrderSubmitted
 from nautilus_trader.model import OrderType
 from nautilus_trader.model import Price
 from nautilus_trader.model import Quantity
 from nautilus_trader.model import StrategyId
 from nautilus_trader.model import TimeInForce
+from nautilus_trader.model import TriggerType
+from nautilus_trader.model import VenueOrderId
 
 from canon_trading.mover import MoverConfig
+from canon_trading.mover import TrailPlan
 from canon_trading.mover import fill_trigger
 from canon_trading.mover import offsets
 from canon_trading.price_step import tick
@@ -694,13 +702,15 @@ def test_s2_stop_closes_through_adapter_or_preserves_cover(drive, pending_modify
         strategy_id=SID,
         order_factory=strategy.order_factory,
         protection=strategy.protection,
-        log=SimpleNamespace(info=lambda _: None),
+        log=SimpleNamespace(info=lambda _: None, warning=lambda _: None),
+        clock=strategy.clock,
         cache=SimpleNamespace(
             positions_open=lambda **kw: eng.cache.positions_open(**kw) if held[0] else [],
             instrument=eng.cache.instrument,
             quote=eng.cache.quote,
             order=eng.cache.order,
             orders=lambda **kw: list(active.values()),
+            bars=eng.cache.bars,
         ),
         cancel_all_orders=cancel_all,
         cancel_order=lambda cid: active.pop(cid, None),
@@ -708,6 +718,8 @@ def test_s2_stop_closes_through_adapter_or_preserves_cover(drive, pending_modify
         modify_order=modify,
         submit_order=submit,
     )
+    protection = importlib.import_module("canon_trading.protection")
+    host.protection = protection.Protection(host, protection.ProtectionConfig())
     module().EMACrossProtected.on_stop(host)
     assert held[0] == 0 or original.client_order_id in active, (
         "stop canceled protection without a close accepted by the adapter",
@@ -717,3 +729,328 @@ def test_s2_stop_closes_through_adapter_or_preserves_cover(drive, pending_modify
         assert all(denial is None for _, _, denial in submissions)
         assert all(order.client_order_id == original.client_order_id for order, _, _ in submissions)
     assert len(submissions) == (0 if pending_modify else 1)
+
+
+def stop_host(drive, *, cover=10, emulated=False, pending=None, filled=0, fill_on_modify=False):
+    """Real factory/adapter check, with venue acknowledgements and share reservations stood in.
+
+    The pin's strategy/mod.rs:400-405 refuses a pending cancel's modification;
+    :777-778 permits a pending update. emulator.rs:814-917 releases a locally
+    modified trail synchronously. A pending venue cancel still reserves shares
+    until its acknowledgement, as the adapter README's TC-E41/81 proof records.
+    """
+    strategy = template()
+    eng = drive(strategy, [quote(0, 9.99, 10.01), quote(1, 9.99, 10.01)])
+    (original,) = working(eng.cache)
+    held = [Decimal(10)]
+    active = {}
+    messages, submissions, modifications, released = [], [], [], []
+    adapter: Any = SimpleNamespace(
+        _provider=SimpleNamespace(find=eng.cache.instrument),
+        cache=eng.cache,
+        _reduce_only_sells=True,
+        _sell_to_close_order_types=SELL_TO_CLOSE_PROVEN,
+    )
+    if cover:
+        active[original.client_order_id] = SimpleNamespace(
+            client_order_id=original.client_order_id,
+            side=OrderSide.SELL,
+            order_type=OrderType.TRAILING_STOP_LIMIT if emulated else OrderType.LIMIT,
+            quantity=Quantity.from_int(cover + filled),
+            leaves_qty=Quantity.from_int(cover),
+            filled_qty=Quantity.from_int(filled),
+            price=Price.from_str("10.10"),
+            trigger_price=Price.from_str("9.80") if emulated else None,
+            is_emulated=emulated,
+            emulation_trigger=TriggerType.BID_ASK if emulated else None,
+            is_open=not emulated,
+            is_inflight=pending is not None,
+            is_closed=False,
+            is_pending_cancel=pending == "cancel",
+            is_pending_update=pending == "update",
+            time_in_force=TimeInForce.DAY,
+            is_reduce_only=True,
+        )
+
+    def positions(**kwargs):
+        assert kwargs == {"instrument_id": AAA, "strategy_id": SID}
+        return [SimpleNamespace(signed_qty=held[0], avg_px_open=10.01)] if held[0] else []
+
+    def orders(**kwargs):
+        assert kwargs == {"instrument_id": AAA, "strategy_id": SID}
+        return list(active.values())
+
+    def submit(order, position_id=None, client_id=None, params=None):
+        denial = AlpacaExecutionClient._denial(adapter, order)
+        reserved = sum(
+            (o.leaves_qty.as_decimal() for o in active.values() if not o.is_closed), Decimal(0)
+        )
+        if denial is None and reserved + order.quantity.as_decimal() > held[0]:
+            denial = "insufficient qty available: existing sell still reserves shares"
+        submissions.append((order, params, denial))
+        if denial is None:
+            active[order.client_order_id] = order
+
+    def modify(cid, *, quantity=None, price=None, trigger_price=None, **kwargs):
+        order = active[cid]
+        modifications.append(cid)
+        if order.is_pending_cancel:  # native Strategy refuses before routing a command
+            return
+        if order.is_emulated:
+            assert trigger_price is not None
+            assert trigger_price.as_decimal() >= Decimal("9.99")
+            sale = strategy.order_factory.limit(
+                AAA,
+                OrderSide.SELL,
+                order.quantity if quantity is None else quantity,
+                price,
+                time_in_force=order.time_in_force,
+                reduce_only=order.is_reduce_only,
+                client_order_id=cid,
+            )
+            assert AlpacaExecutionClient._denial(adapter, sale) is None
+            released.append(sale)
+            order.order_type = OrderType.LIMIT
+            order.is_emulated, order.is_open = False, True
+            order.emulation_trigger = None
+        order.is_pending_update = False
+        order.price = price
+        if fill_on_modify:
+            held[0] -= order.leaves_qty.as_decimal()
+            order.is_closed = True
+
+    def cancel_all(instrument_id, order_side=None):
+        assert instrument_id == AAA
+        assert order_side == OrderSide.BUY or held[0] == 0
+
+    host = SimpleNamespace(
+        settings=strategy.settings,
+        strategy_id=SID,
+        order_factory=strategy.order_factory,
+        clock=strategy.clock,
+        log=SimpleNamespace(
+            info=lambda message: messages.append(("info", message)),
+            warning=lambda message: messages.append(("warning", message)),
+            error=lambda message: messages.append(("error", message)),
+        ),
+        cache=SimpleNamespace(
+            positions_open=positions,
+            orders=orders,
+            order=active.get,
+            instrument=eng.cache.instrument,
+            quote=eng.cache.quote,
+            bars=eng.cache.bars,
+        ),
+        cancel_all_orders=cancel_all,
+        modify_order=modify,
+        submit_order=submit,
+    )
+    protection = importlib.import_module("canon_trading.protection")
+    host.protection = protection.Protection(host, protection.ProtectionConfig())
+    return host, SimpleNamespace(
+        held=held,
+        active=active,
+        messages=messages,
+        submissions=submissions,
+        modifications=modifications,
+        released=released,
+    )
+
+
+def test_f1_pending_update_can_reprice_the_same_venue_sell(drive):
+    host, state = stop_host(drive, pending="update")
+    module().EMACrossProtected.on_stop(host)
+    (sale,) = state.active.values()
+    assert sale.price.as_decimal() == Decimal("9.98")
+    assert state.submissions == []
+    assert sale.leaves_qty.as_decimal() == 10
+
+
+def test_f1_pending_cancel_is_named_and_its_reserved_shares_are_not_sold_twice(drive):
+    host, state = stop_host(drive, pending="cancel")
+    module().EMACrossProtected.on_stop(host)
+    assert state.submissions == []
+    assert any(
+        level in {"warning", "error"}
+        and "AAA.ALPACA" in text
+        and "uncovered" in text
+        and "pending cancel" in text
+        for level, text in state.messages
+    )
+    # The lead's ruling (a), 2026-11-13 21:13: the order is named in an ALERT that says the long may
+    # be left without a working sell if that cancel succeeds; no second sell of its shares is sent.
+    (pending,) = [o for o in state.active.values() if o.is_pending_cancel]
+    assert any(
+        level == "error"
+        and text.startswith("ALERT")
+        and str(pending.client_order_id) in text
+        and "may be left without a working sell if that cancel succeeds" in text
+        for level, text in state.messages
+    ), state.messages
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "unit 12's named limit (the lead, 2026-11-13 21:13): a stopped strategy gets no order events "
+        "(pin crates/trading/src/strategy/mod.rs:1395-1399) and a sell pending cancel cannot be "
+        "modified (:400-405), so a cancel in flight at stop cannot be settled here; the quiesce unit "
+        "(the node's stop waits for it, or alerts) carries it"
+    ),
+)
+def test_f1_pending_cancel_must_finish_with_durable_full_cover(drive):
+    host, state = stop_host(drive, pending="cancel")
+    # Native order state, not flags invented by this seam: the venue has
+    # accepted the sell and its cancellation has not yet been acknowledged.
+    sale = host.order_factory.limit(
+        AAA,
+        OrderSide.SELL,
+        Quantity.from_int(10),
+        Price.from_str("10.10"),
+        time_in_force=TimeInForce.DAY,
+        reduce_only=True,
+    )
+    identity = {
+        "trader_id": sale.trader_id,
+        "strategy_id": sale.strategy_id,
+        "instrument_id": AAA,
+        "client_order_id": sale.client_order_id,
+        "account_id": AccountId("ALPACA-001"),
+        "ts_event": T0,
+        "ts_init": T0,
+    }
+    sale.apply(OrderSubmitted(**identity, event_id=UUID4()))
+    sale.apply(
+        OrderAccepted(
+            **identity,
+            venue_order_id=VenueOrderId("STOP-1"),
+            event_id=UUID4(),
+            reconciliation=False,
+        )
+    )
+    sale.apply(
+        OrderPendingCancel(
+            **identity,
+            venue_order_id=VenueOrderId("STOP-1"),
+            event_id=UUID4(),
+            reconciliation=False,
+        )
+    )
+    assert sale.is_pending_cancel and sale.is_open and not sale.is_emulated
+    state.active.clear()
+    state.active[sale.client_order_id] = sale
+    module().EMACrossProtected.on_stop(host)
+    durable = sum(
+        (
+            order.leaves_qty.as_decimal()
+            for order in state.active.values()
+            if not order.is_closed and not order.is_pending_cancel and not order.is_emulated
+        ),
+        Decimal(0),
+    )
+    assert durable == state.held[0], "a pending cancel cannot cover the long after shutdown"
+
+
+@pytest.mark.parametrize(
+    "emulated,filled,fill_on_modify", [(True, 0, False), (True, 0, True), (False, 3, False)]
+)
+def test_f3_stop_covers_only_the_unreserved_remainder(drive, emulated, filled, fill_on_modify):
+    host, state = stop_host(
+        drive, cover=4, emulated=emulated, filled=filled, fill_on_modify=fill_on_modify
+    )
+    module().EMACrossProtected.on_stop(host)
+    assert len(state.submissions) == 1, "six of the ten held shares still need a sale"
+    sale, params, denial = state.submissions[0]
+    assert denial is None
+    assert sale.quantity.as_decimal() == 6
+    assert sale.order_type == OrderType.LIMIT and sale.time_in_force == TimeInForce.DAY
+    assert sale.is_reduce_only and params == {"extended_hours": True}
+    assert (
+        sum(
+            (o.leaves_qty.as_decimal() for o in state.active.values() if not o.is_closed),
+            Decimal(0),
+        )
+        == state.held[0]
+    )
+
+
+def test_f3_native_stop_releases_four_and_sells_the_remaining_six(drive):
+    strategy = template()
+    eng = drive(strategy, [quote(0, 9.99, 10.01), quote(1, 9.99, 10.01)])
+    (original,) = working(eng.cache)
+    strategy.modify_order(original.client_order_id, quantity=Quantity.from_int(4))
+    eng.end()
+    assert eng.portfolio.net_position(AAA) == 0
+    sales = [order for order in eng.cache.orders(strategy_id=SID) if order.side == OrderSide.SELL]
+    assert sorted(order.quantity.as_decimal() for order in sales) == [Decimal(4), Decimal(6)]
+    assert original.client_order_id in {order.client_order_id for order in sales}
+    adapter: Any = SimpleNamespace(
+        _provider=SimpleNamespace(find=eng.cache.instrument),
+        cache=eng.cache,
+        _reduce_only_sells=True,
+        _sell_to_close_order_types=SELL_TO_CLOSE_PROVEN,
+    )
+    assert all(AlpacaExecutionClient._denial(adapter, order) is None for order in sales)
+
+
+def test_stop_hook_covers_a_non_template_host_and_records_its_sale(drive):
+    host, state = stop_host(drive, cover=0)
+    host.protection.on_stop(AAA)
+    (submission,) = state.submissions
+    sale, params, denial = submission
+    assert sale.quantity.as_decimal() == 10 and denial is None
+    assert sale.is_reduce_only and params == {"extended_hours": True}
+    assert sale.client_order_id.value in host.protection._context.sale_rows
+
+
+@pytest.mark.parametrize("missing", ["quote", "instrument", "positive_bid"])
+@pytest.mark.parametrize(
+    "cover,emulated,pending,uncovered",
+    [
+        (0, False, None, 10),
+        (10, True, None, 10),
+        (4, False, None, 6),
+        (10, False, "cancel", 10),
+        (10, False, None, 0),
+    ],
+)
+def test_f6_stop_reports_only_durable_whole_holding_cover(
+    drive, missing, cover, emulated, pending, uncovered
+):
+    host, state = stop_host(drive, cover=cover, emulated=emulated, pending=pending)
+    if missing == "instrument":
+        host.cache.instrument = lambda _: None
+    elif missing == "quote":
+        host.cache.quote = lambda _: None
+    else:
+        host.cache.quote = lambda _: SimpleNamespace(bid_price=Price.from_str("0"))
+    module().EMACrossProtected.on_stop(host)
+    assert state.submissions == []
+    if uncovered:
+        assert not any("retains protection" in text for _, text in state.messages)
+        assert any(
+            level in {"warning", "error"}
+            and "AAA.ALPACA" in text
+            and "long 10" in text
+            and f"uncovered {uncovered}" in text
+            for level, text in state.messages
+        )
+    else:
+        assert any("retains protection" in text for _, text in state.messages)
+        assert not any(level in {"warning", "error"} for level, _ in state.messages)
+
+
+@pytest.mark.parametrize("context_floor,expected", [(1, "0.20"), (3, "0.60")])
+def test_f9_plan_distance_uses_the_injected_context_spread_floor(context_floor, expected):
+    protection = importlib.import_module("canon_trading.protection")
+    context = SimpleNamespace(settings=SimpleNamespace(spread_floor_m=Decimal(context_floor)))
+    part = protection.Protection(object(), protection.ProtectionConfig(), context=context)
+    plan = TrailPlan(
+        trail=Decimal("0.01"),
+        exit_through=Decimal("0.005"),
+        chase_cap=Decimal("0.02"),
+        atr=None,
+        spread=Decimal("0.20"),
+        bound="test",
+    )
+    assert part._plan_distance(plan, Decimal(10)) == Decimal(expected)

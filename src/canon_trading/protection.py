@@ -8,6 +8,15 @@ submit/cancel commands (rc8 trading/__init__.pyi:538-612); trailing_stop_limit
 accepts reduce_only (common/__init__.pyi:1523-1547), and the emulator retains
 submit params on release (crates/execution/src/order_emulator/emulator.rs:1522-1536).
 
+The callback host's on_stop delegates to on_stop(instrument_id) here. Stop releases
+an emulated trailing sell by modifying its trigger/limit in place (emulator.rs:
+814-917,1450-1487), then sells only shares no outstanding sell reserves. The pin
+allows modification while pending update but refuses it while pending cancel
+(crates/trading/src/strategy/mod.rs:340-417,773-829). A pending cancel is reserved,
+not durable cover: it is named as uncovered, since this synchronous stop hook
+cannot wait for the venue acknowledgement, and stopped strategies receive no
+order events (same file:1395-1399). The Mover keeps its separate stop_mover path.
+
 The Mover lends its existing state to this part, preserving every scheduling and
 order decision. Other strategies use the position/quote callbacks with private
 holding state. The default arm is the deployed Mover's OWN1 (session_window.py's
@@ -34,6 +43,7 @@ from nautilus_trader.model import ClientOrderId
 from nautilus_trader.model import InstrumentId
 from nautilus_trader.model import OrderReleased
 from nautilus_trader.model import OrderSide
+from nautilus_trader.model import OrderType
 from nautilus_trader.model import Price
 from nautilus_trader.model import PriceType
 from nautilus_trader.model import TimeInForce
@@ -233,7 +243,9 @@ class Protection:
             price,
             plan.trail,
             plan.exit_through,
-            least=None if plan.spread is None else self.config.spread_floor_m * plan.spread,
+            least=None
+            if plan.spread is None
+            else self._context.settings.spread_floor_m * plan.spread,
             chase_cap=plan.chase_cap,
         )[0]
 
@@ -371,6 +383,112 @@ class Protection:
         for slot in state.slots.values():
             if state._working(slot):
                 state.cancel_all_orders(slot.instrument_id)
+
+    def on_stop(self, instrument_id: InstrumentId) -> None:
+        """Move local cover to the venue and sell only unreserved shares of this host.
+
+        The caller cancels its BUY entries first. A sell pending cancellation
+        cannot be amended or counted as lasting cover, but still reserves its
+        shares. Name that gap instead of sending a competing sale. Cover after
+        this hook means a venue sell or a release/submit in progress, not an
+        emulated order which disappears with the node.
+        """
+        host = self.strategy
+        held, sells = self._stop_holding(instrument_id)
+        if held <= 0:
+            host.cancel_all_orders(instrument_id, order_side=OrderSide.SELL)
+            return
+        instrument = host.cache.instrument(instrument_id)
+        quote = host.cache.quote(instrument_id)
+        if instrument is None or quote is None or quote.bid_price.as_decimal() <= 0:
+            self._stop_note(instrument_id, held, sells, "no instrument or usable close quote")
+            return
+
+        now = host.clock.timestamp_ns()
+        slot = self._position_slot(instrument_id, now)
+        slot.exiting = True
+        self._ensure_exit(slot, held)
+        self._mark_exit(slot, now, quote.bid_price.as_decimal(), "strategy stop")
+        price = instrument.make_price(
+            exit_price(quote.bid_price.as_decimal(), self._context.settings.exit_ticks, None)
+        )
+        for order in sells:
+            if order.is_pending_cancel:
+                continue
+            if order.is_emulated and order.order_type == OrderType.TRAILING_STOP_LIMIT:
+                trigger = max(
+                    quote.bid_price.as_decimal(),
+                    Decimal(0) if order.trigger_price is None else order.trigger_price.as_decimal(),
+                )
+                host.modify_order(
+                    order.client_order_id,
+                    price=price,
+                    trigger_price=instrument.make_price(up_on_step(trigger)),
+                )
+            elif order.is_open and order.order_type == OrderType.LIMIT and order.price > price:
+                host.modify_order(order.client_order_id, price=price)
+
+        # A local release can fill synchronously. Re-read both the position and
+        # leaves quantities before sizing a second, disjoint sale (F3).
+        held, sells = self._stop_holding(instrument_id)
+        reserved = sum((order.leaves_qty.as_decimal() for order in sells), Decimal(0))
+        remainder = held - reserved
+        if remainder > 0:
+            self._limit_sell(slot, remainder, now, None)
+        held, sells = self._stop_holding(instrument_id)
+        if held > 0:
+            self._stop_note(instrument_id, held, sells, "stop-time sell coverage")
+
+    def _stop_holding(self, instrument_id: InstrumentId) -> tuple[Decimal, list[Any]]:
+        host = self.strategy
+        positions = host.cache.positions_open(
+            instrument_id=instrument_id, strategy_id=host.strategy_id
+        )
+        held = sum((position.signed_qty for position in positions), Decimal(0))
+        sells = [
+            order
+            for order in host.cache.orders(
+                instrument_id=instrument_id, strategy_id=host.strategy_id
+            )
+            if order.side == OrderSide.SELL and not order.is_closed
+        ]
+        return held, sells
+
+    def _stop_note(
+        self, instrument_id: InstrumentId, held: Decimal, sells: list[Any], reason: str
+    ) -> None:
+        # Released/initialized orders already in the cache may be queued for
+        # submission. Local emulation ends with the node; a pending cancel is
+        # not lasting cover even though it may still reserve shares.
+        covered = sum(
+            (
+                order.leaves_qty.as_decimal()
+                for order in sells
+                if not order.is_pending_cancel
+                and not order.is_emulated
+                and order.emulation_trigger is None
+            ),
+            Decimal(0),
+        )
+        if covered >= held:
+            self.strategy.log.info(
+                f"{instrument_id}: stop retains protection for long {held}; {reason}"
+            )
+            return
+        pending = "" if not any(o.is_pending_cancel for o in sells) else "; sell pending cancel"
+        self.strategy.log.warning(
+            f"{instrument_id}: stop long {held}, uncovered {held - covered}; {reason}{pending}"
+        )
+        # The lead's ruling (a), 2026-11-13 21:13: a cancel in flight at stop cannot be settled here
+        # (pin crates/trading/src/strategy/mod.rs:1395-1399, :400-405). Its shares stay reserved, so
+        # no second sell is sent for them; the order is named instead.
+        for order in sells:
+            if order.is_pending_cancel:
+                self.strategy.log.error(
+                    f"ALERT {instrument_id}: sell {order.client_order_id} for "
+                    f"{order.leaves_qty} is pending cancel at stop; the long {held} may be left "
+                    "without a working sell if that cancel succeeds"
+                )
 
     def _sale_sent(
         self,

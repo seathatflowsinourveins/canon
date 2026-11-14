@@ -12,18 +12,12 @@ The node's Alpaca execution client must set reduce_only_sells=True: Protection's
 sells are reduce-only, denied otherwise (packages/canon-alpaca/src/canon_alpaca/
 execution.py:90-102,2597-2609). Its default sell-to-close scope accepts LIMIT,
 not the reduce-only MARKET made by close_all_positions (pin crates/trading/src/
-strategy/mod.rs:1131-1175). Stop modifies an existing emulated trailing sell to
-elect at the bid and release as its marked DAY LIMIT: the pin's emulator applies
-the update and matches immediately (crates/execution/src/order_emulator/
-emulator.rs:814-917), preserving the ID, reduce-only flag and submit params
-(:1450-1487,1522-1536). An already released limit is repriced through the bid;
-an in-flight sell is retained. With no sell a marked DAY limit closes the long;
-without a usable quote existing protection is retained. OrderFactory.limit and
-cancel_all_orders' side filter are at
-python/nautilus_trader/common/__init__.pyi:1388-1406 and trading/__init__.pyi:581-589.
+strategy/mod.rs:1131-1175). Stop cancels BUY entries and delegates to Protection.on_stop;
+that shared method releases/reprices existing sells and covers unreserved shares.
+The side filter is at python/nautilus_trader/trading/__init__.pyi:581-589.
 
-Entry selection and stop-time closing live here. Protection owns normal trailing
-sells, quantity changes and cancellation on closing, using the default Mover arm.
+Entry selection lives here. Protection owns normal trailing sells, stop-time closing,
+quantity changes and cancellation on closing, using the default Mover arm.
 This is a template for offline and paper evaluation, with no claim to an edge.
 """
 
@@ -39,20 +33,16 @@ from nautilus_trader.model import BarType
 from nautilus_trader.model import ClientOrderId
 from nautilus_trader.model import InstrumentId
 from nautilus_trader.model import OrderSide
-from nautilus_trader.model import OrderType
 from nautilus_trader.model import PositionChanged
 from nautilus_trader.model import PositionClosed
 from nautilus_trader.model import PositionOpened
 from nautilus_trader.model import Quantity
 from nautilus_trader.model import QuoteTick
-from nautilus_trader.model import TimeInForce
 from nautilus_trader.trading import Strategy
 
 from .ma_cross import refuse_another_type
 from .ma_cross import refuse_unknown_keywords
 from .ma_cross import refuse_what_cannot_run
-from .price_step import exit_price
-from .price_step import up_on_step
 from .protection import Protection
 from .protection import ProtectionConfig
 
@@ -156,54 +146,7 @@ class EMACrossProtected(Strategy):
     def on_stop(self) -> None:
         instrument_id = self.settings.instrument_id
         self.cancel_all_orders(instrument_id, order_side=OrderSide.BUY)
-        positions = self.cache.positions_open(
-            instrument_id=instrument_id, strategy_id=self.strategy_id
-        )
-        held = sum((position.signed_qty for position in positions), Decimal(0))
-        if held <= 0:
-            self.cancel_all_orders(instrument_id, order_side=OrderSide.SELL)
-            return
-        instrument = self.cache.instrument(instrument_id)
-        quote = self.cache.quote(instrument_id)
-        if instrument is None or quote is None or quote.bid_price.as_decimal() <= 0:
-            self.log.info(f"{instrument_id}: stop retains protection; no usable close quote")
-            return
-        price = instrument.make_price(exit_price(quote.bid_price.as_decimal(), 1, None))
-        sells = [
-            order
-            for order in self.cache.orders(
-                instrument_id=instrument_id, strategy_id=self.strategy_id
-            )
-            if order.side == OrderSide.SELL and not order.is_closed
-        ]
-        if sells:
-            for order in sells:
-                if order.is_pending_cancel or order.is_pending_update:
-                    continue
-                if order.is_emulated and order.order_type == OrderType.TRAILING_STOP_LIMIT:
-                    trigger = max(
-                        quote.bid_price.as_decimal(),
-                        Decimal(0)
-                        if order.trigger_price is None
-                        else order.trigger_price.as_decimal(),
-                    )
-                    self.modify_order(
-                        order.client_order_id,
-                        price=price,
-                        trigger_price=instrument.make_price(up_on_step(trigger)),
-                    )
-                elif order.is_open and order.order_type == OrderType.LIMIT and order.price > price:
-                    self.modify_order(order.client_order_id, price=price)
-            return
-        order = self.order_factory.limit(
-            instrument_id,
-            OrderSide.SELL,
-            instrument.make_qty(held),
-            price,
-            time_in_force=TimeInForce.DAY,
-            reduce_only=True,
-        )
-        self.submit_order(order, params={"extended_hours": True})
+        self.protection.on_stop(instrument_id)
 
     def on_position_opened(self, event: PositionOpened) -> None:
         self.protection.on_position_opened(event)
