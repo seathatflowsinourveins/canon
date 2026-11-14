@@ -57,11 +57,12 @@ Contracts, read 2026-11-12:
 
 The run. It reads Alpaca's clock first and nothing else unless the regular session is open (`is_open`, as
 `custody._part` reads it) with at least `CLOSE_MARGIN` left to its close: a stop Alpaca holds works only
-there, the session is read once, and the task's own time bound is that margin, so no stop goes out after
-the close. It reads the account's `no_shorting` and says it, the positions and the open orders, and
-refuses by name, with nothing sent, a listing of open orders at its maximum (`ORDERS_PAGE_LIMIT`), which
-may not hold every sell. A short is named and left: no order and no market data read for it. That a stop
-never opens or adds to a short rests on the holding and the free shares read in the send step, with the
+there, and the session is read once. The time left is counted from before the clock was asked, and
+each symbol checks it again before its reads and before its send, so no send starts with less than one
+send's bound (`SEND_MARGIN`) to the close. It reads the account's `no_shorting` and says it, the
+positions and the open orders, and refuses by name, with nothing sent, a listing of open orders at its
+maximum (`ORDERS_PAGE_LIMIT`), which may not hold every sell. A short is named and left: no order and no
+market data read for it. That a stop never opens or adds to a short rests on the holding and the free shares read in the send step, with the
 milliseconds between that read and the send as its window, and on Alpaca holding the shares for a stop
 that rests (read on paper, 2026-11-13: a second sell of them was refused with shorting allowed). Whether
 Alpaca refuses a marked stop for more shares than are held where shorting is allowed is not shown, so the
@@ -140,6 +141,8 @@ from alpaca.trading.requests import TrailingStopOrderRequest
 from canon_alpaca.execution import DEFINITIVE_SUBMIT_REFUSALS
 from canon_alpaca.execution import ORDERS_PAGE_LIMIT
 from canon_alpaca.execution import venue_trail
+from canon_alpaca.providers import CONNECT_TIMEOUT_SECS
+from canon_alpaca.providers import READ_TIMEOUT_SECS
 from canon_alpaca.providers import counted
 from canon_alpaca.providers import not_sent
 from nautilus_trader.indicators import AverageTrueRange
@@ -215,9 +218,26 @@ PLANNER = planner_config(session_window.DEFAULT_ARM)
 ATR_BARS = PLANNER.atr_n + 1
 """The most bars an ATR is warmed on: `atr_n` + 1, as `Mover._warm_atr` feeds, so each of the `atr_n`
 ranges has a previous close."""
-CLOSE_MARGIN = timedelta(seconds=300)
-"""The least time left to the close for a run to start: the task's own bound (`paper:protect`'s
-`timeout`), so a run that began in the regular session ends in it."""
+SEND_MARGIN = timedelta(seconds=math.ceil(CONNECT_TIMEOUT_SECS + READ_TIMEOUT_SECS))
+"""The least time left to the close for one stop to be sent: the most one submit may take, the paper
+client's own (connect, read) timeout (`session_window.paper_trading` mounts `providers.with_http_timeout`,
+ADR 0039) with alpaca-py's retries off for the send (`_sending_once`). It is checked again before each
+symbol's reads and just before its send. The bound is on each stall, not the whole exchange: the connect
+wait is per address tried and the read wait is between bytes, and name resolution has none, so a send that
+starts this near the close is most likely, not certainly, answered before it. What Alpaca does with a
+stop that arrives after the close is UNVERIFIED."""
+CLOSE_MARGIN = SEND_MARGIN
+"""The least time left to the close for a run to start: one send's bound, since each send checks the
+time again. It was 300 s, said to be the task's own bound, which is 10 minutes (`paper:protect`'s
+`timeout`), so it held for no reason that stood, and refused a long bought in the last minutes before
+the close (the lead's case of 2026-11-13); a run takes 2 to 4 s on paper (2026-11-13)."""
+
+
+def _whole(span: timedelta) -> int:
+    """Whole seconds, rounded down, so a time left is never said to be more than it is."""
+    return math.floor(span.total_seconds())
+
+
 QUOTE_MOST = timedelta(seconds=60)
 """The oldest latest quote a distance is planned on. An older one (a halt, a thin name) says nothing of
 the spread now, and the spread is the floor. UNCALIBRATED."""
@@ -682,8 +702,11 @@ class _Protect:
         self.only = only
         self.planners: dict[str, mover.Mover] = {}
         self.began = 0.0
-        """`monotonic()` at the clock's read: a later symbol is planned at the clock's time plus what
-        the run has taken since."""
+        """`monotonic()` just before the clock is asked: a later symbol is planned at the clock's time
+        plus what the run has taken since, the clock read's own wait counted."""
+        self.left = timedelta(0)
+        """The time to the close at the clock's read; what is left at a send is this less what the run
+        has taken since."""
         self.client: Any = None
         self.report = ProtectReport(say=say)
         self.stamp = ""
@@ -705,8 +728,8 @@ class _Protect:
                 "plan-only to see each; nothing was read or sent"
             )
             return report
-        clock = _read("Alpaca's clock", self.trading.get_clock, Clock)
         self.began = monotonic()
+        clock = _read("Alpaca's clock", self.trading.get_clock, Clock)
         if not clock.is_open or clock.next_close <= clock.timestamp:
             report.refused = (
                 "outside the regular session: Alpaca's clock says the market is closed (next open "
@@ -714,11 +737,11 @@ class _Protect:
                 "only in the regular session; nothing else was read or sent"
             )
             return report
-        left = clock.next_close - clock.timestamp
-        if left < CLOSE_MARGIN:
+        self.left = clock.next_close - clock.timestamp
+        if (to_close := self._to_close()) < CLOSE_MARGIN:
             report.refused = (
-                f"too near the close: {left.total_seconds():.0f} s to the close, under the "
-                f"{CLOSE_MARGIN.total_seconds():.0f} s this run may take, and no stop is sent after "
+                f"too near the close: {_whole(to_close)} s to the close, under the "
+                f"{_whole(CLOSE_MARGIN)} s one send may take, and no stop is sent after "
                 "it; nothing else was read or sent"
             )
             return report
@@ -898,6 +921,22 @@ class _Protect:
             client_order_id=client_order_id,
         )
 
+    def _to_close(self) -> timedelta:
+        """What is left to the close now: the clock's figure less what the run has taken since it asked."""
+        return self.left - timedelta(seconds=monotonic() - self.began)
+
+    def _too_near(self, symbol: str, held: Decimal, when: str) -> bool:
+        """Name `symbol` unprotected, nothing sent, when less than one send's bound is left to the close."""
+        if (to_close := self._to_close()) >= SEND_MARGIN:
+            return False
+        self.report.note(
+            self.report.unprotected,
+            f"unprotected {symbol}: {held} held, no stop sent: {_whole(to_close)} s to the close "
+            f"{when}, under the {_whole(SEND_MARGIN)} s one send may take, and a stop Alpaca holds "
+            "works only in the regular session",
+        )
+        return True
+
     def _protect(
         self, symbol: str, whole: Decimal, held: Decimal, ours: Decimal, now: datetime, n: int
     ) -> None:
@@ -906,6 +945,8 @@ class _Protect:
         rows = tuple(ROWS) if self.plan_only else (self.row or "",)
         planned: dict[str, tuple[TrailingStopOrderRequest, Decimal, Distance]] = {}
         refused: dict[str, str] = {}
+        if self._too_near(symbol, held, "before its reads"):
+            return
         try:
             if self.client is None:
                 self.client = self.data() if callable(self.data) else self.data
@@ -944,6 +985,8 @@ class _Protect:
                 f"unprotected {symbol}: {held} held, no stop sent: {changed}; the holding or its "
                 "orders changed during the run; run again",
             )
+            return
+        if self._too_near(symbol, held, "by the send"):
             return
         if (aged := book.aged()) > QUOTE_MOST:
             report.note(
