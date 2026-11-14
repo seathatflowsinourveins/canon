@@ -363,11 +363,14 @@ def test_paper_protect_task_on_an_account_that_allows_shorting(capsys: Any) -> N
         pytest.skip(f"needs {DEADLINE_ROOM_SECS} s of the paper runner's deadline left")
     trading: Any = session_window.paper_trading()
     clock = trading.get_clock()
-    if (
-        not clock.is_open
-        or (clock.next_close - clock.timestamp).total_seconds() < CLOSE_MARGIN_SECS
-    ):
-        pytest.skip("needs the regular session with fifteen minutes left")
+    if not clock.is_open:
+        pytest.skip("needs the regular session")
+    if (clock.next_close - clock.timestamp).total_seconds() < CLOSE_MARGIN_SECS:
+        pytest.skip(
+            "needs fifteen minutes left to the close: no paper run covers the protect task's last "
+            "fifteen minutes before a close, which only the simulation cases in tests/test_protect.py "
+            "cover (the close margin's limit)"
+        )
     before = _no_shorting(trading)
     print(f"no_shorting before the run: {str(before).lower()}")
     assert before, "the account is not long-only at the start; nothing sent"
