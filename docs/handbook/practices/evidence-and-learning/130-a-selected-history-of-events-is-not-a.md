@@ -1,0 +1,1 @@
+* A selected history of events is not a ranking population, and a day without a recorded event is not a negative, and selected losers are not ordinary controls; not yet built (roadmap step 7; ADR 0083, M3).

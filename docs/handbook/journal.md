@@ -7,26 +7,31 @@ form and that the entries already on `main` are unchanged.
 
 ## The learn step
 
-A change that taught something lands with its lesson: a new entry here, or a line on a handbook page,
-in the same pull request. A practice that is stopped is deleted where it is stated, not left as a
-fallback, and the entry that stopped it says so. Landing itself is ADR 0014's and its review ADR 0017's.
+A change that taught something lands with its lesson: a new file in `docs/handbook/journal/`, named
+`<YYYY-MM-DD>-<slug>.md`, or a line on a handbook page, in the same pull request. A practice that is
+stopped is deleted where it is stated, not left as a fallback, and the entry that stopped it says so.
+Landing itself is ADR 0014's and its review ADR 0017's.
 
 ## The session-end reflection
 
-Every session ends with a reflection, written as one entry here with the source `reflection`. Its
-`result` gives, for each rule that acted, what it did against holding flat over the session, with the
-count of exits behind it; and the movers missed, from the recorder's ranking against the day's final
-gainers. Each exit's counterfactuals (held to now, matched holding flat, the managed policy, the managed
+Every session ends with a reflection, written as one file in `docs/handbook/journal/`, named
+`<YYYY-MM-DD>-<slug>.md`, with the source `reflection`. Its `result` gives, for each rule that acted,
+what it did against holding flat over the session, with the count of exits behind it; and the movers
+missed, from the recorder's ranking against the day's final gainers. Each exit's counterfactuals (held to now, matched holding flat, the managed policy, the managed
 policy with re-entry, and each shadow arm, with counts and costs at one times and stressed) are its
 `evidence`. The loop that writes it is not yet built (roadmap step 6).
 
 ## An entry's form
 
-A heading `### L<four digits>: <subject>`, the ids in order from `L0001` with none skipped, then these
-ten fields as list lines, in this order, each with a value:
+Add one file under `docs/handbook/journal/`, named `<YYYY-MM-DD>-<slug>.md`: a valid date and a
+lowercase slug of words or numbers joined by hyphens, chosen for the lesson. The file name without
+`.md` is the entry's id, and its heading is `### <id>: <subject>`, matching that name. The name's date
+is the entry's `session`. Read the files in filename order; two entries on the same date need different slugs, never a shared counter.
+Each file holds exactly one entry with these twelve fields as list lines, in this order, each with a
+value:
 
 ```text
-### L0001: <the subject, one line>
+### YYYY-MM-DD-slug: <the subject, one line>
 
 * area: <ranking | entries | exits | sizing | execution | data | risk | strategies>
 * session: <the session's date, YYYY-MM-DD>
@@ -36,13 +41,32 @@ ten fields as list lines, in this order, each with a value:
 * change: <the change it led to and its reference (a record, a pull request), or none>
 * next: <what comes next>
 * status: <open | confirmed | refuted | adopted | superseded>
-* supersedes: <the id of an earlier entry, or none>
+* supersedes: <an existing L.... id or fragment id being corrected, or none; never this entry's own id>
 * source: <reflection | nightly | review | lead | owner>
+* owner: <who closes it: a lane's role, the lead or the owner; none once it is closed>
+* closes: <the verifiable end state: the test or the unit that closes it; none once it is closed>
 ```
+
+An `open` entry names both `owner` and `closes`, and a closed one says `none` in both: an incident's
+action item has an owner and "a verifiable end state" and is tracked to closure, as Google SRE's
+postmortem practice asks (https://sre.google/workbook/postmortem-culture/, "Concrete Action Items").
+It is closed by a later entry that supersedes it. The check refuses an open entry with no owner or end
+state; it does not refuse one left open, so closure is tracked by reading the open entries at each
+reflection. `L0001` through `L0009`, written on this page before the form gained the two fields, keep
+their ten.
+
+An entry already on `main` is never edited, renamed or removed. Correct it in a new file whose
+`supersedes` names it; a fragment may name another fragment of its own date or earlier, even when its
+slug sorts later on the same date, but never one of a later date, and no chain of `supersedes` returns
+to an entry it started from. An `owner` or `closes` that only defers (`TBD`, `later`, `none yet`, `?`)
+names no one. Dotfiles are ignored, and every other file in the folder must have the form above.
 
 ## Entries
 
-<!-- append-only: add new entries below this line; never edit or remove one above it -->
+Closed: `L0001` through `L0009` stay here unchanged. New entries go in `docs/handbook/journal/`;
+do not append an `L0010` or any other entry here.
+
+<!-- append-only: closed; new entries go in docs/handbook/journal/ -->
 
 ### L0001: Five sessions is the least that keeps a best-of-eight false pass under three per cent
 
@@ -105,6 +129,58 @@ ten fields as list lines, in this order, each with a value:
 * lesson: A finding is a claim until a failing test shows it; the count of these findings says what was found tonight, not what a second reader is worth
 * change: each finding went to its lane, in its one fix round or a later unit
 * next: A new entry with the count of findings reproduced, fixed and declined once those rounds land
+* status: open
+* supersedes: none
+* source: review
+
+### L0006: An entry's cap refused a stop for a long that was already held
+
+* area: exits
+* session: 2026-11-13
+* result: Under an own-cap row the protect task twice refused to plan a stop for a long it found in the account, once when the ATR distance and once when the spread floor came out over the 0.02 entry cap; two firings earlier the same holding's distance was under the cap and it got its stop, so a volatile name had a stop or none depending on the minute
+* evidence: ADR 0142's amendment of 2026-11-13; tests/test_protect.py, the cases a found long keeps its own distance over the entry cap and an own distance over the ceiling is named and sends no stop
+* lesson: A bound written for choosing an entry's size does not apply to a holding that has no size left to choose; a protection path takes the bound of what it protects, here the sizing ceiling, and refuses past it by name
+* change: a found holding under an own cap keeps its distance up to the 0.10 sizing ceiling and is refused over it, with the Mover's entry path unchanged (ADR 0142)
+* next: The paper run of this path on account A at the next regular session, and a standing set of protection cases every protection unit passes
+* status: open
+* supersedes: none
+* source: lead
+
+### L0007: A copy bound left a long window's log behind with no word
+
+* area: execution
+* session: 2026-11-13
+* result: The scheduled runner kept each window's records outside the temp folder with a copy bounded at 1 MB, and a window log over that bound was left behind silently; a long window's log is often around 10 MB, so the log of the windows most worth reading was the one lost on a restart
+* evidence: scripts/test-lanes, the cases a log over 1 MB is never dropped silently and the log over 1 MB that cannot be kept is named on stderr with its size
+* lesson: A bound on what is kept says what it left out and where it still is; a silent bound reads later as a record that never existed
+* change: a log over the bound is kept as its first and last 512000 bytes with a line naming what was left out, and one that cannot be kept is named on stderr (mise.toml, kept)
+* next: none
+* status: adopted
+* supersedes: none
+* source: lead
+
+### L0008: The account read could not show what a protective stop did once it ended, and its first fix was proven against no bound
+
+* area: exits
+* session: 2026-11-13
+* result: The paper account read showed only open orders, so a protective stop that had sold or been canceled left no trace in it; the first fix walked 92 days of order history and its proof read took about four of its five allowed minutes, which was judged a pass because it ended; on a busier paper account the same walk met the timeout; bounded to the trade date's submissions, the read listed the date's ended orders in about a second
+* evidence: `src/canon_trading/custody.py` and `tests/test_custody.py`; the paper reads' output, kept outside the repository
+* lesson: A read's proof is judged against its stated bound, its duration included, on an account with a full day's history; a walk the venue cannot bound by the event's time is bounded by the date, with what it leaves out named on its output, and a read that is killed must say it did not finish
+* change: the account read prints the ended orders submitted in the trade date after the flat read, says when its walk did not finish, and names that an order submitted earlier is not listed
+* next: Read an earlier-date protective stop's sale from the venue's fill activities, a next unit
+* status: adopted
+* supersedes: none
+* source: review
+
+### L0009: The default window sells on one quote because persistence is refused on its arm
+
+* area: exits
+* session: 2026-11-13
+* result: The default paper window's trailing stop, triggered on the bid, elects on the first quote at its level, because the strategy refuses a breach count above one unless the trigger is the trade print, the trail is fixed, the size is not from the budget and protection is on; on paper account B, 31 of 34 windows exited by the trailing stop, 8 of them within 60 seconds of the first fill
+* evidence: ADR 0119's amendment of 2026-11-13; the by-hand window records, kept outside the repository
+* lesson: A rule the handbook states (a breach is a count over a span, never one quote) has to be checked against the default arm as it runs, not only against the arm its tests built
+* change: ADR 0119 amended to count spaced two-sided quotes under the default arm, its rows uncalibrated, nothing lifted in code yet
+* next: A failing test on shaped quote tapes, then the paper count per arm of exits by the stop, exits within 60 seconds and re-entries
 * status: open
 * supersedes: none
 * source: review

@@ -40,6 +40,7 @@ class Walk(offline.Walk):
 
     _step = election.Elected._step
     _sell = election.Elected._sell
+    _trail = election.Elected._trail
     _ended = election.Elected._ended
     on_order_event = election.Elected.on_order_event
 
@@ -74,15 +75,38 @@ def end(walk: Walk, status: str, filled: int = 0) -> None:
     walk.order.filled_qty = Quantity.from_int(filled)
 
 
-def test_the_stop_is_a_day_trailing_sell_one_cent_under_the_mark_for_the_one_share() -> None:
+def test_the_stop_is_a_day_trailing_sell_at_alpacas_smallest_trail_for_the_one_share() -> None:
     walk = working()
     ((positional, named),) = walk.made
-    assert positional == (paper.AAPL, OrderSide.SELL, Quantity.from_int(1), Decimal("0.01"))
+    # the stand-in's share was bought at 100: a thousandth of it, and a cent
+    assert positional == (paper.AAPL, OrderSide.SELL, Quantity.from_int(1), Decimal("0.11"))
     assert named == {
         "trailing_offset_type": TrailingOffsetType.PRICE,
         "time_in_force": TimeInForce.DAY,
     }
     assert walk.modified == [] and walk.canceled == []
+
+
+@pytest.mark.parametrize(
+    ("price", "trail"),
+    [
+        ("100", "0.11"),  # a thousandth is a whole cent: that, and a cent
+        ("360.20", "0.38"),  # 0.3602 goes up to 0.37, never down to 0.36, which Alpaca refuses
+        ("9.99", "0.02"),  # under ten dollars a thousandth is under a cent
+        ("1000.01", "1.02"),
+    ],
+)
+def test_the_tight_trail_is_never_under_a_thousandth_of_the_price(price: str, trail: str) -> None:
+    tight = election.tight(Decimal(price))
+    assert tight == Decimal(trail)
+    assert tight - election.CENT >= Decimal(price) * election.SMALLEST
+    assert tight == tight.quantize(election.CENT), "a trail finer than a cent"
+
+
+def test_the_tight_trail_is_taken_from_the_dearest_share_adopted() -> None:
+    walk = Walk()
+    walk.seen["average"] = ["100.0", "250.5"]
+    assert walk._trail() == election.tight(Decimal("250.5"))
 
 
 def test_the_walk_waits_for_the_nodes_order_to_fill_and_changes_nothing_meanwhile() -> None:
@@ -142,7 +166,7 @@ def test_a_stop_filled_while_its_cancel_was_on_the_way_is_still_seen_filled() ->
     assert walk.seen["the node's order ended"] == "FILLED"
     assert walk.seen["elected"] == "yes: while the walk's cancel was on its way"
     walk.events = [("OrderFilled", OURS, 0)]
-    assert election.verdict(walk, [SOLD], Decimal(0), {"orders": 0}) == []
+    assert election.verdict(walk, [SOLD], Decimal(0), {"orders": 0, "positions": 0}) == []
 
 
 class OrderCancelRejected:
@@ -174,7 +198,7 @@ def test_a_fill_already_at_the_node_when_the_limit_passes_is_the_walks_end_not_a
     assert walk.step() == "done"
     assert walk.outcome == "done"
     assert walk.seen["the node's order ended"] == "FILLED"
-    assert election.verdict(walk, [SOLD], Decimal(0), {"orders": 0}) == []
+    assert election.verdict(walk, [SOLD], Decimal(0), {"orders": 0, "positions": 0}) == []
 
 
 def test_a_stop_that_ended_unfilled_as_the_limit_passes_is_named_by_its_end() -> None:
@@ -341,31 +365,37 @@ CONDITION_B = "Alpaca filled the sale and the node's order did not get it: ADR 0
 def test_an_election_the_node_saw_passes_however_alpaca_lists_the_sale(sells: list) -> None:
     """How Alpaca books the sale is recorded, not required: one filled row or two, under the stop's
     own order or another."""
-    assert election.verdict(filled_walk(), sells, Decimal(0), {"orders": 0}) == []
+    assert election.verdict(filled_walk(), sells, Decimal(0), {"orders": 0, "positions": 0}) == []
 
 
 def test_a_fill_the_nodes_order_did_not_get_is_named_as_condition_b_first() -> None:
     """Alpaca shows a filled sale and the node's order ended some other way, or never ended: that is
     the condition, whatever else the walk says about itself."""
-    assert election.verdict(unfilled_walk(), [CANCELED, BECAME], Decimal(0), {"orders": 0})[0] == (
-        CONDITION_B
-    )
+    assert election.verdict(
+        unfilled_walk(), [CANCELED, BECAME], Decimal(0), {"orders": 0, "positions": 0}
+    )[0] == (CONDITION_B)
     timed_out = working()
     timed_out.limit_ns = 0
     timed_out.step()
-    assert election.verdict(timed_out, [BECAME], Decimal(0), {"orders": 1})[0] == CONDITION_B
+    assert (
+        election.verdict(timed_out, [BECAME], Decimal(0), {"orders": 1, "positions": 0})[0]
+        == CONDITION_B
+    )
 
 
 def test_no_election_in_the_time_is_said_as_nothing_shown_and_is_not_condition_b() -> None:
-    problems = election.verdict(unfilled_walk(), [CANCELED], Decimal(1), {"orders": 0})
-    assert problems == ["no election in 120 s: nothing is shown"]
+    # the share is still held, so the cleaning sells it: that is not the election's failure to name
+    problems = election.verdict(
+        unfilled_walk(), [CANCELED], Decimal(1), {"orders": 0, "positions": 1}
+    )
+    assert problems == [f"no election in {election.ELECT_SECS:.0f} s: nothing is shown"]
 
 
 def test_a_stop_alpaca_refused_is_named_by_how_it_ended() -> None:
     walk = working()
     end(walk, "REJECTED")
     walk.step()
-    problems = election.verdict(walk, [], Decimal(1), {"orders": 0})
+    problems = election.verdict(walk, [], Decimal(1), {"orders": 0, "positions": 0})
     assert problems == ["the walk ended: the trailing stop ended REJECTED with no election"]
 
 
@@ -385,7 +415,9 @@ def test_what_else_can_be_wrong_after_an_election_is_named(
 ) -> None:
     walk = filled_walk()
     walk.events = [("OrderFilled", OURS, 0)] * events
-    assert election.verdict(walk, sells, Decimal(held), {"orders": cleaned}) == [problem]
+    assert election.verdict(walk, sells, Decimal(held), {"orders": cleaned, "positions": 0}) == [
+        problem
+    ]
 
 
 def test_the_record_printed_carries_no_id_no_price_and_no_time() -> None:
@@ -425,3 +457,61 @@ def test_the_strategy_is_built_like_the_proofs_and_the_proofs_node_takes_it(
         assert type(node).__name__ == "LiveNode"
     finally:
         node.dispose()
+
+
+def test_an_election_the_cleaning_had_to_sell_for_is_not_a_pass() -> None:
+    # Found by an independent reader (Codex, on the landed proof): the holding is read before the
+    # cleaning, and the verdict looked at the open orders the cleaning found, never at a position it
+    # found and sold. A position that showed only then (a lagging read) left the cleaning's own sale to
+    # make the account flat, and the run passed as if the election had.
+    problems = election.verdict(
+        filled_walk(), [SOLD], Decimal(0), {"orders": 0, "positions": 1, "rounds": 1}
+    )
+    (problem,) = problems
+    assert problem == (
+        "the cleaning found a position to close although none was held when the node ended: the "
+        "run is not shown flat by the election alone"
+    )
+
+
+def test_a_share_still_held_is_named_once_though_the_cleaning_sells_it_too() -> None:
+    # held when the node ended, so the cleaning's sale of it says nothing new
+    problems = election.verdict(filled_walk(), [SOLD], Decimal(1), {"orders": 0, "positions": 1})
+    assert problems == ["1 share(s) still held after the node's order filled"]
+
+
+@pytest.mark.parametrize(
+    ("shown", "last", "reads"),
+    [([1, 1, 0], 0, 3), ([0], 0, 1), ([1], 1, None)],
+    ids=["the position lags the fill", "flat at once", "never flat"],
+)
+def test_the_holding_after_a_fill_is_read_until_it_shows_none_or_the_wait_is_over(
+    monkeypatch: pytest.MonkeyPatch, shown: list[int], last: int, reads: int | None
+) -> None:
+    """Alpaca's position can lag its order listing: after the node's order filled, the holding is read
+    until it shows none, for a bounded time, and what was last seen is returned either way."""
+    monkeypatch.setattr(election.time, "sleep", lambda _seconds: None)
+    asked: list[int] = []
+
+    def held(_trading: Any) -> Decimal:
+        asked.append(1)
+        return Decimal(shown.pop(0) if len(shown) > 1 else shown[0])
+
+    monkeypatch.setattr(election.seam, "held", held)
+    seconds = 0.05 if reads is None else 60.0
+    assert election.settled_held(None, filled_walk(), seconds) == Decimal(last)
+    assert reads is None or len(asked) == reads
+
+
+def test_the_holding_after_a_walk_that_did_not_fill_is_read_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    asked: list[int] = []
+
+    def held(_trading: Any) -> Decimal:
+        asked.append(1)
+        return Decimal(1)
+
+    monkeypatch.setattr(election.seam, "held", held)
+    assert election.settled_held(None, unfilled_walk(), 60.0) == Decimal(1)
+    assert len(asked) == 1

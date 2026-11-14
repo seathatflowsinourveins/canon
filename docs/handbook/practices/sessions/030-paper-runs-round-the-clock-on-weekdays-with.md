@@ -1,0 +1,1 @@
+* Paper runs round the clock on weekdays with no conservative profile: the full factor stack, every factor set as a paired arm with and without it, and paper profit and loss alone deciding nothing; not yet built (roadmap step 6).

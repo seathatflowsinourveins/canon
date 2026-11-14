@@ -812,7 +812,10 @@ class BarsReplayMover(Mover):
             return
         instrument = self._instrument(slot.instrument_id)
         trail, limit = offsets(
-            Decimal(str(entry.avg_px)), self.settings.trail, self.settings.exit_through
+            Decimal(str(entry.avg_px)),
+            self.settings.trail,
+            self.settings.exit_through,
+            chase_cap=self.settings.chase_cap,
         )
         # At the pin risk::AccountRisk::trailing_order_price needs an explicit trigger or
         # cached ticks. Only the matching engine sees the bar's synthetic ticks, so seed the

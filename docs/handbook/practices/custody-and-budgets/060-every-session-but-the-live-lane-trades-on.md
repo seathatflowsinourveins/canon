@@ -1,0 +1,1 @@
+* Every session but the live lane trades on paper alone; the live lane places live orders only through its own tasks, nothing trades live until its mechanism is accepted, and no session reads a credential (ADR 0009, ADR 0103).

@@ -762,6 +762,19 @@ def test_a_firing_record_carries_each_entrys_dollars_and_the_realized_result():
     assert "commission" in result["basis"]
 
 
+def test_a_name_that_entered_is_not_counted_as_passed_over_for_no_context() -> None:
+    """A late context can permit entry after the opening wrote a no-context note."""
+    run = {
+        "notes": {
+            "BBB.ALPACA": ["BBB.ALPACA: entry arm registered: no entry context supplied"],
+        },
+        "entries": [
+            {"instrument_id": "BBB.ALPACA", "client_order_id": "E1", "sizing": {"roster": False}},
+        ],
+    }
+    assert session_window.passed_over_without_context(run) == {"count": 0, "names": []}
+
+
 def test_the_record_counts_ranked_names_a_registered_arm_could_not_enter_for_no_day_context() -> (
     None
 ):
@@ -803,7 +816,8 @@ def test_the_reference_pre_read_reads_every_loaded_asset_for_the_actors_key(monk
         found = {
             s: movers_rank_actor.movers_rank.Reference(close=1.0, session=cutoff) for s in symbols
         }
-        return movers_rank_actor.ReferenceRead(cutoff, found, None, 7)
+        splits = movers_rank_actor.movers_rank.SplitRead(cutoff, session, ())
+        return movers_rank_actor.ReferenceRead(cutoff, found, splits, 7)
 
     monkeypatch.setattr(movers_rank_actor, "alpaca_reference_reader", read)
     requests_seen: list[object] = []

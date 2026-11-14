@@ -74,9 +74,11 @@ from nautilus_trader.common import logging_sync_to_disk
 from nautilus_trader.config import DataClientConfig
 from nautilus_trader.config import InstrumentProviderConfig
 from nautilus_trader.config import LiveNodeConfig
+from nautilus_trader.config import StrategyConfig
 from nautilus_trader.core.datetime import dt_to_unix_nanos
 from nautilus_trader.live import LiveExecutionEngineConfig
 from nautilus_trader.live import LiveNode
+from nautilus_trader.live import SubmissionRecoveryPolicy
 from nautilus_trader.model import AccountId
 from nautilus_trader.model import ClientId
 from nautilus_trader.model import ClientOrderId
@@ -328,7 +330,7 @@ def run(node: LiveNode, launch: str = "hosted") -> None:
 
 def run_with_client(
     body: Callable[[AlpacaExecutionClient], Awaitable[None]],
-    strategy: Trader | CancelAll | Modifier | None = None,
+    strategy: Trader | CancelAll | Modifier | Claimant | None = None,
     exec_engine: LiveExecutionEngineConfig | None = None,
 ) -> None:
     """Run a hosted node, await `body` with its connected execution client once the node has started its
@@ -4381,10 +4383,16 @@ def generated(monkeypatch) -> list[str]:
     return names
 
 
-async def until_named(strategy: Trader | Modifier, *names: str, timeout: float = 10) -> None:
+async def until_true(check: Callable[[], bool], timeout: float = 10) -> None:
     async with asyncio.timeout(timeout):
-        while not any(name in strategy.names() for name in names):
+        while not check():
             await asyncio.sleep(0.01)
+
+
+async def until_named(
+    strategy: Trader | Modifier | Claimant, *names: str, timeout: float = 10
+) -> None:
+    await until_true(lambda: any(name in strategy.names() for name in names), timeout)
 
 
 def test_a_submit_alpaca_took_with_no_answer_is_settled_by_the_engines_order_query(
@@ -7249,6 +7257,26 @@ def test_an_outside_open_orders_fills_shown_whole_are_not_dropped_by_a_later_fai
     assert reports == [[str(uuid.UUID(int=71))]]
 
 
+def hold_fill_retry(client, monkeypatch) -> tuple[asyncio.Event, asyncio.Event]:
+    """Gate only this client's later-read sleep; other loop users keep asyncio's real sleep.
+
+    Contract: Python b703b2c5e704, asyncio/locks.py's Event; tasks.py's current_task.
+    The caller releases the gate in finally and joins the actual retry task before checking it.
+    """
+    sleeping, release = asyncio.Event(), asyncio.Event()
+    original = asyncio.sleep
+
+    async def sleep(delay, result=None):
+        if asyncio.current_task() in client._catching_up.values():
+            sleeping.set()
+            await release.wait()
+            return result
+        return await original(delay, result)
+
+    monkeypatch.setattr(canon_alpaca.execution.asyncio, "sleep", sleep)
+    return sleeping, release
+
+
 @pytest.mark.parametrize(
     "fill",
     [
@@ -7266,31 +7294,28 @@ def test_a_cancel_showing_a_fill_the_node_lost_ends_the_order_with_it(
     # its record, so the fill was never brought, nor applied when its update came late: CANCELED with 0
     # filled where Alpaca shows 1. The fill is brought by its trade ID first, and the cancel follows it.
     #
-    # The case waits on what happens, not on the clock (it failed once in a loaded full run on fixed
-    # sleeps): the cancel's own read has returned, the test then supplies the late fill, and the strategy
-    # sees `OrderCanceled`. A later read of this order is held until the test has supplied the fill.
+    # Regression pinned by `update-during-read`: a later read that is OUT when the fill's own update
+    # ends the order comes back, sees the order ended, and logs itself as the read that brought the
+    # fill, which the stream brought. Stopping an ended order's later reads prevents that false credit.
     #
-    # Regression pinned by `update-during-read`: a
-    # later read that is OUT when the fill's own update ends the order comes back, sees the order ended,
-    # and logs itself as the read that brought the fill, which the stream brought. Under load the old
-    # sleeps could have produced that in `update-after` (inferred from the code: the failing run left no
-    # output). Here the later reads of `update-after` are kept asleep for longer than the run may last
-    # (`run_with_client` ends it at 15 s), so none can be out when the update arrives, and
-    # `update-during-read` puts the update inside a read that is out. Stopping an ended order's later
-    # reads prevents that false credit; `update-after` covers a retry still asleep at the end.
-    monkeypatch.setattr(
-        canon_alpaca.execution, "FILL_READ_RETRY_SECS", 30.0 if fill == "update-after" else 0.05
-    )
+    # Gate both the retry sleep and its activity read. The stream ends update-after while the retry
+    # sleeps, and update-during-read while its read is out. Both retries are joined before checking
+    # their result and logs; neither a background exception nor a false catch-up can pass unnoticed.
+    from .test_adapter_held_report_blind import StreamProbe
+    from .test_adapter_held_report_blind import until
+
+    monkeypatch.setattr(canon_alpaca.execution, "FILL_READ_RETRY_SECS", 0.0)
     venue.trading.script = "accept"
     strategy = trader(order_type="limit", quantity=3)
     strategy.stopped_for = "held open"
     held: list = []
 
     async def body(client) -> None:
-        await until_named(strategy, "OrderAccepted")
-        await until_idle(client, venue)
+        await until(lambda: "OrderAccepted" in strategy.names(), "the order was not accepted")
+        stream = StreamProbe(client, monkeypatch)
+        sleeping, wake = hold_fill_retry(client, monkeypatch)
         placed = placed_order(venue)
-        first_read, reading, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        reading, release = asyncio.Event(), asyncio.Event()
         read_activities = client._fill_activities
         reads = 0
 
@@ -7301,11 +7326,8 @@ def test_a_cancel_showing_a_fill_the_node_lost_ends_the_order_with_it(
             reads += 1
             if reads > 1:
                 reading.set()
-                await release.wait()  # bounded by the timeout below, whose `finally` releases it
-            try:
-                return await read_activities(start, order_ids)
-            finally:
-                first_read.set()  # also when the read fails, so the case says so and does not wait
+                await release.wait()  # every bounded wait below releases this in finally
+            return await read_activities(start, order_ids)
 
         monkeypatch.setattr(client, "_fill_activities", held_read)
         lost = venue.trading.update(
@@ -7317,39 +7339,38 @@ def test_a_cancel_showing_a_fill_the_node_lost_ends_the_order_with_it(
             filled_qty="1",
         )
         listed = venue.trading.activities.pop() if fill != "listed" else None
-        venue.trading.update(placed["id"], "canceled", status="canceled")
-        # A later read cannot outrun the test's late fill, even if the loop is delayed.
+        cancel = venue.trading.update(placed["id"], "canceled", deliver=False, status="canceled")
         try:
-            async with asyncio.timeout(10):
-                await first_read.wait()
-                pending = client._catching_up.get(strategy.client_order_id)
+            await stream.send(venue, cancel)
+            pending = client._catching_up.get(strategy.client_order_id)
+            assert reads == 1
+            if fill == "listed":
+                assert pending is None
+            else:
+                assert pending is not None
+                await until(sleeping.is_set, "the retry did not enter its sleep")
                 if fill == "listed-later":
                     venue.trading.activities.append(listed)
+                    wake.set()
                     release.set()
-                elif fill == "update-after":
-                    venue.stream.send(lost)
-                elif fill == "update-during-read":
-                    await reading.wait()  # a later read of the order is out
-                    venue.stream.send(lost)
-                await until_named(strategy, "OrderCanceled")
+                else:
+                    if fill == "update-during-read":
+                        wake.set()
+                        await until(reading.is_set, "the later activity read did not start")
+                    await stream.send(venue, lost)
+            await until(lambda: "OrderCanceled" in strategy.names(), "the order did not cancel")
         finally:
             release.set()
-        # What became of the later reads: none was waiting when the first read brought the fill; the
-        # one that brought it ended by itself; the one the stream's fill overtook is still asleep, and
-        # ends with the client; the one that was out when the stream's fill came is let finish, so what
-        # it logs is in the log before the case reads it.
-        if fill == "listed":
-            assert pending is None and strategy.client_order_id not in client._catching_up
-        elif fill == "update-after":
-            assert pending is not None and not pending.done()
-        else:
-            assert pending is not None
-            async with asyncio.timeout(10):
-                outcome = (await asyncio.gather(pending, return_exceptions=True))[0]
-            assert fill == "update-during-read" or outcome is None, outcome
-        await settled(
-            client, venue
-        )  # whatever the adapter sends after the end is in before the checks
+            wake.set()
+        if pending is not None:
+            await until(pending.done, "the later-read task did not finish")
+            assert pending.result() is None  # re-raise every task failure, including cancellation
+        assert strategy.client_order_id not in client._catching_up
+        assert strategy.client_order_id not in client._catch_up_targets
+        assert (
+            reads
+            == {"listed": 1, "listed-later": 2, "update-after": 1, "update-during-read": 2}[fill]
+        )
         cached = client.cache.order(strategy.client_order_id)
         held.append((cached.status, cached.filled_qty.as_double(), trade_ids(cached)))
         held.append(lost["execution_id"])
@@ -7361,13 +7382,108 @@ def test_a_cancel_showing_a_fill_the_node_lost_ends_the_order_with_it(
     assert strategy.names()[-2:] == ["OrderFilled", "OrderCanceled"], strategy.names()
     # The line a paper run counts (the lead, 2026-11-11): which read brought the fill.
     # One brought by its own late update logs no read.
-    read = {"listed": "read 1 of 3", "listed-later": "read 2 of 3"}
-    caught = f"Alpaca fill catch-up for {strategy.client_order_id}: caught up on read"
-    lines = [line for line in logged(capfd).splitlines() if "fill catch-up" in line]
+    read = {"listed": 1, "listed-later": 2}
+    prefix = f"Alpaca fill catch-up for {strategy.client_order_id}:"
+    lines = [line for line in logged(capfd).splitlines() if prefix in line]
     if fill in read:
-        assert any(f"{caught} {read[fill][5:]}" in line for line in lines), lines
+        assert len(lines) == 1, lines
+        assert f"{prefix} caught up on read {read[fill]} of 3 (1 shown, 1 held)" in lines[0], lines
     else:
-        assert not any(caught in line for line in lines), lines
+        assert lines == [], lines
+
+
+@pytest.mark.parametrize("ending", ["missing", "stream", "engine"])
+def test_a_fill_retry_waking_after_its_order_is_gone_does_not_read_or_log(
+    venue, monkeypatch, ending
+) -> None:
+    # NautilusTrader d53849b216e2, live/clients.py: cache is the client's assigned view;
+    # generate_order_canceled queues an engine event. Only the missing case substitutes that view,
+    # without removing anything from the native cache. Stream and engine closure use real outputs.
+    from .test_adapter_held_report_blind import LogProbe
+    from .test_adapter_held_report_blind import StreamProbe
+    from .test_adapter_held_report_blind import holding_strategy
+    from .test_adapter_held_report_blind import until
+
+    strategy = holding_strategy(venue)
+
+    async def body(client) -> None:
+        await until(lambda: "OrderAccepted" in strategy.names(), "the order was not accepted")
+        client_order_id = strategy.client_order_id
+        placed = placed_order(venue)
+        venue_order_id = VenueOrderId(placed["id"])
+        cache = client.cache
+        stream = StreamProbe(client, monkeypatch)
+        log = LogProbe(client._log)
+        monkeypatch.setattr(client, "_log", log)
+        sleeping, wake = hold_fill_retry(client, monkeypatch)
+        reads: list = []
+
+        async def read(*args, **kwargs):
+            reads.append((args, kwargs))
+            return False
+
+        monkeypatch.setattr(client, "_catch_up", read)
+        client._catch_up_later(client_order_id, Decimal(1), venue_order_id)
+        pending = client._catching_up[client_order_id]
+        try:
+            await until(sleeping.is_set, "the retry did not enter its sleep")
+            assert not pending.done()
+            if ending == "missing":
+                monkeypatch.setattr(client, "cache", SimpleNamespace(order=lambda _id: None))
+            elif ending == "stream":
+                cancel = venue.trading.update(
+                    placed["id"], "canceled", deliver=False, status="canceled"
+                )
+                await stream.send(venue, cancel)
+                assert client_order_id in client._finished
+            else:
+                client.generate_order_canceled(
+                    cache.order(client_order_id), venue_order_id, client.clock.timestamp_ns()
+                )
+                assert client_order_id not in client._finished
+            if ending != "missing":
+                await until(
+                    lambda: cache.order(client_order_id).is_closed,
+                    "the ending event did not close the cache",
+                )
+            wake.set()
+            await until(pending.done, "the retry did not finish after waking")
+            assert pending.result() is None
+            assert reads == [], "a retry read after its order was gone or closed"
+            assert not [line for line in log.lines if "fill catch-up" in line], log.lines
+            assert client_order_id not in client._catching_up
+            assert client_order_id not in client._catch_up_targets
+        finally:
+            wake.set()
+            monkeypatch.setattr(client, "cache", cache)
+            if not pending.done():
+                pending.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await pending
+            elif not pending.cancelled():
+                pending.result()
+
+    run_with_client(body, strategy)
+
+
+@pytest.mark.parametrize("error", [RuntimeError, AssertionError, asyncio.CancelledError])
+def test_a_later_read_that_raises_fails_the_cancel_case(venue, monkeypatch, capfd, error) -> None:
+    # Python b703b2c5e704, asyncio/tasks.py: gather(return_exceptions=True) returns failures
+    # as values. The case driving the real later() task must raise them, including cancellation.
+    original = AlpacaExecutionClient._catch_up
+
+    async def broken_read(self, order, *args, **kwargs):
+        later = self._catching_up.get(order.client_order_id) is asyncio.current_task()
+        result = await original(self, order, *args, **kwargs)
+        if later:
+            raise error("stand-in later read failed")
+        return result
+
+    monkeypatch.setattr(AlpacaExecutionClient, "_catch_up", broken_read)
+    with pytest.raises(error, match="stand-in later read failed"):
+        test_a_cancel_showing_a_fill_the_node_lost_ends_the_order_with_it(
+            venue, monkeypatch, capfd, "update-during-read"
+        )
 
 
 @pytest.mark.parametrize(
@@ -8426,15 +8542,19 @@ def test_a_cancel_whose_lost_fill_is_never_listed_ends_with_an_error_naming_the_
 ) -> None:
     # ADR 0075's recorded limit, on the lead's terms (2026-11-11): when the reads run out, the order ends
     # with what the node holds, and an ERROR names the order, the shares Alpaca shows and those held.
-    monkeypatch.setattr(canon_alpaca.execution, "FILL_READ_RETRY_SECS", 0.05)
+    from .test_adapter_held_report_blind import StreamProbe
+    from .test_adapter_held_report_blind import until
+
+    monkeypatch.setattr(canon_alpaca.execution, "FILL_READ_RETRY_SECS", 0.0)
     venue.trading.script = "accept"
     strategy = trader(order_type="limit", quantity=3)
     strategy.stopped_for = "held open"
     held: list = []
 
     async def body(client) -> None:
-        await until_named(strategy, "OrderAccepted")
-        await until_idle(client, venue)
+        await until(lambda: "OrderAccepted" in strategy.names(), "the order was not accepted")
+        stream = StreamProbe(client, monkeypatch)
+        sleeping, wake = hold_fill_retry(client, monkeypatch)
         placed = placed_order(venue)
         venue.trading.update(
             placed["id"],
@@ -8445,9 +8565,19 @@ def test_a_cancel_whose_lost_fill_is_never_listed_ends_with_an_error_naming_the_
             filled_qty="1",
         )
         venue.trading.activities.pop()  # never listed
-        venue.trading.update(placed["id"], "canceled", status="canceled")
-        await asyncio.sleep(0.5)
-        await settled(client, venue)
+        cancel = venue.trading.update(placed["id"], "canceled", deliver=False, status="canceled")
+        try:
+            await stream.send(venue, cancel)
+            pending = client._catching_up.get(strategy.client_order_id)
+            assert pending is not None
+            await until(sleeping.is_set, "the retry did not enter its sleep")
+        finally:
+            wake.set()
+        await until(pending.done, "the three empty reads did not finish")
+        assert pending.result() is None
+        await until(lambda: "OrderCanceled" in strategy.names(), "the order did not cancel")
+        assert strategy.client_order_id not in client._catching_up
+        assert strategy.client_order_id not in client._catch_up_targets
         cached = client.cache.order(strategy.client_order_id)
         held.append((cached.status, cached.filled_qty.as_double()))
 
@@ -8460,8 +8590,10 @@ def test_a_cancel_whose_lost_fill_is_never_listed_ends_with_an_error_naming_the_
     )
     # The node's logger is set up once per process, under the first node's trader ID, so the line is
     # matched from its level on.
-    (line,) = [x for x in logged(capfd).splitlines() if error in x]
-    assert "[ERROR] " in line, line
+    prefix = f"Alpaca fill catch-up for {strategy.client_order_id}:"
+    lines = [line for line in logged(capfd).splitlines() if prefix in line]
+    assert len(lines) == 1, lines
+    assert error in lines[0] and "[ERROR] " in lines[0], lines
 
 
 @pytest.mark.parametrize("activities", ["listed", "listed-later"])
@@ -8826,6 +8958,530 @@ def test_an_outside_order_pending_replace_has_its_fills_reported_on_the_order_re
     assert fills == [pending["id"]] and pending["id"] in named, (named, fills)
 
 
+# -- a submit never answered that Alpaca fills (the session window's claim 10, ADR 0044, ADR 0075) ----
+
+LOST_SUBMIT_CHECKS: dict[str, Any] = {
+    "reconciliation_startup_delay_secs": 0,
+    "inflight_check_interval_ms": 100,
+    "inflight_check_threshold_ms": 200,
+    "open_check_interval_secs": 0.25,
+    "open_check_threshold_ms": 200,
+    "position_check_interval_secs": 0.4,
+    "position_check_threshold_ms": 500,
+}
+"""The engine's in-flight check (`FAST_INFLIGHT`) and the paper node's open-order and position checks
+(`PAPER_CHECKS`), with the position check's grace after an order's last activity (one minute by default,
+`position_check_threshold_ns` in `crates/live/src/execution/config.rs` at the pin) cut to half a second,
+so a test sees the engine give up on the submit and then book what Alpaca shows."""
+
+
+class Claimant(Strategy):
+    """Submits nothing itself, records its order events and reads its own position, as `SessionMaCross`
+    does (`held`, by strategy ID); built with a `StrategyConfig`, so it can claim its instrument."""
+
+    def __init__(self, config: StrategyConfig | None = None) -> None:
+        super().__init__(config)
+        self.started = False
+        self.events: list = []
+
+    def on_start(self) -> None:
+        self.started = True
+
+    def on_order_event(self, event) -> None:
+        if type(event).__name__ != "OrderInitialized":
+            self.events.append(event)
+
+    def names(self) -> list[str]:
+        return [type(e).__name__ for e in self.events]
+
+    def held(self) -> Decimal:
+        return sum(
+            (
+                p.signed_qty
+                for p in self.cache.positions_open(instrument_id=AAPL, strategy_id=self.strategy_id)
+            ),
+            Decimal(0),
+        )
+
+
+EXHAUSTED = "Submission recovery exhausted for {}"
+"""What the engine logs when it retains a submit its in-flight check has given up on
+(`exhaust_submission`, `crates/live/src/execution/manager.rs` at the pin)."""
+
+
+def lost_submit_filled(
+    venue,
+    alpaca,
+    monkeypatch,
+    capfd,
+    *,
+    side: str,
+    delivered: bool,
+    retain: bool,
+    claim: bool,
+    took: bool = True,
+    order_unread: bool = False,
+    unread_reads: int = 0,
+    trace_unread_reads: int = 0,
+) -> dict:
+    """One limit order of one share whose submit Alpaca takes and answers 500, every read of the order
+    failing meanwhile (by client order ID, by ID, and the open orders), until the engine's in-flight
+    check has run out of queries; then Alpaca fills it, shows the position it made, and its reads are
+    answered again. `side` is `entry` (a buy from flat) or `close` (a sell of the one share a filled buy
+    left). With `delivered` the fill's trade update reaches the client; without, the stream lost it.
+    `retain` and `claim` are the two upstream settings: the engine's `RETAIN_UNRESOLVED` and the
+    strategy's claim on the instrument. Without `took`, Alpaca never placed the order, and nothing fills.
+    With `order_unread`, Alpaca's order can still not be read by its ID once the fill is made, so the fill
+    report cannot be named. With `trace_unread_reads`, it fills on a replacement whose ancestor read
+    fails that many times before answering. Returns what the node holds once it has settled, and the
+    error the node's run ended with, if any."""
+    reads_lost = {"on": False}
+    queries: list[str] = []
+    get_orders = venue.trading.get_orders
+    by_client_id = venue.trading.get_order_by_client_id
+
+    def lost_orders(filter=None):
+        if reads_lost["on"]:
+            raise ConnectionError("connection reset")
+        return get_orders(filter)
+
+    def lost_lookup(client_id: str):
+        if reads_lost["on"]:
+            queries.append(client_id)
+            raise ConnectionError("connection reset")
+        return by_client_id(client_id)
+
+    monkeypatch.setattr(venue.trading, "get_orders", lost_orders)
+    monkeypatch.setattr(venue.trading, "get_order_by_client_id", lost_lookup)
+    venue.trading.order_lookup_error = lambda _id: (
+        ConnectionError("connection reset") if reads_lost["on"] else None
+    )
+    one_share = {**alpaca.POSITION_AAPL, "qty": "1", "qty_available": "1", "avg_entry_price": "150"}
+    strategy = Claimant(StrategyConfig(external_order_instrument_ids=[AAPL]) if claim else None)
+    engine = LiveExecutionEngineConfig(
+        **LOST_SUBMIT_CHECKS,
+        submission_recovery_policy=(
+            SubmissionRecoveryPolicy.RETAIN_UNRESOLVED
+            if retain
+            else SubmissionRecoveryPolicy.RESOLVE_LOCALLY
+        ),
+    )
+    alpaca_holds = Decimal(1) if side == "entry" else Decimal(0)
+    seen: dict = {}
+
+    def limit(order_side: OrderSide):
+        return strategy.order_factory.limit(
+            AAPL, order_side, Quantity.from_int(1), Price.from_str("150.00")
+        )
+
+    def external_fills() -> list:
+        return [o for o in strategy.cache.orders() if o.strategy_id.value == "EXTERNAL"]
+
+    async def body(client) -> None:
+        if side == "close":
+            venue.trading.script = "fill"
+            strategy.submit_order(limit(OrderSide.BUY))
+            await until_named(strategy, "OrderFilled")
+            venue.trading.positions = [one_share]
+            await settled(client, venue)
+        venue.trading.script = "silent"
+        venue.trading.took_before_error = took
+        venue.trading.submit_error = alpaca.api_error(500, 50010000, "internal server error")
+        reads_lost["on"] = True
+        order = limit(OrderSide.BUY if side == "entry" else OrderSide.SELL)
+        strategy.submit_order(order)
+
+        def own() -> Any:
+            cached = strategy.cache.order(order.client_order_id)
+            assert cached is not None
+            return cached
+
+        # A limit of 5 in-flight checks permits 4 queries before the fifth gives up
+        # (reconciliation.md, "Recovery limits", at the pin): retained, the engine says so; resolved
+        # locally, the order is rejected.
+        await until_true(lambda: len(queries) >= 4)
+        log: list[str] = []
+
+        def given_up() -> bool:
+            if not retain:
+                return own().status == OrderStatus.REJECTED
+            logging_sync_to_disk()
+            captured = capfd.readouterr()
+            log.append(captured.out + captured.err)
+            return EXHAUSTED.format(order.client_order_id) in "".join(log)
+
+        await until_true(given_up, timeout=4)
+        cached = own()
+        seen["given_up"] = (cached.status, cached.is_closed, strategy.held())
+        venue.trading.submit_error = None
+        venue.trading.took_before_error = False
+        reads_lost["on"] = False
+        if order_unread:
+            seen["unread_order_reads"] = 0
+
+            def never_read(_id):
+                seen["unread_order_reads"] += 1
+                return ConnectionError("connection reset")
+
+            venue.trading.order_lookup_error = never_read
+        if unread_reads:
+            left = {"n": unread_reads}
+
+            def once(_id):
+                if left["n"] > 0:
+                    left["n"] -= 1
+                    return ConnectionError("connection reset")
+                return None
+
+            venue.trading.order_lookup_error = once
+        seen["client_order_id"] = order.client_order_id.value
+        if not took:
+            await asyncio.sleep(1.0)  # every check runs again, with the reads answered
+            seen.update(order=(own().status, []), submits=len(venue.trading.submitted))
+            return
+        (placed,) = [
+            p
+            for p in venue.trading._placed.values()
+            if p["client_order_id"] == order.client_order_id.value
+        ]
+        if trace_unread_reads:
+            ancestor = placed
+            placed = {
+                **ancestor,
+                "id": str(uuid.UUID(int=2342)),
+                "client_order_id": "alpaca-made-trace-replacement",
+                "replaces": ancestor["id"],
+            }
+            ancestor.update(status="replaced", replaced_by=placed["id"])
+            venue.trading._placed[placed["id"]] = placed
+            seen["ancestor_reads"] = 0
+
+            def trace_once(order_id):
+                if order_id == ancestor["id"]:
+                    seen["ancestor_reads"] += 1
+                    if seen["ancestor_reads"] <= trace_unread_reads:
+                        return ConnectionError("ancestor connection reset")
+                return None
+
+            venue.trading.order_lookup_error = trace_once
+        update = venue.trading.update(
+            placed["id"], "fill", 1, deliver=delivered, status="filled", filled_qty="1"
+        )
+        venue.trading.positions = [one_share] if side == "entry" else []
+        await until_true(
+            lambda: (
+                (strategy.held() == alpaca_holds and (not delivered or own().is_closed))
+                or bool(external_fills())
+                or (order_unread and seen.get("unread_order_reads", 0) >= 3)
+            ),
+            timeout=5,
+        )
+        await asyncio.sleep(1.0)  # every check runs again: nothing more is booked
+        cached = own()
+        seen.update(
+            order=(cached.status, sorted(trade_ids(cached))),
+            trade_id=update["execution_id"],
+            held=strategy.held(),
+            alpaca_holds=alpaca_holds,
+            external=[(o.side, o.filled_qty.as_double()) for o in external_fills()],
+            submits=len(venue.trading.submitted),
+        )
+
+    try:
+        run_with_client(body, strategy, exec_engine=engine)
+    except RuntimeError as e:
+        seen["run"] = str(e)
+    return seen
+
+
+@pytest.mark.parametrize("side", ["entry", "close"])
+@pytest.mark.parametrize("delivered", [True, False], ids=["delivered", "lost"])
+def test_a_submit_never_answered_and_filled_later_is_the_strategys_own_with_both_settings(
+    venue, alpaca, monkeypatch, capfd, side, delivered
+) -> None:
+    # The session window's claim 10: the node rejected such an order itself (`INFLIGHT_TIMEOUT`), and the
+    # fill Alpaca then made was booked to an `EXTERNAL` order, which `SessionMaCross` does not read: after
+    # a closing sell it sold a share it no longer held, after an entry it bought a second. With the paper
+    # nodes' two settings the order stays open at the node, so a strategy that sends nothing while one
+    # works sends nothing more, and what the node books in the instrument is the strategy's own.
+    seen = lost_submit_filled(
+        venue, alpaca, monkeypatch, capfd, side=side, delivered=delivered, retain=True, claim=True
+    )
+
+    status, closed, _ = seen["given_up"]
+    assert (status, closed) == (OrderStatus.SUBMITTED, False), seen
+    assert seen["held"] == seen["alpaca_holds"], seen
+    assert seen["external"] == [], seen
+    assert seen["submits"] == (1 if side == "entry" else 2), seen  # nothing sent again
+    # Lost, the position check's fill report names the order by the client order ID Alpaca's read of it
+    # shows, so the fill reaches the order itself, under Alpaca's trade ID, and nothing is left unresolved
+    # at the stop.
+    assert seen["order"] == (OrderStatus.FILLED, [seen["trade_id"]]), seen
+    assert "run" not in seen, seen
+
+
+@pytest.mark.parametrize("side", ["entry", "close"])
+def test_a_submit_never_answered_and_filled_later_was_booked_to_external_before(
+    venue, alpaca, monkeypatch, capfd, side
+) -> None:
+    # The claim as the review found it, on the paper nodes' settings before this change (upstream's
+    # defaults): the strategy's own position is not Alpaca's, and an `EXTERNAL` order holds the fill.
+    seen = lost_submit_filled(
+        venue, alpaca, monkeypatch, capfd, side=side, delivered=False, retain=False, claim=False
+    )
+
+    status, closed, _ = seen["given_up"]
+    assert (status, closed) == (OrderStatus.REJECTED, True), seen
+    assert seen["held"] != seen["alpaca_holds"], seen
+    # The fill report, under Alpaca's order ID the node never heard, and the position check's own order
+    # (`RECONCILIATION`), each an `EXTERNAL` one on the order's side.
+    assert seen["external"], seen
+    assert {s for s, _ in seen["external"]} == {
+        OrderSide.BUY if side == "entry" else OrderSide.SELL
+    }, seen
+    assert "run" not in seen, seen
+
+
+def test_the_claim_alone_leaves_the_order_closed_while_alpaca_may_still_fill_it(
+    venue, alpaca, monkeypatch, capfd
+) -> None:
+    # Why the engine retains the submit: claimed but resolved locally, the order is closed at the node
+    # once the in-flight check gives up, with nothing held, while Alpaca holds it; a strategy that sends
+    # nothing while one of its orders works would send again before the position check books the fill
+    # (a minute after the order's last activity, by default).
+    seen = lost_submit_filled(
+        venue, alpaca, monkeypatch, capfd, side="entry", delivered=True, retain=False, claim=True
+    )
+
+    assert seen["given_up"] == (OrderStatus.REJECTED, True, Decimal(0)), seen
+    # Alpaca's later fill is not applied to it.
+    assert seen["order"][0] == OrderStatus.REJECTED, seen
+    assert "run" not in seen, seen
+
+
+@pytest.mark.parametrize("side", ["entry", "close"])
+def test_retained_a_lost_fill_reaches_the_order_by_its_client_order_id(
+    venue, alpaca, monkeypatch, capfd, side
+) -> None:
+    # Retained, the order stays submitted; with its trade update lost, the position check's fill report
+    # carried only Alpaca's order ID, which the node never heard for an order never answered, so the
+    # engine booked the fill to `EXTERNAL` and the order stayed submitted until the stop. The report now
+    # carries the client order ID Alpaca's read of the order shows, as upstream's OKX adapter carries
+    # the one the venue echoes, and the engine matches the fill to the order by it, with no claim.
+    seen = lost_submit_filled(
+        venue, alpaca, monkeypatch, capfd, side=side, delivered=False, retain=True, claim=False
+    )
+
+    assert seen["given_up"][:2] == (OrderStatus.SUBMITTED, False), seen
+    assert seen["order"] == (OrderStatus.FILLED, [seen["trade_id"]]), seen
+    assert seen["held"] == seen["alpaca_holds"], seen
+    assert seen["external"] == [], seen
+    assert "run" not in seen, seen
+
+
+@pytest.mark.parametrize("retain", [True, False], ids=["retained", "resolved locally"])
+def test_a_submit_alpaca_never_placed_is_retained_too_and_nothing_is_sent_again(
+    venue, alpaca, monkeypatch, capfd, retain
+) -> None:
+    # What the retention costs: a submit answered 500 that Alpaca did not place is retained just the
+    # same, since a read that finds no order is no outcome (`_query_order` sends nothing); Alpaca asks
+    # that a timed-out order not be marked canceled "until confirmed" (working-with-orders FAQ). The order
+    # stays submitted, so a strategy that sends nothing while one works sends nothing more for the rest
+    # of the run, and the run ends with the error naming it. Resolved locally, it was rejected.
+    seen = lost_submit_filled(
+        venue,
+        alpaca,
+        monkeypatch,
+        capfd,
+        side="entry",
+        delivered=False,
+        retain=retain,
+        claim=True,
+        took=False,
+    )
+
+    assert seen["submits"] == 1, seen
+    if retain:
+        assert seen["order"][0] == OrderStatus.SUBMITTED, seen
+        assert seen["run"].startswith("Submission recovery incomplete at shutdown"), seen
+        assert seen["client_order_id"] in seen["run"], seen
+    else:
+        assert seen["order"][0] == OrderStatus.REJECTED, seen
+        assert "run" not in seen, seen
+
+
+# -- the code review of the fill report's client order ID (`_unanswered_named`) --------------------
+
+
+def naming(venue, alpaca, monkeypatch, check) -> None:
+    """Run `check(client, strategy, waiting, placed_id, reads)` once the strategy holds a buy whose submit
+    Alpaca took and answered 500, so the node holds it `SUBMITTED` with no Alpaca order ID; `reads`
+    lists every `get_order_by_id`."""
+    strategy = Claimant()
+    reads: list[str] = []
+    by_id = venue.trading.get_order_by_id
+
+    def counted(order_id):
+        reads.append(str(order_id))
+        return by_id(order_id)
+
+    monkeypatch.setattr(venue.trading, "get_order_by_id", counted)
+
+    async def body(client) -> None:
+        venue.trading.script = "silent"
+        venue.trading.took_before_error = True
+        venue.trading.submit_error = alpaca.api_error(500, 50010000, "internal server error")
+        order = strategy.order_factory.limit(
+            AAPL, OrderSide.BUY, Quantity.from_int(1), Price.from_str("150.00")
+        )
+        strategy.submit_order(order)
+        await until_true(lambda: bool(venue.trading._placed))
+        await until_true(lambda: "OrderSubmitted" in strategy.names())
+        (placed,) = venue.trading._placed.values()
+        await check(
+            client, strategy, strategy.cache.order(order.client_order_id), placed["id"], reads
+        )
+
+    run_with_client(body, strategy)
+
+
+def fill_of(alpaca, order_id: str, side: str = "buy", symbol: str = "AAPL"):
+    return fill_report(
+        {**alpaca.FILL_ACTIVITY, "order_id": order_id, "side": side, "symbol": symbol}, 0
+    )
+
+
+def test_a_fill_of_a_submit_never_answered_is_named_and_other_fills_are_not(
+    venue, alpaca, monkeypatch
+) -> None:
+    named: list = []
+
+    async def check(client, strategy, waiting, placed_id, reads) -> None:
+        own = fill_of(alpaca, placed_id)
+        other_side = fill_of(alpaca, placed_id, side="sell")
+        already = canon_alpaca.execution.report_with(
+            own, client_order_id=ClientOrderId("O-elsewhere")
+        )
+        named.extend(await client._unanswered_named([own, other_side, already]))
+        named.append(list(reads))
+
+    naming(venue, alpaca, monkeypatch, check)
+
+    own, other_side, already, reads = named
+    assert own.client_order_id is not None and own.client_order_id.value.startswith("O-"), own
+    assert other_side.client_order_id is None  # not the waiting order's side: not read for it
+    assert already.client_order_id == ClientOrderId("O-elsewhere")
+    assert len(reads) == 1, reads
+
+
+def test_no_order_is_read_while_the_node_holds_no_submit_never_answered(
+    venue, alpaca, monkeypatch
+) -> None:
+    seen: list = []
+
+    async def body(client) -> None:
+        report = fill_of(alpaca, "b5abe576-6a8a-49f3-a353-46b72c1ccae9")
+        seen.append(await client._unanswered_named([report]))
+
+    reads: list[str] = []
+    monkeypatch.setattr(venue.trading, "get_order_by_id", lambda order_id: reads.append(order_id))
+    run_with_client(body)
+
+    ((report,),) = seen
+    assert report.client_order_id is None and reads == []
+
+
+def test_an_order_that_cannot_be_read_is_withheld_and_read_again(
+    venue, alpaca, monkeypatch
+) -> None:
+    named: list = []
+
+    async def check(client, strategy, waiting, placed_id, reads) -> None:
+        venue.trading.order_lookup_error = lambda _id: ConnectionError("connection reset")
+        first = await client._unanswered_named([fill_of(alpaca, placed_id)])
+        venue.trading.order_lookup_error = None
+        (second,) = await client._unanswered_named([fill_of(alpaca, placed_id)])
+        named.extend([first, second, list(reads)])
+
+    naming(venue, alpaca, monkeypatch, check)
+
+    first, second, reads = named
+    assert first == []
+    assert second.client_order_id is not None
+    assert len(reads) == 2, reads
+
+
+def test_an_order_not_the_nodes_is_read_once(venue, alpaca, monkeypatch) -> None:
+    outside = alpaca.alpaca_order(
+        id="c0ffee00-0000-4000-8000-000000000001", client_order_id="theirs-1"
+    )
+    named: list = []
+
+    async def check(client, strategy, waiting, placed_id, reads) -> None:
+        venue.trading.orders.append(outside)  # after start-up, which would have made it the node's
+        for _ in range(2):
+            (report,) = await client._unanswered_named([fill_of(alpaca, outside["id"])])
+            named.append(report)
+        named.append(list(reads))
+
+    naming(venue, alpaca, monkeypatch, check)
+
+    first, second, reads = named
+    assert first.client_order_id is None and second.client_order_id is None
+    assert reads == [outside["id"]], reads
+
+
+def test_a_submit_answered_while_its_order_is_read_is_not_named(venue, alpaca, monkeypatch) -> None:
+    # The node's orders waiting on an answer were taken before the read: an order rejected meanwhile
+    # (the in-flight check giving up under upstream's default, or a refusal) was named, and the engine
+    # given a fill for a closed order rather than booking it.
+    named: list = []
+
+    async def check(client, strategy, waiting, placed_id, reads) -> None:
+        read = client._orders_read
+
+        async def answered_meanwhile(order_ids):
+            found = await read(order_ids)
+            client.generate_order_rejected(
+                waiting, "refused while read", client.clock.timestamp_ns(), False
+            )
+            await until_true(lambda: strategy.cache.order(waiting.client_order_id).is_closed)
+            return found
+
+        monkeypatch.setattr(client, "_orders_read", answered_meanwhile)
+        named.extend(await client._unanswered_named([fill_of(alpaca, placed_id)]))
+
+    naming(venue, alpaca, monkeypatch, check)
+
+    (report,) = named
+    assert report.client_order_id is None
+
+
+@pytest.mark.parametrize("claim", [True, False], ids=["claimed", "unclaimed"])
+def test_a_lost_fill_whose_order_cannot_be_read_keeps_retrying_without_external_booking(
+    venue, alpaca, monkeypatch, capfd, claim
+) -> None:
+    # A failed identity read is not evidence of an outside order, even with an instrument claim.
+    # Keep asking until shutdown; the retained order still makes shutdown fail without its identity.
+    seen = lost_submit_filled(
+        venue,
+        alpaca,
+        monkeypatch,
+        capfd,
+        side="entry",
+        delivered=False,
+        retain=True,
+        claim=claim,
+        order_unread=True,
+    )
+
+    assert seen["order"][0] == OrderStatus.SUBMITTED, seen
+    assert seen["run"].startswith("Submission recovery incomplete at shutdown"), seen
+    assert seen["held"] == Decimal(0), seen
+    assert seen["external"] == [], seen
+    assert seen["unread_order_reads"] >= 3, seen
+
+
 # -- the replace chain's item, closed by ADR 0075's rules: its readers' reproductions, kept as guards -----
 
 
@@ -9118,6 +9774,195 @@ def test_a_stale_terminal_report_does_not_end_an_order_whose_end_waits_for_more_
     assert (status, filled, trades) == (OrderStatus.CANCELED, 2.0, both), strategy.names()
 
 
+# -- Stream acknowledgement time (Nautilus OrderAccepted / Alpaca Order.submitted_at) ---------------
+
+
+@pytest.fixture
+def submit_answer_held(venue, monkeypatch):
+    """Let the stand-in place the order, but hold its HTTP answer until the test releases it."""
+    venue.trading.script = "silent"
+    ready = threading.Event()
+    release = threading.Event()
+    submit = venue.trading.submit_order
+
+    def held(order_data):
+        answer = submit(order_data)
+        ready.set()
+        assert release.wait(10), "the test did not release the submit answer"
+        return answer
+
+    monkeypatch.setattr(venue.trading, "submit_order", held)
+    try:
+        yield ready, release
+    finally:
+        release.set()
+
+
+@pytest.mark.parametrize(
+    ("event", "status", "quantity", "last_event"),
+    [
+        ("new", "new", None, "OrderAccepted"),
+        ("accepted", "accepted", None, "OrderAccepted"),
+        ("pending_new", "pending_new", None, "OrderAccepted"),
+        ("partial_fill", "partially_filled", 1, "OrderFilled"),
+        ("fill", "filled", 2, "OrderFilled"),
+        ("canceled", "canceled", None, "OrderCanceled"),
+        ("expired", "expired", None, "OrderExpired"),
+    ],
+)
+def test_stream_acceptance_time_before_the_http_answer(
+    venue,
+    submit_answer_held,
+    generated,
+    event,
+    status,
+    quantity,
+    last_event,
+) -> None:
+    # OrderAccepted.ts_event becomes the cached ts_accepted (Nautilus d53849b216e2,
+    # crates/model/src/orders/mod.rs:1042-1046). The fill's own time must stay later.
+    ready, release = submit_answer_held
+    strategy = trader(order_type="limit")
+    strategy.stopped_for = "held open"
+
+    async def body(client) -> None:
+        try:
+            async with asyncio.timeout(5):
+                while not ready.is_set():
+                    await asyncio.sleep(0.005)
+            await until_named(strategy, "OrderSubmitted")
+            assert strategy.client_order_id is not None
+            placed = placed_order(venue)
+            submitted_at = datetime.fromisoformat(placed["submitted_at"])
+            update_at = submitted_at + timedelta(seconds=5, microseconds=123456)
+            raw = venue.trading.update(
+                placed["id"],
+                event,
+                quantity,
+                deliver=False,
+                status=status,
+                filled_qty=str(quantity or 0),
+            )
+            update = TradeUpdate.model_validate({**raw, "timestamp": update_at})
+            expected = dt_to_unix_nanos(submitted_at)
+            names = ["OrderSubmitted", "OrderAccepted"]
+            if last_event != "OrderAccepted":
+                names.append(last_event)
+
+            await client._apply(update)
+            await until_named(strategy, last_event)
+            assert strategy.names() == names
+            assert strategy.events[1].ts_event == expected
+            assert client.cache.order(strategy.client_order_id).ts_accepted == expected
+            if last_event != "OrderAccepted":
+                assert strategy.events[-1].ts_event == dt_to_unix_nanos(update_at)
+            if quantity is not None:
+                fill = strategy.events[-1]
+                assert fill.trade_id.value == str(update.execution_id)
+                assert fill.last_qty == Quantity.from_int(quantity)
+                assert fill.last_px == Price.from_str(str(raw["price"]))
+                assert trade_ids(client.cache.order(strategy.client_order_id)) == [
+                    str(update.execution_id)
+                ]
+
+            await client._apply(update)  # a duplicate update must not accept or fill twice
+            release.set()
+            await until_idle(client, venue)
+            await client._apply(update)  # nor does the same update after the HTTP answer
+            await until_idle(client, venue)
+            assert strategy.names() == names
+            assert client.cache.order(strategy.client_order_id).ts_accepted == expected
+            assert generated.count("accepted") == 1
+        finally:
+            release.set()
+
+    run_with_client(body, strategy)
+
+
+def test_stream_acceptance_time_survives_a_pending_cancel(
+    venue, submit_answer_held, generated
+) -> None:
+    ready, release = submit_answer_held
+    strategy = trader(order_type="limit", cancel_on="OrderSubmitted")
+    strategy.stopped_for = "held open"
+    # Once released, the queued HTTP cancel adds no further stream update.
+    venue.trading.cancel_order_by_id = lambda order_id: None
+
+    async def body(client) -> None:
+        try:
+            async with asyncio.timeout(5):
+                while not ready.is_set():
+                    await asyncio.sleep(0.005)
+            await until_named(strategy, "OrderPendingCancel")
+            assert strategy.client_order_id is not None
+            placed = placed_order(venue)
+            submitted_at = datetime.fromisoformat(placed["submitted_at"])
+            update_at = submitted_at + timedelta(seconds=5, microseconds=123456)
+            raw = venue.trading.update(placed["id"], "new", deliver=False, status="new")
+            update = TradeUpdate.model_validate({**raw, "timestamp": update_at})
+            expected = dt_to_unix_nanos(submitted_at)
+            await client._apply(update)
+            assert "OrderAccepted" not in strategy.names()
+            assert client._acknowledged[strategy.client_order_id][1] == expected
+
+            refused_at = update_at + timedelta(seconds=1)
+            refused = TradeUpdate.model_validate(
+                {**raw, "event": "order_cancel_rejected", "timestamp": refused_at}
+            )
+            await client._apply(refused)
+            await until_named(strategy, "OrderAccepted")
+            release.set()
+            await until_idle(client, venue)
+            assert strategy.names() == [
+                "OrderSubmitted",
+                "OrderPendingCancel",
+                "OrderCancelRejected",
+                "OrderAccepted",
+            ]
+            assert strategy.events[-2].ts_event == dt_to_unix_nanos(refused_at)
+            assert strategy.events[-1].ts_event == expected
+            assert client.cache.order(strategy.client_order_id).ts_accepted == expected
+            assert generated.count("accepted") == 1
+        finally:
+            release.set()
+
+    run_with_client(body, strategy)
+
+
+def test_stream_acceptance_time_keeps_an_http_first_acceptance(venue, generated) -> None:
+    venue.trading.script = "silent"
+    strategy = trader(order_type="limit")
+    strategy.stopped_for = "held open"
+
+    async def body(client) -> None:
+        await until_named(strategy, "OrderAccepted")
+        await until_idle(client, venue)
+        placed = placed_order(venue)
+        submitted_at = datetime.fromisoformat(placed["submitted_at"])
+        expected = dt_to_unix_nanos(submitted_at)
+        assert strategy.events[1].ts_event == expected
+        assert client.cache.order(strategy.client_order_id).ts_accepted == expected
+        raw = venue.trading.update(
+            placed["id"],
+            "partial_fill",
+            1,
+            deliver=False,
+            status="partially_filled",
+            filled_qty="1",
+        )
+        update_at = submitted_at + timedelta(seconds=5, microseconds=123456)
+        update = TradeUpdate.model_validate({**raw, "timestamp": update_at})
+        await client._apply(update)
+        await until_idle(client, venue)
+        assert strategy.names() == ["OrderSubmitted", "OrderAccepted", "OrderFilled"]
+        assert client.cache.order(strategy.client_order_id).ts_accepted == expected
+        assert strategy.events[-1].ts_event == dt_to_unix_nanos(update_at)
+        assert strategy.events[-1].trade_id.value == str(update.execution_id)
+        assert generated.count("accepted") == 1
+
+    run_with_client(body, strategy)
+
+
 @pytest.mark.parametrize("cancel", [False, True], ids=["fill", "then-cancel"])
 def test_a_fill_on_an_order_whose_chain_cannot_be_read_waits_rather_than_moving_the_order(
     venue, alpaca, monkeypatch, cancel
@@ -9301,3 +10146,511 @@ def test_an_older_canceled_report_held_back_while_fills_are_caught_up_still_ends
 
     (status, filled, trades), both = held
     assert (status, filled, trades) == (OrderStatus.CANCELED, 2.0, both), strategy.names()
+
+
+def test_window_does_not_claim_a_fill_for_a_client_id_it_never_sent(
+    venue, alpaca, tmp_path
+) -> None:
+    from canon_trading.session_ma_cross import SessionMaCross
+    from canon_trading.session_window import WindowConfig
+    from canon_trading.session_window import window_node
+
+    node, window_strategy, cap = window_node(
+        WindowConfig(symbol="AAPL", log_dir=tmp_path),
+        wind_down_at=datetime.now(UTC) + timedelta(minutes=5),
+        log_name="foreign-fill-claim",
+        feed="iex",
+    )
+    try:
+        assert isinstance(window_strategy, SessionMaCross)
+        assert window_strategy.config is not None
+        claims = window_strategy.config.external_order_instrument_ids
+    finally:
+        node.dispose()
+        del node, window_strategy, cap
+
+    strategy = Claimant(StrategyConfig(external_order_instrument_ids=claims))
+    seen = []
+
+    async def body(client) -> None:
+        # This appears after startup, so the preflight/startup checks saw flat.
+        foreign = alpaca.alpaca_order(
+            id="c0ffee00-0000-4000-8000-000000000001",
+            client_order_id="manual-foreign-1",
+            symbol="AAPL",
+            side="buy",
+            qty="1",
+            filled_qty="1",
+            filled_avg_price="150",
+            status="filled",
+        )
+        venue.trading.orders.append(foreign)
+        venue.trading.activities = [
+            alpaca.fill_activity(foreign, str(uuid.UUID(int=901)), 1, "150", datetime.now(UTC))
+        ]
+        reports = await client._fill_reports(fills_command(instrument_id=AAPL))
+        assert len(reports) == 1
+        assert reports[0].client_order_id is None
+        assert venue.trading.submitted == []
+        client._handle_report(reports[0])
+        venue_id = VenueOrderId(foreign["id"])
+        await until_true(lambda: client.cache.client_order_id(venue_id) is not None)
+        order = client.cache.order(client.cache.client_order_id(venue_id))
+        seen.append(order.strategy_id.value)
+
+    run_with_client(body, strategy)
+    assert seen == ["EXTERNAL"], seen
+
+
+def test_an_unread_foreign_parent_does_not_discard_a_readable_own_fill(
+    venue, alpaca, monkeypatch
+) -> None:
+    foreign = alpaca.alpaca_order(
+        id="c0ffee00-0000-4000-8000-000000000002",
+        client_order_id="manual-replacement-1",
+        replaces="c0ffee00-0000-4000-8000-000000000003",
+        symbol="AAPL",
+        side="buy",
+        qty="1",
+        filled_qty="1",
+        filled_avg_price="150",
+        status="filled",
+    )
+    named = []
+    owner = []
+
+    async def check(client, strategy, waiting, placed_id, reads) -> None:
+        venue.trading.orders.append(foreign)
+        # The foreign parent is deliberately absent: get_order_by_id returns 404.
+        now = datetime.now(UTC)
+        own_report = fill_report(
+            alpaca.fill_activity(
+                venue.trading._placed[placed_id],
+                str(uuid.UUID(int=902)),
+                1,
+                "150",
+                now,
+            ),
+            0,
+        )
+        foreign_report = fill_report(
+            alpaca.fill_activity(foreign, str(uuid.UUID(int=903)), 1, "150", now),
+            0,
+        )
+        owner.append(waiting.client_order_id)
+        named.extend(await client._unanswered_named([own_report, foreign_report]))
+
+    naming(venue, alpaca, monkeypatch, check)
+    assert len(named) == 1
+    assert named[0].client_order_id == owner[0]
+
+
+def test_an_unread_foreign_parent_defers_reconciliation_but_delivers_the_readable_own_fill(
+    venue, alpaca, monkeypatch
+) -> None:
+    # The ancestor-trace case: the same setup, driven through `_fill_reports`
+    # (which exists on main too) instead of `_unanswered_named` (the port's own helper), so the batch
+    # property "the readable own fill survives an unrelated failed trace" can be compared on main
+    # and on the port. The untraceable fill must wait, lest it be booked as an outside order.
+    foreign = alpaca.alpaca_order(
+        id="c0ffee00-0000-4000-8000-000000000002",
+        client_order_id="manual-replacement-1",
+        replaces="c0ffee00-0000-4000-8000-000000000003",
+        symbol="AAPL",
+        side="buy",
+        qty="1",
+        filled_qty="1",
+        filled_avg_price="150",
+        status="filled",
+    )
+    got: list = []
+
+    async def check(client, strategy, waiting, placed_id, reads) -> None:
+        venue.trading.orders.append(foreign)
+        now = datetime.now(UTC)
+        venue.trading.activities = [
+            alpaca.fill_activity(
+                venue.trading._placed[placed_id], str(uuid.UUID(int=902)), 1, "150", now
+            ),
+            alpaca.fill_activity(foreign, str(uuid.UUID(int=903)), 1, "150", now),
+        ]
+        with pytest.raises(RuntimeError, match="fill identity is unread"):
+            await client._fill_reports(fills_command(instrument_id=AAPL))
+        await until_true(
+            lambda: strategy.cache.order(waiting.client_order_id).status == OrderStatus.FILLED
+        )
+        got.append(strategy.cache.order(waiting.client_order_id))
+
+    naming(venue, alpaca, monkeypatch, check)
+    assert len(got) == 1, got
+    assert got[0].client_order_id is not None, got
+    assert trade_ids(got[0]) == [str(uuid.UUID(int=902))], got
+
+
+def test_an_outside_replacement_whose_chain_cannot_be_read_does_not_drop_a_waiting_orders_fill(
+    venue, alpaca, monkeypatch
+) -> None:
+    missing_prior = "00000000-0000-4000-8000-000000000099"
+    outside = alpaca.alpaca_order(
+        id="00000000-0000-4000-8000-000000000001",
+        client_order_id="alpaca-made-1",
+        replaces=missing_prior,
+    )
+    named: list = []
+
+    async def check(client, strategy, waiting, placed_id, reads) -> None:
+        venue.trading.orders.append(outside)
+        venue.trading.order_lookup_error = lambda order_id: (
+            ConnectionError("connection reset") if str(order_id) == missing_prior else None
+        )
+        reports = await client._unanswered_named(
+            [fill_of(alpaca, outside["id"]), fill_of(alpaca, placed_id)]
+        )
+        named.extend(reports)
+
+    naming(venue, alpaca, monkeypatch, check)
+
+    (own_report,) = named
+    assert own_report.client_order_id == ClientOrderId(own_report.client_order_id.value)
+
+
+def test_canceling_a_retained_submit_that_filled_at_alpaca_settles_it_from_the_read_refused(
+    venue, alpaca, monkeypatch, capfd
+) -> None:
+    reads_lost = {"on": True}
+    queries: list[str] = []
+    by_client_id = venue.trading.get_order_by_client_id
+
+    def lost_lookup(client_id: str):
+        if reads_lost["on"]:
+            queries.append(client_id)
+            raise ConnectionError("connection reset")
+        return by_client_id(client_id)
+
+    monkeypatch.setattr(venue.trading, "get_order_by_client_id", lost_lookup)
+    strategy = Claimant(StrategyConfig(external_order_instrument_ids=[AAPL]))
+    engine = LiveExecutionEngineConfig(
+        reconciliation_startup_delay_secs=0,
+        inflight_check_interval_ms=100,
+        inflight_check_threshold_ms=200,
+        submission_recovery_policy=SubmissionRecoveryPolicy.RETAIN_UNRESOLVED,
+    )
+    seen: dict[str, Any] = {}
+
+    async def body(client) -> None:
+        venue.trading.script = "silent"
+        venue.trading.took_before_error = True
+        venue.trading.submit_error = alpaca.api_error(500, 50010000, "internal server error")
+        order = strategy.order_factory.limit(
+            AAPL, OrderSide.BUY, Quantity.from_int(1), Price.from_str("150.00")
+        )
+        strategy.submit_order(order)
+        await until_true(lambda: len(queries) >= 4)
+        log: list[str] = []
+
+        def exhausted() -> bool:
+            logging_sync_to_disk()
+            captured = capfd.readouterr()
+            log.append(captured.out + captured.err)
+            return EXHAUSTED.format(order.client_order_id) in "".join(log)
+
+        await until_true(exhausted, timeout=4)
+        reads_lost["on"] = False
+        (placed,) = venue.trading._placed.values()
+        update = venue.trading.update(
+            placed["id"], "fill", 1, deliver=False, status="filled", filled_qty="1"
+        )
+        # Reproduction harness: Alpaca answers 422 to a cancel of a filled order;
+        # the stand-in otherwise answers 204 and streams `canceled` for it.
+        venue.trading.refuse_cancel = lambda raw: (
+            alpaca.api_error(422, 42210000, "order is not cancelable")
+            if raw["status"] == "filled"
+            else None
+        )
+        # This pin takes a ClientOrderId, not an order.
+        strategy.cancel_order(order.client_order_id)
+        await settled(client, venue)
+
+        def own():
+            cached = strategy.cache.order(order.client_order_id)
+            assert cached is not None
+            return cached
+
+        await until_true(
+            lambda: own().status == OrderStatus.FILLED,
+            timeout=2,
+        )
+        cached = own()
+        seen.update(
+            status=cached.status,
+            trades=trade_ids(cached),
+            trade_id=update["execution_id"],
+            held=strategy.held(),
+        )
+
+    run_with_client(body, strategy, exec_engine=engine)
+
+    assert seen == {
+        "status": OrderStatus.FILLED,
+        "trades": [seen["trade_id"]],
+        "trade_id": seen["trade_id"],
+        "held": Decimal(1),
+    }
+
+
+def test_window_does_not_claim_an_order_for_a_client_id_it_never_sent(
+    venue, alpaca, tmp_path
+) -> None:
+    from canon_trading.session_ma_cross import SessionMaCross
+    from canon_trading.session_window import WindowConfig
+    from canon_trading.session_window import window_node
+
+    node, window_strategy, cap = window_node(
+        WindowConfig(symbol="AAPL", log_dir=tmp_path),
+        wind_down_at=datetime.now(UTC) + timedelta(minutes=5),
+        log_name="foreign-order-claim",
+        feed="iex",
+    )
+    try:
+        assert isinstance(window_strategy, SessionMaCross)
+        assert window_strategy.config is not None
+        claims = window_strategy.config.external_order_instrument_ids
+    finally:
+        node.dispose()
+        del node, window_strategy, cap
+
+    strategy = Claimant(StrategyConfig(external_order_instrument_ids=claims))
+    seen = []
+
+    async def body(client) -> None:
+        foreign = AlpacaOrder(
+            **alpaca.alpaca_order(
+                id="c0ffee00-0000-4000-8000-000000000004",
+                client_order_id="manual-foreign-order",
+                symbol="AAPL",
+                side="buy",
+                qty="1",
+                status="new",
+            )
+        )
+        await client._send_report(foreign)
+        venue_id = VenueOrderId(str(foreign.id))
+        await until_true(lambda: client.cache.client_order_id(venue_id) is not None)
+        order = client.cache.order(client.cache.client_order_id(venue_id))
+        seen.append((order.strategy_id.value, order.status))
+        assert venue.trading.submitted == []
+
+    run_with_client(body, strategy)
+    assert seen == [("EXTERNAL", OrderStatus.ACCEPTED)], seen
+
+
+@pytest.mark.parametrize("stage", ["order", "ancestor", "batch"])
+def test_unanswered_fill_read_failures_are_private_and_retryable(
+    venue, alpaca, monkeypatch, capfd, stage
+) -> None:
+    secret_text = "account=offline-account-id order=offline-order-id"
+    seen = []
+
+    async def check(client, strategy, waiting, placed_id, reads) -> None:
+        order_id = placed_id
+        if stage == "ancestor":
+            replacement = alpaca.alpaca_order(
+                id="c0ffee00-0000-4000-8000-000000000005",
+                client_order_id="alpaca-made-replacement",
+                replaces=placed_id,
+                symbol="AAPL",
+                side="buy",
+            )
+            venue.trading.orders.append(replacement)
+            order_id = replacement["id"]
+        report = fill_of(alpaca, order_id)
+        reports = [report]
+        get_orders = venue.trading.get_orders
+        if stage == "batch":
+            # More than one unknown order makes the naming pass try the bulk read first.
+            foreign = alpaca.alpaca_order(
+                id="c0ffee00-0000-4000-8000-000000000006",
+                client_order_id="manual-foreign-batch",
+            )
+            venue.trading.orders.append(foreign)
+            reports.append(fill_of(alpaca, foreign["id"]))
+
+            def unread_orders(filter=None):
+                raise ConnectionError(secret_text)
+
+            monkeypatch.setattr(venue.trading, "get_orders", unread_orders)
+        venue.trading.order_lookup_error = lambda order_id: (
+            ConnectionError(secret_text) if str(order_id) == placed_id else None
+        )
+        first = await client._unanswered_named(reports)
+        repeated = await client._unanswered_named(reports)
+        venue.trading.order_lookup_error = None
+        monkeypatch.setattr(venue.trading, "get_orders", get_orders)
+        second = await client._unanswered_named(reports)
+        seen.append((second[0].client_order_id, waiting.client_order_id))
+        assert len(first) == len(repeated) == len(reports) - 1
+        assert len(second) == len(reports)
+        if stage == "batch":
+            assert first[0].client_order_id is None and second[1].client_order_id is None
+
+    naming(venue, alpaca, monkeypatch, check)
+    second_id, own_id = seen[0]
+    assert second_id == own_id
+    output = logged(capfd)
+    assert "ConnectionError" in output
+    assert secret_text not in output
+    assert "fill identity read 1 failed" in output
+    assert "fill identity read 2 failed" in output
+
+
+@pytest.mark.parametrize("side", ["entry", "close"])
+def test_a_lost_fill_whose_order_read_fails_once_is_named_on_the_next_read(
+    venue, alpaca, monkeypatch, capfd, side
+) -> None:
+    # The read of the retained order's Alpaca order fails once, then
+    # answers. "Left unnamed and read again" holds only if the engine is not first given the unnamed
+    # report, which it books as an external order under the venue order ID.
+    seen = lost_submit_filled(
+        venue,
+        alpaca,
+        monkeypatch,
+        capfd,
+        side=side,
+        delivered=False,
+        retain=True,
+        claim=False,
+        unread_reads=1,
+    )
+
+    assert "run" not in seen, seen
+    assert seen["order"][0] == OrderStatus.FILLED, seen
+    assert seen["held"] == seen["alpaca_holds"], seen
+    assert seen["external"] == [], seen
+
+
+@pytest.mark.parametrize("claim", [True, False], ids=["claimed", "unclaimed"])
+def test_a_refused_cancel_of_a_filled_retained_submit_settles_after_the_activities_lag(
+    venue, alpaca, monkeypatch, capfd, claim
+) -> None:
+    # The fill activity is listed only 0.5 s after the refused cancel
+    reads_lost = {"on": True}
+    queries: list[str] = []
+    by_client_id = venue.trading.get_order_by_client_id
+
+    def lost_lookup(client_id: str):
+        if reads_lost["on"]:
+            queries.append(client_id)
+            raise ConnectionError("connection reset")
+        return by_client_id(client_id)
+
+    monkeypatch.setattr(venue.trading, "get_order_by_client_id", lost_lookup)
+    strategy = Claimant(StrategyConfig(external_order_instrument_ids=[AAPL]) if claim else None)
+    engine = LiveExecutionEngineConfig(
+        reconciliation_startup_delay_secs=0,
+        inflight_check_interval_ms=100,
+        inflight_check_threshold_ms=200,
+        submission_recovery_policy=SubmissionRecoveryPolicy.RETAIN_UNRESOLVED,
+    )
+    seen: dict[str, Any] = {}
+
+    async def body(client) -> None:
+        venue.trading.script = "silent"
+        venue.trading.took_before_error = True
+        venue.trading.submit_error = alpaca.api_error(500, 50010000, "internal server error")
+        order = strategy.order_factory.limit(
+            AAPL, OrderSide.BUY, Quantity.from_int(1), Price.from_str("150.00")
+        )
+        strategy.submit_order(order)
+        await until_true(lambda: len(queries) >= 4)
+        log: list[str] = []
+
+        def exhausted() -> bool:
+            logging_sync_to_disk()
+            captured = capfd.readouterr()
+            log.append(captured.out + captured.err)
+            return EXHAUSTED.format(order.client_order_id) in "".join(log)
+
+        await until_true(exhausted, timeout=4)
+        reads_lost["on"] = False
+        (placed,) = venue.trading._placed.values()
+        update = venue.trading.update(
+            placed["id"], "fill", 1, deliver=False, status="filled", filled_qty="1"
+        )
+        # Reproduction harness: Alpaca answers 422 to a cancel of a filled order;
+        # the stand-in otherwise answers 204 and streams `canceled` for it.
+        lagged = list(venue.trading.activities)
+        venue.trading.activities.clear()
+        asyncio.get_running_loop().call_later(0.5, venue.trading.activities.extend, lagged)
+        venue.trading.refuse_cancel = lambda raw: (
+            alpaca.api_error(422, 42210000, "order is not cancelable")
+            if raw["status"] == "filled"
+            else None
+        )
+        # This pin takes a ClientOrderId, not an order.
+        strategy.cancel_order(order.client_order_id)
+        await settled(client, venue)
+
+        def own():
+            cached = strategy.cache.order(order.client_order_id)
+            assert cached is not None
+            return cached
+
+        await until_true(
+            lambda: own().status == OrderStatus.FILLED,
+            timeout=4,
+        )
+        cached = own()
+        seen.update(
+            status=cached.status,
+            trades=trade_ids(cached),
+            trade_id=update["execution_id"],
+            held=strategy.held(),
+        )
+
+    run_with_client(body, strategy, exec_engine=engine)
+
+    assert seen == {
+        "status": OrderStatus.FILLED,
+        "trades": [seen["trade_id"]],
+        "trade_id": seen["trade_id"],
+        "held": Decimal(1),
+    }
+
+
+def test_a_lost_replacement_fill_whose_ancestor_read_fails_once_is_named_on_the_next_read(
+    venue, alpaca, monkeypatch, capfd
+) -> None:
+    seen = lost_submit_filled(
+        venue,
+        alpaca,
+        monkeypatch,
+        capfd,
+        side="entry",
+        delivered=False,
+        retain=True,
+        claim=False,
+        trace_unread_reads=1,
+    )
+
+    assert "run" not in seen, seen
+    assert seen["order"][0] == OrderStatus.FILLED, seen
+    assert seen["held"] == seen["alpaca_holds"], seen
+    assert seen["external"] == [], seen
+    assert seen["ancestor_reads"] >= 2, seen
+
+
+def test_a_retained_filled_submit_keeps_reading_past_the_fill_retry_budget(
+    venue, alpaca, monkeypatch, capfd
+) -> None:
+    # Use the same native-node reproduction, with the activities still absent after all ordinary
+    # catch-up reads. Retention must keep asking until they arrive or the node stops.
+    monkeypatch.setattr(canon_alpaca.execution, "FILL_READ_TRIES", 2)
+    monkeypatch.setattr(canon_alpaca.execution, "FILL_READ_RETRY_SECS", 0.05)
+    test_a_refused_cancel_of_a_filled_retained_submit_settles_after_the_activities_lag(
+        venue, alpaca, monkeypatch, capfd, claim=False
+    )
+    output = logged(capfd)
+    assert "retained submit fill read 1 failed" in output
+    assert "retained submit fill read 2 failed" in output
+    assert "retained submit fill read 3 failed" in output
+    assert "ran out after 2 reads" not in output

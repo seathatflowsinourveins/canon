@@ -2053,3 +2053,96 @@ def test_the_paper_tests_checks_of_what_is_working_leave_out_a_listed_order_that
     working = paper_test._working(paper)
     assert [str(o.id) for o in working] == [str(stop.id)]
     assert "listed as open though ended: listed new, its own read filled" in capsys.readouterr().out
+
+
+# ---------- The case set: no position without its exit ----------
+# The lead's rule of 2026-11-13 (order D): in any session, on any account, a position has its exit. Each
+# case below is one of the day's shapes of a long that `paper:protect` finds, and asserts that the long
+# ends the run with a working sell that covers it. The marker gathers the set across files
+# (`pytest -m no_position_without_its_exit`), each naming the clause of ADR 0150 it holds, and
+# `python -m canon_trading.exit_rule` prints every clause's status from them; a case of a gap not yet
+# closed is xfail strict, so the
+# set turns red when its fix lands and the mark is not lifted. A review that finds a new way a position
+# had no exit adds its case here in the same pull request. Inputs are quotes, bars and steps only.
+
+EXIT = pytest.mark.no_position_without_its_exit(clause=2)
+"""ADR 0150's clause 2: a holding the owner opens gets the same exit, by itself."""
+
+
+def _covered(paper: Paper, symbol: str, qty: int, code: int, lines: list[str]) -> None:
+    """The long `symbol` ends the run covered: one GTC trailing stop that sells `qty`, sent, and the run
+    exit 0, never an `unprotected` line for it."""
+    assert code == 0, lines
+    assert [(r.symbol, r.qty) for r in paper.submitted] == [(symbol, qty)]
+    assert not [x for x in lines if x.startswith(f"unprotected {symbol}:")]
+    _no_sale_open_or_cancel(paper)
+
+
+@EXIT
+def test_exit_for_a_quiet_large_name_whose_atr_is_a_fraction_of_a_percent(capsys) -> None:
+    """A quiet, high-priced long: ATR 0.05 on a 500 name, a one-cent spread. The ATR distance is under
+    Alpaca's smallest trail, so the stop is raised to it, not refused."""
+    paper = Paper(positions=[_position("AAA", "10")])
+    code, lines = _run(paper, Data({"AAA": ("499.99", "500.00", "500.00", "0.05")}), capsys)
+    _covered(paper, "AAA", 10, code, lines)
+    (request,) = paper.submitted
+    assert D(str(request.trail_price)) >= protect.VENUE_SMALLEST * D("500.00")
+
+
+@EXIT
+def test_exit_for_a_sub_dollar_name_whose_spread_floor_is_over_the_entry_cap(capsys) -> None:
+    """A sub-dollar long whose two-spread floor (0.04 on 0.97, about 4%) is over the 0.02 entry cap but
+    under the 0.10 ceiling: a found holding keeps that distance (ADR 0142's amendment)."""
+    paper = Paper(positions=[_position("AAA", "100")])
+    code, lines = _run(paper, Data({"AAA": ("0.95", "0.97", "0.96", "0.01")}), capsys)
+    _covered(paper, "AAA", 100, code, lines)
+
+
+@EXIT
+@pytest.mark.xfail(
+    strict=True,
+    raises=AssertionError,
+    reason="gap: a found holding whose distance is over the 0.10 ceiling is refused by name and left "
+    "with no exit (ADR 0142); its cover is the lead's ruling and a separate unit",
+)
+def test_exit_for_a_sub_dollar_name_whose_spread_floor_is_over_the_ceiling(capsys) -> None:
+    """A sub-dollar long with a six-cent spread: the two-spread floor (0.12 on 0.97) is over the 0.10
+    ceiling. Today the run names it unprotected and sends nothing, so it has no exit."""
+    paper = Paper(positions=[_position("AAA", "100")])
+    code, lines = _run(paper, Data({"AAA": ("0.91", "0.97", "0.94", "0.01")}), capsys)
+    _covered(paper, "AAA", 100, code, lines)
+
+
+@EXIT
+def test_exit_for_a_found_long_whose_atr_is_over_the_entry_cap(capsys) -> None:
+    """ATR 0.25 on a 10 name plans 0.025 of the entry under OWN1, over the 0.02 entry cap: a found
+    holding keeps it, and is not refused for a cap that sizes entries."""
+    paper = Paper(positions=[_position("AAA", "10")])
+    code, lines = _run(paper, Data({"AAA": OWN_BOOK}), capsys)
+    _covered(paper, "AAA", 10, code, lines)
+
+
+@EXIT
+def test_exit_for_a_long_already_in_gain_when_first_seen(capsys) -> None:
+    """A long bought at 5.00 and first seen at 10.00: the stop trails from the market now, and its
+    distance is not taken from the entry price."""
+    held = _position("AAA", "10").model_copy(
+        update={"avg_entry_price": "5.00", "cost_basis": "50.00", "unrealized_pl": "50.00"}
+    )
+    paper = Paper(positions=[held])
+    code, lines = _run(paper, Data({"AAA": AAA_BOOK}), capsys)
+    _covered(paper, "AAA", 10, code, lines)
+    expected, _ = _planned(AAA_BOOK, row="OWN1", size_from_budget=True)
+    assert D(str(paper.submitted[0].trail_price)) == expected
+
+
+@EXIT
+def test_exit_for_the_shares_the_owner_added_to_a_protected_long(capsys) -> None:
+    """A protect stop covers the 10 shares it was sent for; the owner then buys 5 more. The next run
+    covers the 5 the stop does not, and leaves the stop as it is."""
+    paper = Paper(
+        positions=[_position("AAA", "15", available="5")],
+        orders=[_stop("AAA", "10", PROTECT_STOP)],
+    )
+    code, lines = _run(paper, Data({"AAA": AAA_BOOK}), capsys)
+    _covered(paper, "AAA", 5, code, lines)

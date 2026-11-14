@@ -57,12 +57,6 @@ def subdollar_quote(bid: Decimal, at: int) -> QuoteTick:
     )
 
 
-OLD_RULE = pytest.mark.xfail(
-    strict=True,
-    reason="the sub-dollar offsets (mover.offsets on tick(entry)) are not on this base",
-)
-
-
 @pytest.mark.parametrize(
     ("bid", "row", "width"),
     [
@@ -70,10 +64,10 @@ OLD_RULE = pytest.mark.xfail(
         # fits: the brief's 0.5923 release came from another distance (UNVERIFIED).
         (Decimal("0.6123"), "OWN1", Decimal("0.0073")),
         (Decimal("0.6123"), "OWN3", Decimal("0.0024")),
-        # At 0.42 a distance of 0.0084 takes 0.02 under the old rule: 0.0116 of spacing against a cap
-        # of 0.0082 at a 0.41 trigger.
-        pytest.param(Decimal("0.4200"), "OWN1", Decimal("0.0084"), marks=OLD_RULE),
-        pytest.param(Decimal("0.4200"), "OWN3", Decimal("0.0028"), marks=OLD_RULE),
+        # At 0.42 a distance of 0.0084 took 0.02 under the old rule: 0.0116 of spacing against a cap
+        # of 0.0082 at a 0.41 trigger. Main's #435 bounds the spacing by the plan's chase cap.
+        (Decimal("0.4200"), "OWN1", Decimal("0.0084")),
+        (Decimal("0.4200"), "OWN3", Decimal("0.0028")),
     ],
 )
 def test_a_subdollar_adopted_long_has_its_spacing_on_the_step_and_within_the_chase_cap(

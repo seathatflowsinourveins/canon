@@ -780,8 +780,8 @@ def prefetched_reference_reader(
 
     `read` is `alpaca_reference_reader` over `symbols` for `key` = (cutoff, session), already running. The
     actor's first call for that key waits for it on the actor's worker thread. A call for another key, a
-    retry after the pre-read was handed over, or a call after the pre-read failed or found no reference,
-    reads afresh through `fallback` (default `alpaca_reference_reader`), as does a first call whose wait for
+    retry after the pre-read was handed over, or a call after the pre-read failed or was not usable
+    (`reference_problem`: no reference close, or no split read), reads afresh through `fallback` (default `alpaca_reference_reader`), as does a first call whose wait for
     the pre-read passes `wait_secs`; a later call uses a pre-read that finished after that wait, so a slow
     pre-read is not thrown away (the fresh read and the pre-read then overlap, two reads at once). Each call appends one line to `notes` saying which happened, and how
     many asked-for symbols the pre-read did not cover (those have no reference, so they are unknown, as any
@@ -802,11 +802,19 @@ def prefetched_reference_reader(
             )
             return read_fresh(symbols, cutoff, session)
         if handed:
-            if not used and read.done() and read.exception() is None and read.result().references:
-                # the pre-read the first call stopped waiting for has since finished: use it
+            if not used and read.done() and read.exception() is None:
+                # the pre-read the first call stopped waiting for has since finished: used if usable
                 used.append(True)
-                note("read at the actor's call: the pre-read finished after its wait and is used")
-                return read.result()
+                if (problem := reference_problem(read.result())) is None:
+                    note(
+                        "read at the actor's call: the pre-read finished after its wait and is used"
+                    )
+                    return read.result()
+                note(
+                    "read at the actor's call: the pre-read finished after its wait and was not "
+                    f"usable ({problem})"
+                )
+                return read_fresh(symbols, cutoff, session)
             note("read at the actor's call: a retry after the pre-read was handed over")
             return read_fresh(symbols, cutoff, session)
         handed.append(True)
@@ -818,8 +826,9 @@ def prefetched_reference_reader(
         if error is not None:
             note(f"read at the actor's call: the pre-read failed ({type(error).__name__}: {error})")
             return read_fresh(symbols, cutoff, session)
-        if not read.result().references:
-            note("read at the actor's call: the pre-read found no reference")
+        if (problem := reference_problem(read.result())) is not None:
+            # as references_before_node refuses it (a second reader of #323): a read with no splits too
+            note(f"read at the actor's call: the pre-read was not usable ({problem})")
             return read_fresh(symbols, cutoff, session)
         used.append(True)
         missing = sum(1 for s in symbols if s not in covered)
@@ -928,9 +937,10 @@ def read_references(
                 for bar in (snapshot.daily_bar, snapshot.previous_daily_bar)
                 if bar is not None and oldest <= bar.timestamp.astimezone(NEW_YORK).date() < cutoff
             ]
-            # a close of zero or less is no reference (movers_stream.reference_close's rule)
-            if daily and max(daily, key=lambda b: b.timestamp).close > 0:
-                last = max(daily, key=lambda b: b.timestamp)
+            # a close of zero or less is no reference (movers_stream.reference_close's rule), nor one
+            # that is not finite, which movers_rank.rank cannot use (a second reader of #323)
+            last = max(daily, key=lambda b: b.timestamp) if daily else None
+            if last is not None and math.isfinite(last.close) and last.close > 0:
                 found[symbol] = movers_rank.Reference(
                     close=last.close, session=last.timestamp.astimezone(NEW_YORK).date()
                 )
@@ -943,16 +953,22 @@ def read_references(
 
 
 def _transient(error: BaseException) -> bool:
-    """Whether a failed snapshot request may succeed if asked again: a 429 or a 5xx from Alpaca (alpaca-py's
-    `APIError.status_code`, `alpaca/common/exceptions.py`, which has already retried 429 and 504 itself), or
-    the connection or its timeout (`requests` and the OS); a 4xx other than 429, or a request alpaca-py
-    refused, is not, and is raised at once (code review of the snapshot read, finding 8)."""
+    """Whether a failed snapshot request may succeed if asked again: a 429 or a 5xx from Alpaca, which
+    alpaca-py has already retried for 429 and 504 itself, or the connection or its timeout (`requests` and
+    the OS); a 4xx other than 429, or a request alpaca-py raised with no response, is not, and is raised
+    at once (code review of the snapshot read, finding 8).
+
+    The status is read through `APIError.response`, which is None when no HTTP error or no response was
+    wrapped; `APIError.status_code` raises on an `HTTPError` that carries no response (alpaca-py at its
+    pin, `alpaca/common/exceptions.py`; a second reader of #323, finding 3). alpaca-py wraps only an
+    `HTTPError` from `raise_for_status` (`alpaca/common/rest.py`), so a dropped connection reaches here
+    as `requests`' own error, not as an `APIError`."""
     import requests
     from alpaca.common.exceptions import APIError
 
     if isinstance(error, APIError):
-        status = error.status_code
-        return status is None or status == 429 or status >= 500
+        status = getattr(error.response, "status_code", None)
+        return isinstance(status, int) and (status == 429 or status >= 500)
     return isinstance(
         error, (requests.ConnectionError, requests.Timeout, TimeoutError, ConnectionError)
     )

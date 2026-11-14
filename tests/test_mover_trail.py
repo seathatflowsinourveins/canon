@@ -1361,9 +1361,11 @@ def test_a_paper_window_refuses_the_vwap_arm_by_name():
 
 
 def test_the_cooldown_row_names_the_clock_arm():
-    rows = (Path(__file__).parents[1] / "docs/handbook/rows.md").read_text()
-    line = next(row for row in rows.splitlines() if row.startswith("| `COOLDOWN_SECS`"))
-    assert "clock" in line
+    rows = Path(__file__).parents[1] / "docs/handbook/rows"
+    lines = [row for path in rows.rglob("*.md") for row in path.read_text().splitlines()]
+    found = [row for row in lines if row.startswith("| `COOLDOWN_SECS` |")]
+    assert len(found) == 1, f"{len(found)} COOLDOWN_SECS rows under docs/handbook/rows/"
+    assert "clock" in found[0]
 
 
 def test_seven_slots_chasing_over_the_soft_line_each_re_price_their_due_sale_without_waiting():
@@ -1415,7 +1417,9 @@ def test_a_slot_warms_its_atr_from_the_cached_minute_bars_newest_first():
     for bar in bars[-4:]:
         reference.handle_bar(bar)
     assert slot.atr.initialized and slot.atr.value == pytest.approx(reference.value)
-    assert any("ATR warmed from 4 cached" in note for note in s.notes[AAA])
+    # The note is written when the slot opens (a refused adoption opens none); the engine case below
+    # checks it.
+    assert slot.atr_warm_bars == 4
 
 
 def test_too_few_cached_bars_leave_the_atr_cold_and_bars_after_now_are_not_used():

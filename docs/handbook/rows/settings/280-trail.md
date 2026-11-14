@@ -1,0 +1,1 @@
+| `TRAIL` | 0.02 of the entry price, a fixed offset under the highest bid: `MoverConfig`'s default and arm F2's. A Mover window that names no trail flag and no `--arm` runs arm OWN1 instead (row `TRAIL_MODE`) | UNCALIBRATED | `MoverConfig` (ADR 0088); the window's default arm (ADR 0106) | 2026-11-12 |

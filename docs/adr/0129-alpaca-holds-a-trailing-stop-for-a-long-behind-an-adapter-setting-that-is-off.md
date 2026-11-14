@@ -5,7 +5,7 @@ decision-makers: lead orchestrator (Claude) for the unit, its conditions and whe
 review-by: 2026-12-12
 ---
 
-# Alpaca holds a trailing stop for a long, sent by the adapter behind a setting that is off; open: its election on paper, the identity of its fill, and the intent on the order it becomes
+# Alpaca holds a trailing stop for a long, sent by the adapter behind a setting that is off; read on paper: a replace under a named ID and an election on the stop's own order; open: Alpaca's `replaced` update for a trailing stop, a distance under its smallest trail, an oversell where shorting is allowed, an election after a replace, and a `GTC` stop at the next open
 
 ## Context and Problem Statement
 
@@ -47,7 +47,9 @@ currently supported only with single orders".
 | The intent | A trailing stop is in `sell_to_close_order_types` only when a node names it there. A reduce-only one is refused otherwise. |
 | A start with no cache | An open trailing stop the cache does not hold maps only with `report_external_trailing_stops`; else the start fails by name. Nothing in a client order ID tells one node's order from another's. |
 
-**Where it may be used.** Only on a long-only account, until the paper proof is in this record. There
+**Where it may be used.** Only on a long-only account, until the oversell reads named under Gaps are in
+this record. They were made on 2026-11-13 for the `DAY` form (Gaps); the `GTC` form is not shown, and
+the setting stays off. On a long-only account
 Alpaca refused a node-sent sell beyond the holding (ADR 0111, a 403); that it refuses the market order a
 trigger creates the same way is UNVERIFIED. A protector uses `GTC` for a holding that outlives the
 session; a Mover window uses `DAY`. No node on `main` turns the setting on. The change that
@@ -84,19 +86,26 @@ account unless a gap says otherwise, then one opt-in paper test runs through the
   nothing turns it on. Still not shown: the `GTC` form of the oversized case and of the case with no
   share held; the intent on the market order a triggered stop becomes; an unmarked trailing stop with no
   share held, which nothing here sends. The runs are in ADR 0111's Confirmation and ADR 0142's Evidence.
-* The venue ID and order type a fill arrives under after the election: a stop with a tight trail left
-  to trigger.
-* Submit, read back, a change of quantity with the offset, and cancel, through the adapter. The same
-  run shows whether Alpaca takes the client order ID a replace names; a refusal would reach the strategy
-  as a rejected modify with the stop left as it was.
+* The venue ID and order type a fill arrives under after the election: read on 2026-11-13 for a stop
+  never replaced (Confirmation). Still open: the same after a replace, where the fill would arrive on
+  the replacement, and a partial election.
+* Submit, read back, a change of quantity with the offset, and cancel, through the adapter, and whether
+  Alpaca takes the client order ID a replace names: read on 2026-11-13 (Confirmation). Still open:
+  whether Alpaca sends its `replaced` update for a trailing stop, which the adapter's `OrderUpdated`
+  waits for.
 * A `GTC` stop electing at the next open, where Alpaca warns of a worse fill: one held overnight.
+* A planned distance under Alpaca's smallest trail (Confirmation; the lead, 2026-11-13): the Mover's
+  floor is two quoted spreads, which on a tightly quoted name is under a thousandth of the price, so a
+  venue stop at that distance would be refused. The unit that first turns the setting on for a window
+  says what happens to such a distance, with a test. Nothing changes until then; the setting is off.
 
 ### Consequences
 
 * Good: a long has a stop that outlives the node, for the price of one clock request a session.
 * Bad: the election is one print inside the NBBO, with none of the counted, spaced prints ADR 0119
   has a strategy wait for. A node uses one or the other for a holding.
-* Bad: it becomes a market order, which no test here has seen filled.
+* Bad: Alpaca's page says it becomes a market order; one such fill has been seen on paper, for one
+  share (Confirmation).
 * Bad: the stop's level between reports is Alpaca's; the node sees it only in a report.
 
 ### Confirmation
@@ -111,8 +120,42 @@ and without the cache. `packages/canon-alpaca/tests/test_replacement_client_orde
 replacement's ID on the same stand-in, which refuses a named ID an order already carries: its form and
 length, two replaces in one reading of the clock, and a restart's reports under the node's own ID;
 `tests/test_custody.py` reads such an ID as the node's and a hand's replacement as foreign. Run in
-`scripts/ci`. The paper proof's reads are added here when they exist. Read so far, over REST by a
-one-off probe and not through the adapter: the three refusals named under the gaps above (2026-11-13).
+`scripts/ci`.
+
+**Paper reads, 2026-11-13, regular session, one long-only paper account, AAPL**, through the adapter
+on a node (`tests/test_paper_venue_trailing_stop.py`, `tests/test_paper_venue_trailing_stop_election.py`,
+`packages/canon-alpaca/tests/test_paper_replace.py`; the account flat before and after each run):
+
+* A `DAY` trailing stop of 5 percent for two shares rested as `trailing_stop`, `sell_to_close`, under
+  the node's own client order ID. A replace to one share and 4 percent was taken under the named ID
+  (the node's with a clock stamp), which reads as the node's lineage, and the cancel ended the
+  replacement.
+* Alpaca has a smallest `trail_price`, observed and not documented: one cent was refused with 422,
+  code 42210000, "trail_price must be >= 0.1% of the stock price". Which price it measures, and
+  whether `trail_percent` has the same bound, are UNVERIFIED.
+* A stop a thousandth of the share's cost and a cent wide, for one share, was accepted, followed the
+  mark, and was elected 41 seconds after it was placed. Alpaca booked the sale on the stop's own
+  order: the test's read shows one sell under the stop's client order ID, still type `trailing_stop`,
+  `sell_to_close`, no second order, no `replaces` link, no legs; the node's log of the run shows four
+  `OrderUpdated` with a rising trigger and the `OrderFilled` under the venue order ID of the
+  acceptance. The node's own order got that one fill and its position closed. So condition (b)'s
+  form, a fill under a new venue ID, did not occur for a stop never replaced.
+* After the replace, `OrderUpdated` reached the node ten seconds later, from the engine's in-flight
+  query and not from a `replaced` trade update; the engine's event kept the first venue order ID
+  while the adapter already held the replacement. Whether Alpaca sent `replaced` is not in the run's
+  log: UNVERIFIED. Until it is read, a tighten is confirmed to the node only by that query.
+* With the same account's long-only setting off for one run and restored in it, one share held and
+  a `DAY` trailing stop for it marked `sell_to_close` resting: a limit sell of one share was refused
+  with 403, code 40310000, "insufficient qty available for order (requested: 1, available: 0)", both
+  marked `sell_to_close` and with no position intent. So while a resting stop holds the shares, Alpaca
+  let no second sell out for them, shorting allowed or not. That run did not send a trailing stop for
+  more shares than are held, since its guard read Alpaca's open-orders listing once and it still showed
+  the canceled stop. Two later runs of a one-off probe that day did, over REST and not through the
+  adapter, and sent a marked stop with no share held: each was refused (Gaps).
+* Not shown: a partial election, an election after a replace, an election with the node down, and
+  more than one share or symbol.
+* These are the proof's reads condition (a) waits for. What Gaps still lists binds the unit that
+  first turns the setting on for a window.
 
 ## Evidence
 
@@ -155,9 +198,18 @@ Read 2026-11-12.
 * That Alpaca enforces `sell_to_close` on the market order a trigger creates, or that a long-only
   account refuses that order beyond the holding — UNVERIFIED.
 * A `GTC` trailing stop electing at the next session's open — UNVERIFIED.
-* That Alpaca takes a new client order ID named on a replace — UNVERIFIED on paper; the reference
-  documents the field, `packages/canon-alpaca/tests/test_replacement_client_order_id.py` runs against a
-  stand-in, and `packages/canon-alpaca/tests/test_paper_replace.py` asserts it on its next paper run.
-* The venue ID and type of that order, and its fills on paper — UNVERIFIED.
+* That Alpaca takes a new client order ID named on a replace — read on paper, 2026-11-13, for a limit
+  order (`packages/canon-alpaca/tests/test_paper_replace.py`) and for a trailing stop (the proof).
+* The venue ID and type of the order an election fills, and its fill on paper — read on paper,
+  2026-11-13, one election of a stop never replaced: the stop's own order. After a replace — UNVERIFIED.
+* Alpaca's smallest `trail_price`, "0.1% of the stock price" — read on paper, 2026-11-13, in its refusal
+  (422, code 42210000). https://docs.alpaca.markets/us/docs/orders-at-alpaca.md, "Trailing Stop
+  Orders", states no smallest trail; its only stated minimums are the price increments of limit and
+  stop prices and a stop-loss leg's one cent — fetched (raw, whole page), 2026-11-13.
+* A second sell for shares a resting trailing stop holds, on an account that allows shorting — read
+  on paper, 2026-11-13: refused, 403, code 40310000, marked and plain. A trailing stop for more shares
+  than are held on such an account, and a marked one with no share held — read on paper, 2026-11-13, by
+  a one-off probe over REST: refused, 403 40310000 and 422 42210000, for the `DAY` form; the `GTC` form
+  — UNVERIFIED.
+* That Alpaca sends a `replaced` trade update for a replaced trailing stop — UNVERIFIED.
 * A submit that crosses the close in flight — UNVERIFIED.
-* Any election of a venue trailing stop on paper — UNVERIFIED; no paper run is part of this record.

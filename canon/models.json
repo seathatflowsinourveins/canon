@@ -106,7 +106,8 @@
       "model": "muse-wonder-1.0",
       "effort": "max",
       "set_in": "launch flags --model and --reasoning-effort (Orca: --model, --effort); the settings key is not documented",
-      "checked_by": "the model and effort the session shows"
+      "checked_by": "the model and effort the session shows",
+      "status": "deferred by the owner, 2026-11-13: no Muse reviewer is started; the row and its launch flags are kept for a resume (ADR 0045, ADR 0059)"
     },
     {
       "runtime": "dsh",

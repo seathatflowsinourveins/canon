@@ -39,6 +39,17 @@ forms are covered, both by the existing paths: the order's own venue ID, and a n
 old in `replaces`. A new venue ID with no link is not adopted (its fills are counted by the existing
 rule for an unknown leg); that form is UNVERIFIED and is built only if a paper read shows it.
 
+Unanswered submissions (ADR 0044), pin read 2026-11-13: `crates/execution/src/engine/mod.rs:1533-1572`
+matches a fill report by client order ID before venue order ID. `_unanswered_named` uses the client ID
+from Alpaca's order read only while the cached order still awaits its submit answer; the fill retains
+Alpaca's trade ID. This follows OKX's `parse_fill_report` at `crates/adapters/okx/src/common/parse.rs:1157`.
+An unread order or ancestor withholds only its own reports for the next request, counting each failed
+attempt: an unnamed report would be booked as external and hide the discrepancy that asks again.
+A refused cancel that
+reads an unacknowledged order FILLED sends that evidence through `_send_report`: retention stops its
+automatic queries (`crates/live/src/execution/submission.rs:23-27`), but later venue reports resolve it.
+If its activities lag, `_catch_up_later` keeps reading until the fills arrive or the node stops.
+
 Contract: `nautilus_trader.live.clients.ExecutionClient`, NautilusTrader v2.0.0rc8 (Python adapter guide,
 "Execution client hooks", https://nautilustrader.io/docs/md/latest/developer_guide/python_adapters.md). The
 client is constructed with the factory's name, config, cache, clock and trader ID and with a venue, account
@@ -53,6 +64,18 @@ joined and the task ended in `_disconnect`, each wait bounded by a deadline on t
 (`data.join_within`, `TASK_GRACE_SECS` and `TASK_ABORT_SECS`), as upstream's Coinbase adapter bounds its
 task drain at disconnect; a wait that runs out fails the disconnect, logged with its reason. Hooks not overridden here
 raise `NotImplementedError`.
+
+An acceptance the stream brings carries the order's `submitted_at`, as the HTTP answer's does: the
+field is required on alpaca-py's `Order` (c42add7c0a70, trading/models.py:226,269), which a trade update
+holds beside its own `timestamp` (:778-779), and NautilusTrader keeps `OrderAccepted.ts_event` as the
+order's `ts_accepted` (d53849b216e2, crates/model/src/orders/mod.rs:1042-1046). Fills and endings keep
+the update's own time. So an acceptance can be dated before an event already applied (the node's own
+submitted time when its clock runs ahead of Alpaca's, or a refused cancel that came first), as the
+engine's own reconciliation dates one from the venue's report (crates/execution/src/engine/mod.rs:1751).
+Two routes are not covered. A fill that arrives while a cancel or modify is pending and before any
+acknowledgement generates the fill alone, and the engine then dates the acceptance with the fill
+(orders/mod.rs:1413-1415). After a replace, the acceptance carries the replacement's `submitted_at`;
+whether Alpaca gives a replacement its own or its predecessor's is UNVERIFIED.
 
 Instruments at connect: the provider's instruments are handed to the node unless its cache already holds
 them, which it does for whatever the data client loaded, since the node connects data clients and fills
@@ -1123,7 +1146,7 @@ def replacement_client_order_id(client_order_id: str, stamp_ns: int) -> str | No
     A replacement must carry a new ID: Alpaca refuses one the order already carries, 422
     "client_order_id must be unique" (paper, 2026-11-10, ADR 0042). Deriving it from the order's own
     keeps the form: `O-20261112-143000-001-001-7` gives `O-20261112-143000-001-001-7` and nineteen
-    digits, still an ID of the node's form to whoever reads an account by it (the lead's ruling,
+    digits, still an ID of the node's form to whoever reads an account by it (a ruling of
     2026-11-12, ADR 0129), while an order whose own ID has another form keeps that other form. It is
     never an ID the node writes, whose counts are short, and the fixed width keeps two orders'
     replacements apart: the count is what is left when the stamp is taken off.
@@ -1509,13 +1532,20 @@ def fill_report(activity: dict, ts_init: int) -> FillReport:
     )
 
 
-def moved_report(report: FillReport, venue_order_id: VenueOrderId) -> FillReport:
-    """`report` on another Alpaca order: a fill listed under an order since replaced, reported on the
-    order that replaced it (`AlpacaExecutionClient._replaced_fills`)."""
+def report_with(
+    report: FillReport,
+    *,
+    venue_order_id: VenueOrderId | None = None,
+    client_order_id: ClientOrderId | None = None,
+) -> FillReport:
+    """`report` on another Alpaca order (a fill listed under an order since replaced, reported on the
+    order that replaced it, `AlpacaExecutionClient._replaced_fills`), or carrying a node order's client
+    order ID, which a fill activity does not (`AlpacaExecutionClient._unanswered_named`); every other
+    field kept."""
     return FillReport(
         account_id=report.account_id,
         instrument_id=report.instrument_id,
-        venue_order_id=venue_order_id,
+        venue_order_id=venue_order_id or report.venue_order_id,
         trade_id=report.trade_id,
         order_side=report.order_side,
         last_qty=report.last_qty,
@@ -1524,6 +1554,9 @@ def moved_report(report: FillReport, venue_order_id: VenueOrderId) -> FillReport
         liquidity_side=report.liquidity_side,
         ts_event=report.ts_event,
         ts_init=report.ts_init,
+        client_order_id=client_order_id or report.client_order_id,
+        venue_position_id=report.venue_position_id,
+        avg_px=report.avg_px,
     )
 
 
@@ -1660,6 +1693,11 @@ class AlpacaExecutionClient(ExecutionClient):
         # node or not (None for none NautilusTrader can hold): the index the node's cache and a walk of
         # `replaces` fill on a miss.
         self._index: dict[str, ClientOrderId | None] = {}
+        # Alpaca order IDs read for `_unanswered_named` and found not to be a node order waiting on its
+        # submit's answer; an order's client order ID does not change, so each is read once.
+        self._not_waiting: set[str] = set()
+        # Failed identity attempts, counted per Alpaca order until a read establishes its owner.
+        self._unanswered_reads: collections.Counter[str] = collections.Counter()
         # Alpaca's acknowledgement of an order that was pending cancel or update when it came, kept for
         # the refusal that puts the order back to `SUBMITTED` (`_accept`).
         self._acknowledged: dict[ClientOrderId, tuple[VenueOrderId, int]] = {}
@@ -1667,6 +1705,7 @@ class AlpacaExecutionClient(ExecutionClient):
         # yet (`_catch_up_later`), one per order, ended at disconnect.
         self._catching_up: dict[ClientOrderId, asyncio.Task[None]] = {}
         self._catch_up_targets: dict[ClientOrderId, Decimal] = {}
+        self._retained_catch_up: set[ClientOrderId] = set()
         # Ends waiting for their fills when the client last disconnected, resumed at the next connect.
         self._waiting_ends: dict[ClientOrderId, Ending] = {}
         # Trade updates, applied in arrival order by one task on the node's loop.
@@ -1790,9 +1829,11 @@ class AlpacaExecutionClient(ExecutionClient):
         self._external_unloaded_symbols.clear()
         self._advisory_trigger_warned.clear()
         self._index.clear()
+        self._unanswered_reads.clear()
         self._acknowledged.clear()
         catching_up, self._catching_up = list(self._catching_up.values()), {}
         self._catch_up_targets.clear()
+        self._retained_catch_up.clear()
         rereads, self._report_rereads = list(self._report_rereads.values()), {}
         for task in (*catching_up, *rereads):
             task.cancel()
@@ -2133,21 +2174,35 @@ class AlpacaExecutionClient(ExecutionClient):
         the order pending cancel, the `canceled` trade update confirms it and nothing is generated here;
         if the lookup fails, nothing is either. If it shows the order canceled, the `canceled` update may
         never come (a dropped stream sends none), so the order is canceled from what Alpaca shows
-        (`_canceled_unseen`).
+        (`_canceled_unseen`). If it shows an unacknowledged order filled, `_send_report` brings its
+        actual fills: a retained submit has no further automatic in-flight queries.
         """
         try:
             held = await self._call(self._venue().get_order_by_id, venue_order_id.value)
         except (APIError, OSError, ValueError, TypeError) as e:  # the classes `_refused` takes
             self._log.error(
                 f"Alpaca refused the cancel of {order.client_order_id} ({error.status_code}) and the "
-                f"lookup failed ({e!r}); the order is left as it is",
+                f"lookup failed ({failure_cause(e)}); the order is left as it is",
             )
             return
         if self._ended(order.client_order_id):
             return  # an update applied during the lookup ended it: nothing is left to refuse
         if isinstance(held, AlpacaOrder) and held.status == AlpacaOrderStatus.FILLED:
             # The cancel met a fill: the stream's `fill` ends the order, or, if it was lost, the engine's
-            # in-flight check reads the order through `_query_order`.
+            # in-flight check reads the order through `_query_order`. A retained unanswered submit has
+            # no more automatic queries at the pin, so use this read to bring its real trade-ID fills.
+            if order.venue_order_id is None:
+                self._accept(order, VenueOrderId(str(held.id)), dt_to_unix_nanos(held.submitted_at))
+                await self._send_report(held)
+                if not self._ended(order.client_order_id):
+                    shown = share_count(held.filled_qty)
+                    if shown is not None and self._held(order, self._record(order)) < shown:
+                        self._catch_up_later(
+                            order.client_order_id,
+                            shown,
+                            VenueOrderId(str(held.id)),
+                            keep_reading=True,
+                        )
             self._log.info(
                 f"Alpaca refused the cancel of {order.client_order_id}: the order is filled; its fill "
                 "settles it"
@@ -2204,7 +2259,7 @@ class AlpacaExecutionClient(ExecutionClient):
                 root = await self._root_id(held)
             except (APIError, OSError, ValueError, TypeError) as e:
                 self._log.warning(
-                    f"Alpaca shows {held_id} canceled and tracing it failed ({e!r}); "
+                    f"Alpaca shows {held_id} canceled and tracing it failed ({failure_cause(e)}); "
                     f"{client_order_id} is left for reconciliation"
                 )
                 return
@@ -2463,7 +2518,7 @@ class AlpacaExecutionClient(ExecutionClient):
             and command.trigger_price in (None, getattr(order, "trigger_price", None))
         ):
             # A replace that changes nothing: `ExecTester`'s one-tick amend of a whole-cent buy (TC-E30)
-            # rounds back to the order's own price (the second reader's finding 2, 2026-11-11).
+            # rounds back to the order's own price.
             return (
                 f"limit price {command.price} on Alpaca's increment is {sent}, the order's own; "
                 "nothing to change"
@@ -2673,7 +2728,7 @@ class AlpacaExecutionClient(ExecutionClient):
         Alpaca's increment (`venue_limit_price`): the node's order then holds what Alpaca holds, and a
         report of the order reconciles with no difference. Before, not after: a strategy that modifies on
         `OrderAccepted` (upstream's `ExecTester` does) would otherwise take this update for its modify's
-        answer (the second reader's finding 1, 2026-11-11). NautilusTrader applies `OrderUpdated` to a
+        answer. NautilusTrader applies `OrderUpdated` to a
         submitted or released order in place (`crates/model/src/orders/mod.rs`)."""
         if order.order_type not in LIMIT_PRICED:
             return
@@ -3136,7 +3191,7 @@ class AlpacaExecutionClient(ExecutionClient):
                     return  # an update applied during the read ended it
                 if behind is None:
                     # Its place in the chain is not known: neither adopted nor counted now; the later
-                    # reads place it and bring its fill by its trade ID (Muse, outside round 2 on ADR 0075).
+                    # reads place it and bring its fill by its trade ID (ADR 0075).
                     self._catch_up_later(
                         client_order_id, self._shown(record, alpaca_order), venue_order_id
                     )
@@ -3174,7 +3229,7 @@ class AlpacaExecutionClient(ExecutionClient):
                 f"Alpaca trade update {event} for {client_order_id} is not mapped in this slice; ignored",
             )
             return
-        self._accept(order, venue_order_id, ts_event)
+        self._accept(order, venue_order_id, dt_to_unix_nanos(alpaca_order.submitted_at))
         if event in FILL_EVENTS:
             await self._fill(order, record, update, venue_order_id, ts_event)
             return  # `_fill` ends the order once its fills reach its quantity
@@ -3303,8 +3358,8 @@ class AlpacaExecutionClient(ExecutionClient):
         if not is_open_order(replacement) and (
             shown is None or chain_filled(shown, record.earlier_filled(replacement_id)) > seen
         ):
-            # Closed with fills the node lacks: their updates may never come (Codex, outside round 2 on
-            # ADR 0075), so the fills are brought by their trade IDs and the end follows them.
+            # Closed with fills the node lacks: their updates may never come (ADR
+            # 0075), so the fills are brought by their trade IDs and the end follows them.
             closed = replacement.status in (AlpacaOrderStatus.CANCELED, AlpacaOrderStatus.EXPIRED)
             if shown is not None and closed:
                 closed_at = dt_to_unix_nanos(
@@ -3462,11 +3517,11 @@ class AlpacaExecutionClient(ExecutionClient):
     async def _behind_current(self, record: OrderRecord, alpaca_order: AlpacaOrder) -> bool | None:
         """Whether a replacement the record has not adopted lies behind the order the record is on now: its
         `replaces` links, from the record or read at Alpaca, never reach that order. Such an order is not
-        adopted (Muse, outside round 1 on ADR 0075: a fill on the middle order of a chain moved the node's
+        adopted (ADR 0075: a fill on the middle order of a chain moved the node's
         order back to it); one whose links reach it is ahead of the record and adopted, so a modify's
-        replacement takes its quantity before its fills count (the code review of the round-1 fixes). None,
+        replacement takes its quantity before its fills count. None,
         with a warning, when a link cannot be read or the chain runs past `MAX_REPLACE_CHAIN`: the order
-        cannot be placed, and neither guess is safe (Muse, outside round 2 on ADR 0075: taken as ahead, it
+        cannot be placed, and neither guess is safe (ADR 0075: taken as ahead, it
         moved the node's order back; taken as behind, a raised quantity would end it early)."""
         current = record.current
         link = str(alpaca_order.replaces) if alpaca_order.replaces is not None else None
@@ -3503,7 +3558,7 @@ class AlpacaExecutionClient(ExecutionClient):
         that the node does not hold, brought by their trade IDs (`_catch_up`).
 
         Ended at once, `_finish` drops the order's record and every later update for it, so a fill the
-        stream lost before the end would never be applied (Codex and Muse, outside round 1 on ADR 0075);
+        stream lost before the end would never be applied (ADR 0075);
         a status report showing the end and more filled is held back from the engine, which would infer
         the fill (`_settled_report`), and the paper node's checks, reading open orders only, never ask
         again. So the end waits on the record while the activities lag (`_catch_up_later`), and is sent
@@ -3629,8 +3684,8 @@ class AlpacaExecutionClient(ExecutionClient):
             listed = self._listed_fills(await self._fill_activities(None, chain), warn=True)
         except (APIError, OSError, TypeError, KeyError, ValueError) as e:
             self._log.warning(
-                f"Alpaca fill activities of {client_order_id} could not be read ({e!r}); its fills Alpaca "
-                "shows are not reported until they are read"
+                f"Alpaca fill activities of {client_order_id} could not be read "
+                f"({failure_cause(e)}); its fills Alpaca shows are not reported until they are read"
             )
             return False
         if listed is None:
@@ -3648,7 +3703,7 @@ class AlpacaExecutionClient(ExecutionClient):
         known = record.trades | {str(t) for t in order.trade_ids}
         # Each order whose fills are to be counted is placed in the chain first, whichever order the read
         # was asked for: a replacement ahead is adopted, so its quantity applies before its fills; one not
-        # placed keeps its fills for the later reads (the code review of round 2's model).
+        # placed keeps its fills for the later reads.
         unplaced: set[str] = set()
         for leg in sorted(
             {r.venue_order_id.value for r in listed.values() if r.trade_id.value not in known}
@@ -3693,7 +3748,7 @@ class AlpacaExecutionClient(ExecutionClient):
         `crates/execution/src/reconciliation/orders.rs:45-53`; its pre-fill events applied before the fills
         in `reconcile_order_with_fills`, `crates/live/src/execution/manager.rs:4522`). A modify raising the
         quantity whose `replaced` was lost otherwise ended the node's order FILLED on the old quantity
-        (Codex, outside round 2 on ADR 0075). One read, made only for an order the record is not on; an
+        (ADR 0075). One read, made only for an order the record is not on; an
         order that cannot be read or placed is not placed, and its fills wait for the later reads."""
         target = venue_order_id.value
         if record.current is None or target == record.current or target in record.superseded:
@@ -3780,7 +3835,12 @@ class AlpacaExecutionClient(ExecutionClient):
         return listed
 
     def _catch_up_later(
-        self, client_order_id: ClientOrderId, shown: Decimal, venue_order_id: VenueOrderId
+        self,
+        client_order_id: ClientOrderId,
+        shown: Decimal,
+        venue_order_id: VenueOrderId,
+        *,
+        keep_reading: bool = False,
     ) -> None:
         """Read the fill activities again, `FILL_READ_TRIES` times in all, `FILL_READ_RETRY_SECS` apart,
         for fills a trade update shows and Alpaca does not list yet: nothing else would read them while
@@ -3788,19 +3848,30 @@ class AlpacaExecutionClient(ExecutionClient):
         default (`open_check_open_only`). These reads walk the replace chain at Alpaca, which the update's
         own read does not. An update showing more while the reads wait, or during one, widens them and
         gives them their reads again. Past the last read the order is left with an error, as Alpaca shows
-        it, to the next start-up."""
+        it, to the next start-up. A retained submit whose cancel found it filled has no automatic
+        recovery queries left: `keep_reading` keeps these reads going until it fills or disconnects,
+        naming and counting each unsuccessful attempt."""
         if self._ended(client_order_id):
             return
         waiting = self._catch_up_targets.get(client_order_id)
         self._catch_up_targets[client_order_id] = max(shown, waiting or Decimal(0))
+        if keep_reading:
+            self._retained_catch_up.add(client_order_id)
         if client_order_id in self._catching_up:
             return
 
         async def later() -> None:
             target, tries = shown, 1  # the update's own read was the first
             try:
-                while tries < FILL_READ_TRIES:
+                while client_order_id in self._retained_catch_up or tries < FILL_READ_TRIES:
+                    if client_order_id in self._retained_catch_up:
+                        self._log.warning(
+                            f"Alpaca retained submit fill read {tries} failed for {client_order_id}; "
+                            "activities are incomplete; reading again until filled or the node stops"
+                        )
                     await asyncio.sleep(FILL_READ_RETRY_SECS)
+                    if self._stopping:
+                        return
                     target, tries = self._widened(client_order_id, target, tries)
                     order = self.cache.order(client_order_id)
                     if order is None or self._ended(client_order_id):
@@ -3816,9 +3887,18 @@ class AlpacaExecutionClient(ExecutionClient):
                         return  # the stream or engine ended it while this read was out
                     widened, tries = self._widened(client_order_id, target, tries + 1)
                     if caught and widened == target:
-                        self._caught_up(
-                            client_order_id, tries, target, max(self._held(order, record), target)
-                        )
+                        if client_order_id in self._retained_catch_up:
+                            self._log.info(
+                                f"Alpaca retained submit fill catch-up for {client_order_id}: "
+                                f"caught up on read {tries} ({target} shown)"
+                            )
+                        else:
+                            self._caught_up(
+                                client_order_id,
+                                tries,
+                                target,
+                                max(self._held(order, record), target),
+                            )
                         self._send_end(client_order_id)
                         return
                     target = widened
@@ -3840,6 +3920,7 @@ class AlpacaExecutionClient(ExecutionClient):
                 if self._catching_up.get(client_order_id) is asyncio.current_task():
                     self._catching_up.pop(client_order_id, None)
                     self._catch_up_targets.pop(client_order_id, None)
+                    self._retained_catch_up.discard(client_order_id)
 
         self._catching_up[client_order_id] = asyncio.ensure_future(later())
 
@@ -4023,7 +4104,7 @@ class AlpacaExecutionClient(ExecutionClient):
                 lambda report=report: self._finished_report(report, fills, deliver=True),
             )
         if report is not None and fills is not None:
-            fills = [moved_report(fill, report.venue_order_id) for fill in fills]
+            fills = [report_with(fill, venue_order_id=report.venue_order_id) for fill in fills]
             if fills_count(fills) != report.filled_qty.as_decimal():
                 self._leave_external_to_reconciliation(
                     held,
@@ -4259,7 +4340,7 @@ class AlpacaExecutionClient(ExecutionClient):
                 current = self.cache.order(client_order_id) or order
                 known = {str(t) for t in current.trade_ids}
                 return [
-                    moved_report(fill, report.venue_order_id)
+                    report_with(fill, venue_order_id=report.venue_order_id)
                     for fill in sorted(companion_fills, key=lambda fill: fill.ts_event)
                     if fill.trade_id.value not in known
                 ]
@@ -4296,7 +4377,9 @@ class AlpacaExecutionClient(ExecutionClient):
         for fill in fills:
             # A refreshed replacement ID may not be indexed yet. Individual fills must use
             # the cached leg until the returned status reconciles that replacement.
-            self._handle_report(moved_report(fill, order.venue_order_id or report.venue_order_id))
+            self._handle_report(
+                report_with(fill, venue_order_id=order.venue_order_id or report.venue_order_id)
+            )
         order = await self._wait_report_cache(
             client_order_id,
             lambda held: held.is_closed and held.filled_qty.as_decimal() >= shown,
@@ -4335,7 +4418,7 @@ class AlpacaExecutionClient(ExecutionClient):
         shown = report.filled_qty.as_decimal()
         # The model's invariant: an order's filled total never goes down. A terminal report showing fewer
         # fills than the node holds, or than an end already waiting for its fills, is an older snapshot,
-        # held until the reads catch up; the client ends the order itself (Codex, outside round 2 on ADR
+        # held until the reads catch up; the client ends the order itself (ADR
         # 0075). The engine keeps the same rule for its own cached total, a report below it being a "fill
         # decrease" it ignores without void evidence, though it still applies a canceled or expired one
         # (`has_material_fill_decrease`, `reconcile_fill_decrease_terminal`, nautilus-trader@d53849b216e2
@@ -4368,7 +4451,7 @@ class AlpacaExecutionClient(ExecutionClient):
         record = self._record(order)
         if report.order_status in (OrderStatus.CANCELED, OrderStatus.EXPIRED):
             # Ended at Alpaca: the client ends it after its fills, since nothing may ask again once the
-            # venue no longer lists it open (Codex, outside round 1 on ADR 0075, finding 3).
+            # venue no longer lists it open (ADR 0075).
             event = "canceled" if report.order_status == OrderStatus.CANCELED else "expired"
             ending = Ending(event, report.venue_order_id, report.ts_last, shown)
             await self._end_after_fills(order, record, ending, walk=True)
@@ -4572,14 +4655,127 @@ class AlpacaExecutionClient(ExecutionClient):
             reports.append(report)
         # Each activity was asked for by a chain member's ID; the chain is applied once its fills are
         # moved to the order now working.
-        # The end is applied after the check: a fill after it is still one of the order's (Antigravity, an
-        # upstream-conformance read of ADR 0075, item 6).
-        completed = [
-            r
-            for r in await self._complete(reports, activities)
-            if command.end is None or r.ts_event <= command.end
-        ] + whole
-        return [r for r in completed if chain is None or r.venue_order_id.value in chain]
+        # The end is applied after the check: a fill after it is still one of the order's (ADR
+        # 0075).
+        deferred: set[str] = set()
+        completed = (
+            await self._unanswered_named(
+                [
+                    r
+                    for r in await self._complete(reports, activities)
+                    if command.end is None or r.ts_event <= command.end
+                ],
+                deferred=deferred,
+            )
+            + whole
+        )
+        completed = [r for r in completed if chain is None or r.venue_order_id.value in chain]
+        if deferred:
+            # A successful empty/partial response permits synthetic position reconciliation at the
+            # pin (node/reconciliation.rs:458-480). Deliver the identified fills independently, then
+            # fail this request's coverage so no inference hides the discrepancy that asks again.
+            for report in completed:
+                self._handle_report(report)
+            raise RuntimeError(
+                "Alpaca fill identity is unread for a pending submit; "
+                "reconciliation is deferred until the next check"
+            )
+        return completed
+
+    def _waiting(self) -> dict[ClientOrderId, Any]:
+        """The node's orders in flight with no Alpaca order ID: submits it never heard answered."""
+        return {
+            order.client_order_id: order
+            for order in self.cache.orders_inflight(venue=VENUE)
+            if order.venue_order_id is None
+        }
+
+    async def _unanswered_named(
+        self, reports: list[FillReport], *, deferred: set[str] | None = None
+    ) -> list[FillReport]:
+        """`reports`, each fill of an Alpaca order that is a submit the node never heard answered carrying
+        that node order's client order ID.
+
+        A fill activity names its Alpaca order and no client order ID. For an order whose submit got no
+        answer the node holds no Alpaca order ID, so NautilusTrader's `reconcile_fill_report` finds no
+        order by the report's and makes the fill an external order
+        (`materialize_external_order_from_fill`, `crates/execution/src/engine/mod.rs` at the pin), while
+        the paper nodes' engine keeps the order itself submitted (`RETAIN_UNRESOLVED`, ADR 0044). The
+        engine matches a report by its client order ID first. Upstream's OKX adapter sets the one the
+        venue echoes on its fill reports (`parse_fill_report`, `crates/adapters/okx/src/common/parse.rs`
+        at the pin); Coinbase's leaves it unset, since its fill records carry none. Alpaca's fill
+        activities carry none either, but its order does (alpaca-py's `Order.client_order_id`).
+
+        Only while the node holds such an order: each Alpaca order a report names that the node does not
+        know, in the instrument and on the side of one, is read (`_orders_read`), once (`_not_waiting`),
+        and its owner found as the order reports find it (`_node_order_id`). A report is named only when
+        that owner is, after the reads, still such an order of the report's instrument and side, so an
+        order closed or answered meanwhile is not named. An order or ancestor that cannot be read has
+        only its own reports withheld and is read again by the next request, counting and naming every
+        failed attempt. An unnamed report would materialize an external order at the pin and hide the
+        discrepancy that triggers the next check. A failed trace proves no ownership and is never
+        recorded in `_not_waiting`.
+        """
+        waiting = self._waiting()
+        if not waiting:
+            return reports
+        kinds = {(order.instrument_id, order.side) for order in waiting.values()}
+        unknown = sorted(
+            {
+                r.venue_order_id.value
+                for r in reports
+                if r.client_order_id is None
+                and (r.instrument_id, r.order_side) in kinds
+                and r.venue_order_id.value not in self._not_waiting
+                and self._held_by_venue_id(r.venue_order_id.value) is None
+            }
+        )
+        if not unknown:
+            return reports
+        owners: dict[str, ClientOrderId] = {}
+        failures: dict[str, str] = {}
+        for order_id, alpaca_order in (await self._orders_read(unknown)).items():
+            if alpaca_order is None:
+                failures[order_id] = "order could not be read"
+                continue
+            try:
+                owner = await self._node_order_id(alpaca_order)
+            except (APIError, OSError, ValueError, TypeError) as e:
+                failures[order_id] = f"ancestor could not be traced ({failure_cause(e)})"
+                continue
+            self._unanswered_reads.pop(order_id, None)
+            if owner is not None and owner in waiting:
+                owners[order_id] = owner
+            else:
+                self._not_waiting.add(order_id)
+        for order_id, reason in failures.items():
+            self._unanswered_reads[order_id] += 1
+            report = next(r for r in reports if r.venue_order_id.value == order_id)
+            self._log.warning(
+                f"Alpaca fill identity read {self._unanswered_reads[order_id]} failed for "
+                f"{report.instrument_id} {report.order_side.name} ({reason}); "
+                "its reports are held for the next request"
+            )
+        if deferred is not None:
+            deferred.update(failures)
+        # After the reads: an order closed or answered meanwhile is left out.
+        waiting = self._waiting()
+        named: list[FillReport] = []
+        for report in reports:
+            if report.venue_order_id.value in failures:
+                continue
+            owner = (
+                owners.get(report.venue_order_id.value) if report.client_order_id is None else None
+            )
+            order = waiting.get(owner) if owner is not None else None
+            if (
+                order is not None
+                and order.instrument_id == report.instrument_id
+                and order.side == report.order_side
+            ):
+                report = report_with(report, client_order_id=order.client_order_id)
+            named.append(report)
+        return named
 
     async def _open_order_fills(
         self, command: live.GenerateFillReports, chain: set[str] | None
@@ -4626,7 +4822,7 @@ class AlpacaExecutionClient(ExecutionClient):
                 why[""] = f"a read failed: {e!r}"
                 orders = []
             # A replacement whose replaced order is open too (`pending_replace`) after it, so the chain's
-            # fills go to the order the order reports name (code review of the round-1 fixes).
+            # fills go to the order the order reports name.
             open_ids = {str(o.id) for o in orders if isinstance(o, AlpacaOrder)}
             orders = sorted(
                 orders,
@@ -4675,7 +4871,7 @@ class AlpacaExecutionClient(ExecutionClient):
                 reports.extend(
                     r
                     if r.venue_order_id.value == order_id
-                    else moved_report(r, VenueOrderId(order_id))
+                    else report_with(r, venue_order_id=VenueOrderId(order_id))
                     for r in kept
                 )
             if not why:
@@ -4837,7 +5033,9 @@ class AlpacaExecutionClient(ExecutionClient):
                 "them; its fills are left to the engine to infer",
             )
         return [
-            moved_report(r, moved[r.venue_order_id.value]) if r.venue_order_id.value in moved else r
+            report_with(r, venue_order_id=moved[r.venue_order_id.value])
+            if r.venue_order_id.value in moved
+            else r
             for r in reports
             if r.venue_order_id.value not in partial
         ]
@@ -4995,7 +5193,9 @@ class AlpacaExecutionClient(ExecutionClient):
                     if isinstance(order, AlpacaOrder) and str(order.id) in wanted:
                         found[str(order.id)] = order
             except (APIError, OSError, TypeError, ValueError) as e:
-                self._log.warning(f"Alpaca orders not read to check fills ({e!r}); reading each")
+                self._log.warning(
+                    f"Alpaca orders not read to check fills ({failure_cause(e)}); reading each"
+                )
         for order_id in order_ids:
             if order_id in found:
                 continue
@@ -5004,7 +5204,7 @@ class AlpacaExecutionClient(ExecutionClient):
             except (APIError, OSError, TypeError, ValueError) as e:
                 # alpaca-py builds `Order(**answer)`: an empty or non-object body is a TypeError, a
                 # value its model refuses a pydantic `ValidationError`, which is a `ValueError`.
-                self._log.warning(f"Alpaca order {order_id} not read to check its fills ({e!r})")
+                self._log.warning(f"Alpaca order not read to check its fills ({failure_cause(e)})")
                 found[order_id] = None
                 continue
             found[order_id] = order if isinstance(order, AlpacaOrder) else None

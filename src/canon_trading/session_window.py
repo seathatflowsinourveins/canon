@@ -252,12 +252,14 @@ from canon_alpaca.execution import DEFINITIVE_SUBMIT_REFUSALS
 from canon_alpaca.execution import INSTRUMENT_REFUSAL
 from canon_alpaca.execution import ORDERS_PAGE_LIMIT
 from canon_alpaca.providers import CONNECT_TIMEOUT_SECS
+from canon_alpaca.providers import DATA_API
 from canon_alpaca.providers import READ_TIMEOUT_SECS
 from canon_alpaca.providers import TRADING_API
 from canon_alpaca.providers import counted
 from canon_alpaca.providers import endpoint_counts
 from canon_alpaca.providers import not_sent
 from canon_alpaca.providers import request_counts
+from canon_alpaca.providers import session_of
 from canon_alpaca.providers import with_http_timeout
 from canon_alpaca.trade_conditions import condition_counts
 from nautilus_trader.common import LogLevel
@@ -271,6 +273,7 @@ from nautilus_trader.model import OrderSide
 from nautilus_trader.model import Quantity
 from nautilus_trader.model import StrategyId
 from nautilus_trader.model import TimeInForce
+from requests.adapters import BaseAdapter
 
 from . import price_step
 from .mover import PAPER_LOSS_SHARE
@@ -1341,8 +1344,15 @@ def strategy_fills(cache, strategy_id: StrategyId) -> list[tuple[str, str, str, 
 
 LIVE_OPEN_FINDINGS = (
     (
-        "entries and rotation are confined to the startup roster: an instrument and its position cap "
-        "exist only for the names loaded at node start; on-demand loading for any ranked name is not built"
+        "late ranked names load their instrument and entry context on demand; their per-name cap is "
+        "Mover sizing alone, with no native PositionCap added while running; their dollar-volume "
+        "baseline is absent unless supplied, so opening/tier/profile rows retain that named limit"
+    ),
+    (
+        "on-demand entry contexts start at most 20 reads per rolling minute and send at most 150 "
+        "data GET attempts per rolling minute, including pages and retries (ADR 0093, UNCALIBRATED); "
+        "other data readers have their own bounds, not a shared data-API limiter; one slow context "
+        "read delays later names, and a running read's outcome at stop remains unknown"
     ),
     (
         "no boats baseline exists until Wave 2's overnight baseline, so overnight every name ranks in the "
@@ -1610,9 +1620,17 @@ def first_publication_secs(run: Mapping[str, Any]) -> float | str:
 def passed_over_without_context(run: Mapping[str, Any]) -> dict[str, Any]:
     """The ranked names a registered arm could not enter because no day context was supplied for them."""
     notes = run.get("notes") or {}
-    names = sorted(
-        str(i) for i, said in notes.items() if any(NO_CONTEXT in str(n) for n in said or ())
+    entered = {str(entry.get("instrument_id")) for entry in run.get("entries", ())}
+    missing = {str(i) for i, said in notes.items() if any(NO_CONTEXT in str(n) for n in said or ())}
+    missing.update(
+        str(instrument)
+        for instrument, read in (run.get("on_demand_contexts") or {}).items()
+        if read.get("ready_ns") is None
+        or read.get("last_failure")
+        or read.get("deferred")
+        or read.get("pending")
     )
+    names = sorted(missing - entered)
     return {"count": len(names), "names": names}
 
 
@@ -1925,6 +1943,10 @@ def window_node(
             warm_up_start=warm_up_start,  # in pre-market, the prior session's (`warm_up_start`)
             strategy_id=STRATEGY_ID,
             order_id_tag="001",
+            # No instrument-wide claim: the pin assigns every unmatched order/fill in a claimed
+            # symbol to the strategy (`crates/execution/src/engine/mod.rs:1418`). The adapter names a
+            # retained submit's fill by confirmed client ID; the engine matches it before considering
+            # external ownership (`:1556`). Foreign activity stays EXTERNAL (ADR 0044, ADR 0075).
             # In the session, `stop()` runs upstream's market exit, with closing orders Alpaca takes.
             manage_stop=not limits,
             market_exit_reduce_only=False,
@@ -1954,7 +1976,11 @@ class WindowReport:
     shortened: str = ""
     """Why the window runs shorter than the minutes asked for, if it does."""
     orders: dict[str, list[str]] = field(default_factory=dict)
+    """Each of the strategy's orders in the node's cache, by client order ID, with its events' names.
+    Reconciled fills of retained submits join their original orders by confirmed client ID; unknown
+    or foreign activity stays EXTERNAL and is not part of the strategy's orders."""
     fills: int = 0
+    """The `OrderFilled` events of those orders, those the node's reconciliation booked included."""
     denials: dict[str, str] = field(default_factory=dict)
     dropped: list[str] = field(default_factory=list)
     cap_checks: int = 0
@@ -2147,6 +2173,9 @@ def _shown_record(report: WindowReport) -> dict:
     fields = asdict(report)
     if fields["result"] == "running" and _SIGNALS.first is not None:
         fields["result"] = f"stopping: {_SIGNALS.first} received; the window has not finished"
+    # the copy's request measurement follows the copy's own result and end, so a result chosen and not yet
+    # ended is not shown `running` or `complete` (`asdict` copies the budget; the report is unchanged)
+    _finish_request_measurement(fields)
     return fields
 
 
@@ -3175,6 +3204,14 @@ def run_window(
                     f"{part}'s {slots_in_use} slots plus {config.spares} spares exceed the "
                     f"ranking interface's {MOVER_CHECKS} names"
                 )
+    # Decide before the account, baseline and ranking reads: a three-minute stream sample on the
+    # closing feed would otherwise keep this firing busy beyond 20:00/04:00, delaying the next feed.
+    # Session bounds are Alpaca Calendar.session_open/session_close (alpaca-py c42add7c0a70,
+    # alpaca/trading/models.py:427-446); the existing end margin and wind-down still apply.
+    now = clock.timestamp.astimezone(NEW_YORK)
+    seconds, shortened = window_seconds(config.minutes, (end_of_session - now).total_seconds())
+    if seconds <= FLATTEN_SECS + 1:
+        raise WindowSkipped(f"under {FLATTEN_SECS + END_MARGIN_SECS} s left in the session")
     try:  # the slow average's bars and the spare ones, in the bar type's own interval
         history_from = warm_up_start(
             part,
@@ -3427,10 +3464,6 @@ def run_window(
             reference_read, reference_notes, REFERENCES_BEFORE_NODE_SECS
         )
 
-    now = clock.timestamp.astimezone(NEW_YORK)
-    seconds, shortened = window_seconds(config.minutes, (end_of_session - now).total_seconds())
-    if seconds <= FLATTEN_SECS + 1:
-        raise WindowSkipped(f"under {FLATTEN_SECS + END_MARGIN_SECS} s left in the session")
     # Absolute times, taken from Alpaca's clock: start-up eats into the window, not into the wind-down.
     ends = clock.timestamp.astimezone(UTC) + timedelta(seconds=seconds)
     seconds -= time.monotonic() - read_at  # what the reads since the clock read have left
@@ -3491,6 +3524,11 @@ def run_window(
             loss_share=loss_share,
             profile_document=profile_document,
         )
+        if isinstance(strategy, Mover) and mover.get("entry_arm", "bridge") != "bridge":
+            reader = on_demand_context_reader(window_data(), calendar, feed=feed)
+            strategy.context_reader = reader
+            strategy.context_stop = reader.stop
+            strategy.context_budget_record = reader.record
         cache = node.cache
         startup_requests = endpoint_counts()
         try:
@@ -3834,6 +3872,127 @@ def mover_entry_contexts(
             reference_from=f"split-adjusted SIP daily bar of {sessions[0]}",
         )
     return contexts
+
+
+CONTEXT_DATA_REQUEST_LIMIT = 150
+"""ADR 0093's data GET/minute row, below ADR 0049's working 200 and the node's 180 ceiling.
+This limit covers on-demand entry contexts only; the window's requests_by_api counts all readers.
+"""
+
+
+class OnDemandContextReader:
+    """The roster loader on a dedicated client, with every HTTP attempt bounded and counted.
+
+    requests 2.34.2's transport-adapter contract (`docs/user/advanced.rst:968-1004`,
+    `src/requests/sessions.py:784`, `:888`) wraps the existing timeout/counter adapter, as
+    history_load's paced trade loader does. The bound is checked before delegating every send,
+    including alpaca-py's pages (`common/rest.py:371-410`) and retries (`:130-134`). No sleep
+    or history read runs on the node loop. One Mover context worker owns this client's session.
+    """
+
+    def __init__(
+        self,
+        data: StockHistoricalDataClient,
+        calendar: AlpacaCalendar | Sequence[AlpacaCalendar] | None,
+        *,
+        feed: str,
+    ) -> None:
+        self.data, self.calendar, self.feed = data, calendar, feed
+        self.clock: Callable[[], float] = time.monotonic
+        self._lock = threading.Lock()
+        self._stopped = False
+        self._sent: deque[float] = deque()
+        self._attempts = self._peak = 0
+        self._refused: Counter[str] = Counter()
+
+    def stop(self) -> None:
+        """A running HTTP call may finish; its next page/retry must not start after stop."""
+        with self._lock:
+            self._stopped = True
+
+    def record(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "api": DATA_API,
+                "scope": "on-demand entry contexts only; also counted in requests_by_api",
+                "limit_per_minute": CONTEXT_DATA_REQUEST_LIMIT,
+                "attempts": self._attempts,
+                "peak_60s": self._peak,
+                "refused": dict(self._refused),
+                "state": "UNCALIBRATED: ADR 0093's row",
+            }
+
+    def _admit(self, instrument_id: InstrumentId) -> None:
+        with self._lock:
+            if self._stopped:
+                raise RuntimeError(f"{instrument_id}: entry context reader stopped")
+            now = self.clock()
+            while self._sent and self._sent[0] <= now - 60:
+                self._sent.popleft()
+            if len(self._sent) >= CONTEXT_DATA_REQUEST_LIMIT:
+                self._refused[str(instrument_id)] += 1
+                raise RuntimeError(
+                    f"{instrument_id}: entry context data GET budget spent: "
+                    f"{CONTEXT_DATA_REQUEST_LIMIT} attempts in the rolling minute"
+                )
+            self._sent.append(now)
+            self._attempts += 1
+            self._peak = max(self._peak, len(self._sent))
+
+    def __call__(self, instrument_id: InstrumentId, at_ns: int) -> Day:
+        session = session_of(self.data)
+        if session is None:
+            raise RuntimeError(
+                f"{instrument_id}: entry context client has no requests.Session; "
+                "cannot count or bound its data GETs"
+            )
+        with_http_timeout(self.data)
+        reader = self
+
+        class BoundedAdapter(BaseAdapter):
+            def __init__(self, delegate: BaseAdapter) -> None:
+                self.delegate = delegate
+
+            def send(
+                self, request, stream=False, timeout=None, verify=True, cert=None, proxies=None
+            ):
+                reader._admit(instrument_id)
+                return self.delegate.send(
+                    request,
+                    stream=stream,
+                    timeout=timeout,
+                    verify=verify,
+                    cert=cert,
+                    proxies=proxies,
+                )
+
+            def close(self) -> None:
+                self.delegate.close()
+
+        mounted = list(session.adapters.items())
+        try:
+            for prefix, adapter in mounted:
+                session.mount(prefix, BoundedAdapter(adapter))
+            # db51d26d's conversion, local to this allowed seam: a float rounds a nanosecond
+            # before a minute/day boundary into that boundary, granting future coverage.
+            seconds, rest = divmod(at_ns, 1_000_000_000)
+            at = datetime.fromtimestamp(seconds, UTC) + timedelta(microseconds=rest // 1000)
+            return mover_entry_contexts(
+                self.data, [instrument_id.symbol.value], at, self.calendar, feed=self.feed
+            )[instrument_id]
+        finally:
+            for prefix, adapter in mounted:
+                session.mount(prefix, adapter)
+
+
+def on_demand_context_reader(
+    data: StockHistoricalDataClient,
+    calendar: AlpacaCalendar | Sequence[AlpacaCalendar] | None,
+    *,
+    feed: str,
+) -> OnDemandContextReader:
+    """Read one name with mover_entry_contexts, on Mover's worker, using a dedicated window client."""
+    return OnDemandContextReader(data, calendar, feed=feed)
 
 
 def mover_entries(run: Mapping[str, Any], cache, pick: MoverPick | None) -> list[dict[str, Any]]:
@@ -4728,9 +4887,11 @@ class _WindowSignals:
         if self.first is not None:
             return  # a forwarded copy, or a second stop: the first one's stop is under way
         self.first = signal.Signals(signum).name
-        if self.record is not None and self.record[1].result == "running":
+        if self.record is not None:
             # never `running` again: a kill before the window's end leaves this mark. The report is not
-            # changed here, only a copy written (`_shown_record`); a result already set is left as it is.
+            # changed here, only a copy written (`_shown_record`); a result already set is written as it
+            # is, since the main thread may have chosen it and not yet written it (a second reader of
+            # #323): a kill then leaves that result, with its request measurement perhaps not final.
             try:
                 _write_window_record(*self.record)
             except Exception as e:  # noqa: BLE001 - the stop goes on; said on stderr
@@ -4882,9 +5043,12 @@ def _close_runner(runner: asyncio.Runner, task: asyncio.Task | None, calls: Call
 
 
 LOCAL_REJECTIONS = ("INFLIGHT_TIMEOUT", "NOT_FOUND_AT_VENUE")
-"""The reasons the node gives a rejection of its own, for a submit never acknowledged: the two
-`create_reconciliation_rejected` calls in `crates/live/src/execution/manager.rs` at the pin (the in-flight
-check out of retries, an order its queries did not find). Alpaca may still take such an order."""
+"""The reasons the node gives a rejection of its own: the two `create_reconciliation_rejected` calls in
+`crates/live/src/execution/manager.rs` at the pin (the in-flight check out of retries, an order its
+queries did not find). Alpaca may still hold such an order. The paper nodes retain a submit never
+acknowledged (`RETAIN_UNRESOLVED`), which takes `SUBMITTED` orders out of both; an `ACCEPTED` order the
+open-order check does not find is still rejected `NOT_FOUND_AT_VENUE`, and a node built without
+`paper_node.exec_engine_config` keeps upstream's default."""
 
 
 def _event_name(event) -> str:
@@ -4982,7 +5146,9 @@ def resolve_session(
     open now and `strategy` runs in it (`WINDOW_STRATEGIES`), in a part with a feed for the window: for a
     `mover` window one of `MOVER_PARTS` (`no_mover_form`), whatever `SESSION_FEEDS` gives the part's
     other windows, so a part with no mover data row has nothing to run rather than a refusal at every
-    firing; else nothing. The schedule fires on a timer and leaves this choice to Alpaca's clock."""
+    firing; else nothing. An extended part without room for the end margin and wind-down is skipped
+    before preflight, so its ranking sample cannot delay the next feed's firing. The schedule fires on
+    a timer and leaves this choice to Alpaca's clock."""
     if clock.is_open:
         return "regular", "Alpaca's clock says the regular session is open"
     if "extended" not in (runs := WINDOW_STRATEGIES[strategy]).sessions:
@@ -4993,14 +5159,141 @@ def resolve_session(
             "the regular session is closed and extended windows are not on (EXTENDED_READY)",
         )
     try:
-        _, part = session_part("extended", clock, calendar)
+        ends, part = session_part("extended", clock, calendar)
         if not mover:
             window_feed(part)
     except RuntimeError as e:  # `WindowSkipped` among them: a part with no feed (`SESSION_FEEDS`)
         return None, str(e)
     if mover and (no_form := no_mover_form(part)) is not None:
         return None, f"the regular session is closed, and {no_form}"
+    if (ends - clock.timestamp).total_seconds() <= END_MARGIN_SECS + FLATTEN_SECS + 1:
+        return None, f"under {FLATTEN_SECS + END_MARGIN_SECS} s left in the session"
     return "extended", f"outside the regular session, in its {part} part"
+
+
+HANDOVER_POLICY_ENV = "CANON_FEED_HANDOVER"
+"""Stream-limit branch: serial (b), the default; overlap (a) requires a preparation process.
+
+The paper task holds B's account and market-data stream locks for this entire process.
+Overlap cannot be enabled by removing either execution lock (ADR 0069).
+"""
+
+
+NOT_MEASURED = "seconds a holding is without an armed stop"
+
+
+class FeedHandoverLog(logging.Handler):
+    """Measure the stream gap at a feed change from the SDK's lifecycle log, not a stop request:
+    one data stream's stop to the next one's authentication, usually the Mover's ranking sample in
+    the next window. It is not `NOT_MEASURED`, which this does not observe.
+
+    Contract: alpaca-py c42add7c0a70, alpaca/data/live/websocket.py:224-230 logs
+    `connected to` after authentication; :267-269 closes the websocket on stop,
+    then :515-518 logs `data stream stopped`. CPython b703b2c5e704,
+    Doc/library/logging.rst:604-635,1008: a handler receives serialized LogRecords
+    with their creation time. This measures those observations, not order re-arm.
+    State is observability only: no holding, quantity, order or credential is saved, and a
+    failure here is said on stderr and never changes the window's exit code. A state file that
+    cannot be read is overwritten by the next observation.
+    """
+
+    def __init__(self, log_dir: Path) -> None:
+        super().__init__(logging.INFO)
+        self.log_dir = log_dir
+        self.feeds: dict[int, str] = {}
+        self.error: str | None = None
+
+    def emit(self, record: logging.LogRecord) -> None:
+        message = record.getMessage()
+        connected = re.fullmatch(
+            r"connected to wss://stream\.data\.alpaca\.markets/(?:v2|v1beta1)/(sip|boats)",
+            message,
+        )
+        if record.thread is None or (connected is None and message != "data stream stopped"):
+            return
+        try:
+            state_path = self.log_dir / "feed-stream-state.json"
+            if connected is not None:
+                feed = connected[1]
+                self.feeds[record.thread] = feed
+                previous = self._previous(state_path)
+                if previous is not None and previous["feed"] != feed:
+                    elapsed = record.created - previous["at_epoch"]
+                    gap = (
+                        round(elapsed, 6)
+                        if previous["state"] == "closed" and math.isfinite(elapsed) and elapsed >= 0
+                        else None
+                    )
+                    measured = {
+                        "policy": "serial",
+                        "from_feed": previous["feed"],
+                        "to_feed": feed,
+                        "metric": "stream_stopped_to_stream_authenticated",
+                        "not_measured": NOT_MEASURED,
+                        "gap_seconds": gap,
+                        "stopped_at_epoch": previous["at_epoch"] if gap is not None else None,
+                        "authenticated_at_epoch": record.created,
+                        "status": "measured"
+                        if gap is not None
+                        else "UNVERIFIED: no observed close or the wall clock moved backwards",
+                    }
+                    write_atomically(self.log_dir / "feed-stream-gap.json", json.dumps(measured))
+                    print(
+                        f"feed-stream-gap: {previous['feed']} -> {feed} policy=serial "
+                        f"gap_seconds={gap if gap is not None else 'UNVERIFIED'} "
+                        "metric=stream_stopped_to_stream_authenticated, "
+                        f"not the {NOT_MEASURED}",
+                        flush=True,
+                    )
+                state = "open"
+            else:
+                feed = self.feeds.pop(record.thread, None)
+                if feed is None:  # a stream never observed authenticated proves no close
+                    return
+                state = "closed"
+            self.log_dir.mkdir(parents=True, exist_ok=True)
+            write_atomically(
+                state_path,
+                json.dumps({"feed": feed, "state": state, "at_epoch": record.created}),
+            )
+        except (OSError, ValueError, TypeError, KeyError) as error:
+            self._failed(error)
+
+    def _previous(self, state_path: Path) -> dict | None:
+        """The last observation, or None when there is none or it cannot be read; an unreadable one
+        is said and then overwritten by this observation."""
+        if not state_path.exists():
+            return None
+        try:
+            previous = json.loads(state_path.read_text())
+            if (
+                not isinstance(previous, dict)
+                or not {"feed", "state", "at_epoch"} <= previous.keys()
+            ):
+                raise ValueError("the state file does not hold feed, state and at_epoch")
+        except (OSError, ValueError) as error:
+            self._failed(error)
+            return None
+        return previous
+
+    def _failed(self, error: Exception) -> None:
+        self.error = f"feed-stream-gap measurement failed: {type(error).__name__}: {error}"
+        print(self.error, file=sys.stderr, flush=True)
+
+
+@contextlib.contextmanager
+def feed_handover_log(log_dir: Path) -> Generator[FeedHandoverLog]:
+    handler = FeedHandoverLog(log_dir)
+    logger = logging.getLogger(STREAM_LOGGER)
+    level = logger.level
+    logger.setLevel(logging.INFO)
+    logger.addHandler(handler)
+    try:
+        yield handler
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(level)
+        handler.close()
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -5012,9 +5305,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     except RuntimeError as e:  # no folder for the records: nothing is read or written
         print(f"paper:session: {e}", file=sys.stderr)
         return 1
+    policy = os.environ.get(HANDOVER_POLICY_ENV, "serial")
+    if policy != "serial":
+        reason = (
+            "overlap requires a separate data-only preparation process before B's account and "
+            "stream locks; this runner has no such path"
+            if policy == "overlap"
+            else f"{HANDOVER_POLICY_ENV} must be serial or overlap, got {policy!r}"
+        )
+        print(f"paper:session: refused: {reason}", file=sys.stderr)
+        return 1
     code = 1
     try:
-        with window_signals():
+        with feed_handover_log(args.log_dir), window_signals():
             code = _main(args)
             if (
                 _SIGNALS.first is not None
@@ -5025,11 +5328,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"paper:session: {e}", file=sys.stderr)
         named = re.search(r"stopped by (SIG[A-Z]+)", str(e))
         code = 128 + signal.Signals[named.group(1)].value if named else 1
-        if _ABANDONED:
-            try:
-                write_heartbeat(args.log_dir, f"failed: {type(e).__name__}: {e}")
-            except OSError:
-                pass
+        try:  # abandoned or not: the schedule's status reads a failed firing from it
+            write_heartbeat(args.log_dir, f"failed: {type(e).__name__}: {e}")
+        except OSError:
+            pass
     except BaseException as e:
         if not _ABANDONED:
             raise
@@ -5414,38 +5716,26 @@ def _main(args: argparse.Namespace) -> int:
     except WindowRefused as e:
         print(f"paper:session: {e}", file=sys.stderr)
         _heard(args.log_dir, f"refused: {e}")  # the refusal stands, said above
-        try:
-            unrecorded = write_record(
-                args.log_dir,
-                {
-                    "session": session,
-                    "strategy": args.strategy,
-                    "result": f"refused: {e}",
-                    **(
-                        {}
-                        if config is None
-                        else {
-                            "trigger": config.trigger,
-                            "validate_trade_sequence": config.validate_trade_sequence,
-                        }
-                    ),
-                    "started_epoch": time.time(),
-                    "started": datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ"),
-                    "stale_after": STALE_RUNNING_SECS,
-                    "commit": running_commit(),
-                    "account": paper_account(),
-                    "request_budget": request_record(()),
-                    **_refused_arm(args),
-                },
-            )
-            if unrecorded is not None:
-                print(
-                    f"paper:session: the refused record's request snapshot failed: {unrecorded}",
-                    file=sys.stderr,
-                )
-        except OSError as written:
-            print(f"paper:session: the record could not be written: {written}", file=sys.stderr)
+        _record_unrun(args, session, f"refused: {e}", config)
         return 1
+    except WindowSignalled as e:
+        # a window stopped before its node ends failed (ADR 0050). Before run_window registered its record
+        # (a signal in the mover's sample or the reference read), a record says so, so an earlier window's
+        # result is not left as the latest. A registered record still `running` (a signal in its first
+        # write, before run_window's `try`) shows only the handler's stopping mark: it is ended here. One
+        # run_window ended holds. `main` says the stop and writes the heartbeat.
+        failed = f"failed: {type(e).__name__}: {e}"
+        if _SIGNALS.record is None:
+            _record_unrun(args, session, failed, config)
+        elif _SIGNALS.record[1].result == "running":
+            log_dir, report = _SIGNALS.record
+            report.result = failed
+            report.ended = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+            try:
+                write_record(log_dir, report, refresh_requests=False)
+            except OSError as written:
+                print(f"paper:session: the record could not be written: {written}", file=sys.stderr)
+        raise
     # KeyError: no key pair in the env; OSError: the HTTP layer's errors, the adapter's timeouts among them
     except (RuntimeError, ValueError, KeyError, APIError, OSError) as e:
         print(f"paper:session: {e}", file=sys.stderr)
@@ -5455,7 +5745,51 @@ def _main(args: argparse.Namespace) -> int:
         _heard_failed(args.log_dir, e)
         raise
     print(json.dumps(asdict(report), indent=2))
+    if report.result.startswith("failed:"):  # a signal after the node: the heartbeat says it too
+        _heard(args.log_dir, report.result)
+    elif _SIGNALS.first is not None:
+        # one after the result was chosen: `main` exits for it, so the heartbeat says so
+        _heard(args.log_dir, f"{report.result}; {_SIGNALS.first} received; the wind-down finished")
     return 0
+
+
+def _record_unrun(
+    args: argparse.Namespace, session: str, result: str, config: WindowConfig | None
+) -> None:
+    """The record of a window that ended before `run_window` registered one (refused, or stopped by a
+    signal), with `result`; one that cannot be written is said on stderr, so the run's own outcome and
+    exit code stand."""
+    try:
+        unrecorded = write_record(
+            args.log_dir,
+            {
+                "session": session,
+                "strategy": args.strategy,
+                "result": result,
+                **(
+                    {}
+                    if config is None
+                    else {
+                        "trigger": config.trigger,
+                        "validate_trade_sequence": config.validate_trade_sequence,
+                    }
+                ),
+                "started_epoch": time.time(),
+                "started": datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ"),
+                "stale_after": STALE_RUNNING_SECS,
+                "commit": running_commit(),
+                "account": paper_account(),
+                "request_budget": request_record(()),
+                **_refused_arm(args),
+            },
+        )
+        if unrecorded is not None:
+            print(
+                f"paper:session: the record's request snapshot failed: {unrecorded}",
+                file=sys.stderr,
+            )
+    except OSError as written:
+        print(f"paper:session: the record could not be written: {written}", file=sys.stderr)
 
 
 if __name__ == "__main__":

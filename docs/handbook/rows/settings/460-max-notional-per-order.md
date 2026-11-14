@@ -1,0 +1,1 @@
+| `MAX_NOTIONAL_PER_ORDER` | $1,000 for the symbol | UNCALIBRATED | ADR 0049; a Mover window bounds each order at its entry figure times 10 instead (`mover_window.OUTER_BOUND_MULTIPLE`; ADR 0091, ADR 0106) | 2026-11-10 |

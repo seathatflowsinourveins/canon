@@ -8,6 +8,7 @@ import os
 import re
 import signal
 import subprocess
+import sys
 import tomllib
 from collections import deque
 from datetime import UTC
@@ -962,7 +963,20 @@ class Paper:
 
     def get_orders(self, filter: Any = None):
         self.calls.append(("get_orders", filter))
+        if filter is not None and _value(filter.status) == "closed":
+            return []
         return self.orders
+
+    def get_clock(self):
+        self.calls.append(("get_clock", None))
+        return Clock.model_validate(
+            {
+                "timestamp": "2026-11-11T18:00:00Z",
+                "is_open": True,
+                "next_open": "2026-11-12T14:30:00Z",
+                "next_close": "2026-11-11T21:00:00Z",
+            }
+        )
 
     def get_account_configurations(self):
         self.calls.append(("get_account_configurations", None))
@@ -1008,6 +1022,8 @@ def test_the_account_read_names_balances_positions_orders_lineage_and_no_shortin
         "  AAPL sell 1 limit limit 680.05 time_in_force day position_intent not shown status new missing",
         "  SPY sell 1 limit limit 679.95 time_in_force day position_intent not shown status new ours",
         "no_shorting: true",
+        custody.ENDED_READING,
+        "ended orders submitted in 2026-11-11 (New York trade date; an order submitted earlier is not listed): none",
     ]
     for identifier in (ACCOUNT_NUMBER, ACCOUNT_ID, str(ours.id), *OURS[:1], FOREIGN[0]):
         assert identifier not in out
@@ -1237,6 +1253,388 @@ def test_a_listing_with_something_other_than_orders_is_a_named_read_failure(
     assert (
         "the open orders answered something other than a list of Order" in capsys.readouterr().err
     )
+
+
+class EndedPaper(Paper):
+    """GET-only history stand-in: the SDK's submission bounds and sort, not ending-time bounds.
+
+    Everything stays in memory. The account's clock is fixed; no real task, credential, or state path.
+    The end statuses here come from Alpaca's Order Lifecycle, including a replaced order.
+    """
+
+    def __init__(self, *ended: Order, now: str = "2026-11-11T18:00:00Z", inclusive=False):
+        super().__init__()
+        self.ended = list(ended)
+        self.now = now
+        self.inclusive = inclusive
+
+    def get_clock(self):
+        return (
+            super().get_clock().model_copy(update={"timestamp": datetime.fromisoformat(self.now)})
+        )
+
+    def get_orders(self, filter: Any = None):
+        if _value(filter.status) != "closed":
+            return super().get_orders(filter)
+        self.calls.append(("get_orders", filter))
+        found = [
+            order
+            for order in self.ended
+            if (filter.after is None or order.submitted_at > filter.after)
+            and (
+                filter.until is None
+                or order.submitted_at < filter.until
+                or (self.inclusive and order.submitted_at == filter.until)
+            )
+        ]
+        found.sort(key=lambda order: order.submitted_at, reverse=_value(filter.direction) != "asc")
+        return found[: filter.limit or 50]
+
+
+def _ended(**fields: Any) -> Order:
+    return _order(
+        **{
+            "client_order_id": PROTECT_STOP,
+            "side": "sell",
+            "type": "trailing_stop",
+            "order_type": "trailing_stop",
+            "time_in_force": "gtc",
+            "limit_price": None,
+            "qty": "3",
+            "filled_qty": "3",
+            "filled_avg_price": "679.21",
+            "status": "filled",
+            "submitted_at": "2026-11-11T15:00:00Z",
+            "filled_at": "2026-11-11T17:02:03Z",
+            "trail_price": "1.25",
+            "hwm": "680.46",
+            **fields,
+        }
+    )
+
+
+@pytest.fixture
+def account_read(monkeypatch, capsys):
+    data_only_unset(monkeypatch)
+    monkeypatch.setattr(custody, "require_get_only", lambda client: None)
+    monkeypatch.setattr(custody.time, "sleep", lambda seconds: None)
+
+    def read(paper: Paper, expected: int = 0):
+        assert custody.account_task(cast(Any, paper)) == expected
+        captured = capsys.readouterr()
+        if expected == 0:
+            assert captured.err == ""
+        return captured
+
+    return read
+
+
+def test_an_ended_filled_trailing_stop_prints_its_times_price_trail_and_high_water_mark(
+    account_read,
+) -> None:
+    """A GTC stop submitted and sold inside the trade date belongs to its result."""
+    out = account_read(EndedPaper(_ended())).out
+    assert (
+        "ended orders submitted in 2026-11-11 (New York trade date; an order submitted earlier is not listed): 1"
+        in out
+    )
+    assert "SPY sell 3 trailing_stop status filled filled_qty 3 filled_avg_price 679.21" in out
+    assert "submitted_at 2026-11-11T15:00:00+00:00" in out
+    assert "filled_at 2026-11-11T17:02:03+00:00" in out
+    assert "trail_price 1.25 trail_percent not shown hwm 680.46" in out
+    assert "ours (a protect stop)" in out
+
+
+def test_an_ended_canceled_order_prints_its_canceled_time(account_read) -> None:
+    out = account_read(
+        EndedPaper(
+            _ended(
+                status="canceled",
+                filled_at=None,
+                filled_qty="0",
+                filled_avg_price=None,
+                canceled_at="2026-11-11T17:05:06Z",
+            )
+        )
+    ).out
+    assert "status canceled filled_qty 0 filled_avg_price not shown" in out
+    assert "filled_at not shown canceled_at 2026-11-11T17:05:06+00:00" in out
+
+
+def test_a_foreign_ended_order_is_named_foreign(account_read) -> None:
+    out = account_read(EndedPaper(_ended(client_order_id=FOREIGN[0]))).out
+    assert "status filled" in out and "foreign" in out
+    assert "ours" not in out
+
+
+@pytest.mark.parametrize("inclusive", [False, True])
+def test_ended_orders_page_with_ties_and_print_only_the_trade_date(
+    account_read, monkeypatch, inclusive: bool
+) -> None:
+    ended = [
+        _ended(
+            submitted_at=(
+                datetime(2026, 11, 11, 17, tzinfo=UTC) - timedelta(seconds=n)
+            ).isoformat(),
+            symbol=f"DAY{n}",
+        )
+        for n in range(502)
+    ]
+    # The first page cuts through three tied submissions. An exclusive cursor without overlap
+    # would lose two of them. An older submission that ended today is not read (the date bound).
+    for n in (499, 500, 501):
+        ended[n] = ended[n].model_copy(update={"submitted_at": ended[499].submitted_at})
+    before = _ended(
+        symbol="PREVIOUS",
+        submitted_at="2026-11-10T15:00:00Z",
+        filled_at="2026-11-11T00:59:59.999999Z",
+    )
+    after = _ended(symbol="FOLLOWING", filled_at="2026-11-12T01:00:00Z")
+    oldest = _ended(symbol="OLDER_GTC", submitted_at="2026-10-01T15:00:00Z")
+    paper = EndedPaper(*ended, before, after, oldest, inclusive=inclusive)
+    sleeps: list[float] = []
+    monkeypatch.setattr(custody.time, "sleep", sleeps.append)
+
+    out = account_read(paper).out
+    assert (
+        "ended orders submitted in 2026-11-11 (New York trade date; an order submitted earlier is not listed): 502"
+        in out
+    )
+    assert out.count("status filled") == 502
+    assert "DAY499 sell" in out and "DAY500 sell" in out and "DAY501 sell" in out
+    assert "OLDER_GTC sell" not in out
+    assert "PREVIOUS" not in out and "FOLLOWING" not in out
+    requests = [
+        r for name, r in paper.calls if name == "get_orders" and _value(r.status) == "closed"
+    ]
+    assert len(requests) == 2
+    assert all(
+        _value(r.direction) == "desc" and r.limit == 500 and r.nested is False for r in requests
+    )
+    assert requests[0].until == datetime(2026, 11, 12, 1, tzinfo=UTC)
+    # The endpoint's bounds are submission times: the walk asks for the date's submissions only.
+    start = datetime(2026, 11, 11, 1, tzinfo=UTC)
+    assert all(r.after == start for r in requests)
+    assert requests[1].until == ended[499].submitted_at + timedelta(microseconds=1)
+    assert sleeps == [session_window.POLL_SECS]
+
+
+def test_no_ended_order_or_account_identifier_appears_in_any_output(account_read) -> None:
+    ended = _ended(replaced_by=str(uuid4()), replaces=str(uuid4()), group_id=str(uuid4()))
+    paper = EndedPaper(ended, _ended(client_order_id=FOREIGN[0], symbol="AAPL"))
+    captured = account_read(paper)
+    output = captured.out + captured.err
+    assert (
+        "ended orders submitted in 2026-11-11 (New York trade date; an order submitted earlier is not listed): 2"
+        in output
+    )
+    for identifier in (
+        ACCOUNT_ID,
+        ACCOUNT_NUMBER,
+        *(str(o.id) for o in paper.ended),
+        *(o.client_order_id for o in paper.ended),
+        str(ended.replaced_by),
+        str(ended.replaces),
+        str(ended.group_id),
+        str(ended.asset_id),
+    ):
+        assert identifier not in output
+
+
+def test_an_empty_trade_date_prints_one_ended_orders_line(account_read) -> None:
+    paper = EndedPaper(
+        _ended(submitted_at="2026-11-10T15:00:00Z", filled_at="2026-11-10T17:02:03Z")
+    )
+    out = account_read(paper).out
+    assert [line for line in out.splitlines() if line.startswith("ended orders")] == [
+        "ended orders submitted in 2026-11-11 (New York trade date; an order submitted earlier is not listed): none",
+    ]
+    assert "status filled" not in out
+
+
+def test_an_ended_percent_trail_without_a_high_water_mark_does_not_invent_one(account_read) -> None:
+    out = account_read(EndedPaper(_ended(trail_price=None, trail_percent="0.75", hwm=None))).out
+    assert "trail_price not shown trail_percent 0.75 hwm not shown" in out
+
+
+@pytest.mark.parametrize(
+    ("now", "start", "end", "trade_date"),
+    [
+        ("2026-11-11T01:00:00Z", "2026-11-11T01:00:00Z", "2026-11-12T01:00:00Z", "2026-11-11"),
+        ("2026-07-08T00:00:00Z", "2026-07-08T00:00:00Z", "2026-07-09T00:00:00Z", "2026-07-08"),
+    ],
+    ids=["new-york-winter", "new-york-summer"],
+)
+def test_ended_orders_use_new_yorks_overnight_trade_date(
+    account_read, now: str, start: str, end: str, trade_date: str
+) -> None:
+    first = datetime.fromisoformat(start)
+    last = datetime.fromisoformat(end)
+    submitted = (first + timedelta(seconds=1)).isoformat()
+    paper = EndedPaper(
+        _ended(symbol="INCLUDED", submitted_at=submitted, filled_at=submitted),
+        _ended(
+            symbol="TOO_EARLY",
+            submitted_at=(first - timedelta(hours=1)).isoformat(),
+            filled_at=(first - timedelta(microseconds=1)).isoformat(),
+        ),
+        _ended(symbol="TOO_LATE", submitted_at=submitted, filled_at=end),
+        now=now,
+    )
+    out = account_read(paper).out
+    assert (
+        f"ended orders submitted in {trade_date} (New York trade date; an order submitted earlier is not listed): 1"
+        in out
+    )
+    assert "INCLUDED sell" in out and "TOO_EARLY" not in out and "TOO_LATE" not in out
+    requests = [
+        r for name, r in paper.calls if name == "get_orders" and _value(r.status) == "closed"
+    ]
+    assert requests[0].until == last
+
+
+@pytest.mark.parametrize(
+    ("status", "field"),
+    [("expired", "expired_at"), ("rejected", "failed_at"), ("replaced", "replaced_at")],
+)
+def test_other_ended_statuses_show_their_returned_ending_time(account_read, status, field) -> None:
+    out = account_read(
+        EndedPaper(_ended(status=status, filled_at=None, **{field: "2026-11-11T17:05:06Z"}))
+    ).out
+    assert f"status {status}" in out
+    assert f"{field} 2026-11-11T17:05:06+00:00" in out
+
+
+def test_an_ended_order_without_its_ending_time_fails_without_an_empty_day_claim(
+    account_read,
+) -> None:
+    captured = account_read(EndedPaper(_ended(filled_at=None)), expected=1)
+    assert "ending time" in captured.err and "not shown" in captured.err
+    assert PROTECT_STOP not in captured.err
+
+
+def test_a_full_page_of_tied_ended_orders_fails_without_truncating_or_looping(account_read) -> None:
+    paper = EndedPaper(*(_ended() for _ in range(501)))
+    captured = account_read(paper, expected=1)
+    assert "ended orders" in captured.err and "cannot advance" in captured.err
+    assert (
+        len([r for name, r in paper.calls if name == "get_orders" and _value(r.status) == "closed"])
+        == 2
+    )
+
+
+def test_an_ended_orders_read_failure_does_not_print_an_identifier_from_the_body(
+    account_read,
+) -> None:
+    class RefusedHistory(EndedPaper):
+        def get_orders(self, filter: Any = None):
+            if _value(filter.status) == "closed":
+                raise APIError(
+                    f'{{"code": 50010000, "message": "{ACCOUNT_NUMBER} {PROTECT_STOP}"}}'
+                )
+            return super().get_orders(filter)
+
+    captured = account_read(RefusedHistory(), expected=1)
+    assert "the ended orders failed: APIError" in captured.err
+    assert ACCOUNT_NUMBER not in captured.err and PROTECT_STOP not in captured.err
+
+
+def test_a_failed_history_read_keeps_the_account_read_printed_before_it(account_read) -> None:
+    """The flat read (positions and open orders) is printed before the history walk starts, so a
+    history failure, or the task's timeout killing a long walk, cannot take it away."""
+
+    class RefusedHistory(EndedPaper):
+        def get_orders(self, filter: Any = None):
+            if _value(filter.status) == "closed":
+                self.printed_before = cast(Any, sys.stdout).getvalue()
+                raise APIError('{"code": 50010000, "message": "refused"}')
+            return super().get_orders(filter)
+
+    paper = RefusedHistory()
+    captured = account_read(paper, expected=1)
+    for line in ("positions: 0", "open orders: 0", "no_shorting: true"):
+        assert line in paper.printed_before and line in captured.out
+    assert "ended orders submitted in" not in captured.out
+    assert captured.out.splitlines()[-2:] == [custody.ENDED_READING, custody.ENDED_NOT_READ]
+    assert "the ended orders failed: APIError" in captured.err
+    assert "nothing else was read" not in captured.err
+    assert "the account, positions, open orders and configuration above were read" in captured.err
+
+
+def test_a_stop_submitted_before_the_date_that_sold_inside_it_is_a_named_limit(
+    account_read,
+) -> None:
+    """The date bound's named limit: a GTC protect stop placed Monday and sold Wednesday is not
+    listed on Wednesday, and the count line says an earlier submission is not listed."""
+    monday = _ended(symbol="MONDAY_STOP", submitted_at="2026-11-09T15:00:00Z")
+    out = account_read(EndedPaper(monday)).out
+    assert "MONDAY_STOP" not in out
+    assert "an order submitted earlier is not listed): none" in out
+
+
+def test_a_killed_history_walk_says_the_date_was_not_read(monkeypatch, capsys) -> None:
+    """The lead, 2026-11-13: a walk killed before it returns never reads as a date with no ended
+    orders. The line flushed before the walk says the read is under way and what its absence of a
+    result means, so a timeout's kill leaves that line and no count."""
+
+    class Killed(BaseException):
+        pass
+
+    class KilledPaper(EndedPaper):
+        def get_orders(self, filter: Any = None):
+            if _value(filter.status) == "closed":
+                raise Killed
+            return super().get_orders(filter)
+
+    data_only_unset(monkeypatch)
+    monkeypatch.setattr(custody, "require_get_only", lambda client: None)
+    with pytest.raises(Killed):
+        custody.account_task(cast(Any, KilledPaper(_ended())))
+    out = capsys.readouterr().out
+    assert custody.ENDED_READING in out
+    assert "not finished" in custody.ENDED_READING
+    assert not custody.ENDED_READING.startswith("ended orders")
+    assert "ended orders submitted in" not in out
+
+
+def test_a_failed_history_walk_says_on_its_output_the_date_was_not_read(account_read) -> None:
+    class FailingPaper(EndedPaper):
+        def get_orders(self, filter: Any = None):
+            if _value(filter.status) == "closed":
+                raise custody.ReadFailed("the ended orders page is outside its submission bound")
+            return super().get_orders(filter)
+
+    out = account_read(FailingPaper(_ended()), 1).out
+    assert out.rstrip().endswith(custody.ENDED_NOT_READ)
+
+
+def test_a_history_longer_than_a_page_before_the_date_is_not_walked(
+    account_read, monkeypatch
+) -> None:
+    """The lead, 2026-11-13: the read is bounded to the trade date. A paper account holds thousands of
+    closed orders from earlier dates; the walk asks only for the date's submissions, so the read ends
+    after one page and no pause instead of paging back through them."""
+    older = [
+        _ended(
+            symbol=f"OLD{n}",
+            submitted_at=(
+                datetime(2026, 11, 10, 20, tzinfo=UTC) - timedelta(minutes=n)
+            ).isoformat(),
+            filled_at="2026-11-11T17:00:00Z",
+        )
+        for n in range(600)
+    ]
+    today = _ended(symbol="TODAY", submitted_at="2026-11-11T15:00:00Z")
+    paper = EndedPaper(today, *older)
+    sleeps: list[float] = []
+    monkeypatch.setattr(custody.time, "sleep", sleeps.append)
+
+    out = account_read(paper).out
+    assert "TODAY sell" in out and "OLD0 sell" not in out
+    closed = [r for name, r in paper.calls if name == "get_orders" and _value(r.status) == "closed"]
+    start = datetime(2026, 11, 11, 1, 0, tzinfo=UTC)  # 2026-11-10 20:00 New York
+    assert [r.after for r in closed] == [start]
+    assert sleeps == []
 
 
 @pytest.mark.parametrize("answer", [None, {"client_order_id": "foreign-id-not-to-print"}, []])

@@ -105,13 +105,28 @@ own-cap refusal above: a holding found in the account has no entry size left to 
 up to the inclusive `sizing.DISTANCE_CEILING` the handbook names (`src/canon_trading/sizing.py:45`;
 `docs/handbook/practices.md:38`). A distance over that ceiling, before or after the price step and
 Alpaca's smallest trail, is refused by name and gets no stop; no fixed fraction is substituted.
-The spread floor and Alpaca's smallest trail still hold (`src/canon_trading/protect.py:387`).
+The spread floor and Alpaca's smallest trail still hold (`src/canon_trading/protect.py:387`, `:424-425`).
 `Mover._entry_trail` takes a default-off `found_holding` parameter for this task alone, covering both
 own-cap branches (`src/canon_trading/mover.py:5506`, `:5541`, `:5610`); the Mover's entry still sizes
 through `size_from_budget`, with its callers unchanged. F2 keeps its existing planning; OWN3 has the
 same own-cap arm as OWN1 and retains its registered ATR multiple. Offline tests reproduce both former
 refusals, the ceiling and price-step boundaries, the plan-only source line, and the entry guards
-(`tests/test_protect.py:574`, `:592`, `:623`); no paper acceptance of this amendment is claimed.
+(`tests/test_protect.py:574`, `:592`, `:623`, `:654`, `:662`, `:681`); no paper acceptance of this amendment is claimed.
+
+**Amendment, 2026-11-13 — not the only task on C.** `mise run paper:protector protect`, the standing
+protector's task (the lead's 24/5 plan of 2026-11-13, Decision D and unit 10; ADR 0146 for protection
+around the clock), not yet on `main`, is admitted on C beside this one (ADR 0114's amendment), on the
+owner's requirement of 2026-11-13, as the lead restates it, that C's holding has its exit in every
+session, and on custody's line that the owner's fill is recognised at once and protected
+(`docs/handbook/philosophy.md`, What never changes). The Context's sentence that a task on C must not be
+able to sell anything by itself holds for this task, `paper:protect`, alone: the protector's engine-held
+stop sends its own sale, within its terms. It sells only to protect a long it finds, reduce-only and for
+the uncovered quantity only; it never opens or adds to a position, never cancels, resizes or adopts an
+order it did not send, and freezes a symbol with a foreign quantity. It takes `--row OWN1|OWN3` and
+refuses F2 and IEX by name. On C it runs only after its proof on account A and only with the lead's go
+by name (`--lead-go "protect <row>"`), and it and `paper:protect protect` never send on C at once (one
+writer per account). These terms are `UNVERIFIED` until the task lands with its tests. This task's terms
+are unchanged: one kind of order, a trailing stop for a long it finds, on a named registered row.
 
 ## Evidence
 
