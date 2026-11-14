@@ -66,6 +66,8 @@ LEG_ID = "0a3c4c3e-6f4f-4e59-9a3a-2f7d1e8b1c11"
 LEG_CLIENT_ID = "owner-msft-leg"
 REPLACEMENT_ID = "5d1e6a90-2b7c-4f3e-8a41-9c0d7e2f3b22"
 NODE_REPLACEMENT_ID = "8f2a1c4d-3e5b-4a6c-9d7e-1b2c3d4e5f60"
+SECOND_REPLACEMENT_ID = "b7c6d5e4-f3a2-4b1c-8d9e-0a1b2c3d4e5f"
+UNHOLDABLE_LINK_ID = REPLACEMENT_ID
 FAILED_CHECK = "Failed to generate order status reports"
 HOUR = timedelta(hours=1)
 HANDLER_FAILED = re.compile(r"Python .*? failed")
@@ -493,58 +495,154 @@ def submit_trailing_stop(strategy: Any) -> Any:
     return order.client_order_id
 
 
-@pytest.mark.parametrize("middle_id", ["", "\u00e9t\u00e9"])
-def test_a_node_chain_cut_short_at_an_unholdable_link_is_never_left_out(
-    venue, capfd, monkeypatch, middle_id
+UNHOLDABLE_IDS = ["", "\u00e9t\u00e9"]
+"""Client order IDs NautilusTrader cannot hold: empty, and not ASCII (`holdable_id`)."""
+
+
+def replaced_through_an_unholdable_link(
+    venue, link_cid: str = "", *, then: str | None = None
+) -> dict:
+    """The node's placed order replaced at Alpaca through a link whose client order ID NautilusTrader
+    cannot hold, then by a replacement of Alpaca's making, open; with `then`, that one replaced again by
+    one more, open and held where the stand-in sends its updates. Returns the open replacement."""
+    placed = _tec.placed_order(venue)
+    later = datetime.now(UTC).isoformat()
+    link = {
+        **placed,
+        "id": UNHOLDABLE_LINK_ID,
+        "client_order_id": link_cid,
+        "replaces": placed["id"],
+        "replaced_by": NODE_REPLACEMENT_ID,
+        "status": "replaced",
+    }
+    replacement = {
+        **placed,
+        "id": NODE_REPLACEMENT_ID,
+        "client_order_id": "alpaca-made-replacement",
+        "replaces": UNHOLDABLE_LINK_ID,
+        "status": "new",
+        "submitted_at": later,
+        "updated_at": later,
+    }
+    venue.trading.orders.extend([link, replacement])
+    placed.update(status="replaced", replaced_by=UNHOLDABLE_LINK_ID)
+    if then is None:
+        return replacement
+    replacement.update(status="replaced", replaced_by=then)
+    newest = {
+        **replacement,
+        "id": then,
+        "client_order_id": "alpaca-made-replacement-2",
+        "replaces": NODE_REPLACEMENT_ID,
+        "replaced_by": None,
+        "status": "new",
+    }
+    venue.trading._placed[then] = newest
+    return newest
+
+
+@pytest.mark.parametrize("link_cid", UNHOLDABLE_IDS)
+def test_r3_a_node_chain_through_an_unholdable_link_is_reported_as_the_nodes_order(
+    venue, capfd, monkeypatch, link_cid
 ) -> None:
-    """The node's trailing stop is replaced twice, and the middle replacement carries a client order ID
-    NautilusTrader cannot hold (empty, or not ASCII), so a trace from the newest stops there
-    (`_root_id`). The running open-order check, through the live node's wiring, must not take the node's
-    own stop for someone else's and leave it out: it fails the report as at base (ADR 0030), and nothing
-    is named left out."""
+    """R3: the trace walks past a link NautilusTrader cannot hold to the node's order, so the running
+    open-order check, through the live node's wiring, reports the open replacement under the node's ID:
+    no refusal, nothing left out."""
     trailing_reporting_off(monkeypatch, venue)
     strategy = TrailingTrader()
     strategy.idle = True
-    direct: list = []
+    node_id: list = []
+    reports: list = []
 
     async def body(client) -> None:
         await _tec.until_idle(client, venue)
-        submit_trailing_stop(strategy)
+        node_id.append(submit_trailing_stop(strategy))
         await _tec.until_idle(client, venue)
         _tec.forget(client)
-        placed = _tec.placed_order(venue)
-        later = datetime.now(UTC).isoformat()
-        middle = {
-            **placed,
-            "id": REPLACEMENT_ID,
-            "client_order_id": middle_id,
-            "replaces": placed["id"],
-            "replaced_by": NODE_REPLACEMENT_ID,
-            "status": "replaced",
-        }
-        newest = {
-            **placed,
-            "id": NODE_REPLACEMENT_ID,
-            "client_order_id": "alpaca-made-replacement",
-            "replaces": REPLACEMENT_ID,
-            "status": "new",
-            "submitted_at": later,
-            "updated_at": later,
-        }
-        venue.trading.orders.extend([middle, newest])
-        placed.update(status="replaced", replaced_by=REPLACEMENT_ID)
+        replaced_through_an_unholdable_link(venue, link_cid)
         await asyncio.sleep(0.8)  # several running checks
-        try:
-            await client._generate_order_status_reports(OPEN_ONLY)
-        except ValueError as e:
-            direct.append(str(e))
+        reports.extend(await client._generate_order_status_reports(OPEN_ONLY))
 
     _tec.run_with_client(body, strategy, exec_engine=OPEN_CHECK_ONLY)
 
     log = engine_log(capfd)
+    assert [(r.venue_order_id.value, r.client_order_id) for r in reports] == [
+        (NODE_REPLACEMENT_ID, node_id[0])
+    ]
     assert lines_naming(log, "ALERT") == [], lines_naming(log, "ALERT")
-    assert lines_naming(log, FAILED_CHECK) != []
-    assert len(direct) == 1 and "order type trailing_stop" in direct[0], direct
+    assert lines_naming(log, FAILED_CHECK) == []
+
+
+@pytest.mark.parametrize("link_cid", UNHOLDABLE_IDS)
+def test_r1_a_fill_on_the_next_replacement_of_a_chain_through_an_unholdable_link_reaches_the_nodes_order(
+    venue, capfd, monkeypatch, link_cid
+) -> None:
+    """R1: the node's trailing stop is replaced through an unholdable link, then once more, and this
+    client has no record of either. A fill on the newest, from the stream, is the node's order's fill:
+    it is not left out and not taken for someone else's order."""
+    trailing_reporting_off(monkeypatch, venue)
+    strategy = TrailingTrader()
+    strategy.idle = True
+    node_id: list = []
+    filled: list = []
+
+    async def body(client) -> None:
+        await _tec.until_idle(client, venue)
+        node_id.append(submit_trailing_stop(strategy))
+        await _tec.until_idle(client, venue)
+        _tec.forget(client)
+        replaced_through_an_unholdable_link(venue, link_cid, then=SECOND_REPLACEMENT_ID)
+        venue.trading.update(
+            SECOND_REPLACEMENT_ID, "partial_fill", 1, status="partially_filled", filled_qty="1"
+        )
+        await _tec.until_idle(client, venue)
+        filled.append(client.cache.order(node_id[0]).filled_qty.as_decimal())
+
+    _tec.run_with_client(body, strategy)
+
+    log = engine_log(capfd)
+    assert filled == [Decimal(1)], filled
+    assert lines_naming(log, "ALERT") == [], lines_naming(log, "ALERT")
+
+
+@pytest.mark.parametrize("first", ["link", "replacement"])
+def test_r2_an_outside_chain_through_an_unholdable_link_is_judged_alike_whichever_is_traced_first(
+    venue, capfd, first
+) -> None:
+    """R2: the owner's OCO leg is replaced through a link whose client order ID NautilusTrader cannot
+    hold. Whether the stream brings the link's update first or only the replacement's, the open
+    replacement is the owner's: left out, named once, and every running check goes on."""
+    venue.trading.positions = [msft_position()]
+    original = owner_leg(status="replaced", replaced_by=UNHOLDABLE_LINK_ID)
+    link = owner_leg(
+        id=UNHOLDABLE_LINK_ID,
+        client_order_id="",
+        replaces=LEG_ID,
+        replaced_by=SECOND_REPLACEMENT_ID,
+        status="replaced",
+    )
+    replacement = owner_leg(
+        id=SECOND_REPLACEMENT_ID, client_order_id="owner-msft-leg-3", replaces=UNHOLDABLE_LINK_ID
+    )
+
+    async def body(client) -> None:
+        venue.trading.orders.extend([original, link, replacement])
+        if first == "link":
+            venue.stream.send(
+                {"event": "replaced", "order": dict(link), "timestamp": link["updated_at"]}
+            )
+        venue.stream.send(
+            {"event": "new", "order": dict(replacement), "timestamp": replacement["updated_at"]}
+        )
+        await _tec.until_idle(client, venue)
+        await asyncio.sleep(0.8)  # several running checks
+
+    _tec.run_with_client(body, _tec.trader(idle=True), exec_engine=OPEN_CHECK_ONLY)
+
+    log = engine_log(capfd)
+    named = [line for line in lines_naming(log, "ALERT") if "owner-msft-leg-3" in line]
+    assert len(named) == 1, lines_naming(log, "ALERT")
+    assert lines_naming(log, FAILED_CHECK) == []
 
 
 def test_an_outside_order_whose_trace_fails_keeps_the_refusal_that_names_no_venue_id(
