@@ -592,10 +592,15 @@ def gain_floor_replay(count):
     gc.collect()
 
     def settings():
+        # The gain lock is off unless asked for, so this replay asks for it.
         if count == 1:
-            return h.OwnerProtectorConfig(strategy_id=h.PROTECTOR, row="OWN1")
+            return h.OwnerProtectorConfig(strategy_id=h.PROTECTOR, row="OWN1", gain_lock=True)
         return h.OwnerProtectorConfig(
-            strategy_id=h.PROTECTOR, row="OWN1", breach_count=count, confirm_gap_ms=0
+            strategy_id=h.PROTECTOR,
+            row="OWN1",
+            breach_count=count,
+            confirm_gap_ms=0,
+            gain_lock=True,
         )
 
     class Probe(h.EngineProtector):

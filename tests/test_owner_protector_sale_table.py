@@ -1856,7 +1856,8 @@ def test_refused_stream_quote_changes_neither_count_level_nor_price(defect):
 
 
 def test_gain_lock_raises_local_level_and_keeps_it_without_an_emulated_order():
-    strategy = counted()
+    # The gain lock is off unless asked for, so this case asks for it.
+    strategy = counted(gain_lock=True)
     strategy.cached.held[0].avg_px_open = Decimal("10.00")
     strategy.observe("12.00", h.T0 + h.SECOND)
     slot = strategy.slots[h.AAA]

@@ -29,6 +29,12 @@ page lists none of them.
 
 Every row of this table is one file under [settings/](rows/settings/).
 
+The owner protector's `gain_lock` setting is **off** unless `paper:protector --gain-lock` is
+explicitly requested (the lead, 2026-11-13): **not a default until its replay proof**. With it off,
+the ordinary trail remains in force; with it on, `ROUND_TRIP_COST` and `NOISE_FLOOR` in
+`src/canon_trading/gain_lock.py` govern arming and the cost floor (constants there, not yet rows of
+this table).
+
 The selectable trail and re-entry rows are a window's settings, not tuned by the bars study.
 The bars replay accepts only the fixed trail and the existing clock cooldown; another mode is refused
 by its field and value. These window rows are excluded from its trial keys and decode as the fixed
