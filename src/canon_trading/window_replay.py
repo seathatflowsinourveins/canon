@@ -3,7 +3,8 @@
 Contract: nautilus-trader v2.0.0rc8 at d53849b216e2, backtesting/apis-and-runs.md:22-95
 and backtest/__init__.pyi:413-537: add_data, run(streaming=True), clear_data, end and
 the three engine reports. trade-execution.md:52-75 and fill-prices-and-matching.md:165-206
-define the touch/tape presets. Composition is mover_window.mover_universe_parts and
+define the touch/tape presets; tape is alpaca-paper-sim-v1's, queue_position
+included (trade-execution.md:114-118). Composition is mover_window.mover_universe_parts and
 window_rank; reference_reader/inline_reads are MoversRankActor's offline contract.
 
 Shutdown: the pinned docs/concepts/strategies.md:768-774 warn that a managed stop requested
@@ -204,6 +205,7 @@ def venue_preset(fill_arm: str, latency: Mapping[str, int] | None = None) -> dic
         "bar_execution": False,
         "trade_execution": fill_arm == "tape",
         "liquidity_consumption": fill_arm == "tape",
+        "queue_position": fill_arm == "tape",
         **({} if described is None else {"latency": described}),
     }
 
@@ -227,7 +229,12 @@ def add_replay_venue(
         **VENUE_SETTINGS,
         **{
             key: preset[key]
-            for key in ("bar_execution", "trade_execution", "liquidity_consumption")
+            for key in (
+                "bar_execution",
+                "trade_execution",
+                "liquidity_consumption",
+                "queue_position",
+            )
         },
     )
 

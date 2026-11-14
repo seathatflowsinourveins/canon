@@ -245,7 +245,7 @@ class OwnedLimit(Strategy):
         self.released.append(event.client_order_id)
 
 
-@pytest.mark.parametrize("arm,expected", [("touch", [10]), ("tape", [3, 3, 3, 1])])
+@pytest.mark.parametrize("arm,expected", [("touch", [10]), ("tape", [1, 3, 3, 3])])
 def test_venue_presets_release_owned_limit_at_touch_or_print_size(alpaca_bars, arm, expected):
     from canon_trading.window_replay import add_replay_venue
     from canon_trading.window_replay import venue_preset
@@ -262,6 +262,7 @@ def test_venue_presets_release_owned_limit_at_touch_or_print_size(alpaca_bars, a
         "bar_execution": False,
         "trade_execution": arm == "tape",
         "liquidity_consumption": arm == "tape",
+        "queue_position": arm == "tape",
     }
     instrument = alpaca_bars.equity("LLL")
     engine = BacktestEngine(BacktestEngineConfig(logging=LoggerConfig(bypass_logging=True)))
@@ -275,11 +276,16 @@ def test_venue_presets_release_owned_limit_at_touch_or_print_size(alpaca_bars, a
         [
             quote(instrument, at, 9.99, 10.01),
             quote(instrument, at + SECOND, 9.99, 10.01),
+            # The ask reaches the sell's limit with 2 displayed ahead of it. Under tape's queue
+            # tracking an L1 limit behind the best price is not filled until the price reaches it
+            # (matching_engine/mod.rs:645-658 at d53849b216e2), and then only once the prints
+            # have taken the quantity displayed ahead (mod.rs:700-828): 1 of the first print.
+            quote(instrument, at + SECOND + SECOND // 2, 10.99, 11.00, 2),
             trade(instrument, at + 2 * SECOND, 11, 3),
             trade(instrument, at + 3 * SECOND, 11, 3),
             trade(instrument, at + 4 * SECOND, 11, 3),
             # A later minute supplies enough quoted liquidity to finish. During the print
-            # minute tape can fill only nine of the ten shares. Touch waits for this quote
+            # minute tape can fill only seven of the ten shares. Touch waits for this quote
             # and fills the whole sell; neither preset is a trade-only venue.
             quote(instrument, at + 61 * SECOND, 11.01, 11.02, 10),
         ]
@@ -294,11 +300,31 @@ def test_venue_presets_release_owned_limit_at_touch_or_print_size(alpaca_bars, a
         ]
         assert sizes == expected
         if arm == "tape":
-            assert sum(sizes[:-1]) == 9
+            assert sum(sizes[:-1]) == 7
             assert all(size <= 3 for size in sizes[:-1])
         assert engine.portfolio.net_position(instrument.id) == Decimal(10 - sum(expected))
     finally:
         engine.dispose()
+
+
+@pytest.mark.parametrize("arm", ["touch", "tape"])
+def test_the_tape_preset_tracks_queue_position_as_the_profile_registers(monkeypatch, arm):
+    """alpaca-paper-sim-v1 sets queue_position with trade_execution (trade-execution.md:114-118 at
+    d53849b216e2; add_venue's default is False, backtest/__init__.pyi:473), as tape_replay's venue
+    does. The window replay's tape preset passes it, and its report names it; touch leaves it off."""
+    from canon_trading import window_replay
+
+    seen = []
+    monkeypatch.setattr(
+        window_replay.BacktestEngine, "add_venue", lambda self, *a, **kw: seen.append(kw)
+    )
+    engine = BacktestEngine(BacktestEngineConfig(logging=LoggerConfig(bypass_logging=True)))
+    try:
+        window_replay.add_replay_venue(engine, arm, "5000 USD")
+    finally:
+        engine.dispose()
+    assert seen[0]["queue_position"] is (arm == "tape")
+    assert window_replay.venue_preset(arm)["queue_position"] is (arm == "tape")
 
 
 MS = 1_000_000
