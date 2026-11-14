@@ -41,9 +41,11 @@ an account or stream lock. It writes only `canon/exit-monitor/<A|B|C>/`: the pas
 not the rows. Cover is an acknowledged stop-kind sell of ours at the venue; a working sale of ours or the
 protect lineage the venue acknowledges and a fresh report names, up to what the venue shows left; or a
 report fresh within three node steps whose state covers, `cold` among them, counted in `status.json` with
-no notice. A known no-cover state is no cover; a hold reads `held`, never uncovered; a freeze reads frozen
-with any result. A state it does not know, missing or not text included, costs that holding the report's
-cover, named without its text, and never the pass. An optional `client_order_id` names one stop or sale
+no notice. A known no-cover state is no cover; a hold reads `held`, never uncovered, unless the holding is
+short or frozen; a freeze reads frozen with any result. A state it does not know, missing or not text
+included, or a quantity or sessions it cannot read, costs that holding the report's cover, named without
+its text, and never the pass; only a row that is not an object fails the file.
+An optional `client_order_id` names one stop or sale
 of our lineage: not added where the venue shows the same stop, counted once if repeated; a report without
 one adds nothing where another exit could be the same. A missing or stale report reads "no protector running". The nodes report; the monitor judges.
 **Not built:** a writer of `reports.json`; the warming bound (the node reports `full_window_at`; a holding
@@ -101,7 +103,8 @@ the clone's refresh and `not_main`, one firing at a time, the row, uninstall. N9
 invented state costing only its holding. Staging, named in the landing: (i) the offline tests; (ii) an
 uncovered long on A, Sunday night after the proof's cells if A's lock is free, A enabled for it alone by
 the owner's steps, which the lead brings once the unit is on `main`: the owner runs `scripts/automation
-install-exit-monitor tests`; one `paper:test` case opens a long, waits for two firings over 120 s apart
+install-exit-monitor tests`; one `paper:test` case (`tests/test_paper_exit_monitor_staging.py`) opens a long,
+waits for two firings over 120 s apart
 and one notice, and closes it in its `finally`; the owner runs `scripts/automation uninstall-exit-monitor
 tests`, and `scripts/automation status` shows no row for A; (iii) a long covered by a venue stop on A,
 Monday's regular session, by hand in sequence (open, `paper:protect tests`, two `mise run

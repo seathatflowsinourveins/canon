@@ -814,10 +814,10 @@ def test_finite_quantities_and_report_shapes_fail_closed(em):
     for qty in ("NaN", "Infinity", "-1"):
         found = assess(em, orders=[order(qty=qty)])[0]
         assert found["state"] == "unknown"
-    assert (
-        assess(em, reports=[{"symbol": "SYN", "quantity": "NaN", "armed_at": NOW}])[0]["state"]
-        == "unknown"
-    )
+    # ADR 0158 (evidence-verifier/14): a report's bad quantity costs its holding the cover, named.
+    found = assess(em, reports=[{"symbol": "SYN", "quantity": "NaN", "armed_at": NOW}])[0]
+    assert found["state"] == "uncovered"
+    assert "quantity is not a number" in found["reason"]
 
 
 def test_bad_position_keeps_one_unknown_finding(em, tmp_path):
@@ -1197,18 +1197,18 @@ def test_a_dormant_notice_does_not_delay_the_uncovered_alert(em, tmp_path, blip)
 
 
 @pytest.mark.parametrize("sessions", [[["regular"]], [{"part": "regular"}]], ids=["list", "dict"])
-def test_malformed_report_ends_the_pass_unknown_and_written(em, tmp_path, sessions):
-    """P5a: a report the pass cannot use is a failed read: every position unknown, the pass recorded
-    and counted toward the blind telling, never a traceback that writes nothing."""
+def test_malformed_report_sessions_cost_only_that_holding(em, tmp_path, sessions):
+    """P5a, amended by ADR 0158 (evidence-verifier/14): a report's bad sessions cost its holding the
+    report's cover, named; the pass is still ok and written, and no read failure is counted."""
     paper = Paper(positions=[position()])
     result = run(em, tmp_path, paper, reports=[level_report(quantity="100", sessions=sessions)])
-    assert not result["ok"]
-    assert [f["state"] for f in result["findings"]] == ["unknown"]
+    assert result["ok"]
+    assert [f["state"] for f in result["findings"]] == ["uncovered"]
+    assert "no valid session eligibility" in result["findings"][0]["reason"]
     status = json.loads((tmp_path / "canon/exit-monitor/A/status.json").read_text())
-    assert status["ok"] is False
-    assert status["unknown"] == 1
+    assert status["ok"] is True
     memory = json.loads((tmp_path / "memory.json").read_text())
-    assert memory["failures"] == 1
+    assert memory["failures"] == 0
 
 
 def test_open_orders_429_is_named(em, tmp_path):
@@ -1671,3 +1671,82 @@ def test_the_contract_table_holds_every_state_the_record_names(em):
         "held": em.HELD,
         "frozen": em.FROZEN,
     }
+
+
+# From 49a02067 (land-carrier-rows), on the deputy's 11:48 order: evidence-verifier/14 and the held row.
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"state": None},
+        {"state": ["armed"]},
+        {"quantity": "many"},
+        {"sessions": "regular"},
+        {"sessions": ["nowhere"]},
+        {"state": "cold", "quantity": "many"},
+    ],
+    ids=[
+        "no-state",
+        "state-not-text",
+        "quantity-not-decimal",
+        "sessions-not-a-list",
+        "unknown-part",
+        "cold-quantity-not-decimal",
+    ],
+)
+def test_a_bad_row_of_the_report_file_costs_only_its_holding(em, tmp_path, bad):
+    root = tmp_path / "canon/exit-monitor/A"
+    root.mkdir(parents=True)
+    broken = level_report(quantity="100")
+    del broken["last_step_at"], broken["step_seconds"]
+    if bad.get("state", "") is None:
+        del broken["state"]
+    else:
+        broken.update(bad)
+    good = level_report(symbol="OTH", quantity="100")
+    del good["last_step_at"], good["step_seconds"]
+    for row in (broken, good):
+        row["armed_at"] = NOW.isoformat()
+    book = {
+        "version": 1,
+        "account": "A",
+        "last_step_at": NOW.isoformat(),
+        "step_seconds": 20,
+        "holdings": [broken, good],
+    }
+    (root / "reports.json").write_text(json.dumps(book))
+    result = run(em, tmp_path, Paper(positions=[position(), position(symbol="OTH")]))
+    assert result["ok"], result["summary"]
+    found = {f["symbol"]: f for f in result["findings"]}
+    assert found["OTH"]["state"] == "covered"
+    assert found["SYN"]["state"] == "uncovered"
+    assert "it adds no cover" in found["SYN"]["reason"]
+
+
+def test_a_frozen_holding_with_a_held_report_reads_frozen(em):
+    reports = [
+        level_report(quantity="100", state="frozen", result="denied"),
+        level_report(quantity="100", state="held", source="order"),
+    ]
+    found = assess(em, reports=reports)[0]
+    assert found["state"] == "uncovered"
+    assert found["frozen"] == "denied"
+
+
+# From 806d3e69, on the deputy's 11:48 order: the staging (ii) case's reader, on what a real pass writes.
+def test_the_staging_case_reads_what_a_real_pass_writes(em, tmp_path):
+    """ADR 0158's staging (ii) reads the pass's stamp and the uncovered event from the folder: its reader
+    is checked here, on the files `run_pass` writes, since the case itself runs only on paper."""
+    from tests.test_paper_exit_monitor_staging import observe
+
+    root = tmp_path / "canon/exit-monitor/A"
+    paper = Paper(positions=[position()])
+    run(em, tmp_path, paper)
+    stamps, event = observe(root, "SYN", NOW)
+    assert stamps == [NOW] and event == {}
+    paper.now = NOW + timedelta(seconds=180)
+    run(em, tmp_path, paper)
+    stamps, event = observe(root, "SYN", NOW)
+    assert stamps == [NOW + timedelta(seconds=180)]
+    assert event["key"].startswith("exit-monitor:A:SYN:") and event["state"] == "uncovered"
+    assert observe(root, "SYN", NOW + timedelta(seconds=181)) == ([], {})
+    assert observe(root, "OTH", NOW)[1] == {}

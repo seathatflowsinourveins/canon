@@ -229,11 +229,8 @@ def _local(value: datetime) -> datetime:
 def _fresh(report: Mapping[str, Any], now: datetime) -> bool:
     if not isinstance(report, Mapping):
         raise ReadFailed("node report is not an object")
-    sessions = report.get("sessions", ["regular"])
-    if not isinstance(sessions, list) or not all(isinstance(part, str) for part in sessions):
-        raise ReadFailed("node report names no valid session eligibility")
-    # A state that is not text is judged in _cover, for its holding alone (ADR 0158); a symbol or an
-    # identity that is not text names no holding, so it still fails the pass.
+    # A state, quantity or sessions it cannot read is judged in _cover, for its holding alone (ADR 0158);
+    # a symbol or an identity that is not text names no holding, so it still fails the pass.
     for field in ("symbol", "client_order_id"):
         if report.get(field) is not None and not isinstance(report[field], str):
             raise ReadFailed(f"node report {field} is not text")
@@ -327,10 +324,21 @@ def _cover(symbol: str, orders: Sequence[Any], reports: Sequence[Any], now: date
     seen_stops: set[str] = set()
     cold = False
     for report in armed_reports:
-        qty = _decimal(report.get("quantity"))
+        # ADR 0158 (evidence-verifier/14): a bad row costs its holding the report's cover, named,
+        # never the pass.
+        try:
+            qty = _decimal(report.get("quantity"))
+        except ReadFailed:
+            report_notes.add("a report's quantity is not a number; it adds no cover")
+            continue
         sessions = report.get("sessions", ["regular"])
-        if not isinstance(sessions, list) or not set(sessions) <= PARTS:
-            raise ReadFailed("node report names no valid session eligibility")
+        if (
+            not isinstance(sessions, list)
+            or not all(isinstance(part, str) for part in sessions)
+            or not set(sessions) <= PARTS
+        ):
+            report_notes.add("a report names no valid session eligibility; it adds no cover")
+            continue
         identity = report.get("client_order_id")
         if identity:
             # Contract row 1 (ADR 0158): the sale a report names is ours, of our nodes' lineage
@@ -1755,7 +1763,9 @@ def main() -> int:
 
 def _said(account: str, result: Mapping[str, Any]) -> dict[str, Any]:
     """What the entry point prints: the agent logs it to watch/, outside the account's folder, so
-    no symbol, quantity or reason; the findings stay in status.json and records/ (ADR 0158)."""
+    no symbol, quantity or reason (ADR 0158). What the folder keeps: records/ every finding but a
+    covered one, status.json the counts, memory.json each holding's state by symbol; a covered
+    finding's detail is not kept anywhere (a whole-pass file is a named follow-up)."""
     findings = result.get("findings") or []
     said: dict[str, Any] = {
         "account": account,
