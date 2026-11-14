@@ -35,18 +35,22 @@ Contracts read at the pins on 2026-11-13:
   sessions.py:490-492: trust_env=False prevents implicit netrc authentication
   or proxy configuration, keeping the task's explicit pair as the sole source.
 
-Files default to CLAUDE_CONFIG_DIR/canon/exit-monitor/<A|B>/ (else ~/.claude).
+Files default to CLAUDE_CONFIG_DIR/canon/exit-monitor/<A|B|C>/ (else ~/.claude).
 memory.json carries episodes; status.json is for unit two to consume; records/
 has one JSONL file per New York trade date (20:00 rolls the date). alerts.jsonl
 is this monitor's OUTBOX, in the watchdog's form, not its shared alert file.
-Unit two owns delivery/retry, status display and installation of the 60s schedule.
+Unit two (ADR 0158): scripts/exit-monitor-notify delivers the outbox after each pass;
+scripts/automation install-exit-monitor <account> installs the 60 s agent for one
+account, never by plain install, and status shows its row. C is read only behind
+the lead's word, LEAD_GO, which the agent reads from exit-monitor/C/go at every
+firing and passes to the task and to monitor_task, each of which checks it again.
 
 Boundary ruling (lead, 2026-11-13): P20 and P21 are separate facts calling for
 different acts, so each has its own notice and status/record entry. Deduplication
 is per kind, account, holding and boundary, never by their joined message.
 
 Node-report contract (the lead's 2026-11-13 R7 level-book ruling), for its later
-writer: reports.json contains version=1, account=A|B, last_step_at (aware ISO),
+writer: reports.json contains version=1, account=A|B|C, last_step_at (aware ISO),
 step_seconds (positive), and holdings=[{symbol, quantity, state, level,
 armed_at, count, required_count, reason, sessions, client_order_id?, result?}].
 Each holding names armed at its level, guarded, counting n of N, waiting with
@@ -115,6 +119,12 @@ from . import symbol_hold
 
 NEW_YORK = ZoneInfo("America/New_York")
 DEFAULT_ACCOUNTS = ("A", "B")
+"""Accounts a pass reads with no further word."""
+GO_ACCOUNTS = ("C",)
+"""Accounts a pass reads only behind the lead's standing word, given in the same step (ADR 0158)."""
+LEAD_GO = "exit-monitor protect"
+"""The lead's word for C, exactly: the agent reads it from canon/exit-monitor/C/go at every firing."""
+REFUSED = "account refused; C needs the lead's named word; nothing read"
 INTERVAL_SECONDS = 60  # UNCALIBRATED: P19's schedule contract; installed by unit two.
 REPORT_FRESH_SECONDS = 150  # UNCALIBRATED: original injected armed-stop shorthand only.
 REPORT_FRESH_STEPS = 3  # UNCALIBRATED (P2/R7); the level book supplies the node's step duration.
@@ -1390,14 +1400,11 @@ def run_pass(
     *,
     tape_reader: Callable | None = None,
     data: Any = None,
+    lead_go: str | None = None,
 ) -> dict[str, Any]:
     """P10-P22: one bounded read pass; all effects are monitor-owned local files."""
-    if account not in DEFAULT_ACCOUNTS:
-        return {
-            "ok": False,
-            "findings": [],
-            "summary": "account refused; C needs the lead's named word; nothing read",
-        }
+    if not admitted(account, lead_go):
+        return {"ok": False, "findings": [], "summary": REFUSED}
     root = _root(account)
     path = memory_path or root / "memory.json"
     findings: list[dict[str, Any]] = []
@@ -1569,19 +1576,24 @@ def run_pass(
         return {"ok": False, "findings": unknown, "summary": reason}
 
 
+def admitted(account: str, lead_go: str | None = None) -> bool:
+    """A and B by default; C only with the lead's word, exactly LEAD_GO, given in this step."""
+    return account in DEFAULT_ACCOUNTS or (account in GO_ACCOUNTS and lead_go == LEAD_GO)
+
+
 def monitor_task(
-    account: str, trading_for: Callable | None = None, *, accounts: Sequence[str] | None = None
+    account: str,
+    trading_for: Callable | None = None,
+    *,
+    accounts: Sequence[str] | None = None,
+    lead_go: str | None = None,
 ) -> dict[str, Any]:
-    """One account per invocation. A/B default; no standing C authorization."""
-    configured = tuple(accounts) if accounts is not None else DEFAULT_ACCOUNTS
-    if account not in configured or account not in DEFAULT_ACCOUNTS:
-        return {
-            "ok": False,
-            "findings": [],
-            "summary": "account refused; C needs the lead's named word; nothing read",
-        }
+    """One account per invocation. A/B default; C only behind the lead's word (ADR 0158)."""
+    configured = tuple(accounts) if accounts is not None else DEFAULT_ACCOUNTS + GO_ACCOUNTS
+    if account not in configured or not admitted(account, lead_go):
+        return {"ok": False, "findings": [], "summary": REFUSED}
     if trading_for is not None:
-        return run_pass(account, trading_for(account))
+        return run_pass(account, trading_for(account), lead_go=lead_go)
     os.environ[DATA_ONLY_ENV] = "1"
     # The task loads exactly one account's pair into its own environment using
     # paper:account's keychain pattern. Nothing reads a second account's pair.
@@ -1589,17 +1601,18 @@ def monitor_task(
         trading = session_window.paper_trading()
         data = session_window.window_data()
     except KeyError:
-        return run_pass(account, None)
-    return run_pass(account, trading, data=data)
+        return run_pass(account, None, lead_go=lead_go)
+    return run_pass(account, trading, data=data, lead_go=lead_go)
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Display-only paper exit monitor; one pass, GET only"
     )
-    parser.add_argument("account", choices=DEFAULT_ACCOUNTS)
+    parser.add_argument("account", choices=DEFAULT_ACCOUNTS + GO_ACCOUNTS)
+    parser.add_argument("--lead-go", help=f"on C: the lead's word, exactly {LEAD_GO!r}")
     args = parser.parse_args()
-    result = monitor_task(args.account)
+    result = monitor_task(args.account, lead_go=args.lead_go)
     print(json.dumps(result, sort_keys=True))
     return 0 if result["ok"] else 1
 

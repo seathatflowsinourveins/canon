@@ -40,8 +40,9 @@ ACCOUNTS = ("tests", "windows", "protect")
 INSTANCE = "instance"
 """The file install-protector writes in each instance folder (scripts/automation); the task writes a
 hold only beside one, so a hold is never made where no runner reads it (review F3)."""
-MONITOR_ACCOUNTS = {"A": "tests", "B": "windows"}
-"""The exit monitor's account letters and the protector instance each reads (C is refused there)."""
+MONITOR_ACCOUNTS = {"A": "tests", "B": "windows", "C": "protect"}
+"""The exit monitor's account letters and the protector instance each reads (C only behind the lead's
+word, exit_monitor.LEAD_GO; ADR 0158)."""
 SYMBOL = re.compile(r"[A-Z][A-Z0-9.-]*", re.ASCII)
 """protector_node.parse_levels' symbol rule without `/`, which cannot name a file."""
 

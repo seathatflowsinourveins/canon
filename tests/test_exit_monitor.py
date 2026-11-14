@@ -731,11 +731,14 @@ def test_overlap_is_refused_without_account_or_stream_lock(em, tmp_path):
     assert not list(tmp_path.rglob("*.lock"))
 
 
-def test_task_entry_is_one_account_get_only_and_has_no_c(em):
+def test_task_entry_is_one_account_get_only_and_reads_c_only_behind_the_word(em):
     root = Path(__file__).parents[1]
     task = tomllib.loads((root / "mise.toml").read_text())["tasks"]["paper:exit-monitor"]
-    assert 'choices "tests" "windows"' in task["usage"]
-    assert "canon-alpaca-paper-protect" not in task["run"]
+    assert 'choices "tests" "windows" "protect"' in task["usage"]
+    assert 'flag "--lead-go <lead_go>"' in task["usage"]
+    run_body = task["run"]
+    go_check = run_body.index('[ "${usage_lead_go:-}" = "exit-monitor protect" ]')
+    assert go_check < run_body.index("canon-alpaca-paper-protect") < run_body.index("security")
     assert "CANON_ALPACA_DATA_ONLY=1" in task["run"]
     assert "canon_trading.exit_monitor" in task["run"]
     assert "lockf" not in task["run"]
@@ -1298,3 +1301,62 @@ def test_a_pass_never_turns_the_process_data_only(em, tmp_path, monkeypatch):
     assert DATA_ONLY_ENV not in os.environ
     assert not result["ok"]
     assert "data-only" in result["summary"]
+
+
+# Unit two (the lead's ruling, 2026-11-14): C is admitted only behind the lead's word, by name, read in
+# the same step; A and B keep their default, and without the word C reads nothing.
+C_GO = "exit-monitor protect"
+
+
+def test_c_is_admitted_only_with_the_lead_go_named_in_that_step(em, tmp_path):
+    calls = []
+
+    def factory(account):
+        calls.append(account)
+        return Paper(positions=[position()], orders=[order()])
+
+    assert em.LEAD_GO == C_GO
+    assert "C" not in em.DEFAULT_ACCOUNTS
+    assert not em.monitor_task("C", trading_for=factory)["ok"]
+    for wrong in ("", "exit-monitor C", "protect OWN1", C_GO + " ", "Exit-monitor protect"):
+        refused = em.monitor_task("C", trading_for=factory, lead_go=wrong)
+        assert not refused["ok"] and "lead's named word" in refused["summary"]
+    assert calls == []
+    assert not (tmp_path / "canon/exit-monitor/C").exists()
+    admitted = em.monitor_task("C", trading_for=factory, lead_go=C_GO)
+    assert calls == ["C"]
+    assert admitted["findings"][0]["state"] == "covered"
+    assert json.loads((tmp_path / "canon/exit-monitor/C/status.json").read_text())["account"] == "C"
+
+
+def test_the_go_never_admits_a_or_b_differently_and_a_pass_on_c_needs_it_too(em, tmp_path):
+    paper = Paper(positions=[position()], orders=[order()])
+    assert not em.run_pass("C", paper)["ok"]
+    assert paper.calls == []
+    assert em.run_pass("C", paper, memory_path=tmp_path / "c.json", lead_go=C_GO)["ok"]
+    assert em.monitor_task(
+        "A", trading_for=lambda a: Paper(positions=[position()], orders=[order()]), lead_go=C_GO
+    )["ok"]
+
+
+def test_the_entry_point_takes_c_and_its_word_and_refuses_c_without_it(
+    em, tmp_path, monkeypatch, capsys
+):
+    seen = []
+    monkeypatch.setattr(
+        em, "monitor_task", lambda account, **kw: seen.append((account, kw)) or {"ok": True}
+    )
+    monkeypatch.setattr("sys.argv", ["exit_monitor", "C", "--lead-go", C_GO])
+    assert em.main() == 0
+    assert seen == [("C", {"lead_go": C_GO})]
+    monkeypatch.undo()
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    monkeypatch.setattr("sys.argv", ["exit_monitor", "C"])
+    assert em.main() == 1
+    assert "lead's named word" in capsys.readouterr().out
+
+
+def test_the_symbol_holds_map_names_c_as_the_protect_instance():
+    from canon_trading import symbol_hold
+
+    assert symbol_hold.MONITOR_ACCOUNTS == {"A": "tests", "B": "windows", "C": "protect"}

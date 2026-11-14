@@ -1,0 +1,162 @@
+#!/bin/bash
+# test-exit-monitor-runner — offline checks of scripts/automation's exit monitor agent (unit two; the lead's
+# ruling of 2026-11-14): install-exit-monitor and uninstall-exit-monitor per account, never by plain install;
+# run-exit-monitor, one `mise run paper:exit-monitor` per firing from the installed checkout, C only behind the
+# lead's standing word in its folder's `go`, read at every firing; and the status row. Everything runs in a
+# temporary folder with HOME, CLAUDE_CONFIG_DIR and CANON_LAUNCHAGENTS_DIR pointed there, with a stand-in
+# `mise` that records its arguments, folder and environment names, and AUTOMATION_SKIP_LAUNCHD=1, so no
+# launchctl call is made. Nothing reaches the network, Alpaca or a keychain. Needs macOS's lockf(1),
+# timeout(1) and plutil(1). Exit 0 if every case passes.
+# shellcheck disable=SC2016,SC2034  # stub bodies and eval'd checks are single-quoted: they expand, and read the variables set before them, when they run
+set -uo pipefail
+# shellcheck disable=SC2046  # one variable name per word
+unset $(git rev-parse --local-env-vars)
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+for t in /usr/bin/lockf /usr/bin/timeout /usr/bin/jq /usr/bin/plutil; do
+  [ -x "$t" ] || { echo "test-exit-monitor-runner: skip (no $t here; macOS only)"; echo "test-exit-monitor-runner: 0 passed, 0 failed, 1 skipped"; exit 0; }
+done
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/canon-test-exit-monitor-runner.XXXXXX") \
+  || { echo "test-exit-monitor-runner: could not create a temp folder" >&2; exit 1; }
+TMP=$(cd "$TMP" && pwd -P)
+cleanup() { [ -n "${KEEP:-}" ] || rm -rf "${TMP:?}"; }
+trap cleanup EXIT
+GIT_CEILING_DIRECTORIES=$(cd "$TMP/.." && pwd -P); export GIT_CEILING_DIRECTORIES
+pass=0; fail=0
+t_pass() { pass=$((pass+1)); echo "  pass  $1"; }
+t_fail() { fail=$((fail+1)); echo "  FAIL  $1"; }
+check()  { local label="$1"; shift; if "$@"; then t_pass "$label"; else t_fail "$label"; fi; }
+
+H="$TMP/home"; AH="$H/.claude"; C="$AH/canon"; B="$TMP/bin"; STUB="$TMP/stub"; LA="$TMP/LaunchAgents"
+mkdir -p "$C/watch" "$B" "$STUB" "$LA"
+export STUB
+# the checkout the agent runs in: a repository on main, and one on another branch
+CO="$TMP/checkout"; WB="$TMP/worker"
+if ! { git init -q -b main "$CO" && echo '[tools]' > "$CO/mise.toml" && git -C "$CO" add -A \
+       && git -C "$CO" -c user.name=t -c user.email=t@example.com commit -qm one \
+       && git clone -q "$CO" "$WB" && git -C "$WB" switch -q -c worker; }; then
+  echo "test-exit-monitor-runner: could not make the checkouts" >&2; exit 1
+fi
+HEAD=$(git -C "$CO" rev-parse HEAD)
+# mise: `mise run paper:exit-monitor <account> [--lead-go <word>]`; records one line per call and exits with
+# $STUB/rc (default 0); with $STUB/hold it holds that many seconds first
+cat > "$B/mise" <<'EOF'
+#!/bin/bash
+[ "$1 $2" = "run paper:exit-monitor" ] || { echo "stand-in mise: unexpected $*" >&2; exit 99; }
+shift 2
+printf 'call cwd=%s args=%s\n' "$PWD" "$*" >> "$STUB/calls"
+compgen -e | sort > "$STUB/env-names"
+[ ! -f "$STUB/hold" ] || sleep "$(cat "$STUB/hold")"
+exit "$(cat "$STUB/rc" 2>/dev/null || echo 0)"
+EOF
+chmod +x "$B/mise"
+printf '#!/bin/bash\nexit 1\n' > "$B/launchctl"; chmod +x "$B/launchctl"
+auto() { env -i HOME="$H" PATH="$B:/usr/bin:/bin:/usr/sbin:/sbin" STUB="$STUB" CLAUDE_CONFIG_DIR="$AH" CANON_LAUNCHAGENTS_DIR="$LA" \
+           CANON_EXITMON_CHECKOUT="${CHECKOUT:-$CO}" AUTOMATION_SKIP_LAUNCHD=1 \
+           /usr/bin/timeout 120 /bin/bash "$ROOT/scripts/automation" "$@" > "$TMP/auto.out" 2>&1; }
+# one firing, as launchd starts it: the installed runner's run-exit-monitor with the plist's arguments
+runner() { : > "$STUB/calls"; env -i HOME="$H" PATH="/usr/bin:/bin" STUB="$STUB" CLAUDE_CONFIG_DIR="$AH" ALPACA_API_KEY=fixture-only \
+             ALPACA_SECRET_KEY=fixture-only ALPACA_EXTRA=fixture-only /usr/bin/timeout 60 /bin/bash "$C/exit-monitor-runner.sh" \
+             run-exit-monitor "$B/mise" "$CO" "$1" > "$TMP/runner.out" 2>&1; RC=$?; }
+calls() { if [ -s "$STUB/calls" ]; then wc -l < "$STUB/calls" | tr -d ' '; else echo 0; fi; }
+st() { jq -r "$2" "$C/watch/exit-monitor-$1.json" 2>/dev/null; }
+
+echo "case 1: install-exit-monitor writes one account's agent, off by default, and plain install writes none"
+auto install-exit-monitor
+check "no account is a usage error that writes nothing" eval 'grep -q "usage: scripts/automation install-exit-monitor" "$TMP/auto.out" && [ -z "$(ls -A "$LA")" ]'
+auto install-exit-monitor live
+check "an account outside tests, windows and protect is refused and nothing is written" eval 'grep -q "no such paper account" "$TMP/auto.out" && [ -z "$(ls -A "$LA")" ]'
+CHECKOUT="$WB" auto install-exit-monitor tests
+check "a checkout off main is refused by name and nothing is written" eval 'grep -q "not on main" "$TMP/auto.out" && [ -z "$(ls -A "$LA")" ]'
+check "plain install never installs an exit monitor agent" eval '! grep -q "exit.monitor" <(sed -n "/^do_install() {/,/^}/p" "$ROOT/scripts/automation")'
+check "plain uninstall never removes one either" eval '! grep -q "exit.monitor" <(sed -n "/^do_uninstall() {/,/^}/p" "$ROOT/scripts/automation")'
+auto status
+check "status prints no exit monitor row while none is installed" eval '! grep -q "exit monitor" "$TMP/auto.out"'
+auto install-exit-monitor protect
+P="$LA/local.canon.exit-monitor-protect.plist"
+check "the plist runs the installed runner's run-exit-monitor on the checkout for this account" eval '[ "$(plutil -extract ProgramArguments.1 raw -o - "$P")" = "$C/exit-monitor-runner.sh" ] && [ "$(plutil -extract ProgramArguments.2 raw -o - "$P")" = run-exit-monitor ] && [ "$(plutil -extract ProgramArguments.4 raw -o - "$P")" = "$CO" ] && [ "$(plutil -extract ProgramArguments.5 raw -o - "$P")" = protect ]'
+check "every 60 s, not at load, as a background job, with its log under watch/" eval '[ "$(plutil -extract StartInterval raw -o - "$P")" = 60 ] && [ "$(plutil -extract RunAtLoad raw -o - "$P")" = false ] && [ "$(plutil -extract StandardOutPath raw -o - "$P")" = "$C/watch/exit-monitor-protect.log" ] && [ "$(plutil -extract EnvironmentVariables.CLAUDE_CONFIG_DIR raw -o - "$P")" = "$AH" ]'
+check "the runner is an installed copy of this tree" cmp -s "$ROOT/scripts/automation" "$C/exit-monitor-runner.sh"
+check "C's folder is made and no go is written; install names where the lead's word goes" eval '[ -d "$C/exit-monitor/C" ] && [ ! -e "$C/exit-monitor/C/go" ] && grep -q "exit-monitor/C/go" "$TMP/auto.out"'
+check "no other account's agent is written" eval '[ "$(ls "$LA")" = local.canon.exit-monitor-protect.plist ]'
+
+echo "case 2: C runs nothing without the lead's standing word, read at every firing"
+runner protect
+check "no go: refused by name, nothing run, exit 0" eval '[ "$RC" = 0 ] && [ "$(calls)" = 0 ] && [ "$(st protect .outcome)" = refused ] && st protect .note | grep -q no_go'
+for word in 'exit-monitor C' 'protect OWN1' 'exit-monitor protect '; do
+  printf '%s' "$word" > "$C/exit-monitor/C/go"
+  runner protect
+  check "a go reading '$word' is refused and runs nothing" eval '[ "$(calls)" = 0 ] && [ "$(st protect .outcome)" = refused ] && st protect .note | grep -q go_mismatch'
+done
+printf 'exit-monitor protect\n' > "$C/exit-monitor/C/go"
+runner protect
+check "with the word: one pass for protect, from the checkout, carrying the word" eval '[ "$RC" = 0 ] && [ "$(calls)" = 1 ] && grep -qx "call cwd=$CO args=protect --lead-go exit-monitor protect" "$STUB/calls"'
+check "no ALPACA_ name reaches the task from the agent's environment" eval '! grep -q "^ALPACA_" "$STUB/env-names"'
+check "the status records ok, the exit code and the checkout's commit" eval '[ "$(st protect .outcome)" = ok ] && [ "$(st protect .exit_code)" = 0 ] && [ "$(st protect .commit)" = "$HEAD" ] && [ "$(st protect .account)" = protect ]'
+rm -f "$C/exit-monitor/C/go"
+runner protect
+check "the word removed: the next firing is refused again" eval '[ "$(calls)" = 0 ] && [ "$(st protect .outcome)" = refused ]'
+
+echo "case 3: A and B need no word and never carry one; a failed pass is recorded as failed"
+runner tests
+check "A: one pass for tests with no word" eval '[ "$(calls)" = 1 ] && grep -qx "call cwd=$CO args=tests" "$STUB/calls" && [ "$(st tests .outcome)" = ok ]'
+printf 'exit-monitor protect\n' > "$C/exit-monitor/C/go"
+runner windows
+check "B: one pass for windows with no word, even while C has one" eval '[ "$(calls)" = 1 ] && grep -qx "call cwd=$CO args=windows" "$STUB/calls"'
+echo 1 > "$STUB/rc"; runner tests
+check "a pass that exits 1 is recorded as failed, with its exit code" eval '[ "$(st tests .outcome)" = failed ] && [ "$(st tests .exit_code)" = 1 ] && [ "$RC" = 1 ]'
+echo 3 > "$STUB/rc"; runner tests
+check "a task that refuses (exit 3) is recorded as refused" eval '[ "$(st tests .outcome)" = refused ] && [ "$(st tests .exit_code)" = 3 ]'
+rm -f "$STUB/rc"
+runner other
+check "the runner refuses any other account and runs nothing" eval '[ "$RC" = 2 ] && [ "$(calls)" = 0 ]'
+
+echo "case 4: one firing per account at a time"
+echo 3 > "$STUB/hold"
+( runner tests ) &
+held=$!
+sleep 1
+env -i HOME="$H" PATH="/usr/bin:/bin" STUB="$STUB" CLAUDE_CONFIG_DIR="$AH" /bin/bash "$C/exit-monitor-runner.sh" run-exit-monitor "$B/mise" "$CO" tests > "$TMP/second.out" 2>&1
+second=$?
+wait "$held"
+rm -f "$STUB/hold"
+check "a firing that finds the account's runner lock held runs nothing and exits 0" eval '[ "$second" = 0 ] && [ "$(calls)" = 1 ] && grep -q "still running" "$TMP/second.out"'
+
+echo "case 5: the status row"
+mkdir -p "$C/exit-monitor/C"
+rm -f "$C/exit-monitor/C/status.json" "$C/exit-monitor/C/notify-status.json"
+now=$(date +%s)
+jq -n --argjson e "$now" '{at_epoch: $e, account: "protect", outcome: "ok", exit_code: 0, note: "pass exit 0", commit: "abc"}' > "$C/watch/exit-monitor-protect.json"
+auto status
+check "ok, saying so, before the monitor has written its first status" eval 'grep -Eq "^  exit monitor protect +ok .*no pass status yet" "$TMP/auto.out"'
+jq -n '{account: "C", ok: true, longs: 2, covered: 2, uncovered: 0, oldest_uncovered_age: 0, healthy: true, unhealthy_reasons: []}' > "$C/exit-monitor/C/status.json"
+jq -n '{pending: 0, sent_now: 0, notified: null}' > "$C/exit-monitor/C/notify-status.json"
+auto status
+check "ok with the longs and their cover counted" eval 'grep -Eq "^  exit monitor protect +ok .*2 longs, 2 covered, 0 uncovered" "$TMP/auto.out"'
+jq '.uncovered = 1 | .covered = 1 | .oldest_uncovered_age = 300 | .healthy = false | .unhealthy_reasons = ["uncovered at or over alert age"]' "$C/exit-monitor/C/status.json" > "$TMP/s" && mv "$TMP/s" "$C/exit-monitor/C/status.json"
+jq -n '{pending: 1, sent_now: 0, notified: false}' > "$C/exit-monitor/C/notify-status.json"
+auto status
+check "UNCOVERED naming the monitor's reason and the carrier's pending count" eval 'grep -Eq "^  exit monitor protect +UNCOVERED .*uncovered at or over alert age.*1 pending" "$TMP/auto.out"'
+check "and status fails while it is" eval '! auto status'
+jq --argjson e "$now" '.outcome = "refused" | .note = "no_go: C runs nothing without the lead'"'"'s standing word"' "$C/watch/exit-monitor-protect.json" > "$TMP/s" && mv "$TMP/s" "$C/watch/exit-monitor-protect.json"
+auto status
+check "REFUSED while C has no word" eval 'grep -Eq "^  exit monitor protect +REFUSED .*no_go" "$TMP/auto.out"'
+jq --argjson e $((now - 4000)) '.at_epoch = $e | .outcome = "ok"' "$C/watch/exit-monitor-protect.json" > "$TMP/s" && mv "$TMP/s" "$C/watch/exit-monitor-protect.json"
+auto status
+check "STALE once no firing has written for longer than the agent's bound" eval 'grep -Eq "^  exit monitor protect +STALE " "$TMP/auto.out"'
+rm -f "$C/watch/exit-monitor-protect.json"
+auto status
+check "UNKNOWN with no readable runner status" eval 'grep -Eq "^  exit monitor protect +UNKNOWN " "$TMP/auto.out"'
+printf '# a changed copy\n' >> "$C/exit-monitor-runner.sh"
+jq -n --argjson e "$now" '{at_epoch: $e, account: "protect", outcome: "ok", exit_code: 0, note: "pass exit 0", commit: "abc"}' > "$C/watch/exit-monitor-protect.json"
+jq '.uncovered = 0 | .covered = 2 | .healthy = true | .unhealthy_reasons = []' "$C/exit-monitor/C/status.json" > "$TMP/s" && mv "$TMP/s" "$C/exit-monitor/C/status.json"
+auto status
+check "OUTDATED when the installed runner differs from this tree" eval 'grep -Eq "^  exit monitor protect +OUTDATED .*install-exit-monitor protect" "$TMP/auto.out"'
+
+echo "case 6: uninstall-exit-monitor removes the agent and keeps the records"
+auto uninstall-exit-monitor protect
+check "the plist is gone; the monitor's folder, its word file and the status are kept" eval '[ ! -e "$P" ] && [ -f "$C/exit-monitor/C/status.json" ] && [ -f "$C/watch/exit-monitor-protect.json" ]'
+auto status
+check "and status prints no exit monitor row again" eval '! grep -q "exit monitor" "$TMP/auto.out"'
+
+echo "test-exit-monitor-runner: $pass passed, $fail failed, 0 skipped"
+[ "$fail" = 0 ]

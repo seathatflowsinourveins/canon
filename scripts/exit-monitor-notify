@@ -19,8 +19,8 @@ set -uo pipefail
 for name in "${!ALPACA_@}"; do unset "$name"; done
 export PATH=/usr/bin:/bin:/usr/sbin:/sbin
 case "${1:-}" in
-  A|B) account="$1" ;;
-  *) echo 'exit-monitor-notify: expected account A or B; C is not authorized' >&2; exit 1 ;;
+  A|B|C) account="$1" ;;
+  *) echo 'exit-monitor-notify: expected account A, B or C' >&2; exit 1 ;;
 esac
 cfg="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
 w="$cfg/canon/exit-monitor/$account"
