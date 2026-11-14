@@ -522,6 +522,15 @@
       "sha": "ae1d0ff57b8bd4252da9ade7353523ac0ac73281",
       "track": "tag:9.2.0"
     },
+    "pytest-xdist": {
+      "default_branch": "master",
+      "default_sha": "1710344f19318014f1b9836b03c226fbbda620ac",
+      "ref": "refs/tags/v3.8.0",
+      "repo": "pytest-dev/pytest-xdist",
+      "resolved_at": "2026-11-14T19:10:46Z",
+      "sha": "1e3e4dc16523c8a8f6c67d95a950166420718c99",
+      "track": "tag:v3.8.0"
+    },
     "python": {
       "default_branch": "main",
       "default_sha": "9d05428b29508873fb26832eea5d17e0e8de60df",

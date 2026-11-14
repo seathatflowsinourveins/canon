@@ -448,6 +448,26 @@
       "pypi": "pytest"
     },
     {
+      "id": "pytest-xdist",
+      "field": "testing",
+      "repo": "pytest-dev/pytest-xdist",
+      "track": "tag:v3.8.0",
+      "role": "tool",
+      "license": "MIT",
+      "why": "Runs pytest cases on worker processes inside each hosted part and on this Mac, so a part ends in minutes and a full local run is practical. A dev-group dependency pinned exactly. At pytest 9.2.0 its --dist loadgroup no longer groups (the node-id rewrite it relies on is ignored; fixed upstream in #1388, in no release), so the serial group is a pytest marker run apart with -n 0, never an xdist_group. ADR 0162.",
+      "evidence": [
+        "https://pypi.org/pypi/pytest-xdist/json",
+        "https://raw.githubusercontent.com/pytest-dev/pytest-xdist/v3.8.0/LICENSE",
+        "https://raw.githubusercontent.com/pytest-dev/pytest-xdist/v3.8.0/src/xdist/remote.py",
+        "https://raw.githubusercontent.com/pytest-dev/pytest-xdist/v3.8.0/src/xdist/plugin.py",
+        "https://raw.githubusercontent.com/pytest-dev/pytest-xdist/v3.8.0/docs/known-limitations.rst",
+        "https://raw.githubusercontent.com/pytest-dev/pytest/9.2.0/doc/en/changelog.rst",
+        "https://github.com/pytest-dev/pytest-xdist/pull/1388"
+      ],
+      "adr": "0162",
+      "pypi": "pytest-xdist"
+    },
+    {
       "id": "ruff",
       "field": "quality",
       "repo": "astral-sh/ruff",
