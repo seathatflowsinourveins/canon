@@ -538,6 +538,24 @@ def test_a_cut_the_venue_keeps_refusing_is_asked_at_most_once_a_second():
     assert 55 <= len(strategy.canceled) <= 61, len(strategy.canceled)
 
 
+def test_a_chase_does_not_cancel_inside_a_refused_cuts_floor():
+    """The cut's refusal and a lower counted quote are judged in one step. The cut waits its
+    floor; the chase must not cancel the same oversized leg in that step by another name."""
+    strategy = c.counted()
+    c.first_leg(strategy)
+    step(strategy)
+    grow(strategy, 5)
+    strategy.test_clock.set_time(h.T0 + 3 * h.SECOND)
+    step(strategy)
+    assert len(strategy.canceled) == 1 and c.row(strategy).row == "PCO"
+    strategy.deliver("CancelRejected", ts_event=h.T0 + 10 * h.SECOND)
+    strategy.observe("9.70", h.T0 + 10 * h.SECOND)
+    assert len(strategy.canceled) == 1, "nothing asked at the refusal's own time"
+    assert c.row(strategy).row == "WK", c.row(strategy)
+    strategy.observe("9.70", h.T0 + 11 * h.SECOND + h.SECOND // 2)
+    assert len(strategy.canceled) == 2 and c.row(strategy).row == "PCO", "the cut, after its floor"
+
+
 def test_resends_and_chase_reprices_have_separate_record_counts():
     strategy = c.counted()
     c.first_leg(strategy)

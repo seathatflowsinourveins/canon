@@ -15,6 +15,8 @@ from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from canon_trading import symbol_hold
 from tests import test_owner_protector as h
 from tests import test_owner_protector_sale_table as c
@@ -355,16 +357,62 @@ def test_each_refused_cancel_after_the_first_is_counted_in_a_line(tmp_path: Path
     assert "asked again after 5 s" in cancel_alerts(strategy)[0], cancel_alerts(strategy)
 
 
-def test_a_stored_order_event_is_judged_before_the_standing_stop_asks(tmp_path: Path) -> None:
-    """The stop that still stands is raised only in a step with no stored order event of the
-    instrument: an Updated stored while the wait ran is judged in the resting row, where it changes
-    nothing, and is never read as a second refusal of a cancel asked in the same step."""
+def test_a_stored_update_is_not_read_as_the_refusal_of_a_cancel_asked_in_its_step(
+    tmp_path: Path,
+) -> None:
+    """The stop is judged before the step's stored order events. An Updated stored before the step
+    cannot answer a cancel the step itself asks: it is not judged as that cancel's refusal, and
+    it does not keep the stop that still stands from asking."""
     strategy = c.counted(symbol_holds_dir=tmp_path)
     leg, ours = held_with_a_refused_cancel(strategy, tmp_path)
     strategy.deliver("Updated", leg=ours, ts_event=h.T0 + 11 * h.SECOND)
     step(strategy, 11)
     slot = strategy.stopped_sales.get(h.AAA) or strategy.slots[h.AAA]
-    assert slot.cancel_refusals == 1, "the stored update is not a refusal"
-    assert strategy.canceled == [leg.client_order_id] and c.row(strategy).row == "TW"
-    step(strategy, 12)
     assert strategy.canceled == [leg.client_order_id] * 2 and c.row(strategy).row == "PCT"
+    assert slot.cancel_refusals == 1, "the stored update is not a refusal"
+
+
+@pytest.mark.parametrize("released", [False, True])
+def test_an_update_stored_at_every_step_does_not_starve_the_standing_stop(
+    tmp_path: Path, released: bool
+) -> None:
+    """A venue update waiting at every step must not keep a refused cancel from being asked again
+    when its wait has passed, under the hold and through a release that waits for it."""
+    strategy = c.counted(symbol_holds_dir=tmp_path)
+    leg, ours = held_with_a_refused_cancel(strategy, tmp_path)
+    if released:
+        symbol_hold.remove_hold(tmp_path, "AAA")
+    for second in range(6, 11):
+        strategy.deliver("Updated", leg=ours, ts_event=h.T0 + second * h.SECOND)
+        step(strategy, second)
+    assert strategy.canceled == [leg.client_order_id] * 2, "asked again five seconds after"
+    assert c.row(strategy).row == "PCT", c.row(strategy)
+
+
+@pytest.mark.parametrize("stored", ["Updated", "Accepted"])
+def test_an_event_stored_before_the_first_stop_is_not_its_cancels_refusal(
+    tmp_path: Path, stored: str
+) -> None:
+    """An update or an acknowledgement already stored when the owner's hold arrives is judged
+    after the stop's cancel in the same step. It is no answer to that cancel: the row waits for
+    the real one, and the real refusal starts the wait."""
+    strategy = c.counted(symbol_holds_dir=tmp_path)
+    c.first_leg(strategy)
+    (leg,) = strategy.sent
+    ours = strategy.cache.order(leg.client_order_id)
+    if stored == "Accepted":
+        strategy.deliver("Filled", quantity=1, leg=ours)
+        step(strategy, 2)
+    strategy.deliver(stored, leg=ours, ts_event=h.T0 + 3 * h.SECOND)
+    symbol_hold.write_hold(tmp_path, "AAA")
+    step(strategy, 3)
+    slot = strategy.stopped_sales.get(h.AAA) or strategy.slots[h.AAA]
+    assert strategy.canceled == [leg.client_order_id] and c.row(strategy).row == "PCT"
+    assert slot.cancel_refusals == 0 and slot.cancel_refused_ns is None
+    strategy.deliver("CancelRejected", leg=ours, ts_event=h.T0 + 10 * h.SECOND)
+    step(strategy, 10)
+    assert c.row(strategy).row == "TW" and slot.cancel_refused_ns == h.T0 + 10 * h.SECOND
+    step(strategy, 11)
+    assert strategy.canceled == [leg.client_order_id], "the real refusal's wait runs"
+    step(strategy, 15)
+    assert strategy.canceled == [leg.client_order_id] * 2

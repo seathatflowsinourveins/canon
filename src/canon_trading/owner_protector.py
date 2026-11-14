@@ -278,11 +278,14 @@ for each cause (the stop, the holding's end, our sale larger than the long) is n
 wait another cause started; a part fill and an acknowledgement at last ask what their row
 already owes. Each refusal is counted in a line with its next wait; its ALERT is written once per
 leg. While a stopped holding's sale is open the owner's hold raises the stop at every step
-(TW x ST) in which no order event of the instrument is stored, so the ask comes whether or not
-the holding ends. UNPACED where a sale known to be working is larger than a live or frozen
+(TW x ST), so the ask comes whether or not the holding ends. The stop, the end and the cut are
+judged before a step's stored order events, so an acknowledgement or an update stored before the
+step is never read as the answer to a cancel that step asks: it is replayed on its leg and judged
+in no row. UNPACED where a sale known to be working is larger than a live or frozen
 holding (the cut for size): an oversell cannot wait. It has a floor: a cut the venue refused is
 asked again no sooner than CUT_FLOOR_SECS after that refusal, at most one cancel a second for
-the holding, so a refusal that persists never becomes a cancel for each quote. Named limits: a
+the holding, so a refusal that persists never becomes a cancel for each quote; the chase asks
+no cancel of that leg inside the floor either. Named limits: a
 refused cut writes its ALERT at each refusal; the floor bounds one holding, not the account's
 sum; at a whole-node stop no step runs again, so a cancel refused there is not asked again and
 the next start finds the sell as cover. UNVERIFIED on the engine and on paper: neither can be
@@ -2013,7 +2016,7 @@ class OwnerProtector(Strategy):
             for instrument_id, stopped in list(self.stopped_sales.items()):
                 try:
                     standing = stopped.sale_state is not None and stopped.sale_state.row == "TW"
-                    owed = self._standing_stop(instrument_id, stopped) if standing else []
+                    owed = ["ST"] if standing else []
                     self._sale_step(instrument_id, [*owed, "NQ"])
                 except Exception as exc:  # noqa: BLE001 - preserve the base's per-holding isolation.
                     self._say(
@@ -2689,12 +2692,6 @@ class OwnerProtector(Strategy):
             return False
         return True
 
-    def _standing_stop(self, instrument_id: InstrumentId, slot: Holding) -> list[str]:
-        """The stop raised again for a stopped holding's open sale (TW), only in a step with no
-        stored order event of the instrument: ST is judged before order events, and one judged
-        after a cancel asked in the same step would be read as that cancel's refusal."""
-        return [] if self._sale_events.get(instrument_id) else ["ST"]
-
     def _hold_counted(
         self, instrument_id: InstrumentId, slot: Holding, quote: QuoteTick | None
     ) -> bool:
@@ -2717,7 +2714,7 @@ class OwnerProtector(Strategy):
             if row == "TW":
                 # The stop still stands with our sale open: the table asks its cancel again when
                 # the sale can take one and the pace allows (TW x ST).
-                self._sale_step(instrument_id, [*self._standing_stop(instrument_id, slot), *timer])
+                self._sale_step(instrument_id, ["ST", *timer])
             elif row not in HOLD_SETTLED_ROWS:
                 self._sale_step(instrument_id, ["ST"])
             else:
@@ -2730,7 +2727,7 @@ class OwnerProtector(Strategy):
             return False
         # Until the release is applied the stop's own work is still owed: in TW our sale is open
         # and its cancel is asked again when it can be (TW x ST), or the release would wait for ever.
-        owed = self._standing_stop(instrument_id, slot) if row == "TW" else []
+        owed = ["ST"] if row == "TW" else []
         self._sale_step(instrument_id, [*owed, "RL", *timer])
         row = slot.sale_state.row
         if row in SALE_STOPPED_ROWS:
@@ -2951,6 +2948,12 @@ class OwnerProtector(Strategy):
                 sale.cancel_ns is None
                 or now - sale.cancel_ns >= protect.PLANNER.chase_secs * SECOND_NS
             )
+            # A cancel of this leg the venue just refused: the chase asks no cancel of it inside
+            # the cut's floor either, or it would be the refused cut by another name.
+            and (
+                slot.cancel_refused_ns is None
+                or now - slot.cancel_refused_ns >= CUT_FLOOR_SECS * SECOND_NS
+            )
             and exit_price(bid, protect.PLANNER.exit_ticks, sale.floor) < order.price.as_decimal()
         )
 
@@ -3158,6 +3161,8 @@ class OwnerProtector(Strategy):
         if derive_mismatch:
             entries.append(("MO", None))
         cell = f"{slot.sale_state.row} x {events[-1] if events else 'step'}"
+        # The legs whose cancel this step has asked: a stored event of theirs is older than it.
+        asked_in_step: set[Any] = set()
         try:
             for tagged in sale_table.order_step(
                 sale_table.Event(code, {str(index): True})
@@ -3183,6 +3188,21 @@ class OwnerProtector(Strategy):
                     )
                     if type(item).__name__ == "OrderFilled":
                         event_held -= item.last_qty.as_decimal()
+                    replayed = self._sale_orders.get(item.client_order_id)
+                    if (
+                        code in {"oACC", "oUPD"}
+                        and item.client_order_id in asked_in_step
+                        and (replayed is None or replayed.status != OrderStatus.FILLED)
+                    ):
+                        # Stored before this step, so before the cancel this step asked for its
+                        # leg (the stop, the end and the cut are judged first): it cannot be
+                        # that cancel's answer, and a pending cancel's row would read it as its
+                        # refusal. It is replayed on the leg and judged in no row.
+                        self._say(
+                            f"{instrument_id}: sale event {code} was stored before this step "
+                            "asked its leg's cancel: no answer to it"
+                        )
+                        continue
                 if code == "MO" and derive_mismatch:
                     current = self._sale_orders.get(slot.protect_id)
                     if current is None:
@@ -3357,8 +3377,10 @@ class OwnerProtector(Strategy):
                         action_reason,
                     )
                     cause = sale_cancel_cause(before.row, event.code)
-                    if action == sale_table.Action.CANCEL and cause is not None:
-                        slot.cancel_asked.add(cause)
+                    if action == sale_table.Action.CANCEL:
+                        asked_in_step.add(slot.protect_id)
+                        if cause is not None:
+                            slot.cancel_asked.add(cause)
                     if action == sale_table.Action.ALERT:
                         if "not refusal_told" in terms:
                             slot.refusal_told = True
