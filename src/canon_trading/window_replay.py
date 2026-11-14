@@ -3,7 +3,8 @@
 Contract: nautilus-trader v2.0.0rc8 at d53849b216e2, backtesting/apis-and-runs.md:22-95
 and backtest/__init__.pyi:413-537: add_data, run(streaming=True), clear_data, end and
 the three engine reports. trade-execution.md:52-75 and fill-prices-and-matching.md:165-206
-define the touch/tape presets. Composition is mover_window.mover_universe_parts and
+define the touch/tape presets; tape is alpaca-paper-sim-v1's, queue_position
+included (trade-execution.md:114-118). Composition is mover_window.mover_universe_parts and
 window_rank; reference_reader/inline_reads are MoversRankActor's offline contract.
 
 Shutdown: the pinned docs/concepts/strategies.md:768-774 warn that a managed stop requested
@@ -24,6 +25,8 @@ entry_limit), and entry_contexts in the window record's summary shape. reference
 maps each universe symbol to {close, session}; alternatively reference_root holds daily
 bars. Optional splits are alpaca-py's ForwardSplit/ReverseSplit payloads with their
 corporate_action_type. All roots are local and already exist; this module fetches nothing.
+Optional latency ({insert_ns, update_ns, delete_ns}, whole nanoseconds) gives the venue
+send_latency.SendLatency, named in the report's venue; absent, the venue has no latency model.
 
 The bars root defines the universe through its equity definitions. It also supplies the
 registered entry arm's prior sessions and current-day prefix: summary counts are checked,
@@ -33,6 +36,19 @@ proof of missing data. Quotes from overlapping roots are deduplicated as one sta
 multiset; roots that each hold a quote the other lacks at one stamp are refused. Universe bars
 and roster ticks are queried in <=60-minute batches on ts_init, including every item at a
 batch boundary exactly once.
+
+Optional rank_file replaces the ranking actor with rank_record.RecordedRankings. Its snapshot,
+day, actor settings, references, baselines and commit must match. RecordedRankings publishes
+from 04:00 as the actor does, so the roster and every name a generation published up to the
+window's end lists get definitions and minute bars from 04:00: the Mover watches, warms and
+drops exactly those names in either mode (its _watch reads cache.instrument, its slots
+cache.bars). Ticks are the roster's alone in both modes. The roster is refused on the same
+grounds in both: undefined, without an entry context, or without a usable reference (the
+recording's unreferenced list). The actor's per-tick records reach the Mover's
+ranking_records at their engine times. Without rank_file the full actor remains the default.
+rank_signals is an in-engine bus observation in both modes, retaining exact values, ts_event
+and publication times for equivalence checks. The report counts loaded instruments; only a
+recorded replay lists them.
 
 No live client or node is constructed. Both presets ingest trades, because Mover builds
 its INTERNAL entry bars from them; only tape uses the prints as matching liquidity.
@@ -58,6 +74,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import difflib
 import hashlib
 import json
 import re
@@ -76,8 +93,6 @@ from typing import TYPE_CHECKING
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from alpaca.data.models.corporate_actions import ForwardSplit
-from alpaca.data.models.corporate_actions import ReverseSplit
 from canon_alpaca.constants import VENUE
 from nautilus_trader.backtest import BacktestEngine
 from nautilus_trader.common import FileWriterConfig
@@ -95,6 +110,8 @@ from nautilus_trader.risk import RiskEngineConfig
 
 from . import early_entry_study as study
 from . import movers_rank
+from . import rank_record
+from . import send_latency
 from . import session_window
 from .backtest import FEE_RATES
 from .backtest import VENUE_SETTINGS
@@ -104,10 +121,7 @@ from .mover_window import OUTER_BOUND_MULTIPLE
 from .mover_window import mover_context_feeds
 from .mover_window import mover_universe_parts
 from .mover_window import part_slots
-from .mover_window import window_rank
 from .movers_rank_actor import REFERENCE_LOOKBACK_DAYS
-from .movers_rank_actor import MoversRankActorConfig
-from .movers_rank_actor import ReferenceRead
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -178,10 +192,12 @@ def _checked_engine(
         check()
 
 
-def venue_preset(fill_arm: str) -> dict[str, Any]:
-    """The complete preset, printable without native enum objects."""
+def venue_preset(fill_arm: str, latency: Mapping[str, int] | None = None) -> dict[str, Any]:
+    """The complete preset, printable without native enum objects. A spec's optional latency
+    (send_latency's three delays) is named only when given; without it the venue has none."""
     if fill_arm not in ("touch", "tape"):
         raise ValueError("fill_arm must be touch or tape")
+    described = send_latency.describe(latency)
     return {
         "name": str(VENUE),
         "preset": fill_arm,
@@ -190,22 +206,36 @@ def venue_preset(fill_arm: str) -> dict[str, Any]:
         "bar_execution": False,
         "trade_execution": fill_arm == "tape",
         "liquidity_consumption": fill_arm == "tape",
+        "queue_position": fill_arm == "tape",
+        **({} if described is None else {"latency": described}),
     }
 
 
-def add_replay_venue(engine: BacktestEngine, fill_arm: str, starting_balance: str) -> None:
-    """Apply the same preset that the report names, with the existing zero-fee rates."""
-    preset = venue_preset(fill_arm)
+def add_replay_venue(
+    engine: BacktestEngine,
+    fill_arm: str,
+    starting_balance: str,
+    latency: Mapping[str, int] | None = None,
+) -> None:
+    """Apply the same preset that the report names, with the existing zero-fee rates, and the
+    spec's latency counted from each send (send_latency), or none."""
+    preset = venue_preset(fill_arm, latency)
     engine.add_venue(
         VENUE,
         starting_balances=account_balances([starting_balance]),
         fee_model=MakerTakerFeeModel(
             maker_rate=FEE_RATES["maker_rate"], taker_rate=FEE_RATES["taker_rate"]
         ),
+        latency_model=send_latency.model(latency),
         **VENUE_SETTINGS,
         **{
             key: preset[key]
-            for key in ("bar_execution", "trade_execution", "liquidity_consumption")
+            for key in (
+                "bar_execution",
+                "trade_execution",
+                "liquidity_consumption",
+                "queue_position",
+            )
         },
     )
 
@@ -520,15 +550,27 @@ def _run_replay(spec: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError("window bounds must be ordered within one regular session")
     if not start < wind_down < end or end - start > timedelta(minutes=60):
         raise ValueError("a window lasts at most 60 minutes and includes its wind-down")
-    if end - wind_down < timedelta(milliseconds=EXIT_INTERVAL_MS):
+    stray = sorted(
+        key
+        for key in spec
+        if key != "latency"
+        and ("latenc" in key.lower() or difflib.get_close_matches(key.lower(), ["latency"]))
+    )
+    if stray:
+        raise ValueError(f"unknown latency key(s) {stray}; the spec's key is latency")
+    delay = send_latency.longest(spec.get("latency"))
+    if end - wind_down < timedelta(milliseconds=EXIT_INTERVAL_MS) + timedelta(
+        microseconds=delay // 1000
+    ):
         raise ValueError(
             "wind_down_at must be at least one market-exit interval "
-            f"({EXIT_INTERVAL_MS} ms) before window_end, where the replay stops the Mover"
+            f"({EXIT_INTERVAL_MS} ms) and the venue's longest latency ({delay} ns) before "
+            "window_end, where the replay stops the Mover"
         )
     arm = spec["trail_arm"]
     if arm not in session_window.TRAIL_ARMS:
         raise ValueError("trail_arm must be F2, OWN1 or OWN3")
-    preset = venue_preset(spec["fill_arm"])
+    preset = venue_preset(spec["fill_arm"], spec.get("latency"))
     bars_root = _local(spec["bars_root"], directory=True)
     catalog = ParquetDataCatalog(str(bars_root))
     quote_catalogs = [
@@ -537,41 +579,33 @@ def _run_replay(spec: Mapping[str, Any]) -> dict[str, Any]:
     if not quote_catalogs:
         raise ValueError("quotes_roots needs at least one catalog")
     trades = ParquetDataCatalog(str(_local(spec["trades_root"], directory=True)))
-    baseline_path = _local(spec["baseline_path"], directory=False)
-    baseline = movers_rank.read_baselines(baseline_path, day)
-    if baseline.problem:
-        raise ValueError(f"baseline not usable: {baseline.problem}")
-    instruments = [
-        i for i in catalog.instruments() if isinstance(i, Equity) and i.id.venue == VENUE
-    ]
-    if not instruments:
-        raise ValueError("the bars catalog holds no ALPACA equity definitions")
-    universe = {i.id for i in instruments}
+    recorded = rank_record.read_record(spec["rank_file"], spec) if "rank_file" in spec else None
     prices = {
         InstrumentId.from_str(f"{row['symbol']}.{VENUE}"): Decimal(str(row["entry_limit"]))
         for row in spec["roster"]
     }
+    listed: list[str] = []
+    if recorded is None:
+        found = catalog.instruments()
+    else:
+        listed = rank_record.listed_names(recorded, _ns(end))
+        found = catalog.instruments(instrument_ids=sorted({*listed, *map(str, prices)}))
+    instruments = [i for i in found if isinstance(i, Equity) and i.id.venue == VENUE]
+    if not instruments:
+        raise ValueError("the bars catalog holds no ALPACA equity definitions")
+    universe = {i.id for i in instruments}
     if len(prices) != len(spec["roster"]) or not prices or not prices.keys() <= universe:
         raise ValueError("the roster must be distinct equities defined in the bars catalog")
-    references, unreferenced = _references(spec, instruments, day, set(prices))
+    if not set(listed) <= {str(i) for i in universe}:
+        raise ValueError("rank file lists equities not defined in the bars snapshot")
     contexts = _contexts(spec, catalog, prices, start)
-    actions = tuple(
-        (
-            ForwardSplit if row["corporate_action_type"] == "forward_splits" else ReverseSplit
-        ).model_validate(row)
-        for row in spec.get("splits", ())
-    )
-    splits = movers_rank.SplitRead(
-        start=min(ref.session for ref in references.values()), end=day, actions=actions
-    )
+    if recorded is not None:
+        # The full replay's _references refuses a roster name without a usable reference; the
+        # recording names every such name of the snapshot.
+        for instrument in prices:
+            if instrument.symbol.value in recorded["unreferenced"]:
+                raise ValueError(f"no usable prior-session reference for {instrument}")
     opened = datetime.combine(day, time(4), NY)
-
-    def read_references(symbols: Sequence[str], cutoff: date, session: date) -> ReferenceRead:
-        if cutoff != day or session != day:
-            raise ValueError("the reference reader is bounded to the spec's trade date")
-        return ReferenceRead(
-            cutoff, {s: references[s] for s in symbols if s in references}, splits, _ns(opened)
-        )
 
     notional = Decimal(str(spec["entry_notional"]))
     trail = dict(session_window.TRAIL_ARMS[arm])
@@ -591,17 +625,26 @@ def _run_replay(spec: Mapping[str, Any]) -> dict[str, Any]:
         trail_cap=trail.pop("trail_cap"),
         trail_rows=trail,
     )
-    ranking = window_rank(
-        MoversRankActorConfig(
-            feed="sip",
-            order_cap=float(notional),
-            baseline_path=str(baseline_path),
-            reference_reader=read_references,
-            inline_reads=True,
-        ),
-        strategy.ranking_records,
-    )
-    evidence: dict[str, Any] = {"bars_read": 0, "quotes_read": 0, "trades_read": 0, "missing": []}
+    if recorded is None:
+        ranking, unreferenced = rank_record.make_actor(
+            spec, instruments, set(prices), strategy.ranking_records
+        )
+    else:
+        ranking = rank_record.RecordedRankings()
+        ranking.generations = [r for r in recorded["generations"] if r["published_ns"] <= _ns(end)]
+        ranking.records = [r for r in recorded["records"] if r["latency_ns"]["handled"] <= _ns(end)]
+        ranking.target = strategy.ranking_records
+        unreferenced = recorded["unreferenced"]
+    subscriber = rank_record.RankSubscriber()
+    evidence: dict[str, Any] = {
+        "bars_read": 0,
+        "quotes_read": 0,
+        "trades_read": 0,
+        "missing": [],
+        "instruments_loaded": len(instruments),
+    }
+    if recorded is not None:
+        evidence["instruments"] = sorted(str(i.id) for i in instruments)
     engine_errors: list[dict[str, Any]] = []
     batches = []
     with _checked_engine(
@@ -611,12 +654,13 @@ def _run_replay(spec: Mapping[str, Any]) -> dict[str, Any]:
             max_notional_per_order={str(i): str(notional * OUTER_BOUND_MULTIPLE) for i in prices}
         ),
     ) as (engine, check_log):
-        add_replay_venue(engine, spec["fill_arm"], spec["starting_balance"])
+        add_replay_venue(engine, spec["fill_arm"], spec["starting_balance"], spec.get("latency"))
         for instrument in instruments:
             engine.add_instrument(instrument)
         engine.add_strategy(strategy)
         for actor in mover_context_feeds(strategy, "sip"):
             engine.add_actor(actor)
+        engine.add_actor(subscriber)
         engine.add_actor(ranking)
         for cap in caps:
             engine.add_strategy(cap)
@@ -689,7 +733,10 @@ def _run_replay(spec: Mapping[str, Any]) -> dict[str, Any]:
                 engine.clear_data()
             low = high + 1
         if first:
-            raise ValueError("the catalog has no data in the replay range")
+            if recorded is None:
+                raise ValueError("the catalog has no data in the replay range")
+            engine.run(start=_ns(opened), end=last, streaming=True)
+            check_log()
         engine.end()
         check_log()
         run = strategy.record()
@@ -710,6 +757,8 @@ def _run_replay(spec: Mapping[str, Any]) -> dict[str, Any]:
                 for row in run["ranking_records"]
                 if row.get("published")
             ],
+            "rank_signals": subscriber.generations,
+            "rank_file": str(spec["rank_file"]) if recorded is not None else None,
             "catalog": evidence,
             "batches": batches,
             "engine_errors": engine_errors,
@@ -736,8 +785,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--spec", required=True, type=Path)
     parser.add_argument("--report", required=True, type=Path)
+    parser.add_argument("--rank-file", type=Path)
+    parser.add_argument("--bars-root", type=Path)
     args = parser.parse_args(argv)
-    report = run_replay(json.loads(args.spec.read_text()))
+    spec = json.loads(args.spec.read_text())
+    if args.rank_file is not None:
+        spec["rank_file"] = str(args.rank_file)
+    if args.bars_root is not None:
+        spec["bars_root"] = str(args.bars_root)
+    report = run_replay(spec)
     args.report.write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
     return 0
 

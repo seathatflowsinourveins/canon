@@ -345,7 +345,8 @@ def test_p6_late_fill_with_a_remake_waiting_for_a_quote_still_finishes_its_recor
     strategy.observe("9.80", at)
     terminal(first, at)
     strategy.cached.latest = None
-    strategy.venue_quotes.clear()  # U-h prices from the venue clock; both sources are absent.
+    strategy.venue_quotes.clear()
+    strategy.replacement_quotes.clear()  # F8 retains usable quotes beyond the latest arrival.
     strategy._on_step(cast(Any, None))
     assert len(strategy.sent) == 1
     fill_at = at + h.SECOND
@@ -441,12 +442,14 @@ def test_expired_sale_with_no_quote_names_the_stall_on_every_step() -> None:
     strategy, first = released()
     terminal(first, RELEASE + h.SECOND, expired=True)
     strategy.cached.latest = None
-    strategy.venue_quotes.clear()  # Removing a cache arrival alone no longer removes the quote.
+    strategy.venue_quotes.clear()
+    strategy.replacement_quotes.clear()  # This case requires every quote source to be absent.
     for _ in range(2):
         before = len(strategy.said)
         strategy._on_step(cast(Any, None))
         assert len(strategy.sent) == 1
-        assert any("sale" in line and "quote" in line for line in strategy.said[before:])
+        assert any("sale stalled" in line and "quote" in line for line in strategy.said[before:])
+        assert strategy._holding_state(h.AAA, strategy.slots[h.AAA])[0] == "frozen"
 
 
 def test_real_core_chases_a_gapped_release_then_fills_the_external_long() -> None:
@@ -744,7 +747,12 @@ def test_a_carried_level_far_above_the_bid_chases_to_the_chase_price_within_one_
     strategy.on_order_released(event)
     accepted(order, at)
     strategy.observe("0.99", at)
-    floor = chase_floor(order.price.as_decimal(), ROWS.chase_cap)
+    # The floor's cap is the larger of the holding's own plan's and the registered row's.
+    distance = strategy.slots[h.AAA].distance
+    assert distance is not None
+    plan_cap = distance.plan.chase_cap
+    assert plan_cap > ROWS.chase_cap, "the carried plan here is wider than the row"
+    floor = chase_floor(order.price.as_decimal(), max(plan_cap, ROWS.chase_cap))
     strategy.observe("0.99", at + CHASE + h.SECOND)
     assert strategy.canceled == [order.client_order_id], "the released sale did not chase"
     terminal(order, at + CHASE + h.SECOND)

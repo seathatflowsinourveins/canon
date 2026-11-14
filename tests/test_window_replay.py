@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import os
+import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -11,6 +14,8 @@ from datetime import UTC
 from datetime import datetime
 from datetime import timedelta
 from decimal import Decimal
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -42,6 +47,9 @@ OPEN = START.replace(hour=4, minute=0)
 END = START + timedelta(minutes=20)
 MINUTE = 60_000_000_000
 SECOND = 1_000_000_000
+HANDLER_ERROR = (
+    r"Python on_\w+ failed|Traceback \(most recent call last\)|mutably borrowed|handler .*failed"
+)
 OFFLINE_GUARDS = """
 import os
 import socket
@@ -237,7 +245,7 @@ class OwnedLimit(Strategy):
         self.released.append(event.client_order_id)
 
 
-@pytest.mark.parametrize("arm,expected", [("touch", [10]), ("tape", [3, 3, 3, 1])])
+@pytest.mark.parametrize("arm,expected", [("touch", [10]), ("tape", [1, 3, 3, 3])])
 def test_venue_presets_release_owned_limit_at_touch_or_print_size(alpaca_bars, arm, expected):
     from canon_trading.window_replay import add_replay_venue
     from canon_trading.window_replay import venue_preset
@@ -254,6 +262,7 @@ def test_venue_presets_release_owned_limit_at_touch_or_print_size(alpaca_bars, a
         "bar_execution": False,
         "trade_execution": arm == "tape",
         "liquidity_consumption": arm == "tape",
+        "queue_position": arm == "tape",
     }
     instrument = alpaca_bars.equity("LLL")
     engine = BacktestEngine(BacktestEngineConfig(logging=LoggerConfig(bypass_logging=True)))
@@ -267,11 +276,16 @@ def test_venue_presets_release_owned_limit_at_touch_or_print_size(alpaca_bars, a
         [
             quote(instrument, at, 9.99, 10.01),
             quote(instrument, at + SECOND, 9.99, 10.01),
+            # The ask reaches the sell's limit with 2 displayed ahead of it. Under tape's queue
+            # tracking an L1 limit behind the best price is not filled until the price reaches it
+            # (matching_engine/mod.rs:645-658 at d53849b216e2), and then only once the prints
+            # have taken the quantity displayed ahead (mod.rs:700-828): 1 of the first print.
+            quote(instrument, at + SECOND + SECOND // 2, 10.99, 11.00, 2),
             trade(instrument, at + 2 * SECOND, 11, 3),
             trade(instrument, at + 3 * SECOND, 11, 3),
             trade(instrument, at + 4 * SECOND, 11, 3),
             # A later minute supplies enough quoted liquidity to finish. During the print
-            # minute tape can fill only nine of the ten shares. Touch waits for this quote
+            # minute tape can fill only seven of the ten shares. Touch waits for this quote
             # and fills the whole sell; neither preset is a trade-only venue.
             quote(instrument, at + 61 * SECOND, 11.01, 11.02, 10),
         ]
@@ -286,11 +300,140 @@ def test_venue_presets_release_owned_limit_at_touch_or_print_size(alpaca_bars, a
         ]
         assert sizes == expected
         if arm == "tape":
-            assert sum(sizes[:-1]) == 9
+            assert sum(sizes[:-1]) == 7
             assert all(size <= 3 for size in sizes[:-1])
         assert engine.portfolio.net_position(instrument.id) == Decimal(10 - sum(expected))
     finally:
         engine.dispose()
+
+
+@pytest.mark.parametrize("arm", ["touch", "tape"])
+def test_the_tape_preset_tracks_queue_position_as_the_profile_registers(monkeypatch, arm):
+    """alpaca-paper-sim-v1 sets queue_position with trade_execution (trade-execution.md:114-118 at
+    d53849b216e2; add_venue's default is False, backtest/__init__.pyi:473), as tape_replay's venue
+    does. The window replay's tape preset passes it, and its report names it; touch leaves it off."""
+    from canon_trading import window_replay
+
+    seen = []
+    monkeypatch.setattr(
+        window_replay.BacktestEngine, "add_venue", lambda self, *a, **kw: seen.append(kw)
+    )
+    engine = BacktestEngine(BacktestEngineConfig(logging=LoggerConfig(bypass_logging=True)))
+    try:
+        window_replay.add_replay_venue(engine, arm, "5000 USD")
+    finally:
+        engine.dispose()
+    assert seen[0]["queue_position"] is (arm == "tape")
+    assert window_replay.venue_preset(arm)["queue_position"] is (arm == "tape")
+
+
+MS = 1_000_000
+LATENCY = {"insert_ns": 5 * MS, "update_ns": 7 * MS, "delete_ns": 7 * MS}
+
+
+def _event_times(order) -> dict[str, int]:
+    """Each event type's first time, so a later partial fill never stands for the first."""
+    times: dict[str, int] = {}
+    for event in order.events():
+        times.setdefault(type(event).__name__, event.ts_event)
+    return times
+
+
+def _latency_run(alpaca_bars, latency) -> tuple[dict[str, int], dict[str, int]]:
+    """OwnedLimit's market BUY (a direct submit) and its emulated SELL, sent at one second with its
+    trigger (bid 10) not yet touched and released when the bid falls to it a second later, on a venue
+    with the given latency. A quote of the same instrument follows every send by 20 ms, so each
+    command settles on its own instrument's data, not on a later timer step (exchange.rs:99-107)."""
+    from canon_trading.window_replay import add_replay_venue
+
+    instrument = alpaca_bars.equity("LLL")
+    engine = BacktestEngine(BacktestEngineConfig(logging=LoggerConfig(bypass_logging=True)))
+    add_replay_venue(engine, "touch", "5000 USD", latency=latency)
+    engine.add_instrument(instrument)
+    strategy = OwnedLimit(StrategyConfig())
+    strategy.instrument = instrument
+    engine.add_strategy(strategy)
+    at = ns(START)
+    engine.add_data(
+        [
+            quote(instrument, at, 9.99, 10.01),
+            quote(instrument, at + 20 * MS, 9.99, 10.01),
+            quote(instrument, at + SECOND, 10.50, 10.51),
+            quote(instrument, at + SECOND + 20 * MS, 10.50, 10.51),
+            quote(instrument, at + 2 * SECOND, 9.99, 10.01),
+            quote(instrument, at + 2 * SECOND + 20 * MS, 9.99, 10.01),
+        ]
+    )
+    try:
+        engine.run()
+        assert strategy.sell is not None
+        assert strategy.released == [strategy.sell.client_order_id]
+        orders = {order.side: order for order in engine.cache.orders()}
+        return _event_times(orders[OrderSide.BUY]), _event_times(orders[OrderSide.SELL])
+    finally:
+        engine.dispose()
+
+
+def _bounds(**extra) -> dict[str, Any]:
+    return {
+        "trade_date": START.date().isoformat(),
+        "window_start": START.isoformat(),
+        "window_end": END.isoformat(),
+        "wind_down_at": (END - timedelta(seconds=2)).isoformat(),
+        "trail_arm": "OWN1",
+        **extra,
+    }
+
+
+@pytest.mark.parametrize(
+    "spec,reason",
+    [
+        (_bounds(latancy=LATENCY), "unknown latency key"),
+        (_bounds(latency_ms=27), "unknown latency key"),
+        (_bounds(latency={**LATENCY, "insert_ns": 2 * SECOND}), "longest latency"),
+        (_bounds(latency={**LATENCY, "insert_ns": 2**64}), "nanoseconds from 0"),
+    ],
+)
+def test_a_latency_the_window_cannot_honour_is_refused_before_any_read(spec, reason):
+    """A misnamed key is never a silent zero-latency run; a delay that would land the wind-down's
+    exit after the replay's flat check (one market-exit interval before window_end) is refused; a
+    delay beyond the module's bound never reaches upstream's u64 arithmetic mid-run."""
+    from canon_trading.window_replay import _run_replay
+
+    with pytest.raises(ValueError, match=reason):
+        _run_replay(spec)
+
+
+def test_a_released_order_meets_the_insert_latency_from_its_release(alpaca_bars, monkeypatch):
+    """The emulator resends a released order's first SubmitOrder, keeping its ts_init
+    (emulator.rs:1522-1594), so a fixed latency, counted from that ts_init, is past by the release.
+    The replay's model counts from the send: the released SELL is accepted no sooner than the insert
+    latency after its release, and the direct BUY is answered as a fixed latency answers it."""
+    from nautilus_trader.execution import StaticLatencyModel
+
+    from canon_trading import window_replay
+
+    buy, sell = _latency_run(alpaca_bars, LATENCY)
+    assert sell["OrderAccepted"] - sell["OrderReleased"] >= LATENCY["insert_ns"]
+    assert buy["OrderFilled"] - buy["OrderSubmitted"] >= LATENCY["insert_ns"]
+
+    static = StaticLatencyModel(
+        base_latency_nanos=0,
+        insert_latency_nanos=LATENCY["insert_ns"],
+        update_latency_nanos=LATENCY["update_ns"],
+        cancel_latency_nanos=LATENCY["delete_ns"],
+    )
+    original = window_replay.BacktestEngine.add_venue
+
+    def fixed(self, *args, **kwargs):
+        kwargs["latency_model"] = static
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(window_replay.BacktestEngine, "add_venue", fixed)
+    fixed_buy, fixed_sell = _latency_run(alpaca_bars, LATENCY)
+    assert fixed_buy == buy
+    # The upstream behaviour this model corrects: under a fixed latency the release is accepted at once.
+    assert fixed_sell["OrderAccepted"] == fixed_sell["OrderReleased"]
 
 
 def test_every_generation_matches_pure_rank_over_the_same_prefix(neutral_catalogs, monkeypatch):
@@ -688,6 +831,7 @@ def test_checked_engine_fails_on_lifecycle_handler_error(neutral_catalogs, monke
     spec, *_ = neutral_catalogs
     # A stand-in without managed stopping isolates the log check from Mover's exit timer.
     worker = f"""
+import copy
 import json
 import sys
 from nautilus_trader.trading import Strategy
@@ -859,3 +1003,363 @@ def test_a_replay_error_before_the_log_check_is_the_one_reported(neutral_catalog
     with pytest.raises(RuntimeError) as failed:
         run_replay({**spec, **later, "trade_date": (START + timedelta(days=1)).date().isoformat()})
     assert str(failed.value).rstrip().splitlines()[-1].startswith("ValueError")
+
+
+@pytest.mark.parametrize("fill_arm", ["touch", "tape"])
+def test_recorded_rankings_match_full_replay_and_load_only_listed_names(
+    neutral_catalogs, monkeypatch, fill_arm
+):
+    from canon_trading import rank_record
+    from canon_trading import window_replay
+
+    monkeypatch.setenv("CANON_COMMIT", "0" * 40)
+
+    worker = window_replay._WORKER
+    spec, *_ = neutral_catalogs
+    # The public writer refuses repository destinations; fixtures use system temp only.
+    with TemporaryDirectory(prefix="canon-rank-equivalence-") as folder:
+        snapshot = Path(folder) / "snapshot"
+        shutil.copytree(spec["bars_root"], snapshot)
+        (snapshot / "SNAPSHOT.json").write_text(json.dumps({"snapshot": str(snapshot)}))
+        spec = {**spec, "bars_root": str(snapshot), "fill_arm": fill_arm}
+        signal_file = snapshot / "rank.json"
+        monkeypatch.setattr(rank_record, "_WORKER", OFFLINE_GUARDS + rank_record._WORKER)
+        record = rank_record.record_rankings(spec, signal_file)
+        monkeypatch.setattr(window_replay, "_WORKER", OFFLINE_GUARDS + worker)
+        full = window_replay.run_replay(spec)
+        expected = [r for r in record["generations"] if r["published_ns"] <= ns(END)]
+        assert full["rank_signals"] == expected
+        # Count the catalog requests in the fresh process, without replacing their results.
+        injection = """
+from nautilus_trader.persistence import ParquetDataCatalog
+from canon_trading import window_replay, movers_rank_actor
+catalog_type = ParquetDataCatalog
+class SelectedCatalog:
+    def __init__(self, *args, **kwargs):
+        self.inner = catalog_type(*args, **kwargs)
+    def instruments(self, instrument_ids=None, **kwargs):
+        assert instrument_ids == ['LLL.ALPACA'], instrument_ids
+        return self.inner.instruments(instrument_ids=instrument_ids, **kwargs)
+    def query_bars(self, identifiers=None, **kwargs):
+        assert identifiers and all(i.startswith('LLL.ALPACA-') for i in identifiers), identifiers
+        return self.inner.query_bars(identifiers=identifiers, **kwargs)
+    def query_quote_ticks(self, identifiers=None, **kwargs):
+        assert identifiers == ['LLL.ALPACA'], identifiers
+        return self.inner.query_quote_ticks(identifiers=identifiers, **kwargs)
+    def query_trade_ticks(self, identifiers=None, **kwargs):
+        assert identifiers == ['LLL.ALPACA'], identifiers
+        return self.inner.query_trade_ticks(identifiers=identifiers, **kwargs)
+    def __getattr__(self, name):
+        return getattr(self.inner, name)
+window_replay.ParquetDataCatalog = SelectedCatalog
+def no_rank(*args, **kwargs):
+    raise AssertionError('recorded replay recomputed ranking')
+movers_rank_actor.MoversRankActor.on_start = no_rank
+"""
+        monkeypatch.setattr(window_replay, "_WORKER", injection + OFFLINE_GUARDS + worker)
+        replay = window_replay.run_replay({**spec, "rank_file": str(signal_file)})
+        assert replay["rank_signals"] == full["rank_signals"]
+        assert replay["catalog"]["instruments"] == ["LLL.ALPACA"]
+        assert replay["catalog"]["bars_read"] < full["catalog"]["bars_read"]
+        # OrderFactory creates a random init_id, and fill events a random event_id.
+        # Native venue/trade IDs also include the loaded instrument's ordinal:
+        # rc8 common/src/factories/order.rs:200; execution/src/matching_engine/
+        # ids_generator.rs:200-235,273-287. Retain client IDs and EVERY other field.
+        native_ids = {"init_id", "event_id", "venue_order_id", "trade_id"}
+        for key in ("orders", "fills"):
+            expected_rows = [{k: v for k, v in r.items() if k not in native_ids} for r in full[key]]
+            actual_rows = [{k: v for k, v in r.items() if k not in native_ids} for r in replay[key]]
+            assert actual_rows == expected_rows
+        assert replay["orders"] and replay["fills"]
+        assert replay["open_positions"] == full["open_positions"] == 0
+        assert [e["message"] for e in replay["engine_errors"]] == [
+            e["message"] for e in full["engine_errors"]
+        ]
+        assert not any(re.search(HANDLER_ERROR, e["message"]) for e in replay["engine_errors"])
+
+
+def test_empty_recorded_ranking_replays_loading_only_the_roster(neutral_catalogs, monkeypatch):
+    from canon_trading import rank_record
+    from canon_trading import window_replay
+
+    monkeypatch.setenv("CANON_COMMIT", "0" * 40)
+
+    spec, *_ = neutral_catalogs
+    with TemporaryDirectory(prefix="canon-empty-rank-") as folder:
+        snapshot = Path(folder) / "snapshot"
+        shutil.copytree(spec["bars_root"], snapshot)
+        (snapshot / "SNAPSHOT.json").write_text(json.dumps({"snapshot": str(snapshot)}))
+        spec: dict[str, Any] = {**spec, "bars_root": str(snapshot)}
+        for row in spec["reference_closes"].values():
+            row["close"] = 20.0
+        signal_file = snapshot / "rank.json"
+        rank_record.record_rankings(spec, signal_file)
+        full = window_replay.run_replay(spec)
+        replay = window_replay.run_replay({**spec, "rank_file": str(signal_file)})
+        assert full["rank_signals"] and all(r["value"] == "" for r in full["rank_signals"])
+        assert replay["rank_signals"] == full["rank_signals"]
+        assert replay["orders"] == full["orders"] == []
+        assert replay["fills"] == full["fills"] == []
+        assert replay["open_positions"] == 0
+        assert not any(re.search(HANDLER_ERROR, e["message"]) for e in replay["engine_errors"])
+        # The roster is loaded as the full replay loads it; no other name is.
+        assert replay["catalog"]["instruments"] == ["LLL.ALPACA"]
+        assert replay["catalog"]["bars_read"] < full["catalog"]["bars_read"]
+        assert replay["catalog"]["quotes_read"] == full["catalog"]["quotes_read"]
+        assert replay["catalog"]["trades_read"] == full["catalog"]["trades_read"]
+
+
+CAPTURE = """
+import atexit
+import copy
+import json
+import os
+from nautilus_trader.persistence import ParquetDataCatalog
+from canon_trading import window_replay
+catalog_type = ParquetDataCatalog
+calls = {"instruments": [], "bars": set(), "quotes": set(), "trades": set()}
+class CapturingCatalog:
+    def __init__(self, *args, **kwargs):
+        self.inner = catalog_type(*args, **kwargs)
+    def instruments(self, instrument_ids=None, **kwargs):
+        calls["instruments"].append(None if instrument_ids is None else sorted(instrument_ids))
+        return self.inner.instruments(instrument_ids=instrument_ids, **kwargs)
+    def query_bars(self, identifiers=None, **kwargs):
+        calls["bars"].update(identifiers or ())
+        return self.inner.query_bars(identifiers=identifiers, **kwargs)
+    def query_quote_ticks(self, identifiers=None, **kwargs):
+        calls["quotes"].update(identifiers or ())
+        return self.inner.query_quote_ticks(identifiers=identifiers, **kwargs)
+    def query_trade_ticks(self, identifiers=None, **kwargs):
+        calls["trades"].update(identifiers or ())
+        return self.inner.query_trade_ticks(identifiers=identifiers, **kwargs)
+    def __getattr__(self, name):
+        return getattr(self.inner, name)
+window_replay.ParquetDataCatalog = CapturingCatalog
+def dump():
+    with open(os.environ["CANON_TEST_CAPTURE"], "w") as out:
+        json.dump({k: sorted(v) if isinstance(v, set) else v for k, v in calls.items()}, out)
+atexit.register(dump)
+"""
+
+
+@pytest.fixture
+def wide_listing(neutral_catalogs, alpaca_bars, monkeypatch):
+    """Listed names beyond the roster: PRE ranks only before the window, WIN inside it with ticks
+    of its own, Z0 is never listed. The roster is LLL alone; every file is in system temp."""
+    spec, _, _, baselines = neutral_catalogs
+    monkeypatch.setenv("CANON_COMMIT", "0" * 40)
+    with TemporaryDirectory(prefix="canon-rank-wide-") as folder:
+        snapshot = Path(folder) / "snapshot"
+        shutil.copytree(spec["bars_root"], snapshot)
+        quotes_root, trades_root = Path(folder) / "quotes", Path(folder) / "trades"
+        shutil.copytree(spec["quotes_roots"][0], quotes_root)
+        shutil.copytree(spec["trades_root"], trades_root)
+        bars = ParquetDataCatalog(str(snapshot))
+        extra = [alpaca_bars.equity("PRE"), alpaca_bars.equity("WIN")]
+        bars.write_instruments(extra)
+        sessions = tuple(START.date() - timedelta(days=n) for n in (3, 4, 5, 6, 7))
+        for instrument in extra:
+            earlier = [
+                minute_bar(instrument, OPEN.replace(day=day.day) + timedelta(minutes=i), 8, 1)
+                for day in reversed(sessions)
+                for i in range(720)
+            ]
+            bars.write_bars(earlier, start=earlier[0].ts_event, end=earlier[-1].ts_init)
+            pre = instrument.id.symbol.value == "PRE"
+            series = [
+                minute_bar(
+                    instrument,
+                    OPEN + timedelta(minutes=i),
+                    12 if pre and i < 120 else 8,
+                    100_000 if pre and i < 120 else 100,
+                )
+                for i in range(330)
+            ]
+            series += [
+                minute_bar(
+                    instrument,
+                    START + timedelta(minutes=i),
+                    8 if pre else 8.6,
+                    100 if pre else 100_000,
+                )
+                for i in range(20)
+            ]
+            bars.write_bars(series, start=ns(OPEN), end=ns(END))
+        win = extra[1]
+        tape = [trade(win, ns(START) + (i + 1) * MINUTE - 2, 8.6) for i in range(20)]
+        book = [quote(win, ns(START) + (i + 1) * MINUTE - 1, 8.59, 8.61) for i in range(20)]
+        ParquetDataCatalog(str(trades_root)).write_trade_ticks(tape, start=ns(START), end=ns(END))
+        ParquetDataCatalog(str(quotes_root)).write_quote_ticks(book, start=ns(START), end=ns(END))
+        baseline_path = Path(folder) / "baseline.json"
+        movers_rank.write_baselines(
+            baseline_path,
+            START.date(),
+            {**baselines, **{i.id.symbol.value: baselines["LLL"] for i in extra}},
+        )
+        (snapshot / "SNAPSHOT.json").write_text(json.dumps({"snapshot": str(snapshot)}))
+        references = copy.deepcopy(spec["reference_closes"])
+        for instrument in extra:
+            references[instrument.id.symbol.value] = dict(references["LLL"])
+        yield {
+            **spec,
+            "bars_root": str(snapshot),
+            "quotes_roots": [str(quotes_root)],
+            "trades_root": str(trades_root),
+            "baseline_path": str(baseline_path),
+            "reference_closes": references,
+            "slots": 2,
+            "fill_arm": "tape",
+        }
+
+
+def _captured_replay(spec, monkeypatch, path, preamble=""):
+    from canon_trading import window_replay
+
+    monkeypatch.setattr(window_replay, "_WORKER", preamble + CAPTURE + OFFLINE_GUARDS + WORKER)
+    monkeypatch.setenv("CANON_TEST_CAPTURE", str(path))
+    report = window_replay.run_replay(spec)
+    return report, json.loads(Path(path).read_text())
+
+
+WORKER = """
+import copy
+import json
+import sys
+from canon_trading.window_replay import _run_replay
+print(json.dumps(_run_replay(json.load(sys.stdin)), allow_nan=False))
+"""
+
+
+def test_recorded_replay_gives_the_mover_the_full_replays_view_when_listing_exceeds_roster(
+    wide_listing, monkeypatch, tmp_path
+):
+    from canon_trading import rank_record
+    from canon_trading.movers_rank_signal import decode_ranking
+
+    spec = wide_listing
+    signal_file = Path(spec["bars_root"]).parent / "rank.json"
+    monkeypatch.setattr(rank_record, "_WORKER", OFFLINE_GUARDS + rank_record._WORKER)
+    record = rank_record.record_rankings(spec, signal_file)
+    listed = {
+        str(e.instrument_id)
+        for row in record["generations"]
+        if row["published_ns"] <= ns(END)
+        for e in decode_ranking(row["value"])
+    }
+    before = {
+        str(e.instrument_id)
+        for row in record["generations"]
+        if row["published_ns"] < ns(START)
+        for e in decode_ranking(row["value"])
+    }
+    # The fixture exercises the findings: a name listed only before the window, one listed
+    # inside it with ticks of its own, both outside the roster, and one never listed.
+    assert "PRE.ALPACA" in before and "PRE.ALPACA" in listed
+    assert "WIN.ALPACA" in listed and "Z0.ALPACA" not in listed
+    full, full_calls = _captured_replay(spec, monkeypatch, tmp_path / "full.json")
+    no_rank = """
+from canon_trading import movers_rank_actor
+def no_rank(*args, **kwargs):
+    raise AssertionError('recorded replay recomputed ranking')
+movers_rank_actor.MoversRankActor.on_start = no_rank
+"""
+    replay, calls = _captured_replay(
+        {**spec, "rank_file": str(signal_file)}, monkeypatch, tmp_path / "cached.json", no_rank
+    )
+    # Ticks only for the names the full replay loads them for: the roster.
+    assert full_calls["quotes"] == full_calls["trades"] == ["LLL.ALPACA"]
+    assert calls["quotes"] == calls["trades"] == ["LLL.ALPACA"]
+    # Definitions and minute bars for the roster and every name listed up to the window's end.
+    assert calls["instruments"] == [sorted(listed | {"LLL.ALPACA"})]
+    assert {b.split("-")[0] for b in calls["bars"]} == listed | {"LLL.ALPACA"}
+    assert replay["catalog"]["quotes_read"] == full["catalog"]["quotes_read"]
+    assert replay["catalog"]["trades_read"] == full["catalog"]["trades_read"]
+    assert {"PRE.ALPACA", "WIN.ALPACA"} <= set(full["mover"]["run"]["opened_slots"])
+    assert full["mover"]["run"]["ranking_records"]
+    assert replay["rank_signals"] == full["rank_signals"]
+
+    # The Mover's own record, every key but the host's wall clock and the random UUID4 of each
+    # history request (warm_up.slots[].request_id), which differs between any two runs.
+    def comparable(run: dict[str, Any]) -> dict[str, Any]:
+        out = {k: v for k, v in run.items() if k != "host_clock"}
+        warm = copy.deepcopy(out.get("warm_up"))
+        if isinstance(warm, dict):
+            for slot in warm.get("slots", []):
+                if isinstance(slot, dict):
+                    slot.pop("request_id", None)
+            out["warm_up"] = warm
+        return out
+
+    mover_full = comparable(full["mover"]["run"])
+    mover_replay = comparable(replay["mover"]["run"])
+    assert [k for k in mover_full if mover_full[k] != mover_replay.get(k)] == []
+    assert mover_replay == mover_full
+    assert replay["generations"] == full["generations"]
+    native_ids = {"init_id", "event_id", "venue_order_id", "trade_id"}
+    for key in ("orders", "fills"):
+        expected_rows = [{k: v for k, v in r.items() if k not in native_ids} for r in full[key]]
+        actual_rows = [{k: v for k, v in r.items() if k not in native_ids} for r in replay[key]]
+        assert actual_rows == expected_rows
+    assert replay["orders"] and replay["fills"]
+    assert not any(re.search(HANDLER_ERROR, e["message"]) for e in replay["engine_errors"])
+
+
+@pytest.mark.parametrize("case", ["undefined", "no_context", "unreferenced"])
+def test_recorded_replay_refuses_the_roster_the_full_replay_refuses(
+    wide_listing, monkeypatch, case
+):
+    from canon_trading import rank_record
+    from canon_trading import window_replay
+
+    spec = copy.deepcopy(wide_listing)
+    symbol = "NOPE" if case == "undefined" else "Z0"
+    spec["roster"].append({"symbol": symbol, "entry_limit": "8.01"})
+    if case != "no_context":
+        spec["entry_contexts"][f"{symbol}.ALPACA"] = dict(spec["entry_contexts"]["LLL.ALPACA"])
+    if case == "unreferenced":
+        del spec["reference_closes"]["Z0"]
+    signal_file = Path(spec["bars_root"]).parent / f"rank-{case}.json"
+    monkeypatch.setattr(rank_record, "_WORKER", OFFLINE_GUARDS + rank_record._WORKER)
+    rank_record.record_rankings(spec, signal_file)
+    monkeypatch.setattr(window_replay, "_WORKER", OFFLINE_GUARDS + WORKER)
+    reason = {
+        "undefined": "roster must be distinct equities defined",
+        "no_context": "no recorded entry context for Z0",
+        "unreferenced": "no usable prior-session reference for Z0",
+    }[case]
+    with pytest.raises(RuntimeError, match=reason):
+        window_replay.run_replay(spec)
+    with pytest.raises(RuntimeError, match=reason):
+        window_replay.run_replay({**spec, "rank_file": str(signal_file)})
+
+
+@pytest.mark.parametrize(
+    "change,reason",
+    [
+        ({"rank_without_baseline": True, "baseline_path": "absent"}, "rank_without_baseline"),
+        ({"max_data_age_secs": 60}, "max_data_age_secs"),
+    ],
+)
+def test_full_replay_refuses_actor_settings_it_does_not_apply(
+    neutral_catalogs, monkeypatch, tmp_path, change, reason
+):
+    from canon_trading import window_replay
+
+    spec, *_ = neutral_catalogs
+    if change.get("baseline_path") == "absent":
+        missing = tmp_path / "no-baseline.json"
+        change = {**change, "baseline_path": str(missing)}
+    monkeypatch.setattr(window_replay, "_WORKER", OFFLINE_GUARDS + WORKER)
+    with pytest.raises(RuntimeError, match=reason):
+        window_replay.run_replay({**spec, **change})
+
+
+def test_full_replay_reports_the_count_of_instruments_not_their_list(neutral_catalogs, monkeypatch):
+    from canon_trading import window_replay
+
+    spec, *_ = neutral_catalogs
+    monkeypatch.setattr(window_replay, "_WORKER", OFFLINE_GUARDS + WORKER)
+    report = window_replay.run_replay(spec)
+    assert report["catalog"]["instruments_loaded"] == 2
+    assert "instruments" not in report["catalog"]
