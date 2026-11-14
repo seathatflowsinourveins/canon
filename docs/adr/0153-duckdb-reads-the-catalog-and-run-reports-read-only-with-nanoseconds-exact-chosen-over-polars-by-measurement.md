@@ -9,16 +9,14 @@ review-by: 2027-02-12
 
 ## Context and Problem Statement
 
-Questions about the Parquet we already hold are answered by scripts written for each one: what a catalog
-root covers, what one day of the market's minute bars says, and what the run reports add up to. Two scout
-reports of 2026-11-14 (the lead's archive, condensed from sources each names) converge on an embedded
-engine that reads Parquet in place, not a server. The lead asked for one engine, DuckDB or Polars,
-chosen by a measurement on our own snapshot, with three terms. The engine stays read-only. It reads
-nanosecond timestamps exactly. It brings no pyarrow into the root environment (ADR 0108).
+Questions about the Parquet we hold (what a catalog root covers, what one day of the market's minute bars
+says, what the run reports add up to) get a script each. Two scout reports of 2026-11-14 converge on an
+embedded engine reading Parquet in place. The lead asked for one engine, DuckDB or Polars, chosen by a
+measurement on our own snapshot: read-only, nanoseconds exact, no pyarrow in the root environment (ADR 0108).
 
 ## Decision Drivers
 
-* It must never write the catalog, the ledger or a run folder, by a documented means that refuses a write.
+* It must never write the catalog, the ledger or a run folder, and a write it is asked to make is refused.
 * NautilusTrader stores `ts_event` and `ts_init` as `Timestamp(Nanosecond, "UTC")`. It warns that SQL readers
   mapping them to microsecond `TIMESTAMPTZ` can truncate (`docs/concepts/data/catalog.md:12-14` at the pin).
 * A coverage grid must come from file names and footers alone. Some files hold days no run may read (ADR 0096).
@@ -35,21 +33,27 @@ nanosecond timestamps exactly. It brings no pyarrow into the root environment (A
 
 ## Decision Outcome
 
-Chosen: **option 1, DuckDB**, opened only through `canon_trading.catalog_query.read_only`, which runs the
-lockdown DuckDB's securing page documents: autoload and autoinstall off, the named extensions loaded,
-`allowed_paths` set to the exact files a query reads, `enable_external_access` false, `lock_configuration` true.
+Chosen: **option 1, DuckDB**, run only through `canon_trading.catalog_query.query(files, sql, params)`.
+It returns rows and lets no connection out, and it holds the read-only term in two layers:
 
-What decides it is the read-only term. DuckDB documents a means that refuses a write: COPY "cannot read
-from or write to files" and ATTACH cannot open a database file. Polars documents no such means. Neither
-its 22 I/O and lazy user-guide pages nor its API offers one, so a Polars reader is read-only only by
-convention. DuckDB also reads row counts from footers (`parquet_file_metadata`). Polars' only footer
-reader returns custom metadata, marked experimental. So a Polars grid over the whole root would read
-rows that no run may read.
+1. DuckDB's documented lockdown, which refuses every file but the named ones: autoload off, `temp_directory`
+   a private folder, `allowed_paths` the exact files, `enable_external_access` false, `lock_configuration` true.
+2. A gate of this repository's own on DuckDB's parser: the query runs only if `extract_statements` types it
+   as one `SELECT`.
 
-The measurement was taken on 2026-11-14, on a snapshot of one week of minute bars for about 12,900
-instruments (24,767 files, 349 MB). Each engine and read ran in a fresh process, four rounds, in
-alternating order. The machine was under load (load average 16 to 30) and nothing was niced. Medians
-are shown, with the cold first run in brackets:
+This corrects the brief: no DuckDB setting makes the files being read refuse a write. The securing page
+says allow-listed paths "can be written to as well as read from", and the second reader overwrote a
+catalog file in place with `COPY ... (USE_TMP_FILE false)` and found the default `.tmp` folder still open.
+Without the gate, six of the test's seventeen refused statements get through, that COPY and LOAD among them.
+
+DuckDB is still the choice. Its lockdown covers all but the named files, and its own parser types the
+statement. Polars documents no refusal of any write, in its 22 I/O and lazy user-guide pages or its API.
+DuckDB reads row counts from footers (`parquet_file_metadata`). Polars' footer readers give the schema and,
+experimentally, custom metadata, but no count, so its grid of the whole root would read forbidden rows.
+
+Measured 2026-11-14 on a snapshot of one week of minute bars, about 12,900 instruments (24,767 files,
+349 MB). Each engine and read ran in a fresh process, four rounds in alternating order, not niced, at a
+one-minute load average of 16 to 32. Medians, with each engine's first run in brackets:
 
 | Read | DuckDB, locked | DuckDB, unlocked | Polars |
 |---|---|---|---|
@@ -58,61 +62,67 @@ are shown, with the cold first run in brackets:
 | One day of the market's minute bars | 2.46 s (2.60), 214 MB | 0.93 s, 221 MB | 0.95 s (1.04), 186 MB |
 | Six run summaries joined to order counts | 0.17 s, 99 MB | 0.16 s, 99 MB | 0.21 s, 93 MB |
 
-For each read, all three produced the same digest of their output. Unlocked, DuckDB and Polars run
-alike; the lockdown costs about 1.5 s on 11,938 files (setting the list, then checking each file against
-it), the price of the term, and it is paid.
+All three gave the same digest for each read. Unlocked, DuckDB and Polars run alike; the lock costs 1.5 s
+(bars) to 2.2 s (grid) on 11,938 files, the price of the term. Three runs in the shipped form, with the
+private `temp_directory`, gave 2.92 s and 2.88 s at a load of 32 to 35. The gate's parse is not timed.
 
-The evidence corrects the brief's premise that a naive read truncates. DuckDB 2.0 reads the catalog's
-columns as `TIMESTAMPTZ_NS` at full precision. The loss comes at a cast to microsecond `TIMESTAMPTZ`,
-which rounds (…123456789 becomes …123457000). A plain fetch into Python raises, because pytz is not
-installed. Polars truncates when it hands a value to Python (`to_list()` gives …123456). The documented
-integer paths are exact in both: DuckDB's `epoch_ns(...)` and Polars' `dt.epoch("ns")`.
+The evidence also corrects the brief's premise that a naive read truncates. DuckDB 2.0 reads the columns
+as `TIMESTAMPTZ_NS` at full precision. A cast to `TIMESTAMPTZ` rounds (…123456789 to …123457000), a plain
+fetch into Python raises without pytz, and Polars' `to_list()` truncates (…123456). `epoch_ns(...)` and
+Polars' `dt.epoch("ns")` are exact; DuckDB documents `epoch_ns` with microsecond examples only.
 
-Polars is kept as a `watch` entry. Not adopted: a server (3) is a daemon plus ingest, and QuestDB takes
-Parquet by conversion (the scout; `UNVERIFIED` here); a table format (4) adds a metadata layer or a rewrite
-of what the catalog's own consolidation maintains; a GPU engine (5) needs NVIDIA (Polars' GPU page; cuDF and
-Sirius per the scout, `UNVERIFIED`), and this machine's GPU is Apple's. ArcticDB, which the scouts also
-read, is BSL 1.1, not open source. Option 6 is what this replaces.
+Polars stays a `watch` entry. Not adopted: a server (3), a daemon plus ingest (QuestDB takes Parquet by
+conversion, the scout; `UNVERIFIED`); a table format (4), a metadata layer or a rewrite of what the
+catalog's consolidation maintains; a GPU engine (5), NVIDIA only (Polars' GPU page; cuDF and Sirius per the
+scout, `UNVERIFIED`) on a machine with Apple's GPU. ArcticDB is BSL 1.1. Option 6 is what this replaces.
 
 ### Consequences
 
-* Good: one SQL reader over Parquet and JSON in place, refused any write, with nanoseconds exact. DuckDB's
-  PyPI metadata requires nothing, and the lock gains only `duckdb` (pyarrow is in its `all` extra only).
-* Bad: a locked instance cannot spill to disk or load an extension later, and a folder cannot be
-  allow-listed without becoming writable. An overwrite of an allowed file was refused only because DuckDB
-  writes a temporary file beside it. That is observed, not documented, and a test watches it.
-* No CLI and no task: DuckDB's docs give neither for this use, and the helper is the smallest form.
+* Good: one SQL reader over Parquet and JSON in place that runs only a SELECT, with nanoseconds exact. The
+  lock gains only `duckdb`, whose PyPI metadata requires nothing (pyarrow is in its `all` extra).
+* Bad: the files' safety rests on the gate, which is ours; a future statement typed SELECT that writes
+  would pass it, and the seventeen statements tested are what is watched. Extensions linked into the wheel
+  still load after the lock (`LOAD json`, a second reader); only the gate refuses LOAD. A folder cannot be
+  allow-listed without becoming writable. Spill under memory pressure, to the private folder, is `UNVERIFIED`.
+* No CLI and no task: DuckDB's docs give neither for this use, and one function is the smallest form.
 
 ### Confirmation
 
-`tests/test_catalog_query.py`, on a catalog the engine wrote: the column type is `TIMESTAMPTZ_NS`; a
-microsecond cast loses the nanoseconds; `epoch_ns` reads `ts_event` and `ts_init` back exact; a COPY or
-ATTACH into the catalog is refused and the tree is unchanged; an allowed file is not overwritten; a file
-not named is refused; the lock cannot be lifted.
+`tests/test_catalog_query.py`, on a catalog the engine wrote, checks four things. The column is
+`TIMESTAMPTZ_NS`, a microsecond cast loses the nanoseconds, and `epoch_ns` reads `ts_event` and `ts_init`
+back exact. Seventeen statements are refused with the tree's content hashes unchanged: COPY in both forms,
+ATTACH, EXPORT, LOAD, INSTALL, SET, RESET, PRAGMA, CALL, EXPLAIN ANALYZE, a second statement, and `query()`
+wrapping a COPY. A file not named is refused. The working directory's `.tmp` is neither readable nor allowed.
 
 ## Evidence
 
 Read 2026-11-14.
 
-* https://github.com/duckdb/duckdb-python/releases/tag/v2.0.0 — Python ≥ 3.11; results stream; Arrow
-  export moved to the relational API — fetched (gh api).
-* https://github.com/duckdb/duckdb/releases/tag/v2.0.0 — engine 2.0.0, Parquet async I/O for local files —
-  fetched (gh api); the 844-line list was searched, not read whole.
-* https://pypi.org/pypi/duckdb/2.0.0/json — MIT classifier; no required dependency; pyarrow in the `all` extra — fetched.
+* https://github.com/duckdb/duckdb-python/releases/tag/v2.0.0 and https://github.com/duckdb/duckdb/releases/tag/v2.0.0
+  — Python ≥ 3.11, results stream, Arrow export moved; engine 2.0.0, Parquet async I/O for local files —
+  fetched (gh api); the engine's 844-line list was searched, not read whole.
+* https://pypi.org/pypi/duckdb/2.0.0/json — MIT classifier; no required dependency; pyarrow in `all` — fetched.
 * https://pypi.org/pypi/polars/2.1.0/json — requires `polars-runtime-32==2.1.0` only, pyarrow in extras — fetched.
 * https://github.com/duckdb/duckdb-web/blob/b421c300096722cf2be64d37a35cc5520a3ceb75/docs/2.0/operations_manual/securing_duckdb/overview.md
-  — the lockdown and its order; "can be written to as well as read from" — fetched.
-* the same commit, `docs/2.0/clients/python/dbapi.md:79-95` — `read_only` is for a database file. Probed:
-  an in-memory database refuses it, and a read-only file database still allows COPY TO a file — fetched, run.
-* the same commit, `docs/2.0/sql/data_types/timestamp.md:27` (`TIMESTAMPTZ_NS` keeps nanoseconds, new in 2.0),
-  `docs/2.0/sql/functions/timestamp.md:172-178` and `timestamptz.md:249-255` (`epoch_ns`),
-  `docs/2.0/clients/python/conversion.md:187` (pytz), `docs/2.0/data/parquet/metadata.md:99-120` — fetched.
+  — COPY and ATTACH refused (146-147), "can be written to as well as read from" (169), the order and the
+  lock (175), defense in depth, not comprehensive (37, 97-102) — fetched.
+* the same commit: `configuration/overview.md:184-185, 225` (`allowed_paths`, `enable_external_access`);
+  `configuration/pragmas.md:600-606` (`temp_directory`); `clients/python/reference/index.md`
+  (`extract_statements`, `StatementType`); `clients/python/dbapi.md:79-95` (`read_only` is for a database
+  file; probed, a read-only file database still allows COPY TO a file) — fetched, run.
+* the same commit: `sql/data_types/timestamp.md:27` (`TIMESTAMPTZ_NS`, new in 2.0), `sql/functions/timestamp.md:172-178`
+  and `timestamptz.md:249-255` (`epoch_ns`, microsecond examples only), `clients/python/conversion.md:187`
+  (pytz), `data/parquet/metadata.md:99-120` (`parquet_file_metadata`) — fetched.
 * `nautilus-trader` at the pin, `docs/concepts/data/catalog.md:12-14` — the truncation warning — resolved
   (`scripts/canon src nautilus-trader`).
 * pola-rs/polars at `7f902bd3` (py-2.1.0): `py-polars/src/polars/expr/datetime.py:1765` (`dt.epoch`), 22 user-guide
-  pages under `io/` and `lazy/` (no read-only means; `lazy/gpu.md:4`, NVIDIA GPUs), `read_parquet_metadata`'s
-  docstring (custom metadata, experimental) — fetched and run.
+  pages under `io/` and `lazy/` (no read-only means; `lazy/gpu.md:4`, NVIDIA GPUs), `read_parquet_metadata`
+  (custom metadata, experimental) and `read_parquet_schema` — fetched and run.
 * https://raw.githubusercontent.com/man-group/ArcticDB/master/LICENSE.txt — Business Source License 1.1 — fetched.
+* `/code-review` high, 2026-11-14: an allowed file overwritten by `USE_TMP_FILE false`, the open `.tmp`, LOAD
+  after the lock, ATTACH of a named file; reproduced as failing tests, fixed by the gate and the private folder.
+* evidence-verifier, 2026-11-14: corrected the header's citation, the `epoch_ns` source, the spill claim, the
+  load range, the lock's cost and the footer-reader sentence, and added the defense-in-depth caveat.
 * The two scout reports of 2026-11-14 in the lead's archive (outside the repository) — read; their
   ClickHouse, QuestDB, Delta, Iceberg, Lance, cuDF and Sirius lines are `UNVERIFIED` here.
 * The measurement, its scripts and per-run results are outside the repository with the lane's report.
