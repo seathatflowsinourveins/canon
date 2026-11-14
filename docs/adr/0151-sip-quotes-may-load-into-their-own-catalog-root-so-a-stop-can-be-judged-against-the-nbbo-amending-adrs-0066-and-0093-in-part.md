@@ -45,11 +45,11 @@ What changes in ADR 0066 and in ADR 0093's clause 10:
 * A SIP load writes to a root whose feed marker says `sip`. The loader already refuses a root of another
   feed (`history_load._check_feed`: "give each feed its own root"; its module header: "SIP and IEX need
   separate roots").
-* What must change for that, none of it built by this record (the change that builds it cites this record
-  and marks this line when it lands): `load_quotes` refuses any feed but IEX
-  (`history_load.py:946-947`); the command line has no `--feed` for quotes; `mise.toml`'s `paper:history`
-  refuses `--feed` in load mode (`:766`); `catalog/README.md` ("SIP roots are refused", `:115`) and
-  `AGENTS.md`'s `paper:history` row say IEX quotes.
+* What had to change for that, built on 2026-11-13 by the change that loads SIP quotes within the
+  bound below and cites this record: `load_quotes` refused any feed but IEX
+  (`history_load.py:946-947`); the command line had no `--feed` for quotes; `mise.toml`'s `paper:history`
+  refused `--feed` in load mode (`:766`); `catalog/README.md` ("SIP roots are refused", `:115`) and
+  `AGENTS.md`'s `paper:history` row said IEX quotes. Each now takes `sip` within the bound.
 * The bound a SIP quote load keeps, the lead's size for a case replay and UNCALIBRATED: at most 8
   symbols, named with `--symbols` (never a symbols file) and counted after strip and upper case; at most
   60 minutes from start to end; and a root of its own that holds no bars or trades, by default
