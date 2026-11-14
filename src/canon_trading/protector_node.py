@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import dataclasses
 import inspect
 import json
 import os
@@ -63,6 +64,7 @@ from nautilus_trader.model import StrategyId
 
 from . import paper_node
 from . import session_window as window
+from . import symbol_hold
 from .owner_protector import OwnerProtector
 from .owner_protector import OwnerProtectorConfig
 from .owner_protector import owner_execution_config
@@ -94,6 +96,13 @@ class ProtectorRun:
     feed: str | None = None
     lead_go: str | None = None
     lock_wait: int = 0
+    symbol_holds_dir: Path | None = None
+    """The owner's per-symbol holds (symbol_hold.FOLDER). The CLI defaults it to the account's
+    instance folder (symbol_hold.instance_holds), as a runner installed before the flag existed
+    starts it (review F1); an in-process build without one reads none, and the protector says so."""
+    symbol_holds: frozenset[str] | None = None
+    """The node's own start read of that folder, under both locks (run_protector), handed to the
+    protector as the holds that stand if its own first read fails (review F4)."""
 
     def __post_init__(self) -> None:
         if self.account not in window.PAPER_ACCOUNT_LOCKS:
@@ -112,6 +121,8 @@ class ProtectorRun:
             raise ValueError("IEX is refused by name: protection requires sip or boats")
         if not self.holds_dir.is_absolute() or not self.inbox.is_absolute():
             raise ValueError("holds-dir and inbox must be absolute paths")
+        if self.symbol_holds_dir is not None and not self.symbol_holds_dir.is_absolute():
+            raise ValueError("symbol-holds-dir must be an absolute path")
         if (
             not isinstance(self.lock_wait, int)
             or isinstance(self.lock_wait, bool)
@@ -180,6 +191,8 @@ def protector_node(
     settings = OwnerProtectorConfig(
         row=config.row,
         levels=config.levels,
+        symbol_holds_dir=config.symbol_holds_dir,
+        symbol_holds=config.symbol_holds,
         feed=feed,
         strategy_id=StrategyId("OwnerProtector-001"),
         order_id_tag="001",
@@ -203,6 +216,35 @@ def protector_node(
         node.dispose()
         raise
     return node, strategy
+
+
+def _symbol_holds(config: ProtectorRun) -> frozenset[str]:
+    """The owner's per-symbol holds, read in the start step under both locks (symbol_hold). An
+    unread folder refuses the start: the runner reads a refusal naming a holds folder as a hold
+    (scripts/automation, do_run_protector). The protector reads the folder again at its start and
+    at every step; this read names the holds in the node's start line."""
+    if config.symbol_holds_dir is None:
+        print("paper:protector: no symbol-holds folder: no per-symbol hold is read", flush=True)
+        return frozenset()
+    try:
+        held, strays, made = symbol_hold.read_holds_if_made(config.symbol_holds_dir)
+    except (OSError, ValueError) as e:
+        # Not a hold of the whole node: the runner reads this as a refused start, never as the
+        # owner's hold of every holding (review F2), so its words name no "holds folder".
+        raise window.WindowRefused(
+            f"the owner's per-symbol hold list {config.symbol_holds_dir} is unreadable "
+            f"({type(e).__name__}); nothing started"
+        ) from e
+    where = "" if made else f" (no {symbol_hold.FOLDER} folder made at {config.symbol_holds_dir})"
+    print(
+        f"paper:protector: {symbol_hold.HELD}: {', '.join(sorted(held))}"
+        if held
+        else f"paper:protector: none held by the owner's word{where}",
+        flush=True,
+    )
+    if strays:
+        print(f"paper:protector: ALERT: {symbol_hold.strays_named(strays)}", flush=True)
+    return held
 
 
 def _lead_go(config: ProtectorRun) -> None:
@@ -506,6 +548,7 @@ def run_protector(
             raise window.WindowRefused("the feed span ended during the start reads")
         # Re-read together immediately before building: a hold arriving in a broker read stops us.
         window.read_start_controls(config.holds_dir, config.inbox)
+        config = dataclasses.replace(config, symbol_holds=_symbol_holds(config))
         _lead_go(config)
         # The level book, under both locks only (the lead's ruling, 2026-11-13, 17:10).
         book = _book_settings(config)
@@ -542,9 +585,12 @@ def run_protector(
                     unread,
                     "last seen at start; current quantity UNVERIFIED; ",
                 )
+            # The owner's word as the protector last read it (OwnerProtector.held).
+            held_now = {i.symbol.value for i in getattr(strategy, "held", ())}
             for symbol, qty in sorted(remaining.items()):
+                word = f"{symbol_hold.HELD}, " if symbol in held_now else ""
                 print(
-                    f"{symbol}: {qty} held, {last_seen}left unprotected by this node; "
+                    f"{symbol}: {qty} held, {last_seen}{word}left unprotected by this node; "
                     "owner's orders untouched"
                 )
             for symbol, why in sorted(unread_now.items()):
@@ -588,6 +634,11 @@ def parse_args(argv: Sequence[str] | None = None) -> ProtectorRun:
     parser.add_argument("--feed", help="sip or boats; otherwise select this span, IEX refused")
     parser.add_argument("--holds-dir", type=Path, required=True)
     parser.add_argument("--inbox", type=Path, required=True)
+    parser.add_argument(
+        "--symbol-holds-dir",
+        type=Path,
+        help="the owner's per-symbol holds; default: this account's protector instance folder's",
+    )
     parser.add_argument("--lead-go", help="C only: the lead's start instruction, 'protect <row>'")
     parser.add_argument(
         "--lock-wait",
@@ -598,6 +649,8 @@ def parse_args(argv: Sequence[str] | None = None) -> ProtectorRun:
     args = parser.parse_args(argv)
     try:
         args.levels = parse_levels(args.levels)
+        if args.symbol_holds_dir is None:
+            args.symbol_holds_dir = symbol_hold.instance_holds(args.account)
         return ProtectorRun(**vars(args))
     except (ValueError, TypeError) as e:
         parser.error(str(e))
