@@ -519,6 +519,43 @@ def test_oversized_leg_is_cut_on_the_first_quote_after_a_refused_cancel():
     assert len(strategy.canceled) == 2 and c.row(strategy).row == "PCO"
 
 
+def test_a_cut_the_venue_keeps_refusing_is_asked_at_most_once_a_second():
+    """A working sale larger than the long is cut with no pace: an oversell cannot wait. It still
+    has a floor. A venue that refuses every cancel at once, on a tape of ten quotes a second for a
+    minute, is asked the cut at most once a second: about sixty cancels in the minute for the
+    holding, never one for each quote, so a refusal that persists cannot spend the account's
+    requests on cancels."""
+    strategy = c.counted()
+    c.first_leg(strategy)
+    step(strategy)
+    grow(strategy, 5)
+    for tenth in range(40, 640):
+        at = h.T0 + tenth * h.SECOND // 10
+        if c.row(strategy).row == "PCO":
+            strategy.deliver("CancelRejected", ts_event=at)
+        strategy.observe("9.80", at)
+    assert c.row(strategy).row in {"PCO", "WK"}, c.row(strategy)
+    assert 55 <= len(strategy.canceled) <= 61, len(strategy.canceled)
+
+
+def test_a_chase_does_not_cancel_inside_a_refused_cuts_floor():
+    """The cut's refusal and a lower counted quote are judged in one step. The cut waits its
+    floor; the chase must not cancel the same oversized leg in that step by another name."""
+    strategy = c.counted()
+    c.first_leg(strategy)
+    step(strategy)
+    grow(strategy, 5)
+    strategy.test_clock.set_time(h.T0 + 3 * h.SECOND)
+    step(strategy)
+    assert len(strategy.canceled) == 1 and c.row(strategy).row == "PCO"
+    strategy.deliver("CancelRejected", ts_event=h.T0 + 10 * h.SECOND)
+    strategy.observe("9.70", h.T0 + 10 * h.SECOND)
+    assert len(strategy.canceled) == 1, "nothing asked at the refusal's own time"
+    assert c.row(strategy).row == "WK", c.row(strategy)
+    strategy.observe("9.70", h.T0 + 11 * h.SECOND + h.SECOND // 2)
+    assert len(strategy.canceled) == 2 and c.row(strategy).row == "PCO", "the cut, after its floor"
+
+
 def test_resends_and_chase_reprices_have_separate_record_counts():
     strategy = c.counted()
     c.first_leg(strategy)

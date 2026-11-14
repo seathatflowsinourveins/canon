@@ -1251,7 +1251,7 @@ ENGINE_CASES = [
             FIRST[:2],
             [
                 ("FL", "HE", "always"),
-                ("OX", "oACC", "always"),
+                ("OX", "oACC", "cancel_due"),
                 ("PCX", "oCXL", "always"),
             ],
             "X",
@@ -1264,7 +1264,7 @@ ENGINE_CASES = [
             FIRST[:2],
             [
                 ("FL", "ST", "always"),
-                ("TW", "oACC", "always"),
+                ("TW", "oACC", "cancel_due"),
                 ("PCT", "oCXL", "long_remains"),
             ],
             "T0",
@@ -1951,6 +1951,8 @@ def test_timer_still_observes_a_stopped_sale_after_cancel_refusal():
     assert row(strategy).row == "TW" and len(strategy.canceled) == 1
     strategy.cached.held[0].signed_qty = Decimal(5)
     strategy.cached.held[0].quantity = h.Quantity.from_int(5)
+    # Our sale is now larger than the long: a new cause, asked at the next step whatever wait the
+    # stop's refused cancel started.
     strategy._on_step(SimpleNamespace(ts_event=h.T0 + 60 * h.SECOND))
     assert row(strategy).row == "PCT" and len(strategy.canceled) == 2
 

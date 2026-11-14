@@ -360,7 +360,10 @@ def test_unread_cover_with_unknown_own_remainder_uses_base_oversell_check(monkey
     assert called and ours.client_order_id in strategy.canceled
 
 
-def test_cover_freeze_retries_refused_oversell_cancel_in_the_judging_step(monkeypatch):
+def test_cover_freeze_retries_refused_oversell_cancel_after_its_floor(monkeypatch):
+    """The cut is not dropped while the cover is unread: refused, it is asked again, unpaced. Its
+    floor (a ruling of 2026-11-14) moves the retry from the step that judges the refusal to the
+    first step a second after it, so a venue that refuses at once is not asked at every step."""
     strategy = counted()
     first_leg(strategy)
     ours = strategy.cache.order(strategy.slots[h.AAA].protect_id)
@@ -377,9 +380,12 @@ def test_cover_freeze_retries_refused_oversell_cancel_in_the_judging_step(monkey
 
     monkeypatch.setattr(sale_table, "transition", traced)
     strategy.deliver_then_step("CancelRejected", leg=ours)
-    assert ("oCRJ", "FCW") in observed and ("MO", "FCP") in observed
-    assert row(strategy).row == "FCP" and len(strategy.canceled) == 2
+    assert ("oCRJ", "FCW") in observed and ("MO", "FCW") in observed
+    assert row(strategy).row == "FCW" and len(strategy.canceled) == 1
     step(strategy, 4)
+    assert ("MO", "FCP") in observed
+    assert row(strategy).row == "FCP" and len(strategy.canceled) == 2
+    step(strategy, 5)
     assert len(strategy.canceled) == 2 and len(strategy.sent) == 1
 
 

@@ -227,10 +227,12 @@
     "whole_cover": "foreign working sells cover the whole long at this step",
     "filled_part": "the engine reads our sale with a filled quantity above zero",
     "cancelable": "the engine reads our sale ACCEPTED or PARTIALLY_FILLED",
-    "reprice_due": "the chase function, called in this counted quote's handler, gives a price under our working leg's limit: the chase interval has passed since this leg's price was set and since a cancel of it was last asked, and the price a tick through this quote's bid, held at the episode's floor until the floor's wait has run, is lower than the leg's limit",
+    "reprice_due": "the chase function, called in this counted quote's handler, gives a price under our working leg's limit: the chase interval has passed since this leg's price was set and since a cancel of it was last asked, no cancel of it was refused within the last CUT_FLOOR_SECS (the cut's floor holds the chase too), and the price a tick through this quote's bid, held at the episode's floor until the floor's wait has run, is lower than the leg's limit",
     "leg_positive": "the leg's quantity is above zero. For EVERY leg it is the uncovered quantity read in this step: the long held less every foreign working sell (ruling 19; shares the owner adds while our leg works join at the next leg sent)",
     "refusal_told": "an ALERT that a sale of this holding could not be placed (the venue refused a leg, or a leg could not be formed) has been written and no leg of it has been ACCEPTED or filled since (held by the glue for the holding; a new run starts with none told)",
     "resend_due": "the refusal's wait has passed. After the nth venue's refusal in a row of this holding (since its open leg last filled, in part or whole: ONLY a fill of the open leg starts the row again; a leg we cancel, a cancel by another hand, an expiry, a replacement, an acceptance and a late fill of an earlier leg neither start it again nor add to it; a new holding starts at none) the wait is the chase interval doubled n-1 times and held at REFUSAL_RETRY_MOST_SECS (60 s, a named constant): 5, 10, 20, 40, then 60 s. After a run of refusals, a later episode's second try waits at the carried delay until a fill. After a cancel of a leg of it by another hand the wait is OUTSIDE_CANCEL_WAIT_SECS (60 s, a constant of its own: that minute is the owner's hand, not a refusal). Each wait is counted from the later of the event's own time and its receipt by the node. True when neither happened in this run; judged in this counted quote's handler and never on a timer",
+    "cancel_due": "a cancel of this leg may be asked now. EITHER none of ours was refused for it; OR the wait since the last refusal has passed: after the nth refused cancel of the leg the wait is the refused sale's own pace (the chase interval doubled n-1 times, held at REFUSAL_RETRY_MOST_SECS: 5, 10, 20, 40, then 60 s), counted from the later of the refusal's own time and its receipt and never from later than the node's clock when it is judged; OR the cause of this ask is new for the leg: no cancel was yet asked for it because of this event (the stop, the holding's end, our sale larger than the long, a part fill, an acknowledgement at last), so the first ask for each cause is never held by a wait another cause started. A new leg starts at none. Where the refused cancel was the CUT FOR SIZE of a working sale in a live or frozen holding the wait is not the pace but a floor, CUT_FLOOR_SECS (1 s) after that refusal: an oversell cannot wait, and a refusal that persists must not become a cancel at every quote",
+    "cancel_refusal_told": "an ALERT that our cancel of this leg was refused has been written (held by the glue for the leg; a new leg starts with none told)",
     "flight_alert_due": "our last command for this leg (its submit, or our cancel of it) has had no answer of any kind for FLIGHT_SECS (60 s, a named constant), and no ALERT has been written for that command's silence; judged in every step of a row that waits for an answer: a counted quote's, or the timer's (ruling 24: a stream of quotes that are not counted must not keep it silent)",
     "long_remains": "a long of this holding is still held after the fill",
     "faulted": "a fault of ours was recorded for this holding in this run: it was in a row frozen by a fault (FZ, FZW, FZP), or a Denied, a voided fill or an event with no column was judged for it (held by the glue for the holding; a new holding starts with none)",
@@ -407,7 +409,7 @@
     "no_leg_of_size_zero": "no leg of size zero or less is ever sent; a first leg whose size reads zero sends nothing, freezes nothing and alerts nothing",
     "nothing_for_a_whole_cover": "nothing is sent for a holding wholly covered by foreign sells; in a row with no sale of ours open, an event that changes the holding's size or the foreign cover re-reads the cover in that step",
     "invalidation_first": "what a step sees is applied in step_order; no leg is sent in a step that also saw a stop, the holding's end, a shrink, a foreign sell placed or a freeze",
-    "no_timer_transition": "a timer step changes no row, asks no cancel and sends nothing; the one line it may order is the ALERT for a command of ours left without an answer; the floor's wait is started and judged only in the handler of a counted quote under the level",
+    "no_timer_transition": "the timer's own event (NQ) changes no row, asks no cancel and sends nothing; the one line it may order is the ALERT for a command of ours left without an answer; the floor's wait is started and judged only in the handler of a counted quote under the level. What a timer step SEES beside it is another event: a mismatch (MO), the holding's end (HE), and the stop the caller raises again at every step while a stopped holding's sale is open (ST in TW), each of which may ask a cancel",
     "row_stored_before_actions": "the row a transition leads to is stored BEFORE its actions are carried out: the engine publishes Initialized inside our submit and PendingCancel inside our cancel, so the echo of a send meets the in-flight row and the echo of a cancel meets its cancel-asked row, and each does nothing",
     "one_alert_per_holding_until_accepted": "a venue's refusal of a leg writes ONE ALERT for the holding; no second ALERT for a refusal of it is written until a leg of it has been accepted, however often the price crosses the level or the leg is refused again; each further refusal is a counted line",
     "resend_no_sooner_than_the_interval": "no leg of a holding's sale leaves inside the wait that follows a venue's refusal of one (5, 10, 20, 40, then 60 s for refusals in a row) or a cancel of one by another hand (OUTSIDE_CANCEL_WAIT_SECS, 60 s), from any row; a leg is sent again only on a counted quote under the level, so an hour of standing refusal costs about 63 refused orders; never on a timer step and never on a quote above the level",
@@ -2497,14 +2499,21 @@
         "occurs": "yes",
         "branches": [
           {
-            "when": "always",
+            "when": "cancel_due",
             "next": "PCO",
             "send": false,
             "cancel": true,
             "alert": false
+          },
+          {
+            "when": "not cancel_due",
+            "next": "WK",
+            "send": false,
+            "cancel": false,
+            "alert": false
           }
         ],
-        "note": "the cut comes first; no new order in this step; never a modify"
+        "note": "the cut comes first; no new order in this step; never a modify. Not paced: an oversell cannot wait. Its floor: a cut the venue refused is asked again no sooner than CUT_FLOOR_SECS (1 s) after that refusal, so a refusal that persists is at most one cancel a second for the holding"
       },
       "HE": {
         "occurs": "yes",
@@ -2923,14 +2932,21 @@
         "occurs": "yes",
         "branches": [
           {
-            "when": "always",
+            "when": "cancel_due",
             "next": "PCO",
             "send": false,
             "cancel": true,
             "alert": false
+          },
+          {
+            "when": "not cancel_due",
+            "next": "PF",
+            "send": false,
+            "cancel": false,
+            "alert": false
           }
         ],
-        "note": "the cut comes first; no new order in this step; never a modify"
+        "note": "the cut comes first; no new order in this step; never a modify. Not paced: an oversell cannot wait. Its floor: a cut the venue refused is asked again no sooner than CUT_FLOOR_SECS (1 s) after that refusal, so a refusal that persists is at most one cancel a second for the holding"
       },
       "HE": {
         "occurs": "yes",
@@ -4344,23 +4360,37 @@
         "occurs": "yes",
         "branches": [
           {
-            "when": "always",
+            "when": "cancel_due",
             "next": "PCX",
             "send": false,
             "cancel": true,
             "alert": false
+          },
+          {
+            "when": "not cancel_due",
+            "next": "OX",
+            "send": false,
+            "cancel": false,
+            "alert": false
           }
         ],
-        "note": "asked in the step it becomes cancelable, then on timer steps"
+        "note": "asked in the step it becomes cancelable, then on timer steps; a cancel the venue refused is asked again at the refused sale's own pace (`cancel_due`), never at every step and never never"
       },
       "HE": {
         "occurs": "yes",
         "branches": [
           {
-            "when": "cancelable",
+            "when": "cancelable and cancel_due",
             "next": "PCX",
             "send": false,
             "cancel": true,
+            "alert": false
+          },
+          {
+            "when": "cancelable and not cancel_due",
+            "next": "OX",
+            "send": false,
+            "cancel": false,
             "alert": false
           },
           {
@@ -4371,7 +4401,7 @@
             "alert": false
           }
         ],
-        "note": "the holding's end seen again (another position sits under the instrument, or our cancel was refused): the owed cancel is asked as soon as our sale can take one, whatever its size against what is then held; an ended holding's sale never rests beside a later holding in silence"
+        "note": "the holding's end seen again (another position sits under the instrument, or our cancel was refused): the owed cancel is asked as soon as our sale can take one, whatever its size against what is then held; an ended holding's sale never rests beside a later holding in silence; a cancel the venue refused is asked again at the refused sale's own pace (`cancel_due`), never at every step and never never"
       },
       "ST": {
         "occurs": "yes",
@@ -4467,15 +4497,22 @@
         "occurs": "yes",
         "branches": [
           {
-            "when": "always",
+            "when": "cancel_due",
             "next": "PCX",
             "send": false,
             "cancel": true,
             "alert": false
+          },
+          {
+            "when": "not cancel_due",
+            "next": "OX",
+            "send": false,
+            "cancel": false,
+            "alert": false
           }
         ],
         "pin": "model/src/orders/mod.rs:233",
-        "note": "acknowledged at last: the owed cancel"
+        "note": "acknowledged at last: the owed cancel; a cancel the venue refused is asked again at the refused sale's own pace (`cancel_due`), never at every step and never never"
       },
       "oREJ": {
         "occurs": "yes",
@@ -4545,15 +4582,22 @@
         "occurs": "yes",
         "branches": [
           {
-            "when": "always",
+            "when": "cancel_due",
             "next": "PCX",
             "send": false,
             "cancel": true,
             "alert": true
+          },
+          {
+            "when": "not cancel_due",
+            "next": "OX",
+            "send": false,
+            "cancel": false,
+            "alert": true
           }
         ],
         "pin": "model/src/orders/mod.rs:235, 245",
-        "note": "sold a part after the end"
+        "note": "sold a part after the end; a cancel the venue refused is asked again at the refused sale's own pace (`cancel_due`), never at every step and never never"
       },
       "oFF": {
         "occurs": "yes",
@@ -4833,11 +4877,18 @@
             "alert": true
           },
           {
-            "when": "not ends_filled",
+            "when": "not ends_filled and not cancel_refusal_told",
             "next": "OX",
             "send": false,
             "cancel": false,
             "alert": true
+          },
+          {
+            "when": "not ends_filled and cancel_refusal_told",
+            "next": "OX",
+            "send": false,
+            "cancel": false,
+            "alert": false
           }
         ],
         "pin": "model/src/orders/mod.rs:270, 1313-1320, 1322-1324",
@@ -4860,11 +4911,18 @@
         "occurs": "yes",
         "branches": [
           {
-            "when": "always",
+            "when": "not cancel_refusal_told",
             "next": "OX",
             "send": false,
             "cancel": false,
             "alert": true
+          },
+          {
+            "when": "cancel_refusal_told",
+            "next": "OX",
+            "send": false,
+            "cancel": false,
+            "alert": false
           }
         ],
         "pin": "model/src/orders/mod.rs:269",
@@ -4915,11 +4973,18 @@
         "occurs": "yes",
         "branches": [
           {
-            "when": "always",
+            "when": "not cancel_refusal_told",
             "next": "OX",
             "send": false,
             "cancel": false,
             "alert": true
+          },
+          {
+            "when": "cancel_refusal_told",
+            "next": "OX",
+            "send": false,
+            "cancel": false,
+            "alert": false
           }
         ],
         "pin": "model/src/orders/mod.rs:266, 943-951, 1067-1068",
@@ -5503,14 +5568,21 @@
         "occurs": "yes",
         "branches": [
           {
-            "when": "always",
+            "when": "cancel_due",
             "next": "FZP",
             "send": false,
             "cancel": true,
             "alert": false
+          },
+          {
+            "when": "not cancel_due",
+            "next": "FZW",
+            "send": false,
+            "cancel": false,
+            "alert": false
           }
         ],
-        "note": "the cut holds while frozen: a cancel is not a send"
+        "note": "the cut holds while frozen: a cancel is not a send; a refused cut is asked again no sooner than CUT_FLOOR_SECS after its refusal"
       },
       "HE": {
         "occurs": "yes",
@@ -6707,14 +6779,21 @@
         "occurs": "yes",
         "branches": [
           {
-            "when": "always",
+            "when": "cancel_due",
             "next": "FCP",
             "send": false,
             "cancel": true,
             "alert": false
+          },
+          {
+            "when": "not cancel_due",
+            "next": "FCW",
+            "send": false,
+            "cancel": false,
+            "alert": false
           }
         ],
-        "note": "the cut holds while frozen: a cancel is not a send"
+        "note": "the cut holds while frozen: a cancel is not a send; a refused cut is asked again no sooner than CUT_FLOOR_SECS after its refusal"
       },
       "HE": {
         "occurs": "yes",
@@ -7656,11 +7735,18 @@
             "alert": false
           },
           {
-            "when": "not ends_filled",
+            "when": "not ends_filled and not cancel_refusal_told",
             "next": "TW",
             "send": false,
             "cancel": false,
             "alert": true
+          },
+          {
+            "when": "not ends_filled and cancel_refusal_told",
+            "next": "TW",
+            "send": false,
+            "cancel": false,
+            "alert": false
           }
         ],
         "pin": "model/src/orders/mod.rs:270, 1313-1320, 1322-1324",
@@ -7683,11 +7769,18 @@
         "occurs": "yes",
         "branches": [
           {
-            "when": "always",
+            "when": "not cancel_refusal_told",
             "next": "TW",
             "send": false,
             "cancel": false,
             "alert": true
+          },
+          {
+            "when": "cancel_refusal_told",
+            "next": "TW",
+            "send": false,
+            "cancel": false,
+            "alert": false
           }
         ],
         "pin": "model/src/orders/mod.rs:269",
@@ -7752,11 +7845,18 @@
         "occurs": "yes",
         "branches": [
           {
-            "when": "always",
+            "when": "not cancel_refusal_told",
             "next": "TW",
             "send": false,
             "cancel": false,
             "alert": true
+          },
+          {
+            "when": "cancel_refusal_told",
+            "next": "TW",
+            "send": false,
+            "cancel": false,
+            "alert": false
           }
         ],
         "pin": "model/src/orders/mod.rs:266, 943-951, 1067-1068",
@@ -7976,23 +8076,37 @@
         "occurs": "yes",
         "branches": [
           {
-            "when": "always",
+            "when": "cancel_due",
             "next": "PCT",
             "send": false,
             "cancel": true,
             "alert": false
+          },
+          {
+            "when": "not cancel_due",
+            "next": "TW",
+            "send": false,
+            "cancel": false,
+            "alert": false
           }
         ],
-        "note": "a stopped holding's open sale that exceeds the long is cut too"
+        "note": "a stopped holding's open sale that exceeds the long is cut too; a cancel the venue refused is asked again at the refused sale's own pace (`cancel_due`), never at every step and never never"
       },
       "HE": {
         "occurs": "yes",
         "branches": [
           {
-            "when": "cancelable",
+            "when": "cancelable and cancel_due",
             "next": "PCT",
             "send": false,
             "cancel": true,
+            "alert": false
+          },
+          {
+            "when": "cancelable and not cancel_due",
+            "next": "TW",
+            "send": false,
+            "cancel": false,
             "alert": false
           },
           {
@@ -8003,19 +8117,34 @@
             "alert": false
           }
         ],
-        "note": "the stopped holding ended (flat, short, or another position under the instrument) with our sale still open: its cancel is asked again as soon as the sale can take one, whatever its size against what is then held; an ended holding's sale never rests beside a later holding in silence"
+        "note": "the stopped holding ended (flat, short, or another position under the instrument) with our sale still open: its cancel is asked again as soon as the sale can take one, whatever its size against what is then held; an ended holding's sale never rests beside a later holding in silence; a cancel the venue refused is asked again at the refused sale's own pace (`cancel_due`), never at every step and never never"
       },
       "ST": {
         "occurs": "yes",
         "branches": [
           {
-            "when": "always",
+            "when": "cancelable and cancel_due",
+            "next": "PCT",
+            "send": false,
+            "cancel": true,
+            "alert": false
+          },
+          {
+            "when": "cancelable and not cancel_due",
+            "next": "TW",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          },
+          {
+            "when": "not cancelable",
             "next": "TW",
             "send": false,
             "cancel": false,
             "alert": false
           }
-        ]
+        ],
+        "note": "THE STOP STILL STANDS (the owner's hold, or the instrument's stop), emitted at every step while our sale is open under it: a cancel the venue refused, or one the leg could not take in flight, is asked again here, so a held symbol's sell does not rest until its holding ends; a cancel the venue refused is asked again at the refused sale's own pace (`cancel_due`), never at every step and never never"
       },
       "FRZ": {
         "occurs": "yes",
@@ -8098,15 +8227,22 @@
         "occurs": "yes",
         "branches": [
           {
-            "when": "always",
+            "when": "cancel_due",
             "next": "PCT",
             "send": false,
             "cancel": true,
             "alert": false
+          },
+          {
+            "when": "not cancel_due",
+            "next": "TW",
+            "send": false,
+            "cancel": false,
+            "alert": false
           }
         ],
         "pin": "model/src/orders/mod.rs:233",
-        "note": "acknowledged at last: the stop could not ask its cancel while the leg was in flight; it asks when the leg can take one"
+        "note": "acknowledged at last: the stop could not ask its cancel while the leg was in flight; it asks when the leg can take one; a cancel the venue refused is asked again at the refused sale's own pace (`cancel_due`), never at every step and never never"
       },
       "oREJ": {
         "occurs": "yes",
@@ -8208,15 +8344,22 @@
         "occurs": "yes",
         "branches": [
           {
-            "when": "always",
+            "when": "cancel_due",
             "next": "PCT",
             "send": false,
             "cancel": true,
             "alert": false
+          },
+          {
+            "when": "not cancel_due",
+            "next": "TW",
+            "send": false,
+            "cancel": false,
+            "alert": false
           }
         ],
         "pin": "model/src/orders/mod.rs:235, 245",
-        "note": "the stop could not ask its cancel while the leg was in flight; it asks when the leg can take one"
+        "note": "the stop could not ask its cancel while the leg was in flight; it asks when the leg can take one; a cancel the venue refused is asked again at the refused sale's own pace (`cancel_due`), never at every step and never never"
       },
       "oFF": {
         "occurs": "yes",

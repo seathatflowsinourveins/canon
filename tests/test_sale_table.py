@@ -22,7 +22,7 @@ from canon_trading import sale_table as sale
 DATA_PATH = Path(__file__).resolve().parents[1] / "src/canon_trading/sale_table.json"
 DATA = json.loads(DATA_PATH.read_text())
 HISTORIES = json.loads(Path(__file__).with_name("sale_table_histories.json").read_text())
-CELLS_HASH = "f3d589f0ec10a4dcd52199ab8a1a5eae82954470ed285d7adb7a45294efa9b3c"
+CELLS_HASH = "046ef1f03b02491e885a24f5c1380de813b84db48f69437971888e46e7835eee"
 CELLS = [(r, e, c) for r, row in DATA["cells"].items() for e, c in row.items()]
 BRANCHES = [(r, e, b) for r, e, c in CELLS for b in c["branches"]]
 
@@ -186,7 +186,11 @@ def test_resting_rows_without_a_chase_are_entered_with_an_alert():
     resting = {"FZW", "FCW", "TW", "OX"}
     for row, _, branch in BRANCHES:
         if row not in resting and branch["next"] in resting:
-            assert branch["alert"]
+            # One exception, by name: a cancel refused AGAIN for a leg whose refused cancel was
+            # already told returns to its resting row in silence (said once per leg).
+            told = "cancel_refusal_told" in branch["when"].split(" and ")
+            assert branch["alert"] != told, (row, branch)
+            assert not told or (row, branch["next"]) in {("PCX", "OX"), ("PCT", "TW")}
 
 
 def test_quantity_and_cover_properties_are_in_the_contract():
@@ -361,7 +365,7 @@ def test_size_and_cover_events_reread_cover(row, event):
 
 @pytest.mark.parametrize("event", ["oACC", "oPF", "MO"])
 def test_stopped_open_sale_asks_the_owed_cancel(event):
-    result = sale.transition(sale.State("TW"), 2, event, {})
+    result = sale.transition(sale.State("TW"), 2, event, {"cancel_due": True})
     assert result.state == sale.State("PCT")
     assert result.actions == (sale.Action.CANCEL,)
 
@@ -683,10 +687,38 @@ def test_the_rows_a_sends_echo_can_meet_are_those_one_account_event_from_flight(
 def test_an_ended_holdings_open_sale_is_asked_canceled_whenever_it_can_take_a_cancel():
     """OX x HE: the end seen again (another position under the instrument, or a refused cancel).
     A reopened holding at least as large as our leg never shows a mismatch, so the end asks."""
-    asked = sale.transition(sale.State("OX"), 2, "HE", {"cancelable": True})
+    asked = sale.transition(sale.State("OX"), 2, "HE", {"cancelable": True, "cancel_due": True})
     assert asked.state == sale.State("PCX") and asked.actions == (sale.Action.CANCEL,)
-    owed = sale.transition(sale.State("OX"), 2, "HE", {"cancelable": False})
+    owed = sale.transition(sale.State("OX"), 2, "HE", {"cancelable": False, "cancel_due": True})
     assert owed.state == sale.State("OX") and owed.actions == ()
+
+
+@pytest.mark.parametrize(
+    "row,event,pending",
+    [
+        ("OX", "HE", "PCX"),
+        ("OX", "MO", "PCX"),
+        ("TW", "HE", "PCT"),
+        ("TW", "MO", "PCT"),
+        ("TW", "ST", "PCT"),
+    ],
+)
+def test_a_cancel_that_repeats_waits_the_refusals_pace(row, event, pending):
+    """An ended or stopped holding's open sale: its cancel is asked when due and not before."""
+    facts = {"cancelable": True}
+    due = sale.transition(sale.State(row), 2, event, {**facts, "cancel_due": True})
+    assert due.state == sale.State(pending) and due.actions == (sale.Action.CANCEL,)
+    waits = sale.transition(sale.State(row), 2, event, {**facts, "cancel_due": False})
+    assert waits.state == sale.State(row) and waits.actions == ()
+
+
+@pytest.mark.parametrize("row,resting", [("PCX", "OX"), ("PCT", "TW")])
+@pytest.mark.parametrize("event", ["oCRJ", "oACC"])
+def test_a_refused_cancel_that_is_asked_again_is_told_once(row, resting, event):
+    first = sale.transition(sale.State(row), 2, event, {"cancel_refusal_told": False})
+    assert first.state == sale.State(resting) and first.actions == (sale.Action.ALERT,)
+    later = sale.transition(sale.State(row), 2, event, {"cancel_refusal_told": True})
+    assert later.state == sale.State(resting) and later.actions == ()
 
 
 @pytest.mark.parametrize("row", DATA["rows"])

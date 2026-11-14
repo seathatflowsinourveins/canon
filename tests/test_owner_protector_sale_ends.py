@@ -92,12 +92,19 @@ def test_an_ended_holdings_sale_is_asked_canceled_again_after_a_refusal() -> Non
     reopen(strategy, 5, 15)
     step(strategy, 5)
     assert strategy.canceled == [leg.client_order_id] and c.row(strategy).row == "PCX"
-    strategy.deliver("CancelRejected", leg=strategy.cache.order(leg.client_order_id))
-    step(strategy, 6)
-    step(strategy, 7)
+    strategy.deliver(
+        "CancelRejected",
+        leg=strategy.cache.order(leg.client_order_id),
+        ts_event=h.T0 + 6 * h.SECOND,
+    )
+    for seconds in range(6, 11):
+        step(strategy, seconds)
+    assert strategy.canceled == [leg.client_order_id], "not before the refusal's wait has passed"
+    assert c.row(strategy).row == "OX", c.row(strategy)
+    step(strategy, 11)
     assert strategy.canceled == [leg.client_order_id] * 2, (
         "the reopened holding is at least as large as our leg, so no mismatch ever asks: the "
-        "holding's end, seen again, does"
+        "holding's end, seen again, does, once the wait has passed"
     )
     assert c.row(strategy).row == "PCX", c.row(strategy)
 
@@ -136,12 +143,14 @@ def test_a_stopped_sale_whose_cancel_was_refused_is_asked_again_when_its_holding
     strategy.deliver("Accepted", leg=ours)
     step(strategy, 4)
     assert strategy.canceled == [leg.client_order_id] and c.row(strategy).row == "PCT"
-    strategy.deliver("CancelRejected", leg=ours)
+    strategy.deliver("CancelRejected", leg=ours, ts_event=h.T0 + 5 * h.SECOND)
     step(strategy, 5)
     assert c.row(strategy).row == "TW", c.row(strategy)
     reopen(strategy, 6, 15)
     step(strategy, 6)
-    assert strategy.canceled == [leg.client_order_id] * 2, "asked again at the holding's end"
+    assert strategy.canceled == [leg.client_order_id] * 2, (
+        "asked again at the holding's end, a new cause: the stop's refused cancel does not hold it"
+    )
     assert c.row(strategy).row == "PCT", c.row(strategy)
 
 
@@ -180,23 +189,254 @@ def test_a_holding_that_goes_flat_while_its_stopped_sale_is_open_has_ended(tmp_p
     assert slot is None or slot.ended, "nothing of the ended holding is judged again"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="count-two follow-up: refused-cancel re-ask with its wait (a refused cancel at a "
-    "holding's end is asked again at every step, with no pace)",
-)
+def refuse_each_cancel(strategy, leg, seconds: range, pending: str) -> None:
+    """One step a second; whenever our cancel is pending the venue refuses it before the step."""
+    ours = strategy.cache.order(leg.client_order_id)
+    for second in seconds:
+        if c.row(strategy).row == pending:
+            strategy.deliver("CancelRejected", leg=ours, ts_event=h.T0 + second * h.SECOND)
+        step(strategy, second)
+
+
+def cancel_alerts(strategy) -> list[str]:
+    return [line for line in strategy.said if line.startswith("ALERT:") and "cancel" in line]
+
+
 def test_a_refused_cancel_at_a_holdings_end_is_asked_again_at_a_pace() -> None:
     """The owner sold and bought again at least our leg's size, so the end is seen at every step
-    and no mismatch ever shows. A venue that refuses our cancel each time must be asked again at a
-    pace (the refused sale's is 5, 10, 20 s), not once a second."""
+    and no mismatch ever shows. A venue that refuses our cancel each time is asked again at the
+    refused sale's own pace (5, 10, 20 s), never once a second and never never, and told once."""
     strategy = c.counted()
     c.first_leg(strategy)
     (leg,) = strategy.sent
     reopen(strategy, 5, 15)
     step(strategy, 5)
+    assert strategy.canceled == [leg.client_order_id] and c.row(strategy).row == "PCX"
+    refuse_each_cancel(strategy, leg, range(6, 45), "PCX")
+    asked = len(strategy.canceled)
+    assert asked == 4, ("asked at 5 s, then 5, 10 and 20 s after each refusal", asked)
+    assert len(cancel_alerts(strategy)) == 1, cancel_alerts(strategy)
+
+
+def test_a_refused_cancel_of_a_flat_holdings_sale_is_asked_again_at_a_pace() -> None:
+    """The holding went flat with our leg working: the mismatch asks the cancel. Refused each time,
+    it is asked again at the pace, not at every timer step."""
+    strategy = c.counted()
+    c.first_leg(strategy)
+    (leg,) = strategy.sent
+    held = strategy.cached.held[0]
+    held.signed_qty, held.quantity = Decimal(0), h.Quantity.from_int(0)
+    strategy.cached.held.clear()
+    step(strategy, 5)
+    assert strategy.canceled == [leg.client_order_id] and c.row(strategy).row == "PCX"
+    refuse_each_cancel(strategy, leg, range(6, 45), "PCX")
+    assert len(strategy.canceled) == 4, len(strategy.canceled)
+    assert len(cancel_alerts(strategy)) == 1, cancel_alerts(strategy)
+
+
+def test_a_held_symbols_refused_cancel_is_asked_again_while_the_hold_stands(tmp_path: Path) -> None:
+    """A hold with our leg in flight; the cancel asked at the acknowledgement is refused. The long
+    remains and the hold stands, so nothing ends the holding: the cancel must still be asked again,
+    at the pace, or the held symbol's sell rests at the venue and can fill."""
+    strategy = c.counted(symbol_holds_dir=tmp_path)
+    strategy.observe("9.89", h.T0 + h.SECOND)
+    strategy.observe("9.88", h.T0 + 2 * h.SECOND)
+    (leg,) = strategy.sent
+    symbol_hold.write_hold(tmp_path, "AAA")
+    step(strategy, 3)
     ours = strategy.cache.order(leg.client_order_id)
-    for seconds in range(6, 16):
-        if c.row(strategy).row == "PCX":
-            strategy.deliver("CancelRejected", leg=ours)
+    strategy.deliver("Submitted", leg=ours)
+    strategy.deliver("Accepted", leg=ours)
+    step(strategy, 4)
+    assert strategy.canceled == [leg.client_order_id] and c.row(strategy).row == "PCT"
+    refuse_each_cancel(strategy, leg, range(5, 44), "PCT")
+    assert len(strategy.canceled) == 4, len(strategy.canceled)
+    assert len(cancel_alerts(strategy)) == 1, cancel_alerts(strategy)
+    assert strategy.sent == [leg], "a hold never sells"
+
+
+def test_a_new_leg_starts_the_refused_cancels_pace_and_its_alert_again() -> None:
+    """The pace and the one ALERT belong to the leg: a later leg's first refused cancel is told."""
+    strategy = c.counted()
+    c.first_leg(strategy)
+    slot = strategy.slots[h.AAA]
+    slot.cancel_refusals, slot.cancel_refused_ns, slot.cancel_refusal_told = 3, h.T0, True
+    strategy.observe("9.70", h.T0 + 60 * h.SECOND)
+    assert c.row(strategy).row == "PCR", c.row(strategy)
+    strategy.deliver("Canceled", ts_event=h.T0 + 61 * h.SECOND)
+    step(strategy, 61)
+    assert c.row(strategy).row == "FL" and len(strategy.sent) == 2
+    assert (slot.cancel_refusals, slot.cancel_refused_ns, slot.cancel_refusal_told) == (
+        0,
+        None,
+        False,
+    )
+
+
+def held_with_a_refused_cancel(strategy, tmp_path: Path):
+    """A hold with our leg in flight; the cancel asked at the acknowledgement is refused at 5 s."""
+    strategy.observe("9.89", h.T0 + h.SECOND)
+    strategy.observe("9.88", h.T0 + 2 * h.SECOND)
+    (leg,) = strategy.sent
+    symbol_hold.write_hold(tmp_path, "AAA")
+    step(strategy, 3)
+    ours = strategy.cache.order(leg.client_order_id)
+    strategy.deliver("Submitted", leg=ours)
+    strategy.deliver("Accepted", leg=ours)
+    step(strategy, 4)
+    assert strategy.canceled == [leg.client_order_id] and c.row(strategy).row == "PCT"
+    strategy.deliver("CancelRejected", leg=ours, ts_event=h.T0 + 5 * h.SECOND)
+    step(strategy, 5)
+    assert c.row(strategy).row == "TW", c.row(strategy)
+    return leg, ours
+
+
+def test_the_first_ask_for_a_new_cause_never_waits_a_refusals_pace(tmp_path: Path) -> None:
+    """The stop's cancel was refused and its wait runs. The owner then sells the whole long: the
+    holding's end is a new cause to ask, and our sell must not rest beside a flat account for the
+    rest of a wait that another cause started."""
+    strategy = c.counted(symbol_holds_dir=tmp_path)
+    leg, _ours = held_with_a_refused_cancel(strategy, tmp_path)
+    held = strategy.cached.held[0]
+    held.signed_qty, held.quantity = Decimal(0), h.Quantity.from_int(0)
+    strategy.cached.held.clear()
+    step(strategy, 6)
+    assert strategy.canceled == [leg.client_order_id] * 2, "asked in the step the end is seen"
+    assert c.row(strategy).row == "PCT", c.row(strategy)
+
+
+def test_part_fills_after_a_refused_cancel_do_not_ask_at_every_fill() -> None:
+    """An ended holding's sale fills in parts while the venue refuses its cancel: a part fill
+    asks the cancel the end already owes, so it waits the end's pace and does not lengthen it."""
+    strategy = c.counted()
+    c.first_leg(strategy)
+    (leg,) = strategy.sent
+    ours = strategy.cache.order(leg.client_order_id)
+    reopen(strategy, 5, 15)
+    step(strategy, 5)
+    strategy.deliver("CancelRejected", leg=ours, ts_event=h.T0 + 6 * h.SECOND)
+    step(strategy, 6)
+    for seconds in (7, 8, 9):
+        strategy.deliver("Filled", quantity=1, leg=ours)
         step(strategy, seconds)
-    assert len(strategy.canceled) <= 3, len(strategy.canceled)
+    assert len(strategy.canceled) == 1, "part fills inside the wait ask nothing"
+    assert strategy.slots[h.AAA].cancel_refusals == 1
+    step(strategy, 11)
+    assert len(strategy.canceled) == 2, "asked again when the wait has passed"
+
+
+def test_a_refusal_stamped_ahead_of_the_clock_does_not_postpone_the_next_ask() -> None:
+    """The wait runs from no later than the node's own clock when the refusal is judged."""
+    strategy = c.counted()
+    c.first_leg(strategy)
+    (leg,) = strategy.sent
+    ours = strategy.cache.order(leg.client_order_id)
+    reopen(strategy, 5, 15)
+    step(strategy, 5)
+    strategy.deliver("CancelRejected", leg=ours, ts_event=h.T0 + 3600 * h.SECOND)
+    for seconds in range(6, 12):
+        step(strategy, seconds)
+    assert len(strategy.canceled) == 2, "asked again five seconds after the refusal was judged"
+
+
+def test_each_refused_cancel_after_the_first_is_counted_in_a_line(tmp_path: Path) -> None:
+    strategy = c.counted(symbol_holds_dir=tmp_path)
+    _leg, ours = held_with_a_refused_cancel(strategy, tmp_path)
+    for seconds in range(6, 30):
+        if c.row(strategy).row == "PCT":
+            strategy.deliver("CancelRejected", leg=ours, ts_event=h.T0 + seconds * h.SECOND)
+        step(strategy, seconds)
+    counted = [
+        line
+        for line in strategy.said
+        if "cancel of our sale refused" in line and not line.startswith("ALERT:")
+    ]
+    assert [line.split("refused ")[1].split(" ")[0] for line in counted] == ["1", "2", "3"], counted
+    assert "asked again after 5 s" in counted[0] and "asked again after 20 s" in counted[2]
+    assert len(cancel_alerts(strategy)) == 1
+    assert "asked again after 5 s" in cancel_alerts(strategy)[0], cancel_alerts(strategy)
+
+
+def test_a_stored_update_is_not_read_as_the_refusal_of_a_cancel_asked_in_its_step(
+    tmp_path: Path,
+) -> None:
+    """The stop is judged before the step's stored order events. An Updated stored before the step
+    cannot answer a cancel the step itself asks: it is not judged as that cancel's refusal, and
+    it does not keep the stop that still stands from asking."""
+    strategy = c.counted(symbol_holds_dir=tmp_path)
+    leg, ours = held_with_a_refused_cancel(strategy, tmp_path)
+    strategy.deliver("Updated", leg=ours, ts_event=h.T0 + 11 * h.SECOND)
+    step(strategy, 11)
+    slot = strategy.stopped_sales.get(h.AAA) or strategy.slots[h.AAA]
+    assert strategy.canceled == [leg.client_order_id] * 2 and c.row(strategy).row == "PCT"
+    assert slot.cancel_refusals == 1, "the stored update is not a refusal"
+
+
+@pytest.mark.parametrize("released", [False, True])
+def test_an_update_stored_at_every_step_does_not_starve_the_standing_stop(
+    tmp_path: Path, released: bool
+) -> None:
+    """A venue update waiting at every step must not keep a refused cancel from being asked again
+    when its wait has passed, under the hold and through a release that waits for it."""
+    strategy = c.counted(symbol_holds_dir=tmp_path)
+    leg, ours = held_with_a_refused_cancel(strategy, tmp_path)
+    if released:
+        symbol_hold.remove_hold(tmp_path, "AAA")
+    for second in range(6, 11):
+        strategy.deliver("Updated", leg=ours, ts_event=h.T0 + second * h.SECOND)
+        step(strategy, second)
+    assert strategy.canceled == [leg.client_order_id] * 2, "asked again five seconds after"
+    assert c.row(strategy).row == "PCT", c.row(strategy)
+
+
+@pytest.mark.parametrize("stored", ["Updated", "Accepted"])
+def test_a_skipped_stored_event_keeps_the_cancel_its_step_asked(
+    tmp_path: Path, stored: str
+) -> None:
+    """An event stored before the step and judged in no row is still replayed on our copy of the
+    leg, which has not yet seen the pending cancel. The cancel the step asked stays requested:
+    the duplicate guard, the fault rows and the holding status read it as pending."""
+    strategy = c.counted(symbol_holds_dir=tmp_path)
+    c.first_leg(strategy)
+    (leg,) = strategy.sent
+    ours = strategy.cache.order(leg.client_order_id)
+    if stored == "Accepted":
+        strategy.deliver("Filled", quantity=1, leg=ours)
+        step(strategy, 2)
+    strategy.deliver(stored, leg=ours, ts_event=h.T0 + 3 * h.SECOND)
+    symbol_hold.write_hold(tmp_path, "AAA")
+    step(strategy, 3)
+    assert strategy.canceled == [leg.client_order_id] and c.row(strategy).row == "PCT"
+    assert leg.client_order_id in strategy.cancel_requested, "the step's own cancel is pending"
+    step(strategy, 4)
+    assert leg.client_order_id in strategy.cancel_requested, "still pending a step later"
+    assert strategy.canceled == [leg.client_order_id]
+
+
+@pytest.mark.parametrize("stored", ["Updated", "Accepted"])
+def test_an_event_stored_before_the_first_stop_is_not_its_cancels_refusal(
+    tmp_path: Path, stored: str
+) -> None:
+    """An update or an acknowledgement already stored when the owner's hold arrives is judged
+    after the stop's cancel in the same step. It is no answer to that cancel: the row waits for
+    the real one, and the real refusal starts the wait."""
+    strategy = c.counted(symbol_holds_dir=tmp_path)
+    c.first_leg(strategy)
+    (leg,) = strategy.sent
+    ours = strategy.cache.order(leg.client_order_id)
+    if stored == "Accepted":
+        strategy.deliver("Filled", quantity=1, leg=ours)
+        step(strategy, 2)
+    strategy.deliver(stored, leg=ours, ts_event=h.T0 + 3 * h.SECOND)
+    symbol_hold.write_hold(tmp_path, "AAA")
+    step(strategy, 3)
+    slot = strategy.stopped_sales.get(h.AAA) or strategy.slots[h.AAA]
+    assert strategy.canceled == [leg.client_order_id] and c.row(strategy).row == "PCT"
+    assert slot.cancel_refusals == 0 and slot.cancel_refused_ns is None
+    strategy.deliver("CancelRejected", leg=ours, ts_event=h.T0 + 10 * h.SECOND)
+    step(strategy, 10)
+    assert c.row(strategy).row == "TW" and slot.cancel_refused_ns == h.T0 + 10 * h.SECOND
+    step(strategy, 11)
+    assert strategy.canceled == [leg.client_order_id], "the real refusal's wait runs"
+    step(strategy, 15)
+    assert strategy.canceled == [leg.client_order_id] * 2
