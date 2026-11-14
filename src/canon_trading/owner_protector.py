@@ -178,13 +178,18 @@ reconciled EXTERNAL position opens at the reconciliation clock, never the venue'
 (crates/live/src/execution/manager.rs:4282-4330, live/src/execution/reconciliation.rs:955-1003,
 execution/src/reconciliation/orders.rs:1322,1348, model/src/position.rs:232), so ts_opened names
 no holding across runs; the entry keeps its own protection start. Whether the entry's holding is
-the one held now is read from the venue (U-e B, start_level.holding_verdict: GET /orders through
-the runner's reader, fills counted by fill time over a 92-day walk, review F1): fewer shares sold
-since the entry was written than it held, so never flat, and a quantity held now that those sells
-and the buys since explain (review F4: a split is not), carries its level. A sell-out is a new
-holding, and its entry may be replaced; a failed, incomplete or unexplained reading is unknown:
-the holding self-arms, guarded, at a level kept in memory, and the book keeps the entry as written
-unless this run's level is higher (review F2). A holding this run sees end has its entry retired:
+the one held now is read from the venue (U-e B, start_level.holding_reading: GET /orders through
+the runner's reader over a 92-day walk, review F1), on the venue's clock alone (DeepSeek P2-2,
+the lead's ruling of 2026-11-13 21:23): each entry keeps the venue's reading of its holding's
+fills, taken when the holding was found (Alpaca's clock, then both sides' orders, then the
+position, `_read_venue`) or carried from a same-holding reading, and every order the node had
+applied, by venue identity. The fills the entry does not hold are those the venue shows beyond
+it: fewer such shares sold than it held, so never flat, and a quantity held now that those sells
+and buys explain (review F4: a split is not), carries its level. A sell-out is a new holding,
+and its entry may be replaced; a failed, incomplete or unexplained reading, or an entry with no
+reading, is unknown: the holding self-arms, guarded, at a level kept in memory, and the book
+keeps the entry as written unless this run's level is higher (review F2), except an entry with
+no reading, which this run's own entry replaces (the lead, 21:32, property 2). A holding this run sees end has its entry retired:
 written with no level, state frozen, reason "holding ended", so no later run carries it (F3). A
 level supplied or kept while flat binds a holding found later only when no buy filled after it was
 kept (start_level.bought_since). Limit: each of those GETs runs on the event thread at the start of
@@ -315,17 +320,25 @@ from .mover import chase_floor
 from .mover import offsets
 from .price_step import exit_price
 from .price_step import up_on_step
+from .start_level import APPLIED_MOST
 from .start_level import LABEL
 from .start_level import NEEDS_REASON
 from .start_level import NEW
 from .start_level import SAME
+from .start_level import UNKNOWN
+from .start_level import Applied
 from .start_level import Entry
+from .start_level import Horizon
 from .start_level import Key
 from .start_level import LevelBook
+from .start_level import Unread
+from .start_level import baseline
 from .start_level import book_path
 from .start_level import bought_since
-from .start_level import holding_verdict
+from .start_level import holding_reading
+from .start_level import leg_key
 from .start_level import overnight_answer
+from .start_level import raw_key
 from .start_level import start_level
 
 if TYPE_CHECKING:
@@ -693,6 +706,10 @@ STREAM_LOGGER = "alpaca.data.live.websocket"
 STREAM_ERROR = "error during websocket communication"
 
 
+class BookUnreadable(Exception):
+    """The level book exists and cannot be read at a write: it is left as it is (F13)."""
+
+
 class _StreamErrors(logging.Handler):
     """Test b (the lead, 2026-11-13 19:01:48), an upstream named limit: a stream message alpaca-py
     cannot parse ends its received batch, and the rest of that batch is lost, logged as STREAM_ERROR
@@ -788,6 +805,8 @@ class OwnerProtector(Strategy):
         self.book_entries: dict[Key, Entry] = {}
         # Item 4: a write failure is named once per kind (exception type and text).
         self.write_failures: set[tuple[str, str]] = set()
+        # F13 (#443's max review): each note a read of the book gave, start or re-read, said once.
+        self.book_notes: set[str] = set()
         self.last_step_ns: int | None = None
         # P11: supplied levels and book entries that armed a holding this run.
         self.applied: set[InstrumentId] = set()
@@ -801,6 +820,10 @@ class OwnerProtector(Strategy):
         self.written_keys: set[Key] = set()
         self.kept_passed: set[InstrumentId] = set()
         self.carried: set[Key] = set()
+        # DeepSeek P2-2 (the lead, 2026-11-13 21:23): each holding's venue reading of its fills, by
+        # the opening it was read for, and the host clock of the last failed attempt with its reason.
+        self.readings: dict[InstrumentId, tuple[tuple[int, int], Horizon]] = {}
+        self.reading_tried: dict[InstrumentId, tuple[int, str]] = {}
         # Review F2: keys whose book entry this run may replace, lower level or not: the venue
         # showed a new holding, the entry had no level, or this run saw the holding end.
         self.replaceable: set[Key] = set()
@@ -1318,9 +1341,85 @@ class OwnerProtector(Strategy):
             return
         self.refused.pop(instrument_id, None)
         self.slots[instrument_id] = self._new_holding(instrument_id, position)
+        self._read_venue(instrument_id)
         self._subscribe_holding(instrument_id)
         self._request_seed(instrument_id)
         self._manage(instrument_id)
+
+    def _keep_reading(self, instrument_id: InstrumentId, position: Any, horizon: Horizon) -> None:
+        self.readings[instrument_id] = ((position.ts_opened, position.ts_init), horizon)
+        self.reading_tried.pop(instrument_id, None)
+
+    def _read_venue(self, instrument_id: InstrumentId) -> None:
+        """A found holding's venue reading of its fills (DeepSeek P2-2), once per opening, retried
+        once a minute after a failure that is named once per reason. With no level book there is
+        nothing to carry, so nothing is read."""
+        if self.level_book_path is None or instrument_id not in self.slots:
+            return
+        position = self._external_long(instrument_id)
+        if position is None:
+            return
+        found = self.readings.get(instrument_id)
+        if found is not None and found[0] == (position.ts_opened, position.ts_init):
+            return
+        key: Key = (self.settings.account_label or "", instrument_id)
+        previous = self.previous_levels.get(key)
+        if (
+            previous is not None
+            and previous.horizon is not None
+            and previous.last_level is not None
+            and not {key} & (self.carried | set(self.not_carried) | self.replaceable)
+        ):
+            return  # Its same-holding verdict, still to come, gives the reading on `same`.
+        now = self.clock.timestamp_ns()
+        tried = self.reading_tried.get(instrument_id)
+        if tried is not None and now - tried[0] < 60 * SECOND_NS:
+            return
+        held = _quantity(position.quantity)
+        try:
+            if held is None:
+                raise ValueError("the node's quantity is not a number")
+            horizon = baseline(self.settings.trading, instrument_id.symbol.value, held)
+        except Exception as exc:  # noqa: BLE001 - an unread venue is named, never guessed.
+            reason = f"{type(exc).__name__}: {exc}"
+            if tried is None or tried[1] != reason:
+                self._say(
+                    f"{instrument_id}: no venue reading of its fills yet ({reason}); a restart "
+                    "before one is read arms it with no carried level; tried again each minute"
+                )
+            self.reading_tried[instrument_id] = (now, reason)
+            return
+        self._keep_reading(instrument_id, position, horizon)
+        self._say(
+            f"{instrument_id}: venue reading of its fills at the venue's "
+            f"{datetime.fromtimestamp(horizon.at_ns / 1_000_000_000, UTC).isoformat()}, "
+            f"{len(horizon.applied)} recent orders kept by identity"
+        )
+
+    def _applied_orders(self, instrument_id: InstrumentId) -> tuple[Applied, ...]:
+        """Every order of the name the node holds with fills: its side, its venue legs and the
+        shares the node applied (`filled_qty`), matched to the venue's orders by identity."""
+        applied = []
+        for order in self.cache.orders(instrument_id=instrument_id):
+            filled = _quantity(order.filled_qty)
+            legs = tuple(sorted({leg_key(str(leg)) for leg in order.venue_order_ids}))
+            if filled and filled > 0 and legs:
+                side = "buy" if order.side == OrderSide.BUY else "sell"
+                applied.append(Applied(side, legs, filled))
+        return tuple(applied)
+
+    def _entry_horizon(self, instrument_id: InstrumentId, position: Any) -> Horizon | None:
+        """The reading an entry for this opening carries: the venue's reading, with every order
+        the node now holds in place of the venue's count of it. None until one is read."""
+        found = self.readings.get(instrument_id)
+        if found is None or found[0] != (position.ts_opened, position.ts_init):
+            return None
+        ours = self._applied_orders(instrument_id)
+        legs = {leg for applied in ours for leg in applied.legs}
+        kept = tuple(a for a in found[1].applied if not legs.intersection(a.legs))
+        if len(ours) + len(kept) > APPLIED_MOST:
+            return None
+        return Horizon(found[1].at_ns, (*ours, *kept))
 
     def on_start(self) -> None:
         if self.started_once:
@@ -1342,7 +1441,7 @@ class OwnerProtector(Strategy):
                 if self.settings.level_book_path is None
                 else Path(self.settings.level_book_path)
             )
-            self.previous_levels = LevelBook.read(self.level_book_path, report=self._say)
+            self.previous_levels = LevelBook.read(self.level_book_path, report=self._say_book_note)
             self.book_entries = dict(self.previous_levels)
             # 3d's cell 0c (the lead, 2026-11-13 19:12): the book's state is said at every start.
             self._say(f"level book enabled for account {self.settings.account_label}")
@@ -1415,16 +1514,25 @@ class OwnerProtector(Strategy):
             if previous.last_level is None:
                 self.replaceable.add(key)
             else:
-                kind, reason = holding_verdict(
+                reading = holding_reading(
                     self.settings.trading, instrument_id.symbol.value, previous, held
                 )
-                if kind == SAME:
+                if reading.kind == SAME:
                     self.carried.add(key)
+                    position = self._external_long(instrument_id)
+                    if reading.horizon is not None and position is not None:
+                        self._keep_reading(instrument_id, position, reading.horizon)
                 else:
-                    assert reason is not None
-                    self.not_carried[key] = reason
-                    if kind == NEW:
+                    assert reading.reason is not None
+                    self.not_carried[key] = reading.reason
+                    # The lead, 2026-11-13 21:32, property 2: an entry with no venue reading (a
+                    # book the composed commit wrote) answers unknown once, by name, and this
+                    # run's own entry, with its reading, replaces it at the first save.
+                    if reading.kind == NEW or (
+                        reading.kind == UNKNOWN and previous.horizon is None
+                    ):
                         self.replaceable.add(key)
+                    self._read_venue(instrument_id)  # Its own reading, now the verdict is in.
         return key, previous
 
     def _name_start(
@@ -1639,6 +1747,8 @@ class OwnerProtector(Strategy):
         stamp = getattr(event, "ts_event", None)
         self._read_roster(stamp if type(stamp) is int else self.clock.timestamp_ns())
         self._discover_holdings()
+        for instrument_id in list(self.slots):
+            self._read_venue(instrument_id)
         # Item 4: the step's time reaches the book at most once per step, so a monitor sees a
         # killed run as a last_step_ns that stops advancing. A TimeEvent's ts_event is the step.
         at = getattr(event, "ts_event", None)
@@ -2743,6 +2853,8 @@ class OwnerProtector(Strategy):
         one's entry or level. Review F3: its book entry is retired, written with no level, state
         frozen, reason "holding ended", so no later run can carry it."""
         key: Key = (self.settings.account_label or "", instrument_id)
+        self.readings.pop(instrument_id, None)
+        self.reading_tried.pop(instrument_id, None)
         self.carried.discard(key)
         self.written_keys.discard(key)
         self.replaceable.add(key)
@@ -2977,6 +3089,7 @@ class OwnerProtector(Strategy):
                 reason,
                 None if level is None else distance,
                 None if level is None or distance is None else offset,
+                self._entry_horizon(instrument_id, position),
             )
         for instrument_id, reason in self.frozen.items():
             if instrument_id in self.slots:
@@ -2993,11 +3106,58 @@ class OwnerProtector(Strategy):
                 entries[key] = replace(prior, state=state, count=None, reason=reason)
                 continue
             entries[key] = Entry(
-                None, position.ts_opened, position.signed_qty, now, self.run, state, None, reason
+                None,
+                position.ts_opened,
+                position.signed_qty,
+                now,
+                self.run,
+                state,
+                None,
+                reason,
+                horizon=self._entry_horizon(instrument_id, position),
             )
         for key, retired in self.retired.items():
             entries.setdefault(key, retired)  # Review F3: unless a new holding's entry replaced it.
         return entries
+
+    def _say_book_note(self, note: str) -> None:
+        if note not in self.book_notes:
+            self.book_notes.add(note)
+            self._say(note)
+
+    def _merged_book(self, on_disk: dict[Key, Entry], unread: Unread, changed: dict[Key, Entry]):
+        """F13 (#443's max review; the lead, 2026-11-13 22:47): what the write holds. A row the
+        re-read rejected is carried unchanged, never replaced by this run's older copy of it,
+        unless this run changed that holding; and a higher level for the same holding (the same
+        protection start) that another run wrote since this run last read or wrote the book is never
+        lowered by this run's write. An entry this run read and judged not the holding held now
+        (the venue's clock, DeepSeek P2-2) is replaced as before."""
+        for key, entry in list(changed.items()):
+            disk = on_disk.get(key)
+            if (
+                disk is not None
+                and disk != self.book_entries.get(key)  # written by another run since
+                and disk.run != entry.run
+                and disk.protection_start_ns == entry.protection_start_ns
+                and disk.last_level is not None
+                and entry.last_level is not None
+                and disk.last_level > entry.last_level
+            ):
+                self._say_book_note(
+                    f"{key[1]}: level book keeps run {disk.run}'s level {disk.last_level} for "
+                    f"the same holding over this run's {entry.last_level}; a level is never "
+                    "lowered across a write"
+                )
+                changed[key] = disk
+        mine = {(account, str(instrument)) for account, instrument in changed}
+        skipped = {raw_key(row) for row in unread.rows}
+        kept = {
+            key: entry
+            for key, entry in self.book_entries.items()
+            if (key[0], str(key[1])) not in skipped
+        }
+        carried = [row for row in unread.rows if raw_key(row) not in mine]
+        return {**kept, **on_disk, **changed}, carried
 
     def _save_levels(self, *, final: bool = False, step_ns: int | None = None) -> None:
         """Write the book when a holding's level or state changed (P10, item 4), every holding's
@@ -3025,12 +3185,21 @@ class OwnerProtector(Strategy):
             # Review F5: the read, merge and replace hold the book's lock, so a writer sharing
             # the path can neither lose this run's entries nor have its own lost.
             with LevelBook.locked(self.level_book_path):
-                on_disk = LevelBook.read(self.level_book_path, report=lambda _note: None)
-                entries = {**self.book_entries, **on_disk, **changed}
+                unread = Unread()
+                on_disk = LevelBook.read(
+                    self.level_book_path, report=self._say_book_note, unread=unread
+                )
+                if unread.book is not None:
+                    raise BookUnreadable(
+                        f"ALERT: level book {self.level_book_path} unreadable ({unread.book}); "
+                        "not overwritten, so no other run's entry is lost; this run's levels "
+                        "are not saved until it reads"
+                    )
+                entries, carried = self._merged_book(on_disk, unread, changed)
                 steps = LevelBook.last_steps(self.level_book_path)
                 if self.last_step_ns is not None:
                     steps[self.settings.account_label] = self.last_step_ns
-                LevelBook.write(self.level_book_path, entries, last_step_ns=steps)
+                LevelBook.write(self.level_book_path, entries, last_step_ns=steps, carried=carried)
             self.written_keys.update(k for k, e in changed.items() if e.run == self.run)
         except Exception as exc:  # noqa: BLE001 - persistence must not replace the run's outcome.
             kind = (type(exc).__name__, str(exc))
