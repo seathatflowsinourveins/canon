@@ -32,6 +32,8 @@ COVER = {"FC", "FCW", "FCP"}
 ENDS = {"X", "T0", "OX", "PCX", "PCT", "TW"}
 LIVE = {"G", "GC", "RW", "FL", "WK", "PF", "PCR", "PCO"}
 INVALIDATES = {"ST", "HE", "HS", "CP", "FRZ"}
+# The account events a step judges before our order's events, so before a stored echo.
+ECHO_PRECEDED_BY = ("ST", "HE", "HS", "HG", "CP", "CL", "FRZ")
 MAX_QUANTITY = 3
 DEPTH = 8
 # Prices, for the price rule alone (ruling 18): whole steps, the level fixed. A counted quote under the
@@ -344,6 +346,17 @@ def advance(world, seen, n, table):
             account = replace(account, legs=(replace(account.legs[0], **{told: True}),))
     if event == "HE" and world.state.row in {"WK", "PF"}:
         assert sale.Action.CANCEL in result.actions, "the_holdings_end_cancels_a_working_sale"
+    if (
+        event == "HE"
+        and origin in {"FZW", "FCW", "OX"}
+        and before.legs
+        and before.legs[0].cancelable
+    ):
+        # An ended holding's sale that can take a cancel is asked canceled from a frozen row and
+        # from the ended row too: a holding reopened at least as large never shows a mismatch.
+        assert sale.Action.CANCEL in result.actions, "an_ended_holdings_sale_is_asked_canceled"
+    if event == "HE" and origin == "T0":
+        assert result.state.row == "X", "a_stopped_holding_that_ends_has_ended"
     if event == "oLF" and world.state.row in {"WK", "PF"} and account.long <= 0:
         assert sale.Action.CANCEL in result.actions, "the_holdings_end_cancels_a_working_sale"
     if world.state.row == "G" and event == "QU":
@@ -437,6 +450,25 @@ def advance(world, seen, n, table):
             )
             assert heard.state == after.state and not heard.actions, "echo_is_inert_where_caused"
             assert heard.named is None, "echo_is_expected_where_caused"
+            # The echo is judged in the step AFTER its action, behind that step's account events
+            # (the table's step order). Whatever one of them makes of the row, the echo is inert.
+            for between in ECHO_PRECEDED_BY:
+                moved = account_event(account, Seen(between))
+                try:
+                    mid = sale.transition(
+                        after.state,
+                        n,
+                        between,
+                        facts(moved, Seen(between), after.state.row),
+                        table=table,
+                    )
+                    late = sale.transition(
+                        mid.state, n, echo, facts(moved, Seen(echo), mid.state.row), table=table
+                    )
+                except sale.SaleTableError:
+                    continue
+                assert late.state == mid.state and not late.actions, "echo_is_inert_one_step_late"
+                assert late.named is None, "echo_is_inert_one_step_late"
     # A late fill's post-fill holding and cover determine the row immediately.
     if event == "oLF" and world.state.row in {"G", "GC"}:
         expected = "X" if account.long <= 0 else ("GC" if account.foreign >= account.long else "G")
@@ -1189,6 +1221,65 @@ def test_the_holdings_end_cancels_our_working_sale_in_that_step():
 def test_seventh_form_mutations_have_teeth(row, event, when, changes, history, property_name):
     with pytest.raises(AssertionError, match=property_name):
         walk(history, table=mutated_branch(row, event, when, **changes))
+
+
+FROZEN_WORKING = WORKING + (Seen("oOTH"),)
+
+
+@pytest.mark.parametrize(
+    "row,event,when,changes,history,property_name",
+    [
+        (
+            "FCW",
+            "oINI",
+            "always",
+            {"next": "FZW", "alert": True},
+            (Seen("QU"), Seen("QU")),
+            "echo_is_inert_one_step_late",
+        ),
+        (
+            "TW",
+            "oINI",
+            "always",
+            {"next": "T0"},
+            (Seen("QU"), Seen("QU")),
+            "echo_is_inert_one_step_late",
+        ),
+        (
+            "FZW",
+            "HE",
+            "cancelable",
+            {"next": "OX", "cancel": False},
+            FROZEN_WORKING + (Seen("HE"),),
+            "an_ended_holdings_sale_is_asked_canceled",
+        ),
+        (
+            "FCW",
+            "HE",
+            "cancelable",
+            {"next": "OX", "cancel": False},
+            WORKING + (Seen("FRZ"), Seen("HE")),
+            "an_ended_holdings_sale_is_asked_canceled",
+        ),
+        (
+            "T0",
+            "HE",
+            "always",
+            {"next": "T0"},
+            (Seen("ST"), Seen("HE")),
+            "a_stopped_holding_that_ends_has_ended",
+        ),
+    ],
+)
+def test_ninth_form_mutations_have_teeth(row, event, when, changes, history, property_name):
+    with pytest.raises(AssertionError, match=property_name):
+        walk(history, table=mutated_branch(row, event, when, **changes))
+
+
+def test_a_frozen_or_ended_holdings_sale_is_canceled_at_the_holdings_end():
+    assert walk(FROZEN_WORKING + (Seen("HE"),)).state.row == "PCX"
+    assert walk(WORKING + (Seen("FRZ"), Seen("HE"))).state.row == "PCX"
+    assert walk((Seen("ST"), Seen("HE"))).state.row == "X"
 
 
 def uncapped(which):

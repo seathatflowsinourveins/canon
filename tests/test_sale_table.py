@@ -22,7 +22,7 @@ from canon_trading import sale_table as sale
 DATA_PATH = Path(__file__).resolve().parents[1] / "src/canon_trading/sale_table.json"
 DATA = json.loads(DATA_PATH.read_text())
 HISTORIES = json.loads(Path(__file__).with_name("sale_table_histories.json").read_text())
-CELLS_HASH = "51b29c3c41636989a456f7ca2d8961724a7621d6db893297cfafa223b8b2aa9f"
+CELLS_HASH = "6e47bf488294f99167ac05c852bd5344e1bb66d0a51668eca433b61776a291a0"
 CELLS = [(r, e, c) for r, row in DATA["cells"].items() for e, c in row.items()]
 BRANCHES = [(r, e, b) for r, e, c in CELLS for b in c["branches"]]
 
@@ -667,12 +667,35 @@ def test_event_mapping_comes_only_from_inventory(ended, remainder):
     assert sale.order_event_column("OrderAccepted", table=sale.table_from_data(changed)) == "oSUB"
 
 
+SEND_ECHO_ROWS = {"FL"} | {
+    branch["next"]
+    for event in ("FRZ", "ST", "HE")
+    for branch in DATA["cells"]["FL"][event]["branches"]
+}
+
+
+def test_the_rows_a_sends_echo_can_meet_are_those_one_account_event_from_flight():
+    assert SEND_ECHO_ROWS == {"FL", "FCW", "TW", "OX"}
+
+
+def test_an_ended_holdings_open_sale_is_asked_canceled_whenever_it_can_take_a_cancel():
+    """OX x HE: the end seen again (another position under the instrument, or a refused cancel).
+    A reopened holding at least as large as our leg never shows a mismatch, so the end asks."""
+    asked = sale.transition(sale.State("OX"), 2, "HE", {"cancelable": True})
+    assert asked.state == sale.State("PCX") and asked.actions == (sale.Action.CANCEL,)
+    owed = sale.transition(sale.State("OX"), 2, "HE", {"cancelable": False})
+    assert owed.state == sale.State("OX") and owed.actions == ()
+
+
 @pytest.mark.parametrize("row", DATA["rows"])
 @pytest.mark.parametrize("echo", ["oINI", "oPCN"])
 def test_every_echo_cell(row, echo):
     state = sale.State(row, 1 if row == "G" else None)
     result = sale.transition(state, 2, echo, {})
-    inert = row == "FL" if echo == "oINI" else DATA["rows"][row]["phase"] == "pc"
+    # A send's echo is judged in the step after it, behind that step's account events: the cover
+    # may have gone unread (FL x FRZ), the instrument stopped (FL x ST) or the holding ended
+    # (FL x HE) in between, so the echo is as inert in those rows as in FL.
+    inert = row in SEND_ECHO_ROWS if echo == "oINI" else DATA["rows"][row]["phase"] == "pc"
     if inert:
         assert result.state == state and result.actions == () and result.named is None
     else:

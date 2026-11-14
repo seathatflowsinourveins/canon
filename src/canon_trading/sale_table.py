@@ -3,7 +3,7 @@
 Pin: nautilus-trader v2.0.0rc8 at d53849b216e2, whose order transitions are
 crates/model/src/orders/mod.rs:207-302, with reconciliation at 1314-1325 and
 late fills at 1367-1389. Canonical cells SHA256:
-51b29c3c41636989a456f7ca2d8961724a7621d6db893297cfafa223b8b2aa9f.
+6e47bf488294f99167ac05c852bd5344e1bb66d0a51668eca433b61776a291a0.
 Order-event inventory: crates/model/src/events/order/any.rs:39-57 and
 crates/trading/src/strategy/mod.rs:1445-1462. Order events, including local echoes,
 are judged in the following step, in the table's step order.

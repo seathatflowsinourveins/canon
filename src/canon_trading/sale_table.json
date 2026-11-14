@@ -499,7 +499,6 @@
     {
       "event": "oINI",
       "from": [
-        "FCW",
         "PF",
         "WK"
       ],
@@ -4240,13 +4239,21 @@
         "occurs": "yes",
         "branches": [
           {
-            "when": "always",
+            "when": "cancelable",
+            "next": "PCX",
+            "send": false,
+            "cancel": true,
+            "alert": false
+          },
+          {
+            "when": "not cancelable",
             "next": "OX",
             "send": false,
             "cancel": false,
             "alert": false
           }
-        ]
+        ],
+        "note": "the holding's end seen again (another position sits under the instrument, or our cancel was refused): the owed cancel is asked as soon as our sale can take one, whatever its size against what is then held; an ended holding's sale never rests beside a later holding in silence"
       },
       "ST": {
         "occurs": "yes",
@@ -4458,7 +4465,7 @@
         "note": "quantities re-read from every leg of ours; the fill is ours, not a shrink"
       },
       "oINI": {
-        "occurs": "unexpected",
+        "occurs": "yes",
         "branches": [
           {
             "when": "always",
@@ -4468,8 +4475,8 @@
             "alert": false
           }
         ],
-        "pin": "model/src/orders/mod.rs:227, 229, 237, 239, 242, 283, 285",
-        "note": "an event the table has no column for (none is produced for a plain limit we never modify): named once, nothing else; an echo not expected in this row answers as the catch-all does"
+        "pin": "trading/src/strategy/mod.rs:2419, 2448-2452",
+        "note": "the echo of the send that entered FL, judged in the step after it: the holding's end came in between (FL x HE), and the echo is still only an echo: nothing"
       },
       "oPCN": {
         "occurs": "unexpected",
@@ -5352,14 +5359,21 @@
         "occurs": "yes",
         "branches": [
           {
-            "when": "always",
+            "when": "cancelable",
+            "next": "PCX",
+            "send": false,
+            "cancel": true,
+            "alert": false
+          },
+          {
+            "when": "not cancelable",
             "next": "OX",
             "send": false,
             "cancel": false,
             "alert": false
           }
         ],
-        "note": "the freeze ends with the holding; MO follows"
+        "note": "the holding ended (flat, short, or another position under the instrument): the freeze ends with it and our sale is asked canceled in this step where it can take a cancel, as a working sale's is (ruling 21: a position reopened at least as large as our leg would never show a mismatch); a leg still in flight owes its cancel (OX)"
       },
       "ST": {
         "occurs": "yes",
@@ -6510,14 +6524,21 @@
         "occurs": "yes",
         "branches": [
           {
-            "when": "always",
+            "when": "cancelable",
+            "next": "PCX",
+            "send": false,
+            "cancel": true,
+            "alert": false
+          },
+          {
+            "when": "not cancelable",
             "next": "OX",
             "send": false,
             "cancel": false,
             "alert": false
           }
         ],
-        "note": "the freeze ends with the holding; MO follows"
+        "note": "the holding ended (flat, short, or another position under the instrument): the freeze ends with it and our sale is asked canceled in this step where it can take a cancel, as a working sale's is (ruling 21: a position reopened at least as large as our leg would never show a mismatch); a leg still in flight owes its cancel (OX)"
       },
       "ST": {
         "occurs": "yes",
@@ -6762,18 +6783,18 @@
         "note": "quantities re-read from every leg of ours; the fill is ours, not a shrink; MO follows in the same step when ours is then too large"
       },
       "oINI": {
-        "occurs": "unexpected",
+        "occurs": "yes",
         "branches": [
           {
             "when": "always",
-            "next": "FZW",
+            "next": "FCW",
             "send": false,
             "cancel": false,
-            "alert": true
+            "alert": false
           }
         ],
-        "pin": "model/src/orders/mod.rs:227, 229, 237, 239, 242, 283, 285",
-        "note": "a fault of ours while the cover was unread: FROZEN to the next start, with the alert"
+        "pin": "trading/src/strategy/mod.rs:2419, 2448-2452",
+        "note": "the echo of the send that entered FL, judged in the step after it: the cover went unread in between (FL x FRZ), and the echo is still only an echo: nothing"
       },
       "oPCN": {
         "occurs": "unexpected",
@@ -7907,7 +7928,7 @@
         "note": "quantities re-read from every leg of ours; the fill is ours, not a shrink"
       },
       "oINI": {
-        "occurs": "unexpected",
+        "occurs": "yes",
         "branches": [
           {
             "when": "always",
@@ -7917,8 +7938,8 @@
             "alert": false
           }
         ],
-        "pin": "model/src/orders/mod.rs:227, 229, 237, 239, 242, 283, 285",
-        "note": "an event the table has no column for (none is produced for a plain limit we never modify): named once, nothing else; an echo not expected in this row answers as the catch-all does"
+        "pin": "trading/src/strategy/mod.rs:2419, 2448-2452",
+        "note": "the echo of the send that entered FL, judged in the step after it: the stop came in between (FL x ST), and the echo is still only an echo: nothing"
       },
       "oPCN": {
         "occurs": "unexpected",
@@ -8052,12 +8073,13 @@
         "branches": [
           {
             "when": "always",
-            "next": "T0",
+            "next": "X",
             "send": false,
             "cancel": false,
             "alert": false
           }
-        ]
+        ],
+        "note": "a stopped holding that ends has ended: nothing of it reaches a later holding of the instrument"
       },
       "ST": {
         "occurs": "yes",
