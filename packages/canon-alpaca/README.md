@@ -282,6 +282,10 @@ Each is stated where it is implemented, with its source.
   `limit` is answered and not written back. The catalog encodes a file whole, writes it as
   `<name>#<n>` and renames it into place, so a process killed while writing leaves either no data file
   or the complete one, and at most that staging file, which the catalog does not read.
+  A latest snapshot uses `request_quotes(id, limit=1, params={"feed": feed, "latest": True,
+  "skip_catalog_data": True, "update_catalog": False})` on a named non-IEX feed matching the
+  established live stream, returns at most one receipt-stamped quote without catalog reads or writes,
+  and makes one SDK call in the historical executor (alpaca-py may retry 429/504 three times, 3 s apart).
 * **Historical bars:** `LAST`, `EXTERNAL`, MINUTE, HOUR, DAY or WEEK (DAY and WEEK at step 1 only);
   stamped at the open by Alpaca, so `ts_event` is the open and `ts_init = ts_event + interval`, per
   NautilusTrader's bar execution-simulation convention, where `interval` is the bar's fixed length:

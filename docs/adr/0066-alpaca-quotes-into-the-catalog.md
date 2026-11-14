@@ -9,6 +9,8 @@ review-by: 2026-12-10
 
 *Amended in part 2026-11-12 by ADR 0151 (proposed): a quote load may name `sip`, into its own root.*
 
+*Amended in part 2026-11-13: a request may ask for one latest quote on the live stream's feed, never written to the catalog (see "Amendment 2026-11-13").*
+
 ## Context and Problem Statement
 
 Roadmap step 7 still has to rank a strategy upstream ships. Upstream's built-in `EmaCross` keeps its
@@ -229,6 +231,39 @@ repeated page tokens, without writing incomplete coverage.
 133 bytes on the wire; whether a full day compresses like one page; how long a backtest takes over a
 quarter of quotes.
 
+## Amendment 2026-11-13: one latest quote on the stream's feed
+
+The owner protector arms a holding on a quote. At a node's start, or when a holding is adopted mid-run,
+there may be no stream quote yet, and in a thin part of the session the next one may be minutes away. The
+lead ruled (2026-11-13) that one request may then ask Alpaca for the latest quote. It is read on the feed
+the stream is reading, never IEX, and it is never catalogued.
+
+The request is `request_quotes(id, limit=1, params={"feed": <feed>, "latest": True,
+"skip_catalog_data": True, "update_catalog": False})`, with `limit` 1 or absent, for one instrument. It
+sends one call to alpaca-py's `get_stock_latest_quote`, which reads `/v2/stocks/quotes/latest`. It answers
+0 or 1 quote, stamped as a stream quote is: Alpaca's timestamp as `ts_event`, and the node's clock at
+receipt as `ts_init`. The feed must be named and equal the client's live stream feed, so a request before
+the stream has started is refused, IEX is refused, and a seed never mixes feeds with the quotes it is
+compared against. Each refusal and each failed call completes the request through `request_failed` with
+its reason, and none raises into the node. History requests without `latest` are unchanged: IEX only,
+and written back as above.
+
+The request sets `skip_catalog_data` and `update_catalog: False`, and the adapter answers it with no
+bounds. Under a registered catalog, NautilusTrader fills a request's start and end and adds stored
+quotes. It also trims each answer by `ts_init`, which would drop a quote stamped at receipt.
+
+Named limit: "one call" is one alpaca-py call. On a 429 or 504, alpaca-py retries inside that call up to 3
+times, 3 s apart. Its `retry_attempts` cannot be set to 0, and nothing here patches it. One seed can
+therefore make up to four HTTP requests and hold the historical lock for about 9 s. ADR 0093's pacing
+counts them. The call runs in the historical executor, so the node's loop is not blocked while it waits.
+
+This does not change the IEX-only rule for history. The catalog keys a quote by instrument, not by feed,
+and the latest quote is never written to it.
+
+NautilusTrader writes a response's quotes into the cache before the strategy sees them. So a seed that
+arrives after a newer stream quote becomes the cache's latest quote, whatever its stamp. What a strategy
+does with that is the strategy's own record, not this adapter's.
+
 ## Evidence
 
 Read 2026-11-10. Fetched means read as raw text; run means executed here.
@@ -281,3 +316,22 @@ Read 2026-11-10. Fetched means read as raw text; run means executed here.
   hours asked for again. Code review (`/code-review`):
   the paper test now has the HTTP timeout and reports a refusal's status; requests an hour long for
   memory; a load in pieces under `paper:test`'s deadline; the page rate stated unambiguously.
+* Amendment 2026-11-13, read that day: https://docs.alpaca.markets/us/reference/stocklatestquotes-1.md
+  (`/v2/stocks/quotes/latest`) and https://docs.alpaca.markets/us/reference/stocklatestquotesingle-1.md
+  (`feed`: `delayed_sip`, `iex`, `otc`, `sip`, `boats`, `overnight`; the default is `sip` with the
+  unlimited subscription, otherwise `iex`), fetched. alpaca-py at its pin (c42add7c0a70):
+  `alpaca/data/historical/stock.py:163-182` (`get_stock_latest_quote(StockLatestQuoteRequest)` reads
+  `/stocks/quotes/latest` and returns `Dict[str, Quote]`), `alpaca/common/constants.py:11-13` and
+  `alpaca/common/rest.py:72-83` (3 retries, 3 s apart, on 429 and 504; a retry count of 0 is not
+  taken), bundled (`scripts/canon src alpaca-py`). NautilusTrader at d53849b216e2:
+  `crates/data/src/engine/mod.rs:1965-1972`, `dispatch.rs:387-390` and
+  `crates/common/src/cache/mod.rs:2379-2402` (a quotes response is added to the cache before it is
+  dispatched); `crates/common/src/python/response.rs:409` (delivered to `on_historical_quotes`);
+  `crates/live/src/python/client/mod.rs:504-527` and `crates/data/src/engine/mod.rs:1827-1844`
+  (`request_failed` gives a terminal response with its reason); `crates/data/src/engine/mod.rs:1540-1548`
+  and `streaming.rs:419-426`, `:476-503`, `:219-224`, `crates/common/src/messages/data/response.rs:47-72`
+  (a registered catalog fills the bounds and adds stored data unless `skip_catalog_data`; write-back is
+  skipped on `update_catalog=False`; an answer is trimmed by `ts_init`), bundled
+  (`scripts/canon src nautilus-trader`). The ruling: the lead, 2026-11-13. Tests:
+  `packages/canon-alpaca/tests/test_latest_quote.py`, 43 offline cases on a native node, red on main
+  before the change. A paper read of one latest quote: UNVERIFIED until the landing lane's paper run.
