@@ -53,6 +53,10 @@ Chosen: **option 1**. Option 2 hides which piece moved; option 3 pins nothing.
    0086's review configuration on the `dsh-tui` profile (`review-acp` is not that configuration). The
    bundle's own code is empty; its dependency `dsh-terminal-bash` spawns the shells, confined by the
    host sandbox unless its mode is `danger-full-access`. The profiles' sandbox mode is `UNVERIFIED`.
+   2026-11-13: at `dsh-v0.2.2-rc.2` the bundle leaves `review-acp` and `build-acp` as well. Its backend is now
+   the terminal panel, which needs the `terminalController` service, and only the Web app's bundle composes
+   that (`packages/bundle/web-app/cordis.patch.yml` L126-127); the rc.2 dumps hold the panel and no
+   controller (Evidence).
 5. **`dsh-subagent-codex`** (`packages/subagent/subagent-codex`, MIT), `tool`, at `dsh-v0.2.1-rc.3`,
    build arm only: delegates one task to a fresh Codex thread in the parent workspace through its own
    `@openai/codex` 0.153.4, outside the `codex-cli` pin. Key-like variables are scrubbed from the child's
@@ -164,3 +168,21 @@ Read 2026-11-11.
   the profiles are started and what the `line` holds off, and asked for the scope note; all are in. A
   second reader of item 2 corrected the entry count from 10,584 to 10,581 and asked that the list's
   provenance be labelled; both are in.
+* 2026-11-13, the four DeepSeek Harness pieces move with the engine pin to `dsh-v0.2.2-rc.2` → `ddac96760b6e`
+  (resolved; ADR 0045's Evidence); `acp-spec` stays at `schema-v1.31.0`. At the new pin `@deepseek-ai/dsh-acp` is
+  0.2.2-rc.2 on `@agentclientprotocol/sdk` 1.4.0, and its README still leaves out `session/load`;
+  `dsh-acp-app`'s `cordis.patch.yml` is unchanged; `dsh-subagent-codex` keeps `@openai/codex` 0.153.4 and
+  `permissionMode` `never`, `dsh-subagent-claude-code` keeps `@anthropic-ai/claude-agent-sdk` 0.3.263 and
+  `dontAsk`, and `scrubbedParentEnv()` drops the same names (resolved). Item 4 changed: the terminal bundle's
+  backend is now `dsh-terminal-panel` in place of `dsh-terminal-bash`, a Web sidebar terminal that needs the
+  `terminalController` service, which only the `web-app` bundle composes and neither ACP profile does, so read in
+  source its tools would find no backend there (the registry entry; `UNVERIFIED`, no tool was called). The
+  bundle therefore leaves both ACP profiles (item 4's 2026-11-13 pointer; `home/dsh/profiles.json`), as it
+  leaves `dsh-tui` (ADR 0086 rule 2's 2026-11-13 pointer), and its entry stays at `dsh-v0.2.2-rc.2`, the
+  version last read. A rehearsal (run 2026-11-13) installed `review-acp` and `build-acp` with their first-party
+  packages at 0.2.2-rc.2, the bundle among them, each in a throwaway `DSH_HOME` with the pinned pnpm 10.34.9,
+  and composed both (exit 0): each dump holds `dsh-terminal-panel` and no terminal controller. A scripted
+  rehearsal (run 2026-11-13, each step's exit code logged) then installed and composed both exactly as
+  `home/dsh/profiles.json` records them, without the bundle: install and `--dump-config` exit 0, no admission
+  refusal, no duplicate id, no `terminal_*` row, and `tool-bash` enabled in `dsh-base`'s row. `acp-probe` was
+  not run on them, since it starts sessions.
