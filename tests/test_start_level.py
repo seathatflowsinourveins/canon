@@ -71,7 +71,12 @@ def entry(subject, **changes):
         "written_ns": 200,
         "run": "shape-first",
     }
+    # DeepSeek P2-2: an entry carries the venue's reading of its fills, here at its write;
+    # horizon=None is an entry written before readings were kept, never the same holding.
+    values.setdefault("horizon", subject.Horizon(values["written_ns"]))
     values.update(changes)
+    if "written_ns" in changes and "horizon" not in changes:
+        values["horizon"] = subject.Horizon(changes["written_ns"])
     return subject.Entry(**values)
 
 
@@ -87,7 +92,7 @@ def test_book_roundtrip_keeps_all_keys_and_exact_decimal_text(subject, tmp_path:
     assert subject.LevelBook.read(path) == entries
     assert all(isinstance(key[1], InstrumentId) for key in subject.LevelBook.read(path))
     data = json.loads(path.read_text())
-    assert data["schema"] == 2
+    assert data["schema"] == subject.SCHEMA == 3
     assert [row["protection_start_ns"] for row in data["entries"]] == [100, 100, 100, 300]
     assert all(isinstance(row["last_level"], str) for row in data["entries"])
     assert "1.105" in [row["last_level"] for row in data["entries"]]
@@ -114,7 +119,7 @@ def test_a_label_that_cannot_name_a_book_file_is_refused(subject, label) -> None
 
 @pytest.mark.parametrize(
     "body",
-    [None, "{", "[]", '{"schema": 3, "entries": []}', '{"schema": 1, "entries": {}}'],
+    [None, "{", "[]", '{"schema": 4, "entries": []}', '{"schema": 1, "entries": {}}'],
 )
 def test_missing_or_malformed_book_returns_no_previous_entries(subject, tmp_path: Path, body):
     path = tmp_path / "levels.json"
@@ -237,10 +242,15 @@ def test_an_old_format_book_reads_with_unknown_state_and_no_step(subject, tmp_pa
     assert subject.LevelBook.last_step_ns(path, "shape") is None
     assert notes == [
         (
+            "level book schema 1: written before venue readings were kept; an entry without one "
+            "is never the same holding, is named, and is replaced at the next save, in schema 3"
+        ),
+        (
             "level book schema 1: each entry's protection start is kept as its "
             "protection_start_ns; holdings are now keyed by account and instrument"
-        )
+        ),
     ]
+    assert rows[("shape", SHAPE)].horizon is None
 
 
 @pytest.mark.parametrize(
@@ -405,7 +415,11 @@ def test_a_schema_1_book_naming_one_holding_twice_keeps_the_newest_by_name(subje
     rows = subject.LevelBook.read(path, report=notes.append)
     assert rows == {
         ("shape", SHAPE): entry(
-            subject, last_level=Decimal("1.10"), protection_start_ns=300, written_ns=400
+            subject,
+            last_level=Decimal("1.10"),
+            protection_start_ns=300,
+            written_ns=400,
+            horizon=None,
         )
     }
     assert any("protection start 100 dropped" in note for note in notes), notes
