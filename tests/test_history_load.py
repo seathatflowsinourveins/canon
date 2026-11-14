@@ -885,7 +885,7 @@ def defined_root(path: Path) -> Path:
 
 
 def run_spans(catalog: Path, spans=SPANS, **kw):
-    return run(catalog, start=spans[0][0], end=spans[-1][1], spans=spans, **kw)
+    return run(catalog, spans=spans, **kw)
 
 
 def ns(moment: datetime) -> int:
@@ -966,10 +966,10 @@ def test_spans_out_of_order_overlapping_or_empty_are_refused_before_any_request(
     assert not (catalog / ".history-load.lock").exists()
 
 
-def test_spans_that_do_not_run_from_start_to_end_are_refused(venue, catalog) -> None:
-    with pytest.raises(HistoryStopped, match="not from"):
-        run(catalog, start=MIN_START, end=SPANS[-1][1] + timedelta(minutes=1), spans=SPANS)
-    assert venue.sent == []
+def test_the_spans_set_the_run_and_start_and_end_are_not_read_beside_them(venue, catalog) -> None:
+    """Review finding 6: no second copy of the bounds for a caller to keep in step."""
+    written = run(catalog, start=MIN_START - timedelta(days=1), end=NOW, spans=SPANS)
+    assert written == 3 * 11 * len(SYMBOLS)
 
 
 def test_a_definitions_root_supplies_the_instruments_of_a_root_that_has_none(
@@ -1004,6 +1004,7 @@ def test_each_phase_prints_its_wall_and_cpu_time_even_when_the_run_stops(venue, 
     run(catalog, out=lines.append)
     phases = [line for line in lines if line.startswith("paper:history: phase ")]
     assert [p.split(":")[2].strip() for p in phases] == [
+        "phase checks",
         "phase definitions",
         "phase coverage",
         "phase fetch and parse",
@@ -1020,7 +1021,40 @@ def test_each_phase_prints_its_wall_and_cpu_time_even_when_the_run_stops(venue, 
             end=MIN_END + timedelta(hours=3),
             out=stopped.append,
         )
-    assert sum(line.startswith("paper:history: phase ") for line in stopped) == 4
+    assert sum(line.startswith("paper:history: phase ") for line in stopped) == 5
+
+
+def test_a_refusal_before_any_phase_prints_no_phase_line(venue, catalog) -> None:
+    """Review finding 3: four zero lines on a run that did nothing read as a measured load."""
+    lines: list[str] = []
+    with pytest.raises(HistoryStopped, match="overlap"):
+        run(
+            catalog,
+            start=MIN_START,
+            end=MIN_END + timedelta(minutes=5),
+            out=lines.append,
+            spans=[(MIN_START, MIN_END), (MIN_END, MIN_END + timedelta(minutes=5))],
+        )
+    assert not [line for line in lines if line.startswith("paper:history: phase ")]
+
+
+def test_a_run_of_spans_takes_minute_bars_only(venue, catalog) -> None:
+    """Review finding 2: a day bar's ts_init is the next midnight, outside a day-session span, so a span
+    would ask for it on every run and never hold it."""
+    with pytest.raises(HistoryStopped, match="1-MINUTE"):
+        run(catalog, specs=("1-MINUTE", "1-DAY"), spans=SPANS)
+    assert venue.sent == []
+
+
+def test_a_definitions_root_holding_anything_but_equity_definitions_is_refused(
+    venue, catalog, tmp_path
+) -> None:
+    """Review finding 5: any other folder under data/ grows the listing the root exists to keep small."""
+    defs = defined_root(tmp_path / "defs")
+    (defs / "data" / "custom").mkdir()
+    with pytest.raises(HistoryStopped, match="custom"):
+        run(catalog, definitions=defs)
+    assert venue.sent == []
 
 
 @pytest.mark.parametrize(
@@ -1029,6 +1063,7 @@ def test_each_phase_prints_its_wall_and_cpu_time_even_when_the_run_stops(venue, 
         (["--start", "2026-11-10T14:00:00Z"], None, "takes no --start or --end"),
         (["--data", "trades"], None, "sip bars only"),
         (["--feed", "boats"], None, "sip bars only"),
+        (["--bars", "1-MINUTE,1-DAY"], None, "1-MINUTE bars only"),
         (
             [],
             "2026-11-10T14:00:00Z 2026-11-10T15:00:00Z\n2026-11-10T14:30:00Z 2026-11-10T16:00:00Z\n",
@@ -1115,6 +1150,7 @@ def test_the_task_passes_a_spans_file_and_definitions_and_no_empty_start_or_end(
     assert "--start" not in sent and "--end" not in sent
     assert sent[sent.index("--spans-file") + 1] == "/spans.txt"
     assert sent[sent.index("--definitions") + 1] == "/defs"
+    assert sent[sent.index("--bars") + 1] == "1-MINUTE"  # review finding 2: no day bars by default
 
     done = mise_load(
         tmp_path, symbols="AAPL", start="2026-11-10T14:00:00Z", end="2026-11-10T15:00:00Z"

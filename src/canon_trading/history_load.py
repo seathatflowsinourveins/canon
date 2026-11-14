@@ -560,13 +560,15 @@ class _Phases:
     """Wall and CPU time per phase of one load, from Python 3.14 `resource.getrusage(RUSAGE_SELF)`, which counts
     every thread of this process (the catalog's own worker threads with it) and `time.monotonic`."""
 
-    NAMES = ("definitions", "coverage", "fetch and parse", "write")
+    NAMES = ("checks", "definitions", "coverage", "fetch and parse", "write")
 
     def __init__(self) -> None:
         self.spent = {name: [0.0, 0.0, 0.0] for name in self.NAMES}
+        self.entered = False
 
     @contextmanager
     def __call__(self, name: str) -> Generator[None]:
+        self.entered = True
         wall, used = time.monotonic(), resource.getrusage(resource.RUSAGE_SELF)
         try:
             yield
@@ -578,6 +580,9 @@ class _Phases:
             spent[2] += after.ru_stime - used.ru_stime
 
     def lines(self) -> list[str]:
+        """None for a run refused before its first phase: zeros there would read as a measured load."""
+        if not self.entered:
+            return []
         return [
             f"paper:history: phase {name}: wall {w:.1f} s, user {u:.1f} s, sys {y:.1f} s"
             for name, (w, u, y) in self.spent.items()
@@ -630,10 +635,15 @@ def _definitions_root(definitions: Path) -> Path:
     if not path.is_dir():
         raise HistoryStopped(f"the definitions root {path} must be an existing directory")
     data = path / "data"
-    held = sorted(name for name, _ in _KINDS if (data / name).exists())
+    held = (
+        sorted(entry.name for entry in data.iterdir() if entry.name != "equity")
+        if data.is_dir()
+        else []
+    )
     if held:
         raise HistoryStopped(
-            f"the definitions root {path} holds {' and '.join(held)}; it holds instrument definitions alone"
+            f"the definitions root {path} holds {', '.join(held)} under data/; it holds equity definitions "
+            "alone, since the pin's instruments() lists all of data/ before it filters"
         )
     return path
 
@@ -662,10 +672,13 @@ def load_history(
     only; each feed keeps its own root, the default by `_default_root`. Raises `HistoryStopped` (or
     `RateLimited`) naming what stopped it.
 
-    `spans`, ordered and disjoint, from `start` to `end`, loads a run of days in this one process: one
-    catalog lock, one definitions read, one coverage read per bar type over `[start, end]` clipped to each
-    span, and one pace schedule across them all. `definitions` reads the instruments from a root of
-    definitions alone instead of the catalog root. Either way a line per phase gives its wall and CPU time.
+    `spans`, ordered and disjoint, loads a run of days of 1-MINUTE bars in this one process, from the
+    first span's start to the last one's end (`start` and `end` are then not read): one catalog lock, one
+    definitions read, one coverage read per bar type over the run clipped to each span, and one pace
+    schedule across them all. `definitions` reads the instruments from a root of equity definitions alone
+    instead of the catalog root; the catalog root then gets none, and a reader that takes its definitions
+    from that root (the movers baseline, the replays, the rank record) finds none there. A line per phase
+    (checks, definitions, coverage, fetch and parse, write) gives its wall and CPU time, once a phase ran.
     """
     if catalog_path is None:
         catalog_path = _default_root("bars", feed)
@@ -716,12 +729,14 @@ def _checked_load(
     phases: _Phases,
 ) -> int:
     try:
+        if spans is not None and any(spec != "1-MINUTE" for spec in specs):
+            raise HistoryStopped(
+                f"a run of spans loads 1-MINUTE bars only, got {list(specs)}: a day bar's ts_init is the "
+                "next midnight, outside a day's span, so it would be asked for on every run and never held"
+            )
         spans = list(spans) if spans is not None else [(start, end)]
         _check_spans(spans)
-        if (spans[0][0], spans[-1][1]) != (start, end):
-            raise HistoryStopped(
-                f"the spans run from {spans[0][0]} to {spans[-1][1]}, not from {start} to {end}"
-            )
+        start, end = spans[0][0], spans[-1][1]
         if not symbols:
             raise HistoryStopped("at least one symbol is required")
         if feed not in BAR_FEEDS:
@@ -759,11 +774,11 @@ def _checked_load(
             )
         if not path.is_dir():
             raise HistoryStopped(f"the catalog at {path} must be an existing directory")
-        defs_path = _definitions_root(definitions) if definitions is not None else path
-        with phases("coverage"):
+        with phases("checks"):
+            defs_path = _definitions_root(definitions) if definitions is not None else path
             _check_kinds(path, "bars")
-        _check_feed(path, feed)
-        catalog = ParquetDataCatalog(str(path))
+            _check_feed(path, feed)
+            catalog = ParquetDataCatalog(str(path))
         ids = [f"{s}.{VENUE}" for s in symbols]
         with phases("definitions"):
             defs = catalog if defs_path == path else ParquetDataCatalog(str(defs_path))
@@ -775,9 +790,9 @@ def _checked_load(
                 "nothing was requested"
             )
         with _catalog_lock(path):
-            with phases("coverage"):
+            with phases("checks"):
                 _check_kinds(path, "bars")
-            _check_feed(path, feed)
+                _check_feed(path, feed)
             return _load_history(
                 client,
                 symbols,
@@ -912,14 +927,16 @@ def _load_history(
                             "none of this response was written"
                         )
                     count = 0
-                    for symbol in batch:
-                        bar_type = bar_types[symbol]
-                        instrument = instruments[str(bar_type.instrument_id)]
-                        bars = []
-                        rounded = 0
-                        first_rounding = ""
-                        try:
-                            with phases("fetch and parse"):
+                    parsed_batch = []
+                    # One phase entry a batch, not a symbol: the timer stays off the hot path it measures.
+                    with phases("fetch and parse"):
+                        for symbol in batch:
+                            bar_type = bar_types[symbol]
+                            instrument = instruments[str(bar_type.instrument_id)]
+                            bars = []
+                            rounded = 0
+                            first_rounding = ""
+                            try:
                                 for bar in result.data.get(symbol, []):
                                     parsed = parse_bar(bar, bar_type, instrument)
                                     if not lo <= parsed.ts_init <= hi:
@@ -929,35 +946,45 @@ def _load_history(
                                         rounded += 1
                                         if not first_rounding:
                                             first_rounding = f"{bar.timestamp} {', '.join(fields)}"
-                        except Exception as e:
-                            raise HistoryStopped(
-                                f"parsing {bar_type} on feed {feed.value} failed "
-                                f"({type(e).__name__}): {e}"
-                            ) from e
-                        if not bars:
-                            continue  # an empty answer writes nothing and is asked for again
-                        if rounded:
-                            out(
-                                f"paper:history: Rounded {rounded} of {len(bars)} Alpaca bars for "
-                                f"{symbol} on feed {feed.value} to price precision "
-                                f"{instrument.price_precision}, half to even as NautilusTrader's "
-                                f"Instrument.make_price rounds; the first: {first_rounding}"
-                            )
-                        claimed = _claim_feed(path, feed)
-                        try:
-                            with phases("write"):
+                            except Exception as e:
+                                raise HistoryStopped(
+                                    f"parsing {bar_type} on feed {feed.value} failed "
+                                    f"({type(e).__name__}): {e}"
+                                ) from e
+                            if bars:  # an empty answer writes nothing and is asked for again
+                                parsed_batch.append(
+                                    (symbol, bar_type, instrument, bars, rounded, first_rounding)
+                                )
+                    with phases("write"):
+                        for (
+                            symbol,
+                            bar_type,
+                            instrument,
+                            bars,
+                            rounded,
+                            first_rounding,
+                        ) in parsed_batch:
+                            if rounded:
+                                out(
+                                    f"paper:history: Rounded {rounded} of {len(bars)} Alpaca bars for "
+                                    f"{symbol} on feed {feed.value} to price precision "
+                                    f"{instrument.price_precision}, half to even as NautilusTrader's "
+                                    f"Instrument.make_price rounds; the first: {first_rounding}"
+                                )
+                            claimed = _claim_feed(path, feed)
+                            try:
                                 catalog.write_bars(bars, start=lo, end=hi)
-                        except Exception as e:
-                            if (
-                                claimed
-                                and not _holds_data(path)
-                                and catalog_feed(path) == feed.value
-                            ):
-                                (path / FEED_FILE).unlink(missing_ok=True)
-                            raise HistoryStopped(
-                                f"writing {bar_type} into {path} failed ({type(e).__name__}): {e}"
-                            ) from e
-                        count += len(bars)
+                            except Exception as e:
+                                if (
+                                    claimed
+                                    and not _holds_data(path)
+                                    and catalog_feed(path) == feed.value
+                                ):
+                                    (path / FEED_FILE).unlink(missing_ok=True)
+                                raise HistoryStopped(
+                                    f"writing {bar_type} into {path} failed ({type(e).__name__}): {e}"
+                                ) from e
+                            count += len(bars)
                     written += count
                     out(f"paper:history: {what}: {count} bars, {gets} GET(s)")
     return written
@@ -1555,6 +1582,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             parser.error("--spans-file takes no --start or --end: the file gives every span")
         if args.data != "bars" or args.feed not in (None, DataFeed.SIP.value):
             parser.error("--spans-file is for sip bars only")
+        if args.bars is not None and any(
+            b.strip() != "1-MINUTE" for b in args.bars.split(",") if b.strip()
+        ):
+            parser.error(
+                "--spans-file loads 1-MINUTE bars only: a day bar's ts_init is the next midnight, outside a "
+                "day's span"
+            )
+        args.bars = "1-MINUTE"
         spans = _read_spans(parser, args.spans_file)
         args.start, args.end = spans[0][0], spans[-1][1]
     elif args.start is None or args.end is None:
