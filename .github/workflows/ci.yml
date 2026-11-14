@@ -27,6 +27,23 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # The parts, as one JSON array from scripts/ci, which alone sets their number (PYTEST_PARTS); the check
+  # job's matrix is read from this job's output, as GitHub's docs show ("Using an output to define two
+  # matrices", https://docs.github.com/en/actions/how-tos/write-workflows/choose-what-workflows-do/run-job-variations).
+  plan:
+    name: parts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      parts: ${{ steps.parts.outputs.parts }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: List the parts
+        id: parts
+        run: echo "parts=$(scripts/ci --list-parts)" >> "$GITHUB_OUTPUT"
+
   # One job per part, a matrix as uv's own workflow splits its tests (`fail-fast: false` and
   # `partition: [1, 2, 3]`, pinned uv, .github/workflows/test.yml:244-248;
   # https://docs.github.com/en/actions/using-jobs/using-a-matrix-for-your-jobs): fail-fast off, so one
@@ -35,15 +52,16 @@ jobs:
   # one required check fails unless every part succeeded.
   check:
     name: checks (${{ matrix.part }})
+    needs: [plan]
     runs-on: ubuntu-24.04
-    # On 2026-11-14 passing runs took 23-38 min created to updated (main 43617194822 33.9 min, 43614583851 36.5;
-    # PR 43579294655 38.4), up from 22 min on 2026-11-13, and runs 43621264808 and 43621201927 were cancelled
-    # at the earlier 40-minute limit; scripts/land waits 95 (ADR 0144)
-    timeout-minutes: 90
+    # Per part, at most 30 minutes, the lead's cap (2026-11-14), to be lowered to about twice the slowest
+    # part once a hosted run of the parts names it; uv's sharded test jobs have 15 (pinned uv,
+    # .github/workflows/test.yml:242). scripts/land waits 45 (ADR 0144, amendment of 2026-11-14).
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        part: [rest, 1/4, 2/4, 3/4, 4/4]
+        part: ${{ fromJSON(needs.plan.outputs.parts) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -145,16 +163,16 @@ jobs:
   required-checks-passed:
     name: all required checks passed
     if: ${{ always() }}
-    needs: [check]
+    needs: [plan, check]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # scripts/ci --verdict fails, naming each, unless every job needed succeeded: a part that failed, was
+      # cancelled or timed out makes the check job's result other than success (scripts/test-ci, case verdict)
       - name: Fail unless every required job succeeded
         env:
           NEEDS_JSON: ${{ toJSON(needs) }}
-        run: |
-          failing=$(echo "$NEEDS_JSON" | jq -r 'to_entries[] | select(.value.result != "success") | "\(.key): \(.value.result)"')
-          if [ -n "$failing" ]; then
-            echo "$failing"
-            exit 1
-          fi
+        run: scripts/ci --verdict

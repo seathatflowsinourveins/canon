@@ -28,7 +28,7 @@
 # The title, which is also the squash commit's subject, is the pull request's own title for --pr, else an
 # open pull request's own title when there is one, else the last commit's subject. The squash subject
 # ends in "(#<number>)", which is added unless the title already ends with it.
-# Environment: LAND_WAIT_SECONDS (default 5700, above the hosted check job's 90-minute timeout) and LAND_POLL_SECONDS (default 10) bound the wait for the
+# Environment: LAND_WAIT_SECONDS (default 2700, above each hosted check part's 30-minute timeout) and LAND_POLL_SECONDS (default 10) bound the wait for the
 # merge. LAND_PR is set by --pr for the run inside the worktree.
 # The fix marker (ADR 0073, addition of 2026-11-11): a commit that fixes a finding names the test that failed
 # before it in a `Fails-before: <test file>::<test function>` trailer and, optionally, the finding in
@@ -582,7 +582,7 @@ else
 fi
 asked="the merge of $url"; [ "$auto" -eq 0 ] || asked="the auto-merge request for $url"
 seen=""; readerr=""   # the last state read that succeeded, and what gh said when one failed
-waited=0; limit="${LAND_WAIT_SECONDS:-5700}"; poll="${LAND_POLL_SECONDS:-10}"
+waited=0; limit="${LAND_WAIT_SECONDS:-2700}"; poll="${LAND_POLL_SECONDS:-10}"
 # unread: a read in the wait failed. On a spent budget the merge's outcome cannot be read until the reset,
 # so the land stops and says so, rather than polling on or calling it not merged.
 unread() {

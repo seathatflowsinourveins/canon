@@ -50,6 +50,12 @@
 #                                   part (pytest_part, below); every other check is a skip line naming part
 #                                   rest. Together the parts run what a plain run runs (ADR 0144, amendment
 #                                   of 2026-11-14)
+#        scripts/ci --list-parts    print the hosted workflow's parts as a JSON array, `rest` and 1/N to N/N
+#                                   for N = PYTEST_PARTS (below), the one place the number of parts is set;
+#                                   the workflow's plan job reads its matrix from it
+#        scripts/ci --verdict       the required check's verdict: read the `needs` context as JSON from
+#                                   NEEDS_JSON and fail, naming each, unless every job it needs succeeded, so
+#                                   a part that failed, was cancelled, timed out or was skipped fails it
 #        scripts/ci --landing  scripts/land's run before a push (ADR 0144): the same quick set, with the secret
 #                              scan over the whole git history and the working tree instead, so nothing the
 #                              push would publish goes out unscanned, and on macOS scripts/test-lanes and
@@ -60,6 +66,25 @@
 # slot N is reserved for --landing, which probes N down to 1; other runs share 1..N-1 (take_slot, below).
 # CANON_TEST_CI=1 (set by scripts/test-ci) skips scripts/test-ci itself, with a skip line.
 set -uo pipefail
+# The number of pytest parts the hosted workflow runs beside part `rest` (ADR 0144, amendment of 2026-11-14):
+# set here alone, read by the workflow through --list-parts.
+PYTEST_PARTS=4
+# --list-parts and --verdict read nothing else and run no check, so they answer before the slot and toolchain.
+case "$#:${1:-}" in
+  1:--list-parts)
+    printf '["rest"'; for ((k = 1; k <= PYTEST_PARTS; k++)); do printf ',"%d/%d"' "$k" "$PYTEST_PARTS"; done
+    printf ']\n'; exit 0 ;;
+  1:--verdict)
+    # needs.<job_id>.result is success, failure, cancelled or skipped (GitHub's contexts reference); a
+    # matrix job's result is its legs' together, so a part cancelled or timed out is not success
+    command -v jq >/dev/null 2>&1 || { echo "ci: FAIL: jq not found; it reads NEEDS_JSON."; exit 1; }
+    if ! printf '%s' "${NEEDS_JSON:-}" | jq -e 'type == "object" and length > 0' >/dev/null 2>&1; then
+      echo "ci: FAIL: NEEDS_JSON is missing, empty or not a JSON object"; exit 1
+    fi
+    failing=$(printf '%s' "$NEEDS_JSON" | jq -r 'to_entries[] | select(.value.result != "success") | "\(.key): \(.value.result)"')
+    if [ -n "$failing" ]; then echo "$failing"; echo "ci: FAIL: a required job did not succeed"; exit 1; fi
+    echo "ci: every required job succeeded"; exit 0 ;;
+esac
 # Priority: once, at the top, this script runs itself again under nice(1) (`man nice`, "nice -n increment utility")
 # at a fixed increment of 5, so every check it starts inherits the lower priority and a run of checks yields to
 # the paper tasks and to whatever else the machine is doing. CANON_CI_NICED marks the second run.
@@ -80,7 +105,7 @@ case "$#:${1:-}" in
     elif [ "$PART" != rest ]; then
       echo "ci: --part takes rest or I/N with 1 <= I <= N, not: $PART"; exit 1
     fi ;;
-  *) echo "ci: usage: scripts/ci [--staged|--landing|--part rest|--part I/N]"; exit 1 ;;
+  *) echo "ci: usage: scripts/ci [--staged|--landing|--part rest|--part I/N|--list-parts|--verdict]"; exit 1 ;;
 esac
 
 if command -v mise >/dev/null 2>&1; then MISE=$(command -v mise)
@@ -251,10 +276,9 @@ skip_line() { n=$((n+1)); KIND[n]="skip"; TEXT[n]="$1"; NOTE[n]=""; }
 # (test-maintenance off macOS), so a skip inside a check stays visible.
 NOTES='^  skip  |^[a-z][a-z-]*: skip \('
 GATED=0   # 1 once a fast check has failed (below)
-pytest_part_job=0   # 1 while a pytest part starts its own pytest (job, below)
 LEFT=()   # checks a quick run leaves to the hosted run (landing_only)
 job() {
-  local note="" keep=0
+  local note="" keep=0 in_part=0
   while :; do
     case "$1" in
       --skips) note='^SKIPPED'; shift ;;
@@ -262,10 +286,11 @@ job() {
       # a pytest part's skips, its count and pytest's summary line (pytest_part, below)
       --part-notes) note='^SKIPPED|^part [0-9]+ of [0-9]+: |^[0-9]+ (passed|failed|skipped|xfailed|deselected)|^no tests ran'; shift ;;
       --git-env) keep=1; shift ;;
+      --in-part) in_part=1; shift ;;   # a pytest part's own pytest, the one job such a part runs
       *) break ;;
     esac
   done
-  if [ "$PART_N" -gt 0 ] && [ "$pytest_part_job" -eq 0 ]; then
+  if [ "$PART_N" -gt 0 ] && [ "$in_part" -eq 0 ]; then
     skip_line "$1 (part rest of this run runs it)"; return 0
   fi
   if [ "$GATED" -eq 1 ]; then
@@ -298,33 +323,43 @@ now() {
 }
 
 # pytest_part I N: the root pytest on part I of N of the tests a plain run collects. The tests are read from
-# pytest's own collection (`--collect-only -q`: one node ID per test, `<file>::<name>[<parameters>]`), with
-# the file of any module skipped at collection (`SKIPPED <file> - <reason>` under --no-fold-skipped), so the
-# parts together run exactly what a plain run would. Each test function, its node ID up to the
-# parametrization, goes to the part a hash of that text modulo N picks: the form of cargo-nextest's
-# `--partition hash:I/N`, which hashes each test and which uv's own workflow runs as a three-part matrix
-# (pinned uv, .github/workflows/test.yml:243-248,318). The parametrization is left out because a parameter
-# can be drawn at import (tests/test_custody.py's FOREIGN holds a uuid4()), so its ID differs in each process
-# and a part could not hash or name it the same way twice; a function's name does not change, and naming it
-# runs every one of its cases. A function is in exactly one part, and the parts do not depend on each
-# other's order. The functions reach pytest as one argument file, read by pytest's own parser
-# (`fromfile_prefix_chars="@"`, pytest 9.2.0 _pytest/config/argparsing.py:509), so no command line grows with
-# the suite. A part with no function passes, saying so; a collection that fails fails the part. The part's
-# count and pytest's summary line are printed, so the hosted parts' cases can be summed against one
-# collection.
+# pytest's own collection (`--collect-only -q`: one node ID per test, `<file>::<name>[<parameters>]`, up to
+# the first empty line), with the file of any module skipped at collection (`SKIPPED <file> - <reason>`
+# under --no-fold-skipped, uncoloured by --color=no). The IDs read must number what pytest says it
+# collected, or the part fails, so a changed verbosity or a stray line cannot leave a part with nothing to
+# run, passing. Each test function, its node ID up to the parametrization, goes to the part a hash of that
+# text modulo N picks: the form of cargo-nextest's `--partition hash:I/N`, which hashes each test and which
+# uv's own workflow runs as a three-part matrix (pinned uv, .github/workflows/test.yml:243-248,318). The
+# parametrization is left out because a parameter can be drawn at import (tests/test_custody.py's FOREIGN
+# holds a uuid4()), so its ID differs in each process and a part could not hash or name it the same way
+# twice; a function's name does not change, and naming it runs every one of its cases. A function is in
+# exactly one part, the parts do not depend on each other's order, and a part runs its functions in
+# collection order, as a plain run does. They reach pytest as one argument file, read by pytest's own
+# parser (`fromfile_prefix_chars="@"`, pytest 9.2.0 _pytest/config/argparsing.py:509). A part with no
+# function passes, saying so; a collection that fails fails the part. The part prints its count and
+# pytest's summary line, so the hosted parts' cases can be summed against the collected count.
 pytest_part() {
-  local i=$1 n=$2 ids="$WORK/part.ids"
-  tool uv run --locked pytest --collect-only -q -rs --no-fold-skipped >"$WORK/part.collect" 2>&1 \
+  local i=$1 n=$2 ids="$WORK/part.ids" fns="$WORK/part.fns" want got
+  tool uv run --locked pytest --collect-only -q --color=no -rs --no-fold-skipped >"$WORK/part.collect" 2>&1 \
     || { echo "pytest's collection failed:"; cat "$WORK/part.collect"; return 1; }
-  { grep -E '^[^ ]+::' "$WORK/part.collect" | sed 's/\[.*//'
-    sed -n 's/^SKIPPED \([^ :]*\) - .*/\1/p' "$WORK/part.collect"; } | sort -u \
+  # the node IDs are the lines before the first empty one; what follows (skips, warnings) is the summary
+  awk '/^$/ { exit } /^[^ ]+::/' "$WORK/part.collect" >"$ids"
+  # the count pytest itself reports: "N test(s) collected", or "no tests collected"
+  want=$(sed -nE 's/^([0-9]+) tests? collected.*/\1/p; s/^no tests collected.*/0/p' "$WORK/part.collect" | tail -n 1)
+  got=$(awk '!seen[$0]++' "$ids" | wc -l | tr -d ' ')
+  if [ -z "$want" ] || [ "$got" != "$want" ]; then
+    echo "pytest reported ${want:-no count of} collected tests, and $got node IDs were read from its list:"
+    cat "$WORK/part.collect"; return 1
+  fi
+  # in collection order, each function once, so a part runs its functions in the order a plain run does
+  { sed 's/\[.*//' "$ids"; sed -n 's/^SKIPPED \([^ []*\).* - .*/\1/p' "$WORK/part.collect"; } | awk '!seen[$0]++' \
     | LC_ALL=C awk -v i="$i" -v n="$n" '
         BEGIN { for (c = 1; c < 256; c++) ord[sprintf("%c", c)] = c }
         { h = 0; for (k = 1; k <= length($0); k++) h = (h * 31 + ord[substr($0, k, 1)]) % 2147483647
-          if (h % n == i - 1) print }' >"$ids"
-  if [ ! -s "$ids" ]; then echo "part $i of $n: no test function falls in this part"; return 0; fi
-  echo "part $i of $n: $(wc -l <"$ids" | tr -d ' ') test functions"
-  tool uv run --locked pytest -q -rfEs --no-fold-skipped "@$ids"
+          if (h % n == i - 1) print }' >"$fns"
+  if [ ! -s "$fns" ]; then echo "part $i of $n: no test function falls in this part, of $want collected tests"; return 0; fi
+  echo "part $i of $n: $(wc -l <"$fns" | tr -d ' ') test functions, of $want collected tests"
+  tool uv run --locked pytest -q -rfEs --no-fold-skipped "@$fns"
 }
 
 # Shell files: regular files in the index (so staged new files are included) whose first line is a sh or
@@ -438,9 +473,7 @@ else
   if [ "$py_ok" -eq 1 ] && [ "$PART" = rest ]; then
     skip_line "pytest (the pytest parts of this run run it)"
   elif [ "$py_ok" -eq 1 ] && [ "$PART_N" -gt 0 ]; then
-    pytest_part_job=1
-    job --part-notes "pytest, part $PART_I of $PART_N"  pytest_part "$PART_I" "$PART_N"
-    pytest_part_job=0
+    job --in-part --part-notes "pytest, part $PART_I of $PART_N"  pytest_part "$PART_I" "$PART_N"
   elif [ "$py_ok" -eq 1 ]; then
     landing_only --skips "pytest"        tool uv run --locked pytest -q -rfEs --no-fold-skipped
   else

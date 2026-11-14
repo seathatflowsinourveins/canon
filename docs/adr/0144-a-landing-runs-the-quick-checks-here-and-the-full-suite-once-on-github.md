@@ -70,7 +70,9 @@ landings started after it is on `main`; it changes no landing already in flight.
    created to updated (on `main` 43617194822 33.9 and 43614583851 36.5, the `checks` job 33 min 48 s and
    36 min 21 s; pull request run 43579294655 38.4, its job 38 min 19 s), and `main`'s push run 43621264808
    and pull request run 43621201927 were cancelled at the 40-minute timeout while pytest ran. About 20 more
-   landings are expected, so the limit leaves room for further growth. The review gate,
+   landings are expected, so the limit leaves room for further growth. Amended again the same day, when
+   the check ran in parts (the amendment of 2026-11-14 below): each part's limit is 30 minutes and the wait
+   45 (`LAND_WAIT_SECONDS`, default 2700), still above it. The review gate,
    address check, branch rebase/merge rule, exact-head squash-merge arguments, subject and body stay as
    they are. Repository settings, rulesets and merge queues are untouched.
 5. **The lane's tests.** A lane still runs its unit's own tests before landing, and one full pytest when
@@ -172,6 +174,8 @@ Read 2026-11-13. Sources below distinguish direct reads from the lead's supplied
 matrix of five parts that run at once on their own runners, `part: [rest, 1/4, 2/4, 3/4, 4/4]` with
 `fail-fast: false`, each running `scripts/ci --part <part>` (`.github/workflows/ci.yml`):
 
+* A `parts` job runs `scripts/ci --list-parts`, which prints the parts as a JSON array, and the matrix is
+  read from its output. `scripts/ci` sets the number of pytest parts in one place, `PYTEST_PARTS=4`.
 * `scripts/ci --part rest` runs every check a plain run runs except the root pytest, which is a skip line
   naming the parts that run it. The self-test scripts, canon lint, ty, ruff, the shell and workflow
   checks, the secret scan and the projects apart are all here.
@@ -181,15 +185,19 @@ matrix of five parts that run at once on their own runners, `part: [rest, 1/4, 2
   up to the parametrization, modulo N picks, so each test is in exactly one part and a part does not
   depend on the others. The parametrization is left out because a parameter drawn at import changes the
   ID in each process (`tests/test_custody.py` parametrizes on a `uuid4()`); naming the function runs
-  every one of its cases. The part's functions reach pytest as one argument file (`@file`). The part
-  prints how many functions it holds and pytest's summary line. A collection that fails fails the part.
+  every one of its cases. The part's functions reach pytest as one argument file (`@file`), in
+  collection order. The node IDs the part reads must number what pytest reports it collected, or the part
+  fails. The part prints how many functions it holds, of how many collected tests, and pytest's summary
+  line. A collection that fails fails the part.
 
 Together the five parts run what one plain `scripts/ci` runs, each check and each collected test once.
-The `all required checks passed` job still needs `check` and still fails unless its result is `success`,
-so the ruleset's two required contexts, `signoff` and `all required checks passed`, are unchanged, and so
-is `scripts/land`, which reads the required checks by bucket and not by name. Each part keeps the
-`checks` job's timeout, and the landing wait stays above it (rule 4 and its amendment of 2026-11-14).
-Local runs (`--staged`, `--landing`, plain) are unchanged.
+The `all required checks passed` job needs `parts` and `check` and runs `scripts/ci --verdict`, which
+fails, naming each, unless every job it needs has the result `success`: a part that failed, was cancelled
+or timed out leaves `check`'s result otherwise. The ruleset's two required contexts, `signoff` and `all
+required checks passed`, are unchanged, and so is the way `scripts/land` reads them, by bucket and not by
+name. Each part's limit is 30 minutes, the lead's cap, to be set to about twice the slowest part once a
+hosted run of the parts names it; `scripts/land`'s wait is 45 minutes, above it (rule 4). Local runs
+(`--staged`, `--landing`, plain) are unchanged.
 
 **Why.** The one job's run took 33 to 38 minutes on 2026-11-14 when it passed (`gh run list --workflow
 ci.yml`: on `main` 43617194822 33.9 min, 43614583851 36.5, 43611536636 35.4; pull request runs 32.9 to
@@ -206,15 +214,16 @@ the count one collection of the whole suite gives at that commit. A hash of the 
 lost the two `uuid4()` cases: collected again, one part reported `ERROR: not found` for it. No file of the suite holds a module fixture whose setup
 takes more than 0.3 s, so running a file's tests in several processes costs little.
 
-**Costs.** One pull request now starts seven hosted jobs (five parts, the macOS job and the aggregator)
-where it started three, against the 20 concurrent standard jobs GitHub documents for Free (above), so
+**Costs.** One pull request now starts eight hosted jobs (the parts job, five parts, the macOS job and the
+aggregator) where it started three, against the 20 concurrent standard jobs GitHub documents for Free (above), so
 several landings at once can queue. Each part installs the environment and collects the suite itself.
 The hash moves tests between parts as IDs are added, so a part's time drifts; the parts' times in each
 run's jobs list show it.
 
 **Not verified.** GitHub's matrix and contexts pages say nothing about the `needs.<job>.result` of a matrix
-job one of whose legs failed (read 2026-11-14). That a failed part makes `check`'s result `failure`, and so
-fails the required check, rests on uv's practice below and is UNVERIFIED by a failing hosted run here.
+job one of whose legs failed (read 2026-11-14). That a failed, cancelled or timed-out part makes `check`'s
+result other than `success` rests on uv's practice below and is UNVERIFIED by such a hosted run here;
+`scripts/test-ci` shows that the verdict fails on any result but `success`.
 That every part ends within fifteen minutes is shown by the first landing under this amendment, whose pull
 request names each part's wall time and the summed count against one collection at the same commit; the
 time of part `rest`, whose checks the one job's log does not time, is UNVERIFIED until that run.
@@ -225,7 +234,10 @@ prints its count and pytest's summary; together the parts name every collected f
 a module skipped at collection included, a function's parametrized cases go to one part as one name, and
 one file's functions can fall in different parts; part `rest` runs no root pytest and
 runs ruff, ty and the test scripts; a malformed part (`0/3`, `4/3`, `3`, `x/y`, `foo`) is refused by
-name; a failed collection fails the part and the run. 477 passed and 0 failed on 2026-11-14; against
+name; a failed collection fails the part and the run, and so does a count of node IDs that differs from
+the count pytest reports; `--list-parts` prints `rest` and `1/4` to `4/4`. Case `verdict`: the verdict
+passes only when every job needed succeeded, and fails naming a part's `failure`, `cancelled` or
+`skipped`, and fails on a missing or malformed `NEEDS_JSON`. 477 passed and 0 failed on 2026-11-14; against
 `main`'s `scripts/ci` 37 fail, and against a version that hashed whole files 12 fail.
 
 **Evidence** (read 2026-11-14):
@@ -245,6 +257,10 @@ name; a failed collection fails the part and the run. 477 passed and 0 failed on
   combination; with `fail-fast: true` "all jobs that are in progress or queued will be cancelled" once one
   fails, which `fail-fast: false` turns off. The workflow syntax reference gives `fail-fast` a default of
   `true` (read through a summary of that page, so its wording is UNVERIFIED).
+* https://docs.github.com/en/actions/how-tos/write-workflows/choose-what-workflows-do/run-job-variations,
+  "Using an output to define two matrices" — a job's output, `fromJSON(needs.<job>.outputs.<name>)`, as a
+  later job's matrix. https://docs.github.com/en/actions/reference/workflows-and-actions/contexts —
+  `needs.<job_id>.result` is `success`, `failure`, `cancelled` or `skipped` (both read 2026-11-14).
 * https://docs.github.com/en/actions/using-jobs/using-jobs-in-a-workflow — "If you would like a job to run
   even if a job it is dependent on did not succeed, use the `always()` conditional expression".
 * `gh run list --workflow ci.yml` and `gh run view 43617194822 --json jobs,--log`, read 2026-11-14 — the
