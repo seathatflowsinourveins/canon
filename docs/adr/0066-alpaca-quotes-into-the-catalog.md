@@ -348,4 +348,7 @@ Read 2026-11-10. Fetched means read as raw text; run means executed here.
   skipped on `update_catalog=False`; an answer is trimmed by `ts_init`), bundled
   (`scripts/canon src nautilus-trader`). The ruling: the lead, 2026-11-13. Tests:
   `packages/canon-alpaca/tests/test_latest_quote.py`, 43 offline cases on a native node, red on main
-  before the change. A paper read of one latest quote: UNVERIFIED until the landing lane's paper run.
+  before the change. A paper read of one latest quote, 2026-11-13 after the close, run: account A,
+  `mise run paper:test -- -s -k latest_quote_seed` (`test_paper_latest_quote_seed.py`): a stream on `sip`,
+  one latest request two seconds later, before any stream quote, answered once with no failure and one
+  quote, stamped on receipt after the request was sent, its `ts_event` the close; `1 passed`.
