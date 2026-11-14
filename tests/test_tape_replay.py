@@ -14,6 +14,7 @@ from collections import Counter
 from datetime import UTC
 from datetime import datetime
 from decimal import Decimal
+from functools import partial
 from itertools import pairwise
 from pathlib import Path
 from typing import Any
@@ -485,8 +486,16 @@ def test_a_malformed_venue_fill_is_refused_before_any_engine(shape, fills, messa
     assert message in report["refusals"][0]["reason"]
 
 
-def test_gain_lock_records_the_protectors_events_and_release_above_cost_floor(shape) -> None:
-    row = holding(runner().replay(shape["spec"]))
+def test_gain_lock_records_the_protectors_events_and_release_above_cost_floor(
+    shape, monkeypatch
+) -> None:
+    # The gain lock is off unless asked for (OwnerProtectorConfig.gain_lock), and the replay
+    # builds its config without it, so this case asks for the lock, as the gain-lock files do.
+    module = runner()
+    monkeypatch.setattr(
+        module, "OwnerProtectorConfig", partial(module.OwnerProtectorConfig, gain_lock=True)
+    )
+    row = holding(module.replay(shape["spec"]))
     gain = row["gain_lock_events"][0]
     assert gain["event"] == "armed"
     assert gain["at"] > row["arming"][0]["at"]
