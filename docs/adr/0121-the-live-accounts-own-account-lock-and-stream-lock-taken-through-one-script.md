@@ -57,14 +57,21 @@ and a test to hold the copies equal; one script is tested once and names the liv
    clock that gives no time and a shell that ends inside a step each end in a refusal by name, status
    above 0. (One end has bash's message alone: in POSIX mode bash 3.2 ends itself, status 1, at such an
    error. The checks of the numbers keep every call from it.)
-6. **The deadline.** The command runs under timeout(1), which "makes itself the leader of a process group
-   that the command inherits", and once timeout has ended, or the script is told to stop, the whole group
-   is killed. With no `--grace` the signal is SIGKILL, as `paper:test` and `paper:session` send; with one,
-   SIGTERM first and SIGKILL after the grace, for a command that cancels what it sent when told to end,
-   as `paper:close` runs. A stop tells timeout alone, which passes it on, so the command is told once,
-   and a second stop meanwhile is only noted (as `mise.toml`'s `bounded`). The command reads the script's
-   standard input. From a terminal it is exec'd in the terminal's process group, where neither the
-   deadline nor the grace applies: the caller's own limit, a mise task's `timeout`, bounds it.
+6. **The deadline and a stop.** The command runs under timeout(1), which "makes itself the leader of a
+   process group that the command inherits", from a terminal or not; it is never exec'd, so the script's
+   shell keeps descriptors 9 and 7, and a command that closes or reopens either frees no lock. Once timeout
+   has ended the group is killed, and the script ends only when none of it is left. At the deadline, with no
+   `--grace`, the signal is SIGKILL, as `paper:test` and `paper:session` send; with one, SIGTERM first and
+   SIGKILL after the grace, for a command that cancels what it sent when told to end, as `paper:close`
+   runs. A stop (SIGTERM, SIGINT or SIGHUP to the script, a Ctrl-C at its terminal included) is passed on
+   as that signal to timeout alone, which passes it to the command, so the command is told once; a second
+   stop meanwhile is only noted. With a grace the group is killed that long after a stop; with none the
+   deadline bounds it. The run's status is the command's, 128 + the signal where a signal ended it.
+   timeout is started under job control, since without it "asynchronous commands ignore SIGINT" (`man
+   bash`). The command reads the script's standard input; in a process group of its own it can write to
+   a terminal but cannot read it or change its settings: a read stops it (SIGTTIN), as does a change such
+   as `stty -echo` (SIGTTOU), timeout takes the stop for its end and exits 1 (both observed), the group is
+   killed, and the run ends at once with status 1, the read unanswered or the change not made.
 
 **The gap, and what would close it.** No task calls the script. Closed by the first `live:*` task that
 writes, proven on a paper account under that account's lock, with its paper run recorded in that task's
@@ -83,11 +90,14 @@ record.
   nor a shell paper task looks. That is `main`'s today, in `session_window.py` and `protector_node.py`,
   both on the trading path, and is closed by a unit there. In this repository only tests set the variable
   (`tests/conftest.py`, `scripts/test-lanes` and this self-test; a search for its assignments).
-* Limit: a stop between timeout's start and the note of its process id signals nothing, and the command
-  runs to its deadline under its locks (as `mise.toml`'s `bounded`). A command can return the script's
-  own 1 and 3: the refusal's line on stderr tells them apart. The clock is checked once, before any lock:
-  a later empty reading at the stream step leaves that wait without its bound, under the account's lock,
-  and runs nothing unlocked. The script is not on `scripts/land`'s trading-path list.
+* Limit: a script started with SIGINT ignored (an asynchronous command of a shell without job control)
+  keeps it ignored, as bash allows no trap of it, so a SIGINT to it reaches nothing. A descendant that puts
+  itself into another process group and closes 9 and 7 is neither killed nor waited for. From a terminal, a
+  command that asks for typed input or sets the terminal (a password prompt) ends 1 at once: it takes
+  that before the script, or runs off a terminal. A command can return the script's own 1 and 3: the
+  refusal's line on stderr tells them apart. The clock is checked once, before any lock: a later empty
+  reading at the stream step leaves that wait without its bound, under the account's lock, and runs
+  nothing unlocked. The script is not on `scripts/land`'s trading-path list.
 
 ### Confirmation
 
@@ -95,18 +105,26 @@ record.
 copy that still names the real one is not run): the lock held while the command runs and free after; a
 second run waits its bound and runs nothing, with `TMPDIR` naming another folder too; the deadline, and a
 SIGTERM to the script or to the group's leader, leave nothing running and both locks free; one stop tells
-the command once, and a second during the grace leaves the first stop's status; the live and the paper
-locks do not wait for each other; `protect --stream` holds account C's two locks; a run with
-`CANON_PAPER_SESSION_DIR` set is refused on each account; an unknown temporary folder, a lock file that
+the command once, a second during the grace is only noted, and the run ends with the command's status; a
+command that ignores SIGTERM keeps the lock held until the grace's or the deadline's SIGKILL; a command
+that closes or reopens 9 and 7 and leaves a child running keeps both live locks held, a second run
+refused, until that child is gone; a SIGTERM or SIGINT to the script reaches the command as that signal;
+the live and the paper locks do not wait for each other; `protect --stream` holds account C's two locks;
+a run with `CANON_PAPER_SESSION_DIR` set is refused on each account; an unknown temporary folder, a lock file that
 cannot be opened and a clock that gives no time each stop the run; a leading zero is a wrong call, and
 `--wait 09` runs nothing while both live locks are held; with the whole-number and leading-zero checks
 taken out of a copy, a wait of `08`, of `1.5` and of a word, each without `--stream` and with it, break
-the account's lock step and are refused there, as is a broken stream step; the grace; a piped line; a
-pseudo-terminal.
-82 cases on macOS 27.2 under bash 3.2.57, run by hand, 2026-11-14. Failing first: 9 with no script (the
-builder's figure, reproduced by a second reader), and 38 of these cases against the script as first
-written. No case touches a real lock, a keychain or the network. No paper run applies: the script
-reaches no account.
+the account's lock step and are refused there (the word by the exit's line, which names the step), as is
+a broken stream step; the grace; a piped line; on a pseudo-terminal, the descriptors, the child, the two
+stops and one Ctrl-C, which reaches the command once.
+107 cases on macOS 27.2 under bash 3.2.57, run by hand, 2026-11-14. Failing first: 9 with no script (the
+builder's figure, reproduced by a second reader), 38 of the first 82 against the script as first written
+(37 in a later reader's run: one count of signals depends on timing), and 16 of the 107 against the script
+that exec'd from a terminal. With one guard of clause 6 taken out of a copy: 11 cases fail without the
+repeated wait, 1 without the second stop's guard, and 2 without job control, after which a case on the
+pseudo-terminal does not end. None fails without the last wait for the group to be gone: that wait is
+UNVERIFIED by a case. No case touches a real lock, a keychain or the network. No paper run applies: the
+script reaches no account.
 
 ## Evidence
 
@@ -120,6 +138,9 @@ Read 2026-11-14 unless a line gives another date.
   February 26, 2026, a later revision of the page macOS's descends from: the descriptor form, the `-t 0`
   sentence and the shell-script example are there in the same words. Fetched; that macOS's lockf behaves
   as FreeBSD's is shown only by the cases above.
+* `man bash` on this machine (bash 3.2.57) — SIGNALS: "When job control is not in effect, asynchronous
+  commands ignore SIGINT and SIGQUIT"; `-m`: "Background processes run in a separate process group".
+  Bundled.
 * `man timeout` on this machine — "If the --foreground option is not specified, timeout makes itself the
   leader of a process group that the command inherits and sends the signal to that process group"; "A
   descendant that puts itself into another process group, for example by calling setsid(2), is not
@@ -144,3 +165,8 @@ Read 2026-11-14 unless a line gives another date.
 * A third reader, 2026-11-14 (a high read of that correction): no case failed with the account step's own
   refusal taken out, since each such case passed `--stream` and the stream step refused instead. Closed
   by the same cases without `--stream`, asked for that step's own line: 4 fail with the refusal removed.
+* A fourth reader, 2026-11-14 (a high read): from a terminal the script exec'd the command, so one that
+  reopened descriptor 9 freed the live lock and a second live run started (reproduced). Closed by clause
+  6's one path, on the lead's three properties: the lock outlives all the command started, a stop reaches
+  the command and the run ends with its status, the same with a terminal and without; each on a case that
+  failed first.

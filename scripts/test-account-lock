@@ -66,12 +66,14 @@ check "the lock folder is the per-user temporary folder and nothing else: one as
       eval '[ "$(grep -c "^tmp=" "$AL")" = 1 ] && grep -qxF "tmp=\"\$(/usr/bin/getconf DARWIN_USER_TEMP_DIR)\" || tmp=\"\"" "$AL" && ! grep -Eq "\\\$\{?(TMPDIR|LOCK)" "$AL"'
 check "... and the one variable of the environment it reads is the one it refuses a run for: CANON_PAPER_SESSION_DIR, which moves the Python holder's folder" \
       eval '[ "$(LC_ALL=C grep -cE "\\\$\{?[A-Z][A-Z_]+" "$AL")" = 1 ] && grep -qxF "if [ -n \"\${CANON_PAPER_SESSION_DIR:-}\" ]; then" "$AL" && grep -qxF "PAPER_DIR_ENV = \"CANON_PAPER_SESSION_DIR\"" "$SW"'
-check "from a terminal the command is exec'd, after both locks are held" \
-      eval '[ "$(grep -n "^\[ ! -t 0 \] || exec \"\$@\"\$" "$AL" | cut -d: -f1)" -gt "$(grep -n "^locked=1\$" "$AL" | cut -d: -f1)" ]'
+# an exec'd command holds the only copy of descriptors 9 and 7, so one that closes or reopens either frees the
+# lock while it runs (the high read's P2-1); the script's own shell keeps both until the run ends, from a terminal too
+check "the command is never exec'd, from a terminal or not: the script's shell keeps descriptors 9 and 7 until the run ends" \
+      eval '! grep -Eq "exec \"\\\$@\"" "$AL" && ! grep -Eq "^[^#]*\[ (! )?-t 0 \]" "$AL"'
 # timeout passes a SIGTERM it gets on to the command (man timeout), so a SIGTERM to its whole group as well would
 # tell the command twice, and break off a cancel that a plain handler had begun
-check "a stop tells timeout alone to end, never its whole group, so the command is told once" \
-      eval 'grep -qxF "        kill -TERM \"\$g\" 2>/dev/null" "$AL" && [ "$(grep -c "kill -TERM" "$AL")" = 1 ]'
+check "a stop is passed on, as the signal it is, to timeout alone and never its whole group, so the command is told once" \
+      eval 'grep -qxF "    kill -s \"\$1\" \"\$g\" 2>/dev/null" "$AL" && [ "$(grep -cE "kill -(s )?(TERM|INT|HUP|\"\\\$1\")" "$AL")" = 1 ]'
 
 # ---------- a wrong call ----------
 echo "a wrong call:"
@@ -406,12 +408,14 @@ CLEANS
     "$C" live --wait 2 --deadline 60 --grace 10 -- "$D/cmd" > "$D/out" 2>&1 < /dev/null & op=$!
     ready "$D" "$op"; s0=$(date +%s); kill -TERM "$op" 2>/dev/null; wait "$op"; orc=$?; took=$(( $(date +%s) - s0 ))
     settle "$D"; up=$(left_up "$D")
-    check "live --grace 10, a SIGTERM to the script: the command is told to end and cleans up (${took} s), then nothing is left (left:${up:- none}), the lock free" \
-          eval '[ -s "$D/cleaned" ] && [ "$orc" = 143 ] && [ "$took" -lt 10 ] && [ -z "$up" ] && free $LIVE_LOCK'
+    # the run's status is the command's (the lead's property 2, 2026-11-14): it cleaned up and ended 0, so 0, where
+    # it was 143, the stop's, before
+    check "live --grace 10, a SIGTERM to the script: the command is told to end and cleans up (${took} s), the run ends with its status, 0 ($orc), then nothing is left (left:${up:- none}), the lock free" \
+          eval '[ -s "$D/cleaned" ] && [ "$orc" = 0 ] && [ "$took" -lt 10 ] && [ -z "$up" ] && free $LIVE_LOCK'
     reap "$D"
   }
   # a second stop while the first is under way (a task's timeout, then a closed terminal's SIGHUP) is only noted:
-  # the run ends with the first stop's status, and the script does not signal the command a second time.
+  # the script does not signal the command a second time, and the run ends as the first stop's grace ends it.
   # lingers <folder>: a command that, told to end, notes it and keeps running, as a cleanup that takes its time
   lingers() {
     mkdir -p "$1"
@@ -433,8 +437,11 @@ LINGERS
     while [ ! -s "$D/told" ] && kill -0 "$op" 2>/dev/null; do sleep 0.1; done
     kill -HUP "$op" 2>/dev/null; wait "$op"; orc=$?; took=$(( $(date +%s) - s0 ))
     settle "$D"; up=$(left_up "$D")
-    check "live --grace 4, a SIGTERM to the script and then a SIGHUP during the grace: the run ends as the first stop ends it (exit $orc, 143 expected), in ${took} s, nothing left (left:${up:- none}), the lock free" \
-          eval '[ -s "$D/told" ] && [ "$orc" = 143 ] && [ "$took" -lt 20 ] && [ -z "$up" ] && free $LIVE_LOCK'
+    # shellcheck disable=SC2034  # read by the eval'd check
+    told=$(wc -l < "$D/told" 2>/dev/null | tr -d ' ')
+    # the status is the command's: the grace's SIGKILL ended it, so 137, where it was 143, the first stop's, before
+    check "live --grace 4, a SIGTERM to the script and then a SIGHUP during the grace: the command is told once (${told:-0}), and the grace's SIGKILL ends it (exit $orc, 137 expected), in ${took} s, nothing left (left:${up:- none}), the lock free" \
+          eval '[ "${told:-0}" = 1 ] && [ "$orc" = 137 ] && [ "$took" -lt 20 ] && [ -z "$up" ] && free $LIVE_LOCK'
     reap "$D"
   }
   # one stop tells the command once: timeout passes on the SIGTERM it gets, so one more from the script to the
@@ -456,9 +463,113 @@ ONCE
     ready "$D" "$op"; kill -TERM "$op" 2>/dev/null; wait "$op"; orc=$?
     # shellcheck disable=SC2034  # read by the eval'd check
     told=$(wc -l < "$D/terms" 2>/dev/null | tr -d ' ')
-    check "live --grace 10, one SIGTERM to the script: the command is told to end once (told ${told:-0} times), and the run ends 143 ($orc)" \
-          eval '[ "${told:-0}" = 1 ] && [ "$orc" = 143 ]'
+    # the status is the command's: it ended by itself, 0, where it was 143, the stop's, before
+    check "live --grace 10, one SIGTERM to the script: the command is told to end once (told ${told:-0} times), and the run ends with its status, 0 ($orc)" \
+          eval '[ "${told:-0}" = 1 ] && [ "$orc" = 0 ]'
   fi
+
+  # ---------- the lock outlives all the command started; a stop reaches the command ----------
+  # The lead's three properties for the wrapper (2026-11-14): (1) the locks are held until the command and all it
+  # started have ended, whatever it does with descriptors 9 and 7 and whatever child it leaves running; (2) a
+  # SIGTERM or SIGINT to the script reaches the command, the script ends only after it, and with its status
+  # (128 + the signal where the command dies of it); (3) both the same with and without a terminal on stdin.
+  # Each stand-in writes cmd.pid once its traps are set, so a signal sent after that finds them.
+  # alive <pid file>: the process is running (a zombie, ps STAT Z, is not)
+  alive() { [ -s "$1" ] || return 1; case "$(/bin/ps -o stat= -p "$(cat "$1")" 2>/dev/null)" in ""|Z*) return 1 ;; esac; }
+  # drops <folder> <close|reopen>: a command that closes, or reopens on files of its own, descriptors 9 and 7;
+  # starts a child (descriptors as the command left them, SIGTERM and SIGHUP ignored, so neither a stop nor a
+  # terminal's hangup at its session leader's end ends it, nothing on the terminal) that it leaves
+  # running; notes, while it runs, whether each live lock is held (75) or free (0), and whether a second run on the
+  # live account, with a wait of 1 s, runs its command; and ends 7
+  drops() {
+    mkdir -p "$1"
+    cat > "$1/cmd" <<DROPS
+#!/bin/bash
+case "$2" in close) exec 9>&- 7>&- ;; *) exec 9>>"$1/own-9" 7>>"$1/own-7" ;; esac
+echo \$\$ > "$1/cmd.pid"
+/bin/bash -c 'trap "" TERM HUP; echo \$\$ > "$1/child.pid"; exec /bin/sleep 60' < /dev/null > /dev/null 2>&1 &
+while [ ! -s "$1/child.pid" ]; do /bin/sleep 0.05; done
+for f in $LIVE_LOCK $LIVE_STREAM; do /usr/bin/lockf -k -t 0 "$L/\$f" true 2>/dev/null; echo "\$f \$?"; done > "$1/probed"
+"$C" live --stream --wait 1 --deadline 5 -- /usr/bin/touch "$1/second-ran" < /dev/null > "$1/second.out" 2>&1; echo \$? > "$1/second.rc"
+exit 7
+DROPS
+    chmod +x "$1/cmd"
+  }
+  # notes <folder>: a command that, told to end by SIGINT or SIGTERM, notes which and ends 3 or 4
+  notes() {
+    mkdir -p "$1"
+    cat > "$1/cmd" <<NOTES
+#!/bin/bash
+trap 'echo INT >> "$1/got"; exit 3' INT
+trap 'echo TERM >> "$1/got"; exit 4' TERM
+echo \$\$ > "$1/cmd.pid"
+while :; do /bin/sleep 0.2; done
+NOTES
+    chmod +x "$1/cmd"
+  }
+  # dies <folder>: a command that keeps every signal's default action, so a SIGINT or SIGTERM ends it
+  dies() {
+    mkdir -p "$1"
+    printf '#!/bin/bash\necho $$ > "%s/cmd.pid"\nexec /bin/sleep 60\n' "$1" > "$1/cmd"; chmod +x "$1/cmd"
+  }
+  # held_through <folder> <how> <where>: property 1's checks of a drops run, its status in rc
+  held_through() {
+    # shellcheck disable=SC2034  # read by the eval'd checks
+    local D="$1" inside; inside=$(tr '\n' ' ' < "$1/probed" 2>/dev/null)
+    check "live --stream$3, a command that ${2}s descriptors 9 and 7: while it runs both live locks are held (${inside:-not probed})" \
+          eval 'grep -qx "$LIVE_LOCK 75" "$D/probed" && grep -qx "$LIVE_STREAM 75" "$D/probed"'
+    check "... a second run on the live account meanwhile waits its 1 s and runs nothing (exit $(cat "$D/second.rc" 2>/dev/null))" \
+          eval '[ "$(cat "$D/second.rc" 2>/dev/null)" = 1 ] && [ ! -e "$D/second-ran" ]'
+    check "... the run ends with the command's status, 7 ($rc), only once the child it left running has ended, and both locks are free" \
+          eval '[ "$rc" = 7 ] && [ -s "$D/child.pid" ] && ! alive "$D/child.pid" && free $LIVE_LOCK && free $LIVE_STREAM'
+  }
+  # stopped <folder> <signal> <expected status> <where>: property 2's checks, the run's status in rc
+  stopped() {
+    # shellcheck disable=SC2034  # read by the eval'd checks
+    local D="$1" sig="$2" want="$3" got; got=$(tr '\n' ' ' < "$1/got" 2>/dev/null)
+    case "$want" in
+      3|4) check "live --stream$4, a SIG$sig to the script: the command is told by SIG$sig once (told: ${got:-nothing}), and the run ends after it with its status, $want ($rc)" \
+                 eval '[ "$got" = "$sig " ] && [ "$rc" = "$want" ] && ! alive "$D/cmd.pid" && free $LIVE_LOCK && free $LIVE_STREAM' ;;
+      *) check "live --stream$4, a SIG$sig to the script, a command that keeps its default action: it dies of SIG$sig and the run ends after it with $want ($rc)" \
+               eval '[ "$rc" = "$want" ] && [ -s "$D/cmd.pid" ] && ! alive "$D/cmd.pid" && free $LIVE_LOCK && free $LIVE_STREAM' ;;
+    esac
+  }
+  # signalled <folder> <signal>: the stand-in in <folder> under the script, not on a terminal, sent <signal> once
+  # it runs; status in rc. Started under `set -m`: without job control an asynchronous command starts with SIGINT
+  # ignored, which bash then cannot trap (man bash, SIGNALS), so a SIGINT to it would test nothing
+  signalled() {
+    set -m; "$C" live --stream --wait 2 --deadline 60 -- "$1/cmd" > "$1/out" 2>&1 < /dev/null & op=$!; set +m
+    while [ ! -s "$1/cmd.pid" ] && kill -0 "$op" 2>/dev/null; do sleep 0.1; done
+    kill -"$2" "$op" 2>/dev/null; wait "$op"; rc=$?
+  }
+  echo "the lock outlives all the command started, and a stop reaches the command (not on a terminal):"
+  # a command that ignores SIGTERM, told to stop: the lock stays held until the grace's SIGKILL, or with no grace
+  # the deadline's, ends the group, and is free only once none of the group is left (the coordinator's condition,
+  # 2026-11-14). Nothing is waited for between the run's end and the checks of what is left.
+  # shellcheck disable=SC2034  # orc, held, up and took are read by the eval'd checks
+  for g_d in "2 60" "0 4"; do
+    gr=${g_d% *}; dl=${g_d#* }; D="$TMP/ignores-stop-$gr"; hang "$D" "trap '' TERM"
+    set -m; "$C" live --stream --wait 2 --deadline "$dl" --grace "$gr" -- "$D/cmd" > "$D/out" 2>&1 < /dev/null & op=$!; set +m
+    ready "$D" "$op"; s0=$(date +%s); kill -TERM "$op" 2>/dev/null; sleep 1
+    free "$LIVE_LOCK"; held=$?
+    wait "$op"; orc=$?; took=$(( $(date +%s) - s0 )); up=$(left_up "$D")
+    check "live --stream --grace $gr --deadline $dl, a command that ignores SIGTERM, a SIGTERM to the script: 1 s later the lock is still held" \
+          eval '[ "$held" != 0 ] && [ -s "$D/child.pid" ]'
+    check "... the $([ "$gr" = 0 ] && echo "deadline's" || echo "grace's") SIGKILL ends it (exit $orc, 137 expected, in ${took} s), and at the run's end none of its group is left (left:${up:- none}) and both locks are free" \
+          eval '[ "$orc" = 137 ] && [ "$took" -ge $(( (gr > 0 ? gr : dl) - 1 )) ] && [ "$took" -lt 20 ] && [ -z "$up" ] && free $LIVE_LOCK && free $LIVE_STREAM'
+    reap "$D"
+  done
+  for how in close reopen; do
+    D="$TMP/drops-$how"; drops "$D" "$how"
+    "$C" live --stream --wait 2 --deadline 30 -- "$D/cmd" > "$D/out" 2>&1 < /dev/null; rc=$?
+    held_through "$D" "$how" ""; reap "$D"
+  done
+  for sig in TERM INT; do
+    D="$TMP/notes-$sig"; notes "$D"; signalled "$D" "$sig"
+    stopped "$D" "$sig" "$([ "$sig" = INT ] && echo 3 || echo 4)" ""; reap "$D"
+    D="$TMP/dies-$sig"; dies "$D"; signalled "$D" "$sig"
+    stopped "$D" "$sig" "$([ "$sig" = INT ] && echo 130 || echo 143)" ""; reap "$D"
+  done
 
   # ---------- from a terminal ----------
   echo "from a terminal:"
@@ -468,9 +579,50 @@ ONCE
     rm -f "${W:?}/probed"
     # shellcheck disable=SC2034  # rc is read by the eval'd check
     { AL_COPY="$C" AL_PROBE="$W/probe" /usr/bin/expect -c 'set timeout 30; spawn -noecho $env(AL_COPY) live --stream --wait 2 --deadline 30 -- $env(AL_PROBE); expect eof; lassign [wait] p s o v; exit $v' > "$W/out" 2>&1; rc=$?; }
-    check "live --stream on a pseudo-terminal: the command is exec'd holding both locks, and its exit status (7) is the run's" \
+    check "live --stream on a pseudo-terminal: the command runs holding both locks, and its exit status (7) is the run's" \
           eval '[ "$rc" = 7 ] && probed $LIVE_LOCK 75 && probed $LIVE_STREAM 75 && probed canon-paper-test.lock 0'
     check "... both free once it has ended" eval 'free $LIVE_LOCK && free $LIVE_STREAM'
+    # on_term <folder> <none|TERM|INT|ctrl-c>: the stand-in in <folder> under the script on a pseudo-terminal; once
+    # it runs, a signal to the script's pid, or a Ctrl-C typed at the terminal (to its foreground process group);
+    # status in rc (128 + the signal's number, as a shell reports it, if the process was killed by one), 198 if the
+    # run outlived expect's 40 s
+    cat > "$W/on-term.exp" <<'EXP'
+set timeout 40
+set d $env(AL_DIR); set act $env(AL_ACT)
+spawn -noecho {*}$argv
+set p [exp_pid]
+if {$act ne "none"} {
+  set n 0
+  while {(![file exists $d/cmd.pid] || [file size $d/cmd.pid] == 0) && $n < 300} { after 100; incr n }
+  if {$act eq "ctrl-c"} { send "\003" } else { exec kill -$act $p }
+}
+expect { eof {} timeout { exit 198 } }
+set r [wait]
+if {[lindex $r 4] eq "CHILDKILLED"} { exit [expr {128 + [dict get {SIGHUP 1 SIGINT 2 SIGKILL 9 SIGTERM 15} [lindex $r 5]]}] }
+exit [lindex $r 3]
+EXP
+    on_term() {
+      local d="$1" act="$2"; shift 2
+      AL_DIR="$d" AL_ACT="$act" /usr/bin/expect -f "$W/on-term.exp" -- "$C" live --stream --wait 2 --deadline 60 -- "$d/cmd" > "$d/out" 2>&1 < /dev/null; rc=$?
+    }
+    for how in close reopen; do
+      D="$TMP/term-drops-$how"; drops "$D" "$how"; on_term "$D" none
+      held_through "$D" "$how" " on a pseudo-terminal"; reap "$D"
+    done
+    for sig in TERM INT; do
+      D="$TMP/term-notes-$sig"; notes "$D"; on_term "$D" "$sig"
+      stopped "$D" "$sig" "$([ "$sig" = INT ] && echo 3 || echo 4)" " on a pseudo-terminal"; reap "$D"
+      D="$TMP/term-dies-$sig"; dies "$D"; on_term "$D" "$sig"
+      stopped "$D" "$sig" "$([ "$sig" = INT ] && echo 130 || echo 143)" " on a pseudo-terminal"; reap "$D"
+    done
+    # one Ctrl-C at the terminal reaches the command once: a second would cut its cleanup short (the note above
+    # paper:test in mise.toml)
+    D="$TMP/term-ctrl-c"; notes "$D"; on_term "$D" ctrl-c
+    # shellcheck disable=SC2034  # read by the eval'd check
+    got=$(tr '\n' ' ' < "$D/got" 2>/dev/null)
+    check "live --stream on a pseudo-terminal, one Ctrl-C typed there: the command is told by SIGINT once (told: ${got:-nothing}), and the run ends after it with its status, 3 ($rc)" \
+          eval '[ "$got" = "INT " ] && [ "$rc" = 3 ] && ! alive "$D/cmd.pid" && free $LIVE_LOCK && free $LIVE_STREAM'
+    reap "$D"
   fi
 fi
 
