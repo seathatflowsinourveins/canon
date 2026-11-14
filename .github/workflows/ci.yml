@@ -1,5 +1,7 @@
 # CI for Canon (docs/adr/0013-quality-gates.md, docs/adr/0014-landing-workflow.md).
-# It runs scripts/ci, the same script the commit gate and scripts/land run, on Ubuntu; and on a hosted macOS
+# It runs scripts/ci, the same script the commit gate and scripts/land run, on Ubuntu, split into five parts
+# that run at once on their own runners (ADR 0144, amendment of 2026-11-14): `rest`, every check but the
+# root pytest, and the root pytest's parts 1 to 4, each collected test in exactly one; and on a hosted macOS
 # runner the two self-tests whose cases need lockf(1), plutil(1) and an expect(1) that opens a pseudo-terminal
 # at /usr/bin, as macOS has them, and which skip those cases on Ubuntu (ADR 0082).
 #
@@ -25,13 +27,23 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # One job per part, a matrix as uv's own workflow splits its tests (`fail-fast: false` and
+  # `partition: [1, 2, 3]`, pinned uv, .github/workflows/test.yml:244-248;
+  # https://docs.github.com/en/actions/using-jobs/using-a-matrix-for-your-jobs): fail-fast off, so one
+  # failing part does not cancel the others and every failure is shown. required-checks-passed needs this
+  # job, as uv's own required job needs its matrix job (pinned uv, .github/workflows/ci.yml:440-495), so the
+  # one required check fails unless every part succeeded.
   check:
-    name: checks
+    name: checks (${{ matrix.part }})
     runs-on: ubuntu-24.04
     # On 2026-11-14 passing runs took 23-38 min created to updated (main 43617194822 33.9 min, 43614583851 36.5;
     # PR 43579294655 38.4), up from 22 min on 2026-11-13, and runs 43621264808 and 43621201927 were cancelled
     # at the earlier 40-minute limit; scripts/land waits 95 (ADR 0144)
     timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [rest, 1/4, 2/4, 3/4, 4/4]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -48,8 +60,10 @@ jobs:
       - name: Install the locked Python environment
         run: uv sync --locked
 
-      - name: Run every check
-        run: scripts/ci
+      - name: Run this part's checks
+        env:
+          PART: ${{ matrix.part }}
+        run: scripts/ci --part "$PART"
 
   # The self-test cases Ubuntu skips, run where they can run: the paper runner under lockf(1) and timeout(1),
   # the paper lock's deadline and the sandbox node's stream lock, and the LaunchAgent plists read back with

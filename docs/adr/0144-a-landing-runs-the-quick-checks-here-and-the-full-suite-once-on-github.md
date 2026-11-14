@@ -165,3 +165,89 @@ Read 2026-11-13. Sources below distinguish direct reads from the lead's supplied
   figures, retained local unit tests and full pytest for a new module, and the instruction to leave
   today's in-flight landings alone. The measurement logs were not supplied or independently read:
   UNVERIFIED independently; no URL is available for this instruction.
+
+## Amendment, 2026-11-14: the hosted check runs in five parts at once, behind the same required check
+
+**What changes.** Rule 3's `checks` job no longer runs the whole of `scripts/ci` in one job. It is a job
+matrix of five parts that run at once on their own runners, `part: [rest, 1/4, 2/4, 3/4, 4/4]` with
+`fail-fast: false`, each running `scripts/ci --part <part>` (`.github/workflows/ci.yml`):
+
+* `scripts/ci --part rest` runs every check a plain run runs except the root pytest, which is a skip line
+  naming the parts that run it. The self-test scripts, canon lint, ty, ruff, the shell and workflow
+  checks, the secret scan and the projects apart are all here.
+* `scripts/ci --part I/N` runs the lock check and the environment, then the root pytest on part I of N of
+  the tests pytest's own collection lists (with the file of any module skipped at collection); every
+  other check is a skip line naming part `rest`. A test function goes to the part a hash of its node ID,
+  up to the parametrization, modulo N picks, so each test is in exactly one part and a part does not
+  depend on the others. The parametrization is left out because a parameter drawn at import changes the
+  ID in each process (`tests/test_custody.py` parametrizes on a `uuid4()`); naming the function runs
+  every one of its cases. The part's functions reach pytest as one argument file (`@file`). The part
+  prints how many functions it holds and pytest's summary line. A collection that fails fails the part.
+
+Together the five parts run what one plain `scripts/ci` runs, each check and each collected test once.
+The `all required checks passed` job still needs `check` and still fails unless its result is `success`,
+so the ruleset's two required contexts, `signoff` and `all required checks passed`, are unchanged, and so
+is `scripts/land`, which reads the required checks by bucket and not by name. Each part keeps the
+`checks` job's timeout, and the landing wait stays above it (rule 4 and its amendment of 2026-11-14).
+Local runs (`--staged`, `--landing`, plain) are unchanged.
+
+**Why.** The one job's run took 33 to 38 minutes on 2026-11-14 when it passed (`gh run list --workflow
+ci.yml`: on `main` 43617194822 33.9 min, 43614583851 36.5, 43611536636 35.4; pull request runs 32.9 to
+37.9), and three runs were cancelled at the 40-minute timeout, 40.4 min each (`main` at `fa321292`,
+43621264808, and two pull request runs). Its log prints no per-check time, but the root pytest alone ran
+for 1,862.72 s (31 min 3 s) in one local run at `fa321292` (`pytest --durations=0` under `nice -n 15`,
+12,466 passed, 66 skipped, 30 xfailed), so it is the run's long pole. The split is by test, not by file:
+one file, `packages/canon-alpaca/tests/test_execution_client.py`, took 551 of the 1,834 s the durations
+list sums, and the four parts a hash of each file would have made summed 167, 504, 305 and 859 s. Hashed
+by test function, the same durations sum to 474, 420, 486 and 454 s, each part under nine minutes of test
+time before its environment install and collection. At `fa321292` the four parts' argument files,
+collected by pytest, held 2,782, 2,513, 3,562 and 3,705 tests, 12,562 together with no ID in two parts,
+the count one collection of the whole suite gives at that commit. A hash of the full node ID would have
+lost the two `uuid4()` cases: collected again, one part reported `ERROR: not found` for it. No file of the suite holds a module fixture whose setup
+takes more than 0.3 s, so running a file's tests in several processes costs little.
+
+**Costs.** One pull request now starts seven hosted jobs (five parts, the macOS job and the aggregator)
+where it started three, against the 20 concurrent standard jobs GitHub documents for Free (above), so
+several landings at once can queue. Each part installs the environment and collects the suite itself.
+The hash moves tests between parts as IDs are added, so a part's time drifts; the parts' times in each
+run's jobs list show it.
+
+**Not verified.** GitHub's matrix and contexts pages say nothing about the `needs.<job>.result` of a matrix
+job one of whose legs failed (read 2026-11-14). That a failed part makes `check`'s result `failure`, and so
+fails the required check, rests on uv's practice below and is UNVERIFIED by a failing hosted run here.
+That every part ends within fifteen minutes is shown by the first landing under this amendment, whose pull
+request names each part's wall time and the summed count against one collection at the same commit; the
+time of part `rest`, whose checks the one job's log does not time, is UNVERIFIED until that run.
+
+**Confirmation.** `scripts/test-ci` case `parts`: each part I of 3 runs its pytest on its own test
+functions, given as one argument file, and no ruff, ty or test script, leaving those to part `rest`; it
+prints its count and pytest's summary; together the parts name every collected function once, the file of
+a module skipped at collection included, a function's parametrized cases go to one part as one name, and
+one file's functions can fall in different parts; part `rest` runs no root pytest and
+runs ruff, ty and the test scripts; a malformed part (`0/3`, `4/3`, `3`, `x/y`, `foo`) is refused by
+name; a failed collection fails the part and the run. 477 passed and 0 failed on 2026-11-14; against
+`main`'s `scripts/ci` 37 fail, and against a version that hashed whole files 12 fail.
+
+**Evidence** (read 2026-11-14):
+
+* uv at its pin `316c827e058c`, `.github/workflows/test.yml:243-248,318`: the `cargo-test-windows` job is
+  a matrix `partition: [1, 2, 3]` with `fail-fast: false`, each leg running
+  `--partition hash:${{ matrix.partition }}/3`, cargo-nextest's hash partition, which hashes each test;
+  this repository applies the same form to each pytest test function. `.github/workflows/ci.yml:440-495`: uv's
+  `required-checks-passed` job runs `if: always()`, needs `test`, the workflow holding that matrix job,
+  and fails unless each need's result is `success`.
+* pytest 9.2.0, as `uv.lock` pins it: `_pytest/config/argparsing.py:509` builds its parser with
+  `fromfile_prefix_chars="@"`, so `@<file>` reads one argument per line; `_pytest/main.py:1155` splits a
+  node ID's parametrization off at its first `[` before splitting the rest at `::`, so an ID whose
+  parameters hold `::` (the suite has some) names one test; `_pytest/terminal.py:1387-1404` prints a skip
+  under `--no-fold-skipped` as `SKIPPED <node ID> - <reason>`.
+* https://docs.github.com/en/actions/using-jobs/using-a-matrix-for-your-jobs — a matrix runs one job per
+  combination; with `fail-fast: true` "all jobs that are in progress or queued will be cancelled" once one
+  fails, which `fail-fast: false` turns off. The workflow syntax reference gives `fail-fast` a default of
+  `true` (read through a summary of that page, so its wording is UNVERIFIED).
+* https://docs.github.com/en/actions/using-jobs/using-jobs-in-a-workflow — "If you would like a job to run
+  even if a job it is dependent on did not succeed, use the `always()` conditional expression".
+* `gh run list --workflow ci.yml` and `gh run view 43617194822 --json jobs,--log`, read 2026-11-14 — the
+  run times above; the `checks` job's "Run every check" step took 33.6 of its 33.8 minutes.
+* The live ruleset on `main`, read with `gh api repos/{owner}/{repo}/rules/branches/main` on 2026-11-14 —
+  required status checks `signoff` and `all required checks passed`, unchanged.
