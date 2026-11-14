@@ -1064,7 +1064,9 @@ case_ "src/canon_trading/sizing.py is on the trading path" t_fix_protector_path 
 case_ "src/canon_trading/trail.py is on the trading path" t_fix_protector_path src/canon_trading/trail.py
 case_ "src/canon_trading/arming.py is on the trading path" t_fix_protector_path src/canon_trading/arming.py
 case_ "src/canon_trading/movers_rank.py is on the trading path" t_fix_protector_path src/canon_trading/movers_rank.py
-case_ "src/canon_trading/movers_rank_signal.py is on the trading path" t_fix_protector_path src/canon_trading/movers_rank_signal.py
+case_ "src/canon_trading/early_entry_study.py is on the trading path" t_fix_protector_path src/canon_trading/early_entry_study.py
+case_ "src/canon_trading/trail_profile.py is on the trading path" t_fix_protector_path src/canon_trading/trail_profile.py
+case_ "mise.toml is on the trading path" t_fix_protector_path mise.toml
 case_ "src/canon_trading/movers_rank_actor.py is on the trading path" t_fix_protector_path src/canon_trading/movers_rank_actor.py
 case_ "every trading-path glob matches a tracked file"      t_trading_globs
 
