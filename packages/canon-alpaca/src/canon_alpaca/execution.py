@@ -1583,25 +1583,35 @@ def activity_order_id(activity: object) -> str | None:
     return str(order_id) if order_id is not None else None
 
 
-def position_status_report(position: AlpacaPosition, ts_init: int) -> PositionStatusReport:
-    """A `PositionStatusReport` for one Alpaca US equity position.
+def position_status_report(
+    position: AlpacaPosition, ts_init: int, odd: Callable[[str], None] | None = None
+) -> PositionStatusReport:
+    """A `PositionStatusReport` for one Alpaca US equity position, read by custody's one quantity rule
+    (`canon_trading.custody._listed`; the lead, 2026-11-13 21:21).
 
-    The direction is taken from `side`; Alpaca documents `qty` as "The number of shares" without saying
-    whether a short is negative, so its magnitude is used. Alpaca gives positions no timestamp, so
-    `ts_last` is the time of the request.
+    Alpaca's reference describes `side` with the values "long" and "short" and `qty` as "The number of
+    shares", and does not say whether a short's quantity is negative
+    (https://docs.alpaca.markets/us/reference/getallopenpositions.md, read 2026-11-13): a short's sign is
+    UNVERIFIED. So the quantity is read as a finite number before its sign is taken off (`decimal_value`
+    raises `ValueError` naming it otherwise, which fails the whole position report, and at start-up the
+    node's reconciliation, as any position this slice cannot represent), and the position is a short by its `side` or by a quantity
+    below zero; a short is never reported LONG. A position labelled long with a quantity below zero is
+    reported a short of its magnitude and handed to `odd` once, with both fields. Alpaca gives positions
+    no timestamp, so `ts_last` is the time of the request.
     """
-    side = {
-        AlpacaPositionSide.LONG: PositionSide.LONG,
-        AlpacaPositionSide.SHORT: PositionSide.SHORT,
-    }[position.side]
+    qty = decimal_value(position.qty, "position quantity")
+    labelled_short = position.side == AlpacaPositionSide.SHORT
+    short = labelled_short or qty < 0
+    if short and not labelled_short and odd is not None:
+        odd(
+            f"Alpaca position in {position.symbol} is labelled long with quantity {position.qty}; "
+            "reported as a short of its magnitude"
+        )
     return PositionStatusReport(
         account_id=ACCOUNT_ID,
         instrument_id=InstrumentId(Symbol(position.symbol), VENUE),
-        position_side=side,
-        quantity=whole_quantity(
-            abs(decimal_value(position.qty, "position quantity")),
-            f"{position.symbol} position quantity",
-        ),
+        position_side=PositionSide.SHORT if short else PositionSide.LONG,
+        quantity=whole_quantity(abs(qty), f"{position.symbol} position quantity"),
         ts_last=ts_init,
         ts_init=ts_init,
         avg_px_open=decimal_value(position.avg_entry_price, "average entry price"),
@@ -5239,7 +5249,7 @@ class AlpacaExecutionClient(ExecutionClient):
                     "loaded; not reported",
                 )
                 continue
-            reports.append(position_status_report(position, ts_init))
+            reports.append(position_status_report(position, ts_init, odd=self._log.warning))
         # Alpaca's "All Open Positions" lists the account's open positions, and "Once a position is closed,
         # it will no longer be queryable" (https://docs.alpaca.markets/us/reference/getallopenpositions.md).
         # NautilusTrader takes only "An explicit flat report" as evidence of flat ("Missing reports do not
