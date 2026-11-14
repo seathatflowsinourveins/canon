@@ -624,7 +624,10 @@ def _remaining(order: Any) -> Decimal | None:
 
 
 def _reported(entry: Entry) -> tuple[Any, ...]:
-    """What the node report shows of a holding; a change in any of these is written at once."""
+    """What the node report shows of a holding, and the venue's reading a restart reads; a change
+    in any of these is written at the next save, a quote's or a step's. A retry that recovers only
+    the horizon is a change too, so a run lost before another change leaves the next start its
+    reading (rd-owner-protector F3)."""
     return (
         entry.last_level,
         entry.quantity,
@@ -633,6 +636,7 @@ def _reported(entry: Entry) -> tuple[Any, ...]:
         entry.reason,
         entry.distance,
         entry.limit_offset,
+        entry.horizon,
     )
 
 
@@ -836,6 +840,14 @@ class Holding:
     # Set when the owner's word held this holding after its sell was placed: its release re-places
     # the sell at the next step while the bid is above the level, with no new observation.
     rearm_at_step: bool = False
+    # Our leg whose cancel the owner's hold requested (count one), a trail not yet released
+    # included: when it ends, a sale it became ends with it, whether the hold still stands or not,
+    # so the release re-arms the trail and never sends the sale again (rd-owner-protector F1). A
+    # rejected cancel clears it.
+    held_cancel: ClientOrderId | None = None
+    # Every leg of a sale ended under the hold: a late fill on one is still ours, and re-evaluates
+    # the holding in its own event (rd-owner-protector F2).
+    held_ids: set[ClientOrderId] = field(default_factory=set)
     # The owner's hold at a count above one (`_hold_counted`): applied to this holding, and its
     # waiting release already said.
     hold_applied: bool = False
@@ -1894,6 +1906,13 @@ class OwnerProtector(Strategy):
         if event.client_order_id not in self.sent_ids:
             return
         self.cancel_requested.discard(event.client_order_id)
+        slot = self.slots.get(event.instrument_id)
+        if slot is not None and slot.held_cancel == event.client_order_id:
+            order = self.cache.order(event.client_order_id)
+            if order is not None and not order.is_closed:
+                # The leg works on; a step still held cancels it again. A leg that ended across
+                # the cancel (an expiry, say) keeps the mark, so its sale ends with it (review F1).
+                slot.held_cancel = None
         self.deferred_lines.append(
             f"{event.instrument_id}: our cancel rejected: {event.reason}; "
             "re-evaluate on the next quote or step"
@@ -1931,6 +1950,7 @@ class OwnerProtector(Strategy):
         if slot is None or not (
             event.client_order_id == slot.protect_id
             or (slot.sale is not None and event.client_order_id in slot.sale.order_ids)
+            or event.client_order_id in slot.held_ids
         ):
             return
         if slot.gain_armed_at is not None and slot.gain_entry is not None:
@@ -2217,6 +2237,7 @@ class OwnerProtector(Strategy):
         if self.frozen.get(instrument_id, "").startswith(WAITING):
             self.frozen.pop(instrument_id)
         if order is not None:
+            slot.held_cancel = order.client_order_id
             self._cancel_own(
                 slot,
                 reason=f"{instrument_id}: {symbol_hold.HELD}: canceling our own sell only "
@@ -2224,12 +2245,20 @@ class OwnerProtector(Strategy):
             )
             return
         if slot.sale is not None:
-            self._log_sale(instrument_id, slot.sale)
-            self._say(
-                f"{instrument_id}: {symbol_hold.HELD}: our sale ended with its cancel; the "
-                f"release re-arms the trail at {slot.level}"
-            )
-            slot.sale = None
+            self._end_held_sale(instrument_id, slot)
+
+    def _end_held_sale(self, instrument_id: InstrumentId, slot: Holding) -> None:
+        """A sale the owner's hold canceled ends, held or released since: its legs stay ours for a
+        late fill (F2), and the release re-arms the trail, never the sale (F1)."""
+        sale = slot.sale
+        assert sale is not None
+        self._log_sale(instrument_id, sale)
+        self._say(
+            f"{instrument_id}: {symbol_hold.HELD}: our sale ended with its cancel; the "
+            f"release re-arms the trail at {slot.level}"
+        )
+        slot.held_ids |= sale.order_ids
+        slot.sale, slot.held_cancel = None, None
 
     def _gain_lock(
         self,
@@ -3539,7 +3568,24 @@ class OwnerProtector(Strategy):
                         trigger = reached
             if trigger is not None and (slot.level is None or trigger > slot.level):
                 slot.level = trigger
-            if order.is_closed:
+            if (
+                order.is_closed
+                and order.client_order_id == slot.held_cancel
+                and (
+                    slot.sale is not None
+                    or order.status not in (OrderStatus.DENIED, OrderStatus.REJECTED)
+                )
+            ):
+                # The leg the hold canceled has ended: so has a sale it was released into, though
+                # the hold may have been removed before this pass (F1); the trail is re-armed below.
+                # A trail the venue refused is still frozen by the refusal path.
+                self.cancel_requested.discard(order.client_order_id)
+                slot.held_ids.add(order.client_order_id)
+                slot.protect_id, order = None, None
+                if slot.sale is not None:
+                    self._end_held_sale(instrument_id, slot)
+                slot.held_cancel = None
+            elif order.is_closed:
                 if order.status in (OrderStatus.DENIED, OrderStatus.REJECTED):
                     if slot.sale is None:
                         # C1's P2-1, the ruled design (the lead, 2026-11-13 19:11): a 403 or 422 is

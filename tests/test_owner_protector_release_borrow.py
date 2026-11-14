@@ -65,7 +65,9 @@ class Borrowed(OwnerProtector):
         self,
     ) -> None:  # no engine, no super(): only the plain attributes a handler may use
         self.__dict__.update(
-            slots={AAA: SimpleNamespace(protect_id="P-1", gain_applied_floor=None)},
+            slots={
+                AAA: SimpleNamespace(protect_id="P-1", gain_applied_floor=None, held_cancel=None)
+            },
             sent_ids={"P-1"},
             cancel_requested={"P-1"},
             venue_quotes={},
