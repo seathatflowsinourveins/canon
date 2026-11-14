@@ -111,6 +111,7 @@ from canon_alpaca.providers import require_get_only
 
 from . import custody
 from . import session_window
+from . import symbol_hold
 
 NEW_YORK = ZoneInfo("America/New_York")
 DEFAULT_ACCOUNTS = ("A", "B")
@@ -135,7 +136,9 @@ ORDERS_PAGE_LIMIT = 500  # Alpaca's documented maximum, not a calibrated thresho
 BAR_PAGE_LIMIT = 10000  # alpaca-py's documented /stocks/bars page size at the pin.
 STOP_KINDS = frozenset({"stop", "stop_limit", "trailing_stop"})
 ACKNOWLEDGED = frozenset({"new", "partially_filled"})
-STATES = ("covered", "dormant", "uncovered", "unknown")
+STATES = ("covered", "dormant", "uncovered", "unknown", "held")
+"""`held`: a long the owner's word holds (symbol_hold), read from the protector instance's
+symbol-holds folder. It is told as held, never as a fault: no alert and no uncovered age."""
 PARTS = frozenset({"regular", "pre-market", "after-hours", "overnight"})
 DENIED_LIMIT = "no node report: a locally denied sell is alerted at the alert age, not at once"
 # Source: packages/canon-alpaca/README.md, "Wash trades"; observations, not documentation.
@@ -256,7 +259,7 @@ def _cover(symbol: str, orders: Sequence[Any], reports: Sequence[Any], now: date
                 raise ReadFailed("frozen node report names no denied or rejected sell")
             frozen = result
             continue
-        if state in ("guarded", "waiting"):
+        if state in ("guarded", "waiting", "held"):
             continue
         if state not in ("armed", "counting"):
             raise ReadFailed("node report state is not a level-book state")
@@ -311,6 +314,8 @@ def assess(
     fills: Mapping[str, datetime] | None = None,
     rejected: Mapping[str, str] | None = None,
     read_error: str = "",
+    held: frozenset[str] = frozenset(),
+    holds_error: str = "",
 ) -> list[dict[str, Any]]:
     """P1-P9/P22: pure; supplied clock/calendar facts override the wall-time test seam.
 
@@ -379,6 +384,17 @@ def assess(
             state, reason = "unknown", invalid
         if read_error:
             state, reason = "unknown", read_error
+        if state == "uncovered" and symbol in held and not short:
+            # The owner's word is a fact apart from coverage (as an exit block is): a held long
+            # whose cover is short is named as held, never alerted as uncovered at every repeat.
+            state = "held"
+            reason = (
+                f"{symbol_hold.HELD}: the protector sells none of it; removing the hold re-arms it"
+                + (f"; {reason}" if frozen or cover else "")
+            )
+        elif state == "uncovered" and holds_error and not frozen:
+            # A hold that cannot be read is unknown; a freeze still shows as one (review F8).
+            state, reason = "unknown", holds_error
         if foreign:
             reason += f"; a foreign sell rests for {foreign}"
         if report_note:
@@ -390,12 +406,14 @@ def assess(
         if state == "uncovered" and cover >= quantity:
             remainder = max(Decimal(0), quantity - active)
         source, since = "since first seen", now
-        if state != "covered":
+        if state not in ("covered", "held"):  # A hold is no fault: it carries no age (review F7).
             previous = memory.get("episodes", {}).get(symbol)
             if previous:
                 since, source = _stamp(previous["since"]), previous["source"]
             elif memory.get("states", {}).get(symbol) == "covered":
                 source = "since cover lost"
+            elif memory.get("states", {}).get(symbol) == "held":
+                source = "since the owner's hold was removed"
             elif symbol in (fills or {}):
                 since, source = _stamp((fills or {})[symbol]), "since fill"
         findings.append(
@@ -409,7 +427,9 @@ def assess(
                 "remainder": str(remainder),
                 "excess": str(excess),
                 "age_source": source,
-                "age_seconds": max(0.0, (now - since).total_seconds()) if state != "covered" else 0,
+                "age_seconds": max(0.0, (now - since).total_seconds())
+                if state not in ("covered", "held")
+                else 0,
                 "since": since.isoformat(),
                 "reason": reason,
                 "exit": exit_kind,
@@ -423,6 +443,7 @@ def assess(
                 "frozen": frozen,
                 "frozen_source": frozen_source,
                 "invalid": bool(invalid),
+                "held_by_owner": symbol in held,
             }
         )
     return findings
@@ -1138,6 +1159,19 @@ def _snapshot(position: Any) -> dict[str, Any]:
     }
 
 
+def _owner_holds(account: str) -> tuple[frozenset[str], str]:
+    """The owner's per-symbol holds for this account's protector instance (symbol_hold), with the
+    reason a folder present but unread is not taken as no hold. No instance folder: none held."""
+    folder = symbol_hold.instance_holds(symbol_hold.MONITOR_ACCOUNTS[account])
+    if not folder.exists():
+        return frozenset(), ""
+    try:
+        held, _strays = symbol_hold.read_holds(folder)
+    except (OSError, ValueError) as exc:
+        return frozenset(), f"symbol-holds folder unread ({type(exc).__name__}): a hold is unknown"
+    return held, ""
+
+
 def _reports(path: Path, account: str) -> list[dict[str, Any]]:
     if not path.exists():
         return []
@@ -1218,7 +1252,7 @@ def _finish(
     exit_blocks, block_notices = _block_events(account, now, blocking_buys, memory, not error)
     events.extend(block_notices)
     old_episodes = memory["episodes"]
-    current = {f["symbol"]: f for f in findings if f["state"] != "covered"}
+    current = {f["symbol"]: f for f in findings if f["state"] not in ("covered", "held")}
     cleared = sorted(set(old_episodes) - set(current))
     new_episodes = 0
     episodes = {}
@@ -1474,6 +1508,7 @@ def run_pass(
                 positions = list(known.values())
             if error:
                 fresh_reports = []
+            held, holds_error = _owner_holds(account)
             findings = assess(
                 account,
                 positions,
@@ -1488,6 +1523,8 @@ def run_pass(
                 fills=fills,
                 rejected=rejected,
                 read_error=error,
+                held=held,
+                holds_error=holds_error,
             )
             blocking_buys = (
                 _blocking_buys(account, positions, orders, findings, _part(now, clock, days))

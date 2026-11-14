@@ -7,6 +7,7 @@ import os
 import socket
 import subprocess
 import sys
+from datetime import UTC
 from datetime import datetime
 from datetime import timedelta
 from decimal import Decimal
@@ -70,7 +71,7 @@ TradingClient.__init__ = forbidden
 
 
 def ns(at: datetime) -> int:
-    return int(at.timestamp() * SECOND)
+    return (at - datetime(1970, 1, 1, tzinfo=UTC)) // timedelta(microseconds=1) * 1000
 
 
 def minute_bar(instrument, opened: datetime, close: float, volume: int) -> Bar:
@@ -393,6 +394,133 @@ Mover.record = observed_record
     json.dumps(report, allow_nan=False)
 
 
+@pytest.mark.parametrize("tail_seconds", [0, 0.000006, 30])
+def test_regular_mover_finishes_managed_stop_before_engine_disposal(
+    neutral_catalogs, monkeypatch, tail_seconds
+):
+    from canon_trading import window_replay
+
+    spec, *_ = neutral_catalogs
+    # Observe the real composed Mover after engine.end(), before _checked_engine disposes it.
+    # The later bound also exercises shutdown when no market data reaches window_end.
+    injection = """
+from canon_trading.mover import Mover
+record = Mover.record
+on_stop = Mover.on_stop
+def observed_stop(self):
+    on_stop(self)
+    self.observed_stop_ns = self.clock.timestamp_ns()
+def observed_record(self):
+    return {
+        **record(self),
+        "observed_state": str(self.state()),
+        "observed_manage_stop": self.manage_stop_set,
+        "observed_stop_ns": getattr(self, "observed_stop_ns", None),
+    }
+Mover.on_stop = observed_stop
+Mover.record = observed_record
+"""
+    monkeypatch.setattr(
+        window_replay, "_WORKER", OFFLINE_GUARDS + injection + window_replay._WORKER
+    )
+    end = END + timedelta(seconds=tail_seconds)
+    # The stop path does not depend on the fill arm, so one arm covers it.
+    report = window_replay.run_replay({**spec, "fill_arm": "touch", "window_end": end.isoformat()})
+    run = report["mover"]["run"]
+    assert run["observed_manage_stop"] is True
+    assert report["open_positions"] == 0
+    assert {fill[1] for fill in run["fills"]} == {"BUY", "SELL"}
+    assert run["observed_state"] == "ComponentState.STOPPED", json.dumps(
+        report["engine_errors"], indent=2
+    )
+    assert run["observed_stop_ns"] >= ns(end)
+    assert report["replay_stop"] == {"requested": True}
+    assert report["engine_errors"] == [], report["engine_errors"]
+
+
+class _Cache:
+    def __init__(self, positions, orders):
+        self.positions, self.orders, self.asked = positions, orders, []
+
+    def positions_open(self, *, strategy_id):
+        self.asked.append(("positions", strategy_id))
+        return self.positions
+
+    def orders_open(self, *, strategy_id):
+        self.asked.append(("orders", strategy_id))
+        return self.orders
+
+
+class _Strategy:
+    strategy_id = "Mover-001"
+
+    def __init__(self, running, positions=(), orders=()):
+        self.running, self.stopped = running, False
+        self.cache = _Cache(list(positions), list(orders))
+
+    def is_running(self):
+        return self.running
+
+    def stop(self):
+        self.stopped = True
+
+
+@pytest.mark.parametrize(
+    ("positions", "orders", "expected"),
+    [
+        ([], [], {"requested": True}),
+        (
+            ["long"],
+            [],
+            {
+                "requested": False,
+                "reason": "not flat one market-exit interval before window_end",
+                "open_positions": 1,
+                "open_orders": 0,
+            },
+        ),
+        (
+            [],
+            ["sell"],
+            {
+                "requested": False,
+                "reason": "not flat one market-exit interval before window_end",
+                "open_positions": 0,
+                "open_orders": 1,
+            },
+        ),
+    ],
+)
+def test_the_replay_stops_only_a_flat_mover_with_no_open_order(positions, orders, expected):
+    from canon_trading.window_replay import _stop_if_flat
+
+    strategy = _Strategy(True, positions, orders)
+    assert _stop_if_flat(strategy) == expected
+    assert strategy.stopped is (expected == {"requested": True})
+    assert ("positions", "Mover-001") in strategy.cache.asked
+    stopped = _Strategy(False)
+    assert _stop_if_flat(stopped) == {"requested": False, "reason": "not running"}
+    assert stopped.stopped is False
+
+
+def test_a_wind_down_inside_the_last_exit_interval_is_refused(neutral_catalogs):
+    from canon_trading.window_replay import run_replay
+
+    spec, *_ = neutral_catalogs
+    late = (END - timedelta(milliseconds=500)).isoformat()
+    with pytest.raises(RuntimeError) as failed:
+        run_replay({**spec, "wind_down_at": late})
+    assert "at least one market-exit interval" in str(failed.value)
+
+
+def test_nanoseconds_of_a_fractional_time_are_exact():
+    from canon_trading.window_replay import _ns
+
+    at = datetime(2026, 11, 13, 14, 33, 12, 345678, tzinfo=UTC)
+    assert _ns(at) == 1794580392345678000
+    assert _ns(END + timedelta(microseconds=6)) == ns(END) + 6000
+
+
 def test_full_cli_run_never_reaches_the_outside_world(neutral_catalogs, monkeypatch, tmp_path):
     from alpaca.trading.client import TradingClient
     from canon_alpaca import providers
@@ -558,8 +686,7 @@ def test_checked_engine_fails_on_lifecycle_handler_error(neutral_catalogs, monke
     from canon_trading import window_replay
 
     spec, *_ = neutral_catalogs
-    # A stand-in without managed stopping reaches both callbacks. Mover's managed stop
-    # remains RUNNING at this pin's backtest end and does not invoke its Python on_stop.
+    # A stand-in without managed stopping isolates the log check from Mover's exit timer.
     worker = f"""
 import json
 import sys

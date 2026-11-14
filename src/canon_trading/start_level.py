@@ -74,12 +74,14 @@ def start_level(previous: Decimal | None, rebuilt: Decimal) -> Decimal:
     return max(previous, rebuilt)
 
 
-STATES = ("armed", "guarded", "counting", "waiting", "frozen")
+STATES = ("armed", "guarded", "counting", "waiting", "frozen", "held")
 """Item 4 (the lead, 2026-11-13 17:13): the book is the protector's node report. `armed` has a
 working sell at its level; `guarded` holds the sale on the first-observation guard; `counting` is
-n of 2 observations; `waiting` and `frozen` carry a reason. None is a book written before states."""
+n of 2 observations; `waiting` and `frozen` carry a reason. None is a book written before states.
+`held` is a holding the owner's word holds (symbol_hold.HELD): no sell of ours, its level kept as
+written or as this run last raised it, never lowered, and a reason."""
 NEEDS_LEVEL = ("armed", "guarded", "counting")
-NEEDS_REASON = ("waiting", "frozen")
+NEEDS_REASON = ("waiting", "frozen", "held")
 
 
 @dataclass(frozen=True)
