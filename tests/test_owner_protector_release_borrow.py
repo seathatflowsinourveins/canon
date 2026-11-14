@@ -71,6 +71,9 @@ class Borrowed(OwnerProtector):
             venue_quotes={},
             released_at={},
             deferred_lines=[],
+            # The strategy's own settings object, a plain attribute: both handlers read its count
+            # to leave a two-quote sale's events to the step that judges them.
+            settings=SimpleNamespace(breach_count=1),
         )
 
     def __getattribute__(self, name: str) -> Any:
