@@ -9,8 +9,8 @@ review-by: 2027-02-12
 
 ## Context and Problem Statement
 
-The hosted check runs one serial pytest of about 12,500 cases in about 31 minutes on a 4-core runner,
-against a 40-minute limit. Stage S1 splits it into parts by a hash of the test function; stage S2 runs
+The hosted check ran one serial pytest of 12,562 cases, 1,862 s of a run of about 36 minutes, on a 4-core
+runner, under a limit raised from 40 to 90 minutes as a stopgap. Stage S1 splits it into parts by a hash of the test function; stage S2 runs
 workers inside each part, so each part ends in under 5 minutes hosted and a full run on this Mac in under
 8 minutes. Some cases take a lock, a port, a fixed path, the home folder or the wall clock, and must never
 share a core with a parallel worker.
@@ -35,16 +35,19 @@ run serial.
 
 1. **The library.** `pytest-xdist==3.8.0` (2025-07-01, the newest release), MIT, in `[dependency-groups]
    dev` (`uv add --dev pytest-xdist==3.8.0`); it brings `execnet` 2.1.2. Registry entry `pytest-xdist`,
-   role `tool`, tag `v3.8.0`. Its plugin loads in every pytest run and distributes nothing without `-n`.
+   role `tool`, tag `v3.8.0`. Its plugin loads in every pytest run and distributes nothing unless `-n` (or `--tx` with `--dist`) is given;
+this repository sets neither in its pytest options.
 2. **`loadgroup` is broken at pytest 9.2.0, and is not used.** xdist 3.8.0 groups by rewriting
-   `item._nodeid` to add `@<group>`; pytest 9.2.0 holds node ids as a structured `NodeId` (its changelog,
-   #14758), and the rewrite no longer takes effect. The probe below found 18 cases marked
+   `item._nodeid` to add `@<group>`; pytest 9.2.0 reads `nodeid` from a structured id (`Node.nodeid`
+   returns `str(self._id)`, `_pytest/nodes.py:290-292`), so the write lands unread in the node's `__dict__`
+   (`nodes.py:138-147`). pytest's changelog (#14758) calls the change "fully backward compatible for
+   plugins"; for this private attribute it is not, as xdist #1386 reports and the probe shows. The probe below found 18 cases marked
    `xdist_group("serial")` spread over all four workers under `--dist loadgroup`, as under `load`, with no
    `@serial` in their ids. The fix (xdist #1388, merged 2026-10-07) is in no release; a release that carries
    it is adopted through `adopt-upstream` and this probe re-run before any grouping is relied on.
 3. **The serial group.** A pytest marker names the cases the split lane's shared-state audit lists; each
    part runs `-m "not <marker>"` with workers, then `-m "<marker>"` with `-n 0`, in the main process with no
-   worker beside it (the pattern pandas uses with `single_cpu`, as a scout read its workflow).
+   worker beside it (the pattern pandas uses with `single_cpu`, its workflow read 2026-11-14).
 4. **The distribution mode** (`load`, `loadfile`, `loadscope` or `worksteal`) and the worker count are
    chosen by measurement on the real suite when S2 is wired into `scripts/ci`, not by this record. All of
    them ran every probe case exactly once.
@@ -85,10 +88,18 @@ Read 2026-11-14. "Fetched at the pin" is the tree `scripts/canon src pytest-xdis
 * https://raw.githubusercontent.com/pytest-dev/pytest/9.2.0/doc/en/changelog.rst — #14758, node ids held
   as a structured `NodeId` — fetched at the pin (`scripts/canon src pytest`).
 * https://github.com/pytest-dev/pytest-xdist/issues/1386 and https://github.com/pytest-dev/pytest-xdist/pull/1388 —
-  closed and merged 2026-10-07, "Fix loadgroup with pytest main node IDs"; `master` 112 commits past
-  `v3.8.0` — fetched (`gh api`).
+  closed and merged 2026-10-07, "Fix loadgroup with pytest main node IDs"; merge commit `4616feb8` not in
+  `v3.8.0`; `master` 112 commits past `v3.8.0` — fetched (`gh api`).
+* pytest 9.2.0 `src/_pytest/nodes.py:138-147,214-218,290-292` — `__dict__` in `Node.__slots__`, `_id` set
+  in the constructor, `nodeid` as `str(self._id)` — fetched at the pin (`scripts/canon src pytest`).
 * The lead's ruling on the hosted check's architecture, 2026-11-14 (outside the repository) — 12,562 cases,
-  one serial run 1,862 s, the stages and properties — read.
-* The CI scouts' reports of 2026-11-14 (outside the repository) — read; pandas' `single_cpu` group at
-  `numprocesses: 0` is a scout's reading, `UNVERIFIED` here.
-* The probe, 2026-11-14 — the counts in Confirmation — measured.
+  one serial run 1,862 s, the stages and properties — fetched (a file outside the repository).
+* The CI scouts' reports of 2026-11-14 (outside the repository) — fetched (files outside the repository).
+* https://github.com/pandas-dev/pandas/blob/main/.github/workflows/unit-tests.yml — lines 178-200, `not
+  single_cpu` at `numprocesses: 'auto'` and `single_cpu` at `0` — fetched by the evidence-verifier
+  2026-11-14, on `main`, unpinned.
+* The probe, 2026-11-14 — the counts in Confirmation — UNVERIFIED as a source (a local run, not a
+  document); the evidence-verifier re-ran it in its own folder with the same result, `loadscope` included
+  (one worker per file).
+* Corrected 2026-11-14 after the evidence-verifier's pass: the Context's run time and limit, the reach of
+  "distributes nothing", the code path behind the broken rewrite and the changelog's contrary claim.
