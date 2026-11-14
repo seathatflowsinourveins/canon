@@ -1,4 +1,5 @@
-"""Alpaca's historical SIP bars/trades, or IEX or bounded SIP quotes, into a catalog (ADR 0093).
+"""Alpaca's historical SIP bars/trades, IEX or bounded SIP quotes, or bounded BOATS (overnight)
+bars, trades or quotes, into a catalog (ADR 0093).
 
 `mise run paper:history <account>` runs this module with one paper account's pair in data-only mode
 (ADR 0070): it sends market data GETs and nothing else, and takes neither the account's lock nor a
@@ -143,6 +144,23 @@ adapter's `fetch_trades` precedent). Incomplete history stops before writing any
 piece's hook is removed on success or failure. CLI bounds are checked before building a client.
 The adapter itself is unchanged. Paper loads on account A's pair, PLCE in hourly pieces and SPY over
 the row bound in parts, are recorded in catalog/README.md.
+
+Overnight (2026-11-13): `feed=boats` (CLI `--feed boats`) asks for Blue Ocean ATS's overnight feed for
+bars, trades or quotes. Alpaca's historical bars, trades and quotes references list `boats` ("Blue
+Ocean ATS, overnight US trading data"), and its 24/5 page says: "To access delayed historical
+overnight data, make sure to include the parameter `feed=boats` in your request, `feed=overnight` will
+give error", "provided that the end parameter in your request is at least 15 minutes old"; "The
+overnight session operates from 8:00 PM ET Sunday to 4:00 AM ET Friday" (all read 2026-11-13). So
+`--feed overnight` is refused by name with Alpaca's sentence (`OVERNIGHT_REFUSAL`), and nothing is sent.
+A boats load takes at most `BOATS_MAX_SYMBOLS` (8) symbols named with `--symbols`, never a file, over
+at most `BOATS_MAX_SPAN` (8 hours, one overnight session), ending at least `PUBLICATION_DELAY` before
+now, each refused by name before any lock or request; the symbol bound is UNCALIBRATED, since Alpaca
+states no rate, depth or symbol cap for the feed. Boats data keeps roots of its own: bars and trades in
+`BOATS_CATALOG` (`catalog/boats`), quotes in `BOATS_QUOTES_CATALOG` (`catalog/boats-quotes`). The feed
+marker refuses another feed's root, `_check_kinds` keeps quotes apart from bars and trades, and every
+other rule above holds unchanged: GET only, the pace, the first 429 and a refused feed stopping by name,
+nothing falling back to `sip`. Whether the feed answers on a paper pair for trades and bars is
+UNVERIFIED here; `tests/test_paper_quote_history.py` saw its quotes begin on 2024-09-16 (2026-11-10).
 """
 
 from __future__ import annotations
@@ -228,6 +246,30 @@ not measured (UNVERIFIED), so the row stays under the lower one. The trading API
 FEED = DataFeed.SIP
 """Named on every request; a refusal stops the run and nothing falls back to `iex` (ADR 0093)."""
 
+BAR_FEEDS = TRADE_FEEDS = (DataFeed.SIP, DataFeed.BOATS)
+"""The feeds a bar or trade load may name: `sip`, the default, and `boats` inside its bound below."""
+
+BOATS_MAX_SYMBOLS = 8
+"""The most distinct symbols one `boats` load takes, of any kind: UNCALIBRATED, the bound of a case
+replay as `SIP_QUOTES_MAX_SYMBOLS` is. Alpaca states no rate, depth or symbol cap for the feed
+(its 24/5 page, read 2026-11-13). The symbols are named on the command line, never a file."""
+
+BOATS_MAX_SPAN = timedelta(hours=8)
+"""The longest `end - start` one `boats` load takes: one overnight session. Alpaca's 24/5 page: "The
+overnight session operates from 8:00 PM ET Sunday to 4:00 AM ET Friday" (read 2026-11-13)."""
+
+BOATS_CATALOG = DEFAULT_CATALOG / "boats"
+"""The CLI's default root for `boats` bars and trades, apart from every `sip` root."""
+
+BOATS_QUOTES_CATALOG = DEFAULT_CATALOG / "boats-quotes"
+"""The CLI's default root for `boats` quotes, apart from `boats` bars and trades (ADR 0151)."""
+
+OVERNIGHT_REFUSAL = (
+    "Alpaca's 24/5 page: \"To access delayed historical overnight data, make sure to include the "
+    'parameter `feed=boats` in your request, `feed=overnight` will give error" (read 2026-11-13)'
+)
+"""Why `--feed overnight` is refused by name rather than sent."""
+
 SYMBOLS_PER_CALL = 200
 """Symbols in one request: about 1.2 KB of query at five characters a symbol. Alpaca states no most
 (UNVERIFIED)."""
@@ -255,8 +297,9 @@ trading day 2025-11-03 in New York, which ends at 05:00 UTC on 2025-11-04 (its e
 QUOTES_MAX_PAGES = TRADES_MAX_PAGES
 """The adapter's fetch_trades page ceiling; never treat capped pagination as complete."""
 
-QUOTE_FEEDS = (DataFeed.IEX, DataFeed.SIP)
-"""The quote feeds a load may name: `iex`, the default, and `sip` inside its bound below."""
+QUOTE_FEEDS = (DataFeed.IEX, DataFeed.SIP, DataFeed.BOATS)
+"""The quote feeds a load may name: `iex`, the default, `sip` inside its bound below, and `boats`
+inside `BOATS_MAX_SYMBOLS` and `BOATS_MAX_SPAN`."""
 
 SIP_QUOTES_MAX_SYMBOLS = 8
 """The most distinct symbols one `sip` quote load takes: UNCALIBRATED, the lead's bound for a case
@@ -412,21 +455,48 @@ def _claim_feed(path: Path, feed: DataFeed = FEED) -> bool:
 
 
 def _check_kinds(path: Path, loading: str, feed: DataFeed = FEED) -> None:
-    """Keep quotes apart: `sip` quotes go in a root with no bars or trades, and bars or trades in a root
-    with no quotes, of either feed (ADR 0151). The feed marker alone cannot tell, since
-    `sip` quotes, bars and trades share it. Read with the pinned `list_instruments(data_type)`."""
+    """Keep quotes apart: `sip` and `boats` quotes go in a root with no bars or trades, and bars or
+    trades in a root with no quotes, of any feed (ADR 0151). The feed marker alone cannot tell, since
+    one feed's quotes, bars and trades share it. Read with the pinned `list_instruments(data_type)`."""
     catalog = ParquetDataCatalog(str(path))
     held = [name for name, kind in _KINDS if catalog.list_instruments(kind)]
     if loading == "quotes":
-        if feed == DataFeed.SIP and (others := [k for k in held if k != "quotes"]):
+        own = {DataFeed.SIP: SIP_QUOTES_CATALOG, DataFeed.BOATS: BOATS_QUOTES_CATALOG}
+        if feed in own and (others := [k for k in held if k != "quotes"]):
             raise HistoryStopped(
-                f"the catalog at {path} holds {' and '.join(others)}, and sip quotes go in a root of "
-                f"their own (default {SIP_QUOTES_CATALOG}; ADR 0151); nothing was requested"
+                f"the catalog at {path} holds {' and '.join(others)}, and {feed.value} quotes go in a "
+                f"root of their own (default {own[feed]}; ADR 0151); nothing was requested"
             )
     elif "quotes" in held:
         raise HistoryStopped(
             f"the catalog at {path} holds quotes, and a root of quotes takes no bars or trades "
             "(ADR 0151); nothing was requested"
+        )
+
+
+def _default_root(kind: str, feed: DataFeed) -> Path:
+    """The root a load of `kind` on `feed` writes when none is named: each feed and quotes apart."""
+    if feed == DataFeed.BOATS:
+        return BOATS_QUOTES_CATALOG if kind == "quotes" else BOATS_CATALOG
+    return SIP_QUOTES_CATALOG if kind == "quotes" and feed == DataFeed.SIP else DEFAULT_CATALOG
+
+
+def _boats_bound(symbols: Sequence[str], start: datetime, end: datetime) -> None:
+    """Refuse a `boats` load over `BOATS_MAX_SYMBOLS` symbols or `BOATS_MAX_SPAN`, by name, before any
+    lock or request. Symbols count as given, each distinct string once, so the count is never below the
+    instruments a load asks for; the count is checked first. Only the span is held, not that the window
+    lies inside a 20:00-04:00 New York session: boats serves the overnight session alone, and what it
+    answers for another hour is UNVERIFIED."""
+    count = len(set(symbols))
+    if count > BOATS_MAX_SYMBOLS:
+        raise HistoryStopped(
+            f"a boats load takes at most {BOATS_MAX_SYMBOLS} symbols (BOATS_MAX_SYMBOLS), got {count}; "
+            "nothing was requested"
+        )
+    if end - start > BOATS_MAX_SPAN:
+        raise HistoryStopped(
+            f"a boats load spans at most {BOATS_MAX_SPAN}, one overnight session (BOATS_MAX_SPAN), "
+            f"got {end - start}; nothing was requested"
         )
 
 
@@ -482,8 +552,9 @@ def load_history(
     specs: Sequence[str],
     start: datetime,
     end: datetime,
-    catalog_path: Path = DEFAULT_CATALOG,
+    catalog_path: Path | None = None,
     *,
+    feed: DataFeed = FEED,
     pace: Pace = PACE,
     symbols_per_call: int = SYMBOLS_PER_CALL,
     max_rows: int = MAX_ROWS_PER_CALL,
@@ -493,7 +564,11 @@ def load_history(
     out: Callable[[str], None] = print,
 ) -> int:
     """Load `specs` bars of `symbols` whose `ts_init` lies in `[start, end]` into the catalog root, and
-    return the bars written. Raises `HistoryStopped` (or `RateLimited`) naming what stopped it."""
+    return the bars written. `feed` is `sip` by default, or `boats` within its bound, 1-MINUTE bars
+    only; each feed keeps its own root, the default by `_default_root`. Raises `HistoryStopped` (or
+    `RateLimited`) naming what stopped it."""
+    if catalog_path is None:
+        catalog_path = _default_root("bars", feed)
     try:
         for name, value in (("start", start), ("end", end)):
             if value.tzinfo is None:
@@ -502,6 +577,17 @@ def load_history(
             raise HistoryStopped(f"start {start} is not before end {end}")
         if not symbols:
             raise HistoryStopped("at least one symbol is required")
+        if feed not in BAR_FEEDS:
+            raise HistoryStopped(
+                f"bars feed {feed.value} is refused; sip, or boats within its bound; nothing was requested"
+            )
+        if feed == DataFeed.BOATS:
+            _boats_bound(symbols, start, end)
+            if any(spec != "1-MINUTE" for spec in specs):
+                raise HistoryStopped(
+                    f"boats bars are 1-MINUTE only, got {list(specs)}: what a boats day bar means is "
+                    "UNVERIFIED; nothing was requested"
+                )
         if not specs or any(spec not in BAR_SPECS for spec in specs):
             raise HistoryStopped(
                 f"bar specifications must be one or more of {', '.join(BAR_SPECS)}, got {list(specs)}"
@@ -525,7 +611,7 @@ def load_history(
         if not path.is_dir():
             raise HistoryStopped(f"the catalog at {path} must be an existing directory")
         _check_kinds(path, "bars")
-        _check_feed(path)
+        _check_feed(path, feed)
         catalog = ParquetDataCatalog(str(path))
         ids = [f"{s}.{VENUE}" for s in symbols]
         instruments = {str(i.id): i for i in catalog.instruments(instrument_ids=ids)}
@@ -537,7 +623,7 @@ def load_history(
             )
         with _catalog_lock(path):
             _check_kinds(path, "bars")
-            _check_feed(path)
+            _check_feed(path, feed)
             return _load_history(
                 client,
                 symbols,
@@ -547,6 +633,7 @@ def load_history(
                 path,
                 catalog,
                 instruments,
+                feed=feed,
                 pace=pace,
                 symbols_per_call=symbols_per_call,
                 max_rows=max_rows,
@@ -574,6 +661,7 @@ def _load_history(
     catalog: ParquetDataCatalog,
     instruments: dict[str, Any],
     *,
+    feed: DataFeed,
     pace: Pace,
     symbols_per_call: int,
     max_rows: int,
@@ -621,10 +709,10 @@ def _load_history(
                         timeframe=timeframe,
                         start=window[0],
                         end=window[1],
-                        feed=FEED,
+                        feed=feed,
                     )
                     what = (
-                        f"{spec} bars of {len(batch)} symbol(s) from {batch[0]}, feed {FEED.value}"
+                        f"{spec} bars of {len(batch)} symbol(s) from {batch[0]}, feed {feed.value}"
                     )
                     try:
                         result = client.get_stock_bars(request)
@@ -684,7 +772,7 @@ def _load_history(
                                         first_rounding = f"{bar.timestamp} {', '.join(fields)}"
                         except Exception as e:
                             raise HistoryStopped(
-                                f"parsing {bar_type} on feed {FEED.value} failed "
+                                f"parsing {bar_type} on feed {feed.value} failed "
                                 f"({type(e).__name__}): {e}"
                             ) from e
                         if not bars:
@@ -692,18 +780,18 @@ def _load_history(
                         if rounded:
                             out(
                                 f"paper:history: Rounded {rounded} of {len(bars)} Alpaca bars for "
-                                f"{symbol} on feed {FEED.value} to price precision "
+                                f"{symbol} on feed {feed.value} to price precision "
                                 f"{instrument.price_precision}, half to even as NautilusTrader's "
                                 f"Instrument.make_price rounds; the first: {first_rounding}"
                             )
-                        claimed = _claim_feed(path)
+                        claimed = _claim_feed(path, feed)
                         try:
                             catalog.write_bars(bars, start=lo, end=hi)
                         except Exception as e:
                             if (
                                 claimed
                                 and not _holds_data(path)
-                                and catalog_feed(path) == FEED.value
+                                and catalog_feed(path) == feed.value
                             ):
                                 (path / FEED_FILE).unlink(missing_ok=True)
                             raise HistoryStopped(
@@ -730,8 +818,9 @@ def load_trades(
     symbols: Sequence[str],
     start: datetime,
     end: datetime,
-    catalog_path: Path = DEFAULT_CATALOG,
+    catalog_path: Path | None = None,
     *,
+    feed: DataFeed = FEED,
     pace: Pace = PACE,
     max_rows: int = MAX_ROWS_PER_CALL,
     clock: Callable[[], float] = time.monotonic,
@@ -744,6 +833,8 @@ def load_trades(
     writer (contracts in this module's header), an overfull interval in parts. Prints skipped
     rather than written are added to `skipped` by kind (`size 0`), for the caller's done line.
     """
+    if catalog_path is None:
+        catalog_path = _default_root("trades", feed)
     try:
         for name, value in (("start", start), ("end", end)):
             if value.tzinfo is None:
@@ -752,9 +843,17 @@ def load_trades(
             raise HistoryStopped(f"start {start} is not before end {end}")
         if not symbols or any(not symbol.strip() for symbol in symbols):
             raise HistoryStopped("at least one nonempty symbol is required")
+        if feed not in TRADE_FEEDS:
+            raise HistoryStopped(
+                f"trades feed {feed.value} is refused; sip, or boats within its bound; "
+                "nothing was requested"
+            )
+        if feed == DataFeed.BOATS:
+            _boats_bound(symbols, start, end)
         if end > now() - PUBLICATION_DELAY:
             raise HistoryStopped(
-                f"end {end} must be at least {PUBLICATION_DELAY} before now for published SIP trades"
+                f"end {end} must be at least {PUBLICATION_DELAY} before now for published "
+                f"{feed.value} trades"
             )
         if max_rows < 1:
             raise HistoryStopped(f"the trade row bound must be positive, got {max_rows}")
@@ -773,7 +872,7 @@ def load_trades(
         if not path.is_dir():
             raise HistoryStopped(f"the catalog at {path} must be an existing directory")
         _check_kinds(path, "trades")
-        _check_feed(path)
+        _check_feed(path, feed)
         catalog = ParquetDataCatalog(str(path))
         ids = [f"{s}.{VENUE}" for s in dict.fromkeys(s.strip() for s in symbols)]
         instruments = {str(i.id): i for i in catalog.instruments(instrument_ids=ids)}
@@ -785,7 +884,7 @@ def load_trades(
         written = 0
         with _catalog_lock(path), _paced_trade_gets(client, pace, clock, sleep):
             _check_kinds(path, "trades")
-            _check_feed(path)
+            _check_feed(path, feed)
             for identifier in ids:
                 instrument = instruments[identifier]
                 missing = catalog.get_missing_intervals_for_request(
@@ -795,7 +894,7 @@ def load_trades(
                     part: int | None = lo
                     while part is not None:
                         loaded, part, unsized = _load_trade_part(
-                            client, catalog, path, instrument, part, hi, pace, max_rows, out
+                            client, catalog, path, instrument, part, hi, pace, max_rows, out, feed
                         )
                         written += loaded
                         if unsized and skipped is not None:
@@ -820,6 +919,7 @@ def _load_trade_part(
     pace: Pace,
     max_rows: int,
     out: Callable[[str], None],
+    feed: DataFeed = FEED,
 ) -> tuple[int, int | None, int]:
     """Fetch and write one part of a missing interval, from `lo` to `hi`: the trades written,
     where the next part starts, or `None` once the interval is done, and the size-0 prints skipped.
@@ -827,12 +927,12 @@ def _load_trade_part(
     timestamp, so no timestamp is split across parts, the coverage written ends one nanosecond
     before it, and the next part starts there."""
     symbol = instrument.id.symbol.value
-    what = f"trades of {symbol}, feed {FEED.value}, interval [{lo}, {hi}]"
+    what = f"trades of {symbol}, feed {feed.value}, interval [{lo}, {hi}]"
     before = _sent()
     try:
         history = fetch_trades(
             client,
-            StockTradesRequest(symbol_or_symbols=symbol, feed=FEED, limit=max_rows + 1),
+            StockTradesRequest(symbol_or_symbols=symbol, feed=feed, limit=max_rows + 1),
             start_ns=lo,
             end_ns=hi,
         )
@@ -913,15 +1013,15 @@ def _load_trade_part(
     if rounded:
         out(
             f"paper:history: Rounded {rounded} of {len(ticks)} Alpaca trades "
-            f"for {symbol} on feed {FEED.value} to price precision "
+            f"for {symbol} on feed {feed.value} to price precision "
             f"{instrument.price_precision}, half to even as NautilusTrader's "
             f"Instrument.make_price rounds; the first: {first_rounding}"
         )
-    claimed = _claim_feed(path)
+    claimed = _claim_feed(path, feed)
     try:
         catalog.write_trade_ticks(ticks, start=lo, end=covered_to)
     except Exception as e:
-        if claimed and not _holds_data(path) and catalog_feed(path) == FEED.value:
+        if claimed and not _holds_data(path) and catalog_feed(path) == feed.value:
             (path / FEED_FILE).unlink(missing_ok=True)
         raise HistoryStopped(f"writing {what} into {path} failed ({type(e).__name__}): {e}") from e
     out(f"paper:history: {what}: {len(ticks)} trades to {covered_to}, {gets} GET(s)")
@@ -957,15 +1057,19 @@ def _quote_bounds(start: datetime, end: datetime, now: datetime) -> tuple[int, i
 
 
 def _quote_feed(feed: DataFeed, symbols: Sequence[str], start: datetime, end: datetime) -> None:
-    """Refuse a feed other than `iex` or `sip`, and a `sip` load outside its bound, by name.
+    """Refuse a feed other than `iex`, `sip` or `boats`, and a `sip` or `boats` load outside its
+    bound, by name.
 
     Nothing falls back from one feed to the other. Symbols count once after strip and upper case.
     Whether they came from a file is the CLI's to refuse, since a sequence does not say (`main`).
     """
     if feed not in QUOTE_FEEDS:
         raise HistoryStopped(
-            f"quote feed {feed.value} is refused; iex, or sip within its bound (ADR 0151)"
+            f"quote feed {feed.value} is refused; iex, or sip or boats within its bound (ADR 0151)"
         )
+    if feed == DataFeed.BOATS:
+        _boats_bound(symbols, start, end)
+        return
     if feed != DataFeed.SIP:
         return
     if end - start > SIP_QUOTES_MAX_SPAN:
@@ -1034,7 +1138,7 @@ def load_quotes(
     symbols: Sequence[str],
     start: datetime,
     end: datetime,
-    catalog_path: Path = DEFAULT_CATALOG,
+    catalog_path: Path | None = None,
     *,
     feed: DataFeed = DataFeed.IEX,
     pace: Pace = PACE,
@@ -1050,9 +1154,12 @@ def load_quotes(
     the last); the row sentinel detects an overfull piece, which loads in parts, and more quotes in
     one microsecond than the bound stop the piece before any of it is written. The SDK's microsecond
     timestamps and adapter's dropped-quote rules apply; start after the ambiguous 2025-11-03 unit
-    cutover (ADR 0066). `feed` is `iex` by default, or `sip` for at most `SIP_QUOTES_MAX_SYMBOLS`
-    symbols over at most `SIP_QUOTES_MAX_SPAN`; each feed keeps its own root.
+    cutover (ADR 0066). `feed` is `iex` by default, `sip` for at most `SIP_QUOTES_MAX_SYMBOLS`
+    symbols over at most `SIP_QUOTES_MAX_SPAN`, or `boats` within `BOATS_MAX_SYMBOLS` and
+    `BOATS_MAX_SPAN`; each feed keeps its own root, the default by `_default_root`.
     """
+    if catalog_path is None:
+        catalog_path = _default_root("quotes", feed)
     try:
         start_ns, end_ns = _quote_bounds(start, end, now())
         if not symbols or any(not symbol.strip() for symbol in symbols):
@@ -1225,44 +1332,69 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--start", type=_when, required=True, help="ISO 8601 with a time zone")
     parser.add_argument("--end", type=_when, required=True, help="ISO 8601 with a time zone")
     parser.add_argument(
-        "--bars", default="1-MINUTE,1-DAY", help="1-MINUTE, 1-DAY or both, comma-separated"
+        "--bars",
+        help="1-MINUTE, 1-DAY or both, comma-separated; default both, or 1-MINUTE for boats",
     )
     parser.add_argument(
         "--catalog",
         type=Path,
-        help=f"the catalog root; default {DEFAULT_CATALOG}, or {SIP_QUOTES_CATALOG} for sip quotes",
+        help=(
+            f"the catalog root; default {DEFAULT_CATALOG}, {SIP_QUOTES_CATALOG} for sip quotes, "
+            f"{BOATS_CATALOG} for boats bars and trades, {BOATS_QUOTES_CATALOG} for boats quotes"
+        ),
     )
     parser.add_argument("--data", choices=("bars", "trades", "quotes"), default="bars")
     parser.add_argument(
         "--feed",
-        choices=[f.value for f in QUOTE_FEEDS],
-        help="quotes: iex (the default) or sip within its bound; bars and trades are sip only",
+        choices=[*dict.fromkeys(f.value for f in (*QUOTE_FEEDS, *BAR_FEEDS)), "overnight"],
+        help=(
+            "quotes: iex (the default), or sip or boats within its bound; bars and trades: sip (the "
+            "default) or boats within its bound; overnight is refused, as Alpaca's docs say"
+        ),
     )
     args = parser.parse_args(argv)
-    quote_feed = None  # only quotes have a feed to choose; bars and trades load sip (FEED)
-    if args.data != "quotes":
-        if args.feed not in (None, FEED.value):
-            parser.error(f"--feed {args.feed} is for --data quotes only; {args.data} load sip")
+    if args.feed == "overnight":
+        parser.error(f"--feed overnight is refused; give --feed boats. {OVERNIGHT_REFUSAL}")
+    if args.data == "quotes":
+        feed = DataFeed(args.feed or DataFeed.IEX.value)
     else:
-        quote_feed = DataFeed(args.feed or DataFeed.IEX.value)
-        if quote_feed == DataFeed.SIP and args.symbols_file is not None:
+        feed = DataFeed(args.feed) if args.feed else FEED  # a bare bar or trade load builds no feed
+        if feed not in BAR_FEEDS:
             parser.error(
-                "sip quotes take --symbols named on the command line, not --symbols-file "
-                f"(at most {SIP_QUOTES_MAX_SYMBOLS}; ADR 0151)"
+                f"--feed {feed.value} is for --data quotes only; {args.data} load sip or boats"
             )
+    quote_feed = feed if args.data == "quotes" else None
+    if feed == DataFeed.SIP and quote_feed is not None and args.symbols_file is not None:
+        parser.error(
+            "sip quotes take --symbols named on the command line, not --symbols-file "
+            f"(at most {SIP_QUOTES_MAX_SYMBOLS}; ADR 0151)"
+        )
+    if feed == DataFeed.BOATS and args.symbols_file is not None:
+        parser.error(
+            "boats loads take --symbols named on the command line, not --symbols-file "
+            f"(at most {BOATS_MAX_SYMBOLS}, BOATS_MAX_SYMBOLS)"
+        )
+    if args.bars is None:
+        args.bars = "1-MINUTE" if feed == DataFeed.BOATS else "1-MINUTE,1-DAY"
     if args.catalog is None:
-        args.catalog = SIP_QUOTES_CATALOG if quote_feed == DataFeed.SIP else DEFAULT_CATALOG
+        args.catalog = _default_root(args.data, feed)
     for name in ("start", "end"):
         if getattr(args, name).tzinfo is None:
             parser.error(f"--{name} must carry a time zone")
     if args.start >= args.end:
         parser.error(f"--start {args.start} is not before --end {args.end}")
+    now = utc_now()
+    if feed == DataFeed.BOATS and args.end > now - PUBLICATION_DELAY:
+        parser.error(
+            f"--end must be at least {PUBLICATION_DELAY.total_seconds() / 60:.0f} minutes before now "
+            "for boats data: Alpaca's 24/5 page gives historical overnight data \"provided that the end "
+            'parameter in your request is at least 15 minutes old" (read 2026-11-13)'
+        )
     if args.data == "trades" and dt_to_unix_nanos(args.start) < 0:
         parser.error("--start precedes 1970-01-01 UTC, the catalog's epoch")
     specs = [s.strip() for s in args.bars.split(",") if s.strip()]
     if args.data == "bars" and (not specs or any(s not in BAR_SPECS for s in specs)):
         parser.error(f"--bars takes {', '.join(BAR_SPECS)}, got {args.bars!r}")
-    now = utc_now()
     if args.data == "quotes":
         try:
             _quote_bounds(args.start, args.end, now)
@@ -1270,7 +1402,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             parser.error(str(e))
     if args.data == "trades" and args.end > now - PUBLICATION_DELAY:
         parser.error(
-            f"--end must be at least {PUBLICATION_DELAY} before now for published SIP trades"
+            f"--end must be at least {PUBLICATION_DELAY} before now for published {feed.value} trades"
         )
     for spec in specs if args.data == "bars" else []:
         if args.end > now - margin(spec):
@@ -1299,17 +1431,26 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not symbols:
         parser.error("no symbols given")
     symbols = list(dict.fromkeys(symbols))
-    if quote_feed is not None:
-        try:
+    try:
+        if quote_feed is not None:
             _quote_feed(quote_feed, symbols, args.start, args.end)
-        except HistoryStopped as e:
-            parser.error(str(e))
+        elif feed == DataFeed.BOATS:
+            _boats_bound(symbols, args.start, args.end)
+    except HistoryStopped as e:
+        parser.error(str(e))
     skipped: dict[str, int] = {}
     try:
         client = history_client()
         if args.data == "trades":
             written = load_trades(
-                client, symbols, args.start, args.end, args.catalog, now=utc_now, skipped=skipped
+                client,
+                symbols,
+                args.start,
+                args.end,
+                args.catalog,
+                feed=feed,
+                now=utc_now,
+                skipped=skipped,
             )
         elif quote_feed is not None:
             written = load_quotes(
@@ -1317,7 +1458,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         else:
             written = load_history(
-                client, symbols, specs, args.start, args.end, args.catalog, now=utc_now
+                client, symbols, specs, args.start, args.end, args.catalog, feed=feed, now=utc_now
             )
     except RateLimited as e:
         print(f"paper:history: {e}", file=sys.stderr, flush=True)
