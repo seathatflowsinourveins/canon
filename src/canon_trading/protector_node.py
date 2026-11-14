@@ -532,9 +532,9 @@ def run_protector(
         # its label or by its sign, is below zero and never read as a long, and one that cannot be read
         # is named with an ALERT and skipped, its symbol and any level for it left out of the node, so
         # every other long is still covered (the lead, 2026-11-13 21:27 and 21:35).
-        # A zero quantity (a short read as -0 among them) is no holding this node can protect: it is
-        # named and skipped like an unreadable one, never a refusal of every other long. What the start
-        # skips and refuses is one predicate, `window.start_account`, which the running protector's
+        # A zero or fractional quantity is no holding this node can protect: it is named and skipped
+        # like an unreadable one, never a refusal of every other long (F3, the lead, 2026-11-14 12:08).
+        # What the start skips and refuses is one predicate, `window.start_account`, which the protector's
         # roster read calls too (review F1; the lead's term (a), 2026-11-13 23:49).
         start = window.start_account(*window.position_reads(trading))
         held, unread = dict(start.held), dict(start.skipped)
@@ -551,7 +551,8 @@ def run_protector(
         if not held:
             raise window.WindowRefused("no starting holding; no protector node started")
         if start.refused:
-            # Named here, before any node: the adapter's start-up would fail on it (execution.py:372).
+            # Empty while the start passes no orders: an unmappable open order still aborts inside
+            # reconciliation, which the adapter unit owns (case 4; review finding 2, declined).
             raise window.WindowRefused(
                 "; ".join(start.refused[s] for s in sorted(start.refused))
                 + "; no protector node started"
@@ -597,11 +598,23 @@ def run_protector(
                 except Exception as e:  # noqa: BLE001 - report and keep the final holdings read
                     errors.append(f"dispose failed: {type(e).__name__}")
             try:
-                remaining, unread_now = window.position_reads(trading)
+                # Quantities as read; the predicate only adds a fractional holding's reason, so a
+                # fresh read is never named UNVERIFIED (review finding 3).
+                read_held, unread_now = window.position_reads(trading)
+                final = window.start_account(read_held, unread_now)
+                fractional = {
+                    symbol: why
+                    for symbol, why in final.skipped.items()
+                    if symbol not in unread_now and read_held.get(symbol, 0) != 0
+                }
+                remaining = {s: q for s, q in read_held.items() if s not in fractional}
+                unread_now = {**unread_now, **fractional}
+                fresh = set(fractional)
                 last_seen = ""
             except Exception as e:  # noqa: BLE001 - last seen is explicitly not a current account read
                 errors.append(f"end positions read failed: {type(e).__name__}")
                 # What the start could not read is named again, as the start read it.
+                fresh = set()
                 remaining, unread_now, last_seen = (
                     held,
                     unread,
@@ -618,7 +631,7 @@ def run_protector(
             for symbol, why in sorted(unread_now.items()):
                 known = (
                     f"{held[symbol]} held, last seen at start; current quantity UNVERIFIED; "
-                    if symbol in held
+                    if symbol in held and symbol not in fresh
                     else ""
                 )
                 print(
