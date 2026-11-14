@@ -134,7 +134,7 @@ runner
 check "three starts: the predecessor, its successor, and the refused third" [ "$(calls)" = 3 ]
 w=$(call 2 | sed -n 's/.*--lock-wait \([0-9]*\).*/\1/p')
 check "the successor carries a bounded --lock-wait of its lead and the stop budget (got '${w}')" eval '[ -n "$w" ] && [ "$w" -ge 3 ] && [ "$w" -le 5 ]'
-check "the predecessor started with no wait" eval '! call 1 | grep -q -- --lock-wait'
+check "the predecessor started with no wait" eval '! grep -q -- --lock-wait <<<"$(call 1)"'
 r1=$(at RELEASED 1); l2=$(at LOCKED 2)
 check "never two holders: the successor locked after the predecessor released" eval '[ -n "$r1" ] && [ -n "$l2" ] && [ "$l2" -ge "$r1" ]'
 check "the successor held the lock within the stop budget of the predecessor's exit" eval '[ -n "$r1" ] && [ -n "$l2" ] && [ $((l2 - r1)) -le 2 ]'
@@ -181,7 +181,7 @@ check "a go naming another row: nothing starts, by name" eval '[ "$(calls)" = 0 
 echo "windows OWN1" > "$INST/go"; runner
 check "a go naming another account: nothing starts, by name" eval '[ "$(calls)" = 0 ] && st '"'"'.outcome == "refused" and (.note | test("go"))'"'"''
 echo "protect OWN1" > "$INST/go"; runner
-check "with 'protect OWN1' the start carries --lead-go protect OWN1" eval 'call 1 | grep -q -- "--lead-go protect OWN1"'
+check "with 'protect OWN1' the start carries --lead-go protect OWN1" eval 'grep -q -- "--lead-go protect OWN1" <<<"$(call 1)"'
 
 echo "case 5: the level book is read in each start's step, by the node once it holds the lock"
 fresh windows
@@ -208,8 +208,8 @@ printf '%s\n' "1 0 0" "refuse no starting holding" > "$STUB/plan"
 runner
 cwd=$(call 1 | sed -n 's/.* cwd=\([^ ]*\) .*/\1/p')
 check "it ran somewhere other than the clone" eval '[ -n "$cwd" ] && [ "$cwd" != "$CL" ]'
-check "a linked worktree whose common git directory is the clone's" eval 'call 1 | grep -q "dirs=[^ ]*/worktrees/[^ ]* $CL/.git "'
-check "detached at the fetched main commit" eval 'call 1 | grep -q "head=$MAIN " && ! git -C "$CL" worktree list --porcelain | grep -q "^branch "'
+check "a linked worktree whose common git directory is the clone's" eval 'grep -q "dirs=[^ ]*/worktrees/[^ ]* $CL/.git " <<<"$(call 1)"'
+check "detached at the fetched main commit" eval 'grep -q "head=$MAIN " <<<"$(call 1)" && ! grep -q "^branch " <<<"$(git -C "$CL" worktree list --porcelain)"'
 check "the worktree is removed after its run" eval '[ ! -e "$cwd" ] && [ "$(git -C "$CL" worktree list --porcelain | grep -c '"'"'^worktree '"'"')" = 1 ]'
 
 echo "case 7: account A is not started in the movers recorder's hours"
@@ -238,7 +238,7 @@ printf '%s\n' "4 0.5 0 write=9.9" "1 0 0" "refuse no starting holding" > "$STUB/
 book 9.5
 runner
 b2=$(awk '$1 == "BOOK" && $2 == 2 { print $3; exit }' "$STUB/timeline"); w1=$(at WROTE 1); r1=$(at RELEASED 1); l2=$(at LOCKED 2)
-check "the successor was launched early with a lock wait" eval 'call 2 | grep -q -- "--lock-wait "'
+check "the successor was launched early with a lock wait" eval 'grep -q -- "--lock-wait " <<<"$(call 2)"'
 check "the predecessor wrote at its stop, holding the lock" eval '[ -n "$w1" ] && [ -n "$r1" ] && [ "$w1" -le "$r1" ]'
 check "the successor read the book only after it took the lock" eval '[ -n "$b2" ] && [ -n "$l2" ] && [ "$b2" -ge "$l2" ] && [ "$l2" -ge "$r1" ]'
 check "and so read the predecessor's write" [ "$(bookread 2)" = AAA=9.9 ]
@@ -372,7 +372,7 @@ planned=$(jq -sr '.[0].planned_end_epoch' "$INST/runs.jsonl")
 retry_at=$(awk '$1 == 3 { print $2; exit }' "$STUB/prepares")
 check "S5 checkout failure stays visible alongside a freeze while the predecessor runs" [ "$seen" = 1 ]
 check "S5 preparation is retried before end minus lead" eval '[ -n "$retry_at" ] && [ "$retry_at" -lt $((planned - 2)) ]'
-check "S5 a recovered checkout still launches the successor for the seam" eval '[ "$(calls)" -ge 2 ] && call 2 | grep -q -- "--lock-wait " && rec ".[1].launched_epoch < $planned and .[1].started_epoch != null"'
+check "S5 a recovered checkout still launches the successor for the seam" eval '[ "$(calls)" -ge 2 ] && grep -q -- "--lock-wait " <<<"$(call 2)" && rec ".[1].launched_epoch < $planned and .[1].started_epoch != null"'
 check "S5 recovery clears the checkout failure from the status before the successor is launched" [ "$cleared" = 1 ]
 check "S5 recovery leaves no checkout failure in the final status" st '.outcome == "refused" and (.note | test("checkout_failed") | not)'
 

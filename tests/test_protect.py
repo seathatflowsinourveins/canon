@@ -1336,6 +1336,8 @@ def _run_cancel_on_b(tmp_path: Path, cancel: str) -> tuple[subprocess.CompletedP
 
 
 def test_a_cancel_on_b_reads_bs_pair_under_bs_lock_and_runs_only_the_cancel(tmp_path) -> None:
+    if not Path("/usr/bin/lockf").is_file():
+        pytest.skip("the paper task uses macOS /usr/bin/lockf")
     done, asked, ran = _run_cancel_on_b(tmp_path, "true")
     assert done.returncode == 0, done.stderr
     assert "-s canon-alpaca-paper-windows " in asked and "canon-alpaca-paper-protect" not in asked
