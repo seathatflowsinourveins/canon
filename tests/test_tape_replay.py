@@ -360,7 +360,12 @@ def test_a_scripted_sell_out_at_the_seam_is_a_new_holding_and_carries_no_level(s
 def test_the_venue_reader_answers_as_the_venue_would_for_a_persisted_holding(shape) -> None:
     module = runner()
     spec = two_segments(shape)
-    spec["venue_fills"] = {"LLL": [{"side": "sell", "quantity": 4, "filled_at": SEAM}]}
+    spec["venue_fills"] = {
+        "LLL": [
+            {"side": "buy", "quantity": 10, "filled_at": SEAM + 2000},
+            {"side": "sell", "quantity": 10, "filled_at": SEAM},
+        ]
+    }
     checked = module._checked(spec, Path.cwd())
     reader = module._VenueReader(checked)
     now = {"ns": START - SECOND}
@@ -378,18 +383,53 @@ def test_the_venue_reader_answers_as_the_venue_would_for_a_persisted_holding(sha
     assert reader.get("/positions/LLL") == {"symbol": "LLL", "qty": "10"}
     assert reader.get("/orders", sells) == []
     now["ns"] = SEAM
-    assert reader.get("/positions/LLL") == {"symbol": "LLL", "qty": "6"}
+    # Flat between the sell and the buy-back: no position, as get_open_position raises.
+    with pytest.raises(ValueError, match="no position in LLL"):
+        reader.get("/positions/LLL")
     (order,) = reader.get("/orders", sells)
     assert (order["side"], order["filled_qty"], order["filled_at"]) == (
         "sell",
-        "4",
+        "10",
         "2025-03-11T15:00:06+00:00",
     )
-    assert reader.get("/orders", {**sells, "side": "buy"}) == []
+    assert reader.get("/orders", {**sells, "status": "open"}) == []
     assert reader.get("/orders", {**sells, "until": "2025-03-11T15:00:05+00:00"}) == []
+    now["ns"] = SEAM + 2000
+    assert reader.get("/positions/LLL") == {"symbol": "LLL", "qty": "10"}
+    both = {"symbols": "LLL", "status": "all"}
+    assert [o["side"] for o in reader.get("/orders", both)] == ["buy", "sell"]
+    assert [o["side"] for o in reader.get("/orders", {**both, "direction": "asc"})] == [
+        "sell",
+        "buy",
+    ]
+    assert [o["side"] for o in reader.get("/orders", {**both, "limit": 1})] == ["buy"]
     assert reader.get("/positions/MMM") == {"symbol": "MMM", "qty": "7"}
     with pytest.raises(ValueError, match="cannot answer /account"):
         reader.get("/account")
+
+
+def test_unread_entries_are_the_levels_each_segment_wrote_without_a_reading() -> None:
+    def segment(index: int, *entries: dict[str, Any]) -> dict[str, Any]:
+        return {"index": index, "book": {"entries": list(entries)}}
+
+    unread = {"instrument_id": "LLL.ALPACA", "run": "r:1", "last_level": "20.44"}
+    report = runner()._unread_entries(
+        [
+            segment(1, unread, {**unread, "instrument_id": "MMM.ALPACA", "horizon_ns": 1}),
+            segment(
+                2,
+                unread,  # left by segment 1: not segment 2's
+                {**unread, "run": "r:2", "last_level": None},  # no level: carries nothing
+                {**unread, "run": "old:1"},  # an earlier replay's entry in a reused book
+                {**unread, "instrument_id": "MMM.ALPACA", "run": "r:2"},
+            ),
+        ],
+        "r",
+    )
+    assert [(row["segment"], row["instrument_id"]) for row in report] == [
+        (1, "LLL.ALPACA"),
+        (2, "MMM.ALPACA"),
+    ]
 
 
 def test_the_report_names_each_seam_crossing_and_each_entry_without_a_reading(shape) -> None:
@@ -406,13 +446,10 @@ def test_the_report_names_each_seam_crossing_and_each_entry_without_a_reading(sh
         )
         assert (row["rebought_at"], row["rebought_price"]) == (again["at"], again["last_px"])
         assert "artefact" in row
-    unread = [
-        (segment["index"], entry["instrument_id"])
-        for segment in report["segments"]
-        for entry in segment["book"]["entries"]
-        if entry.get("horizon_ns") is None
-    ]
-    assert [(e["segment"], e["instrument_id"]) for e in report["entries_without_reading"]] == unread
+    for row in report["entries_without_reading"]:
+        book = report["segments"][row["segment"] - 1]["book"]["entries"]
+        (entry,) = [e for e in book if e["instrument_id"] == row["instrument_id"]]
+        assert entry.get("horizon_ns") is None and entry["run"] == f"neutral-shape:{row['segment']}"
     rendered = runner().render_markdown(report)
     assert "## Seams (the re-buy is an artefact of the replay)" in rendered
     assert "## Book entries with no venue reading" in rendered
@@ -425,6 +462,18 @@ def test_the_report_names_each_seam_crossing_and_each_entry_without_a_reading(sh
         ({"LLL": [{"side": "short", "quantity": 1, "filled_at": SEAM}]}, "buy or sell"),
         ({"LLL": [{"side": "sell", "quantity": 0.5, "filled_at": SEAM}]}, "whole shares"),
         ({"LLL": [{"side": "sell", "quantity": 1}]}, "side, quantity and filled_at"),
+        ({"LLL": [{"side": "sell", "quantity": 4, "filled_at": SEAM}]}, "net to zero"),
+        (
+            {
+                "LLL": [
+                    {"side": "sell", "quantity": 20, "filled_at": SEAM},
+                    {"side": "buy", "quantity": 20, "filled_at": SEAM + 1000},
+                ]
+            },
+            "sell more than the holding holds",
+        ),
+        ({"LLL": [{"side": "sell", "quantity": 1, "filled_at": SEAM - SECOND}]}, "first seam"),
+        ({"LLL": [{"side": "sell", "quantity": 1, "filled_at": SEAM + 1}]}, "whole microsecond"),
     ],
 )
 def test_a_malformed_venue_fill_is_refused_before_any_engine(shape, fills, message) -> None:

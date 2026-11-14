@@ -115,8 +115,11 @@ LIMITS = (
         "The venue reader is a stand-in for the holding's identity, not evidence from a venue. It "
         "answers the clock on the engine's clock and presents each holding as one that persisted "
         "across every seam, held since its buy time; it shows no trade between runs unless the spec scripts one "
-        "(venue_fills), and never the engine's own orders. A restart therefore tests book "
-        "continuity for the same holding, or, with a scripted fill, the verdict on another."
+        "(venue_fills: whole microseconds, at or after the first seam, netting to zero, since "
+        "every segment buys the holding's quantity again), and never the engine's own orders. "
+        "So a protector sale in an earlier segment is not shown: the venue still presents the "
+        "full quantity, as the re-buy does. A restart therefore tests book continuity for the "
+        "same holding, or, with a scripted sell-out and buy-back, the verdict on a new one."
     ),
     (
         "Cold-start bars and quotes come from the engine cache, not a historical endpoint; bars "
@@ -255,13 +258,37 @@ def _checked(spec: Any, base: Path) -> dict[str, Any]:
                 or quantity != quantity.to_integral_value()
             ):
                 raise ValueError(f"venue fill quantity of {symbol} must be positive whole shares")
+            at = _stamp(fill["filled_at"])
+            if at % 1000:
+                raise ValueError(
+                    f"venue fill time of {symbol} must be a whole microsecond, as Alpaca shows it"
+                )
+            holding = holdings[InstrumentId.from_str(f"{symbol}.ALPACA")]
+            if len(segments) < 2 or at < segments[0][1] or at < holding["buy_time"]:
+                raise ValueError(
+                    f"venue fill of {symbol} must fall at or after the first seam and its buy time"
+                )
             rows_out.append(
                 {
                     "id": f"venue-fill-{symbol}-{number}",
                     "side": fill["side"],
                     "quantity": int(quantity),
-                    "filled_at": _stamp(fill["filled_at"]),
+                    "filled_at": at,
                 }
+            )
+        # Every segment's engine buys the holding's quantity again, so the venue's quantity must
+        # come back to it: a script nets to zero and never sells more than is held.
+        rows_out.sort(key=lambda row: row["filled_at"])
+        held = holding["quantity"]
+        for row in rows_out:
+            shares = int(row["quantity"])
+            held += shares if row["side"] == "buy" else -shares
+            if held < 0:
+                raise ValueError(f"venue fills of {symbol} sell more than the holding holds")
+        if held != holding["quantity"]:
+            raise ValueError(
+                f"venue fills of {symbol} must net to zero: every segment buys "
+                f"{holding['quantity']} again"
             )
         venue_fills[symbol] = rows_out
     roots = {key: _path(spec[key], base) for key in ("quotes_root", "trades_root", "bars_root")}
@@ -310,19 +337,35 @@ class _VenueReader:
         if route == "/clock":
             return {"timestamp": _iso(self._now())}
         if route == "/orders" and params is not None:
+            # GetOrdersRequest's fields carry alpaca-py's enums, whose value is the query text;
+            # its status defaults to open (trading/requests.py:208), and every scripted order is
+            # filled, so closed.
+            def text(key: str) -> Any:
+                return getattr(params.get(key), "value", params.get(key))
+
             symbols = str(params.get("symbols", "")).split(",")
-            # GetOrdersRequest's fields carry alpaca-py's enums, whose value is the query text.
-            side = getattr(params.get("side"), "value", params.get("side"))
-            after = _bound(params.get("after"))
-            until = _bound(params.get("until"))
-            return [
-                _order(symbol, fill)
-                for symbol in symbols
-                for fill in self._shown(symbol)
-                if (side is None or fill["side"] == side)
-                and (after is None or fill["filled_at"] >= after)
-                and (until is None or fill["filled_at"] <= until)
-            ]
+            if text("status") not in (None, "all", "closed"):
+                return []
+            side, after, until = (
+                text("side"),
+                _bound(params.get("after")),
+                _bound(params.get("until")),
+            )
+            listed = sorted(
+                (
+                    fill | {"symbol": symbol}
+                    for symbol in symbols
+                    for fill in self._shown(symbol)
+                    if (side is None or fill["side"] == side)
+                    and (after is None or fill["filled_at"] >= after)
+                    and (until is None or fill["filled_at"] <= until)
+                ),
+                key=lambda fill: fill["filled_at"],
+                reverse=text("direction") != "asc",
+            )
+            if params.get("limit") is not None:
+                listed = listed[: int(params["limit"])]
+            return [_order(fill["symbol"], fill) for fill in listed]
         if route.startswith("/positions/"):
             symbol = route.removeprefix("/positions/")
             holding = self.holdings.get(InstrumentId.from_str(f"{symbol}.ALPACA"))
@@ -332,6 +375,10 @@ class _VenueReader:
                 fill["quantity"] if fill["side"] == "buy" else -fill["quantity"]
                 for fill in self._shown(symbol)
             )
+            if held == 0:
+                # get_open_position: "Throws an APIError if the position does not exist"
+                # (alpaca-py c42add7c0a70 trading/client.py:251-262).
+                raise ValueError(f"the venue holds no position in {symbol}")
             return {"symbol": symbol, "qty": str(held)}
         raise ValueError(f"offline venue reader cannot answer {route}")
 
@@ -912,7 +959,7 @@ def replay(spec: Any, *, base: Path | None = None) -> dict[str, Any]:
             )
             return report
     report["seams"] = _seams(report["segments"])
-    report["entries_without_reading"] = _unread_entries(report["segments"])
+    report["entries_without_reading"] = _unread_entries(report["segments"], checked["run_label"])
     report["status"] = "completed"
     return report
 
@@ -945,9 +992,11 @@ def _seams(segments: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return seams
 
 
-def _unread_entries(segments: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Every book entry a segment left with no venue reading (horizon_ns): one a restart
-    judging identity on the venue's clock never carries."""
+def _unread_entries(segments: list[dict[str, Any]], run_label: str) -> list[dict[str, Any]]:
+    """Every level a segment wrote with no venue reading (horizon_ns): one a restart judging
+    identity on the venue's clock never carries. The book after a segment is the whole file, so
+    only entries that segment's own run wrote are its own; an entry with no level carries
+    nothing either way."""
     return [
         {
             "segment": segment["index"],
@@ -957,7 +1006,9 @@ def _unread_entries(segments: list[dict[str, Any]]) -> list[dict[str, Any]]:
         }
         for segment in segments
         for entry in (segment["book"] or {}).get("entries", [])
-        if entry.get("horizon_ns") is None
+        if entry.get("run") == f"{run_label}:{segment['index']}"
+        and entry.get("last_level") is not None
+        and entry.get("horizon_ns") is None
     ]
 
 
@@ -999,7 +1050,10 @@ def render_markdown(report: dict[str, Any]) -> str:
         ("seams", "Seams (the re-buy is an artefact of the replay)"),
         ("entries_without_reading", "Book entries with no venue reading"),
     ):
-        records = report.get(name, [])
+        if name not in report:
+            parts.extend([f"## {title}", "Not computed: the run did not complete."])
+            continue
+        records = report[name]
         keys = list(dict.fromkeys(key for record in records for key in record))
         parts.extend([f"## {title}", _table(records, keys) if records else "None."])
     for segment in report["segments"]:
