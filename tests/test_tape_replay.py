@@ -14,7 +14,6 @@ from collections import Counter
 from datetime import UTC
 from datetime import datetime
 from decimal import Decimal
-from functools import partial
 from itertools import pairwise
 from pathlib import Path
 from typing import Any
@@ -568,22 +567,60 @@ def test_a_malformed_venue_fill_is_refused_before_any_engine(shape, fills, messa
     assert message in report["refusals"][0]["reason"]
 
 
-def test_gain_lock_records_the_protectors_events_and_release_above_cost_floor(
-    shape, monkeypatch
-) -> None:
-    # The gain lock is off unless asked for (OwnerProtectorConfig.gain_lock), and the replay
-    # builds its config without it, so this case asks for the lock, as the gain-lock files do.
+def test_gain_lock_records_the_protectors_events_and_release_above_cost_floor(shape) -> None:
+    # The gain lock is off unless asked for (OwnerProtectorConfig.gain_lock); the spec asks for
+    # it, as the gain-lock files do, and the builder passes it to the protector's config.
     module = runner()
-    monkeypatch.setattr(
-        module, "OwnerProtectorConfig", partial(module.OwnerProtectorConfig, gain_lock=True)
-    )
-    row = holding(module.replay(shape["spec"]))
+    shape["spec"]["gain_lock"] = True
+    report = module.replay(shape["spec"])
+    assert report["status"] == "completed", report
+    assert report["gain_lock"] is True
+    row = holding(report)
     gain = row["gain_lock_events"][0]
     assert gain["event"] == "armed"
     assert gain["at"] > row["arming"][0]["at"]
     floor = Decimal(gain["entry"]) + Decimal(gain["round_trip_cost"])
     assert Decimal(gain["floor"]) >= floor
     assert Decimal(row["releases"][0]["price"]) >= Decimal(gain["floor"])
+
+
+@pytest.mark.parametrize("value", [1, 0, "true", "false", None, [], {}])
+def test_a_non_boolean_gain_lock_is_refused_by_name_before_any_engine(
+    shape, monkeypatch, value
+) -> None:
+    module = runner()
+    monkeypatch.setattr(module, "BacktestEngine", lambda *_a, **_k: pytest.fail("engine built"))
+    shape["spec"]["gain_lock"] = value
+    report = module.replay(shape["spec"])
+    assert report["status"] == "refused"
+    assert report["segments"] == []
+    assert report["refusals"][0]["source"] == "spec"
+    reason = report["refusals"][0]["reason"]
+    assert "gain_lock" in reason and "boolean" in reason
+
+
+@pytest.mark.parametrize(("given", "expected"), [(True, True), (False, False), ("absent", False)])
+def test_the_builder_passes_gain_lock_to_the_protectors_config(shape, given, expected) -> None:
+    module = runner()
+    spec = dict(shape["spec"])
+    if given != "absent":
+        spec["gain_lock"] = given
+    assert module._config(module._checked(spec, Path.cwd()), 0).gain_lock is expected
+
+
+def test_an_absent_gain_lock_is_false_and_replays_as_it_does_today(shape) -> None:
+    # No gain_lock key: the lock is off and the replay's decisions are the ones it had before
+    # the key existed, so a pre-#479 report and a post-#479 one can be told apart by the value.
+    module = runner()
+    assert "gain_lock" not in shape["spec"]
+    report = module.replay(shape["spec"])
+    assert report["status"] == "completed", report
+    assert report["gain_lock"] is False
+    row = holding(report)
+    assert not row["gain_lock_events"]
+    (release,) = row["releases"]
+    assert release["at"] == START + 8 * SECOND
+    assert Decimal(release["quantity"]) == 10
 
 
 def test_full_run_and_cli_reports_need_no_socket_or_alpaca_environment(
