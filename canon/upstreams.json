@@ -948,6 +948,38 @@
       "pypi": "pandas"
     },
     {
+      "id": "duckdb",
+      "field": "catalog-query",
+      "repo": "duckdb/duckdb-python",
+      "track": "tag:v2.0.0",
+      "role": "tool",
+      "license": "MIT",
+      "why": "Read-only SQL over the catalog's Parquet in place and over the run reports: an embedded library, no daemon, no pyarrow (its PyPI metadata puts pyarrow in the 'all' extra only). Opened only through canon_trading.catalog_query, which locks external access to the exact files a query reads. Chosen over Polars by measurement on a catalog snapshot (ADR 0153). The engine is duckdb/duckdb v2.0.0.",
+      "evidence": [
+        "https://github.com/duckdb/duckdb-python/releases/tag/v2.0.0",
+        "https://github.com/duckdb/duckdb/releases/tag/v2.0.0",
+        "https://pypi.org/pypi/duckdb/2.0.0/json",
+        "https://github.com/duckdb/duckdb-web/blob/b421c300096722cf2be64d37a35cc5520a3ceb75/docs/2.0/operations_manual/securing_duckdb/overview.md"
+      ],
+      "adr": "0153",
+      "pypi": "duckdb"
+    },
+    {
+      "id": "polars",
+      "field": "catalog-query",
+      "repo": "pola-rs/polars",
+      "track": "tag:py-2.1.0",
+      "line": "py-",
+      "role": "watch",
+      "license": "MIT",
+      "why": "Measured against DuckDB as the catalog's read-only query engine and not adopted (ADR 0153): it documents no means by which a write is refused and no footer-only row count, so the coverage grid could not be read without touching row data. Not installed or imported.",
+      "evidence": [
+        "https://github.com/pola-rs/polars/releases/tag/py-2.1.0",
+        "https://pypi.org/pypi/polars/2.1.0/json"
+      ],
+      "adr": "0153"
+    },
+    {
       "id": "openviking",
       "field": "agent-extensions",
       "repo": "volcengine/OpenViking",
