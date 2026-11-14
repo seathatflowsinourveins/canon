@@ -152,6 +152,27 @@ commits with the two trailers as JSON, parsed by git's `%(trailers)` format. Git
 the one-trailer last paragraph `scripts/land` passed it on #183 to #186; a trailer added by this change
 reaching main through GitHub is UNVERIFIED until the first fix lands with one.
 
+*Addition of 2026-11-13, the protector's and the Mover's order path:* `TRADING_PATHS` also holds every
+module through which the protector or the Mover computes an order's price, trigger, distance, quantity,
+side or time in force, or decides whether one is sent or canceled. These are the protector, its node, the
+gain lock and the start level (`owner_protector`, `protector_node`, `gain_lock`, `start_level`); the
+protect task, the Protection part and the close (`protect`, `protection`, `custody`); the Mover and its
+window (`mover`, `mover_window`); its entry switch and entry check (`arming`, `early_entry_study`); its
+size, price step and distance (`sizing`, `price_step`, `trail`, and `trail_profile`, whose reader checks
+the document the distance is computed from); `movers_rank`, whose session clock bounds the bars protect
+plans a distance on and sets the trail's segment; and `movers_rank_actor`, whose trade date decides a
+re-entry. `scripts/automation`, which holds the protector runner, and `mise.toml`, which holds the paper
+tasks and their account guards, are listed whole because no pattern picks out a part of either, so every
+edit to either is on the path. Choosing which names the Mover looks at is left off, because each order on
+a chosen name is still built, sized and protected by the listed modules and the gate judges the choice:
+`movers_screener`, `movers_stream`, `movers_rank_signal` and `rank_shared` (its name filter, and the
+atomic write `start_level` uses). Also left off are modules that check a setting, read data or study
+offline (`request_budget`, whose check only refuses a malformed limit, since the request ceiling is in
+`paper_node`; `history_load`, `movers_baseline`, `bars_to_catalog`, `tuning_study`, `tuning_contract`,
+`screener_board`, `exit_monitor`) and modules no code on `main` imports (`rebuilt_level`,
+`ema_cross_protected`). The sale table is not on `main` yet, and the change that lands it adds its
+pattern. `scripts/test-land` has one case per added path.
+
 ## Evidence
 
 Read 2026-11-10 and 2026-11-11.
@@ -186,3 +207,7 @@ Read 2026-11-10 and 2026-11-11.
 * `git log --format='%s | %(trailers:key=Co-Authored-By,valueonly)' f76675e..349fc9e` (#183 to #186), and
   `scripts/test-land`'s fix-marker cases (run 2026-11-11). An evidence-verifier pass on 2026-11-11
   corrected the convention claim and the trading path's scope.
+* The import graph of `src/canon_trading/` at `e6f8cbd3`, nested imports included, traced from the
+  order-sending modules (read 2026-11-13; a `/code-review` at high effort found the first trace had missed
+  the nested imports of `early_entry_study` and `trail_profile`, and that `mise.toml`'s guards decide a send) for the addition of 2026-11-13, and `scripts/test-land`'s trading-path cases,
+  red at `e6f8cbd3` and green with the added patterns (run 2026-11-13).
