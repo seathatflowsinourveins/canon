@@ -29,11 +29,12 @@
 #   --draft         publish the branch for review, not for landing: run the same address check and landing
 #                   checks, push, open a draft pull request if none is open for the branch, and stop. It posts
 #                   no review or signoff status and asks for no merge, so nothing can merge from it ("Draft
-#                   pull requests cannot be merged", docs.github.com, about-pull-requests); the hosted
-#                   workflow runs on it as on any pull request. Needs origin; takes neither --pr nor
+#                   pull requests cannot be merged", docs.github.com, about-pull-requests). That the hosted
+#                   workflow runs on a draft is UNVERIFIED until the first one. Needs origin; takes neither --pr nor
 #                   --reviewed, since the note is recorded when the branch lands. The landing later is this
-#                   script without --draft, which marks the open draft ready (gh pr ready) once its checks
-#                   have passed and before it posts any status.
+#                   script without --draft, which uses the draft's description unless --body is given, and
+#                   marks the draft ready (gh pr ready) once its checks have passed and both statuses are
+#                   posted, just before the merge. An open pull request that is not a draft is refused.
 # The title, which is also the squash commit's subject, is the pull request's own title for --pr, else an
 # open pull request's own title when there is one, else the last commit's subject. The squash subject
 # ends in "(#<number>)", which is added unless the title already ends with it.
@@ -401,10 +402,21 @@ if [ -n "$INNER_PR" ]; then
 elif [ -n "$existing" ]; then
   text_pr="${existing%% *}"
 fi
+# Whether the open pull request is a draft, read once and only when one is open (one this run opens is a
+# draft exactly when --draft opened it). A draft run publishes only to a draft: an open pull request ready
+# for review is left for its landing, so --draft never pushes to one that reads as ready.
+existing_draft=false
+if [ -n "$existing" ]; then
+  existing_draft=$(gh pr view "${existing%% *}" --json isDraft --jq .isDraft) \
+    || die "could not read whether ${existing#* } is a draft; nothing was pushed"
+  [ "$DRAFT" -eq 0 ] || [ "$existing_draft" = true ] \
+    || die "the open pull request for $branch, ${existing#* }, is ready for review, not a draft, so --draft would not keep it out of merging; land it with scripts/land, or close it first. Nothing was pushed"
+fi
 
 # The pull request's title and description, which also become the squash commit's subject and message.
 # Title: that pull request's own title, else the last commit's subject. Description: --body; else, for
-# a --pr run, the pull request's own body; else the commits' own messages. A --pr run may have merged main
+# a --pr run or a branch with an open pull request (a draft's, say), that pull request's own body; else
+# the commits' own messages. A --pr run may have merged main
 # into the branch, so its last commit and messages are not the pull request's own text. Merge commits, such
 # as one that brought main into a pushed branch, are left out of the title and the description.
 if [ -n "$text_pr" ]; then
@@ -418,9 +430,9 @@ fi
 pr_body="$BODY"
 if [ -z "$pr_body" ]; then
   pr_body="$tmpd/body"
-  if [ -n "$INNER_PR" ]; then
-    gh pr view "$INNER_PR" --json body --jq .body > "$pr_body" \
-      || die "could not read the description of pull request $INNER_PR; nothing was landed"
+  if [ -n "$text_pr" ]; then
+    gh pr view "$text_pr" --json body --jq .body > "$pr_body" \
+      || die "could not read the description of pull request $text_pr; nothing was landed"
   elif [ "$(git rev-list --count --no-merges "$base..$branch")" -eq 1 ]; then
     git log -1 --no-merges --format=%b "$base..$branch" > "$pr_body"
   else git log --reverse --no-merges --format='* %s%n%n%b' "$base..$branch" > "$pr_body"; fi \
@@ -557,16 +569,9 @@ num=${found%% *}; url=${found#* }
 
 # A draft stops here: published and checked by the hosted run, with no status and no merge request.
 if [ "$DRAFT" -eq 1 ]; then
-  note "draft: $branch is pushed to $url; nothing was signed off or merged. Land it in its slot with: scripts/land --reviewed \"<what ran and what came of it>\" (and --body if it had one)"
+  how="scripts/land"; [ ${#needs[@]} -eq 0 ] || how="$how --reviewed \"<what ran and what came of it>\""
+  note "draft: $branch is pushed to $url; nothing was signed off or merged. Land it in its slot with: $how (the pull request's description is used unless --body is given)"
   exit 0
-fi
-
-# GitHub merges no draft, and auto-merge would wait on one for ever, so an open draft for this branch is
-# marked ready here: after its checks have passed and before any status is posted.
-is_draft=$(gh pr view "$num" --json isDraft --jq .isDraft) || die "could not read whether $url is a draft; nothing was merged"
-if [ "$is_draft" = true ]; then
-  gh pr ready "$num" >/dev/null || die "could not mark the draft $url ready for review; nothing was merged"
-  note "marked the draft $url ready for review"
 fi
 
 # Record the review first: `signoff` is the status the ruleset waits for, so nothing can merge before the
@@ -584,6 +589,14 @@ answer=$(gh api -X POST "repos/{owner}/{repo}/statuses/$sha" -f state=success -f
 # status name, done through GitHub's commit status API.
 answer=$(gh api -X POST "repos/{owner}/{repo}/statuses/$sha" -f state=success -f context=signoff \
    -f description="scripts/ci --landing (quick checks, history secret scan, macOS self-tests on macOS) passed locally" 2>&1 >/dev/null) || refused signoff "$answer"
+
+# GitHub merges no draft, and auto-merge would wait on one for ever, so an open draft is marked ready here:
+# after its checks passed and both statuses were taken, so a refused status leaves it a draft.
+if [ "$existing_draft" = true ]; then
+  answer=$(gh pr ready "$num" 2>&1 >/dev/null) \
+    || answered "could not mark the draft $url ready for review, so nothing was merged" "$answer"
+  note "marked the draft $url ready for review"
+fi
 
 # The ruleset also requires the hosted workflow's aggregating job, backed by the full scripts/ci suite on
 # GitHub's runners. Both merge calls name the commit that was checked, so GitHub refuses to merge anything else,
