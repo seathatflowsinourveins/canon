@@ -383,8 +383,11 @@ Known limits:
   that it cannot represent, traced through `replaces`, still fails the report. The leave-out keys on the
   engine's `open_only`, which the running check sets from `open_check_open_only` (default true); with
   that off, the check asks as start-up does and such an order fails it. A running fill request names
-  one instrument, so a partly filled such order fails its own symbol's request alone, and nothing is
-  inferred for that symbol (ADR 0075).
+  one instrument, so a partly filled such order fails its own symbol's request, and nothing is inferred
+  for that symbol (ADR 0075). Each such request spends its `FILL_READ_TRIES` reads before it fails, and
+  the position check's requests share one deadline (`timeout_reconciliation`, 30 s by default), so enough
+  of them can run the stage out of time for every symbol, as before this leave-out. A trace cut short at
+  an order NautilusTrader cannot hold is never left out.
 * Timestamps lose sub-microsecond precision: alpaca-py parses them into `datetime`.
 * A trading client given to the constructor is the caller's: every connect uses it, a disconnect does not
   drop it, and nothing is built from the environment in its place (the adapter guide closes in
@@ -1687,6 +1690,9 @@ class AlpacaExecutionClient(ExecutionClient):
         self._left_out: set[str] = set()
         """Alpaca IDs of the open orders the node does not hold and cannot represent, left out of the
         running reports and named once each (`_leave_out`)."""
+        self._cut_short: set[str] = set()
+        """Alpaca IDs of the orders whose `replaces` trace stopped at an order NautilusTrader cannot hold
+        (`_root_id`): not shown to be outside the node's chains, so never left out."""
         self._advisory_trigger_warned: set[str] = set()
         self._odd_positions_named: set[str] = set()
         # Clients given here are the caller's: used on every connect, never replaced by ones built from
@@ -1856,6 +1862,8 @@ class AlpacaExecutionClient(ExecutionClient):
         self._external_fills.clear()
         self._external_reconciliation.clear()
         self._external_unloaded_symbols.clear()
+        self._left_out.clear()
+        self._cut_short.clear()
         self._advisory_trigger_warned.clear()
         self._index.clear()
         self._unanswered_reads.clear()
@@ -2925,6 +2933,8 @@ class AlpacaExecutionClient(ExecutionClient):
             walked.add(prior_id)
             if prior_id in self._index:
                 root = self._index[prior_id] or root
+                if prior_id in self._cut_short:
+                    self._cut_short.add(order_id)
                 break
             held = self._held_by_venue_id(prior_id)
             if held is not None:
@@ -2944,6 +2954,7 @@ class AlpacaExecutionClient(ExecutionClient):
                 )
             prior_cid = holdable_id(prior.client_order_id)
             if prior_cid is None:
+                self._cut_short.add(order_id)
                 break  # the order before cannot be held: the trace stops here
             root = prior_cid
             if self.cache.order(root) is not None:
@@ -3051,8 +3062,11 @@ class AlpacaExecutionClient(ExecutionClient):
             # A left-out order's replacement is judged on its own update, under its own ID.
             self._left_out.discard(order_id)
             return
-        # `_apply` traced it (`_node_order_id`): the node does not hold it.
-        reason = self._unrepresentable_outside(update.order)
+        # `_apply` traced it (`_node_order_id`): the node does not hold it. A trace cut short at an
+        # order NautilusTrader cannot hold has not shown that, and takes the path it took before.
+        reason = (
+            None if order_id in self._cut_short else self._unrepresentable_outside(update.order)
+        )
         if reason is not None:
             # Named once; its stream fills are never shown to the engine, which does not hold it.
             self._leave_out(update.order, reason)
@@ -4684,12 +4698,20 @@ class AlpacaExecutionClient(ExecutionClient):
                 continue
             try:
                 report = await self._order_report(order, found)
-            except ValueError:
-                # Left out only when the order cannot be represented on its own terms and its trace
-                # finds no order of the node's: a trace that fails raises again here, as it did above.
+            except ValueError as refusal:
+                # Left out only when the order cannot be represented on its own terms and a trace of its
+                # whole chain finds no order of the node's. A trace that fails, or one cut short at an
+                # order NautilusTrader cannot hold, keeps `_order_report`'s refusal, whose words name
+                # no venue order ID (ADR 0030).
                 reason = self._unrepresentable_outside(order) if running else None
-                if reason is None or await self._node_order_id(order, found) is not None:
+                if reason is None:
                     raise
+                try:
+                    ours = await self._node_order_id(order, found)
+                except APIError, OSError, ValueError, TypeError:
+                    raise refusal from None
+                if ours is not None or str(order.id) in self._cut_short:
+                    raise  # `_order_report`'s refusal, still the one handled here
                 self._leave_out(order, reason)
                 left_out.add(str(order.id))
                 continue

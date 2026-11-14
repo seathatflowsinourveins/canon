@@ -457,6 +457,142 @@ def test_an_untraced_replacement_of_the_nodes_own_trailing_stop_is_reported_not_
     assert lines_naming(engine_log(capfd), "ALERT") == []
 
 
+def trailing_reporting_off(monkeypatch, venue) -> None:
+    """The adapter's default reporting (outside trailing stops not reported), with the node's own
+    trailing stops sent, and Alpaca's clock open."""
+    provider = InstrumentProviderConfig(load_ids=[str(AAPL), str(MSFT)])
+    monkeypatch.setattr(
+        _tec,
+        "exec_config",
+        lambda: AlpacaExecutionClientConfig(
+            instrument_provider=provider, submit_trailing_stops=True
+        ),
+    )
+    now = datetime.now(UTC)
+    monkeypatch.setattr(
+        venue.trading,
+        "get_clock",
+        lambda: Clock(
+            timestamp=datetime.now(UTC), is_open=True, next_open=now, next_close=now + HOUR
+        ),
+        raising=False,
+    )
+    venue.trading.script = "accept"
+
+
+def submit_trailing_stop(strategy: Any) -> Any:
+    order = strategy.order_factory.trailing_stop_market(
+        instrument_id=AAPL,
+        order_side=OrderSide.SELL,
+        quantity=Quantity.from_int(2),
+        trailing_offset=Decimal("1.25"),
+        trailing_offset_type=TrailingOffsetType.PRICE,
+        time_in_force=TimeInForce.GTC,
+    )
+    strategy.submit_order(order)
+    return order.client_order_id
+
+
+@pytest.mark.parametrize("middle_id", ["", "\u00e9t\u00e9"])
+def test_a_node_chain_cut_short_at_an_unholdable_link_is_never_left_out(
+    venue, capfd, monkeypatch, middle_id
+) -> None:
+    """The node's trailing stop is replaced twice, and the middle replacement carries a client order ID
+    NautilusTrader cannot hold (empty, or not ASCII), so a trace from the newest stops there
+    (`_root_id`). The running open-order check, through the live node's wiring, must not take the node's
+    own stop for someone else's and leave it out: it fails the report as at base (ADR 0030), and nothing
+    is named left out."""
+    trailing_reporting_off(monkeypatch, venue)
+    strategy = TrailingTrader()
+    strategy.idle = True
+    direct: list = []
+
+    async def body(client) -> None:
+        await _tec.until_idle(client, venue)
+        submit_trailing_stop(strategy)
+        await _tec.until_idle(client, venue)
+        _tec.forget(client)
+        placed = _tec.placed_order(venue)
+        later = datetime.now(UTC).isoformat()
+        middle = {
+            **placed,
+            "id": REPLACEMENT_ID,
+            "client_order_id": middle_id,
+            "replaces": placed["id"],
+            "replaced_by": NODE_REPLACEMENT_ID,
+            "status": "replaced",
+        }
+        newest = {
+            **placed,
+            "id": NODE_REPLACEMENT_ID,
+            "client_order_id": "alpaca-made-replacement",
+            "replaces": REPLACEMENT_ID,
+            "status": "new",
+            "submitted_at": later,
+            "updated_at": later,
+        }
+        venue.trading.orders.extend([middle, newest])
+        placed.update(status="replaced", replaced_by=REPLACEMENT_ID)
+        await asyncio.sleep(0.8)  # several running checks
+        try:
+            await client._generate_order_status_reports(OPEN_ONLY)
+        except ValueError as e:
+            direct.append(str(e))
+
+    _tec.run_with_client(body, strategy, exec_engine=OPEN_CHECK_ONLY)
+
+    log = engine_log(capfd)
+    assert lines_naming(log, "ALERT") == [], lines_naming(log, "ALERT")
+    assert lines_naming(log, FAILED_CHECK) != []
+    assert len(direct) == 1 and "order type trailing_stop" in direct[0], direct
+
+
+def test_an_outside_order_whose_trace_fails_keeps_the_refusal_that_names_no_venue_id(
+    venue, alpaca
+) -> None:
+    """The owner's replaced OCO leg is open, and the read of the order it replaced fails (500). The open
+    check's refusal is `_order_report`'s ValueError, whose words name the cause by class and code and no
+    venue order ID, not the read's raw error."""
+    venue.trading.positions = [msft_position()]
+    venue.trading.order_lookup_error = lambda order_id: (
+        alpaca.api_error(500, 50010000, f"internal error reading {order_id}")
+        if order_id == LEG_ID
+        else None
+    )
+    refused: list = []
+
+    async def body(client) -> None:
+        venue.trading.orders.append(
+            owner_leg(id=REPLACEMENT_ID, client_order_id="owner-msft-leg-2", replaces=LEG_ID)
+        )
+        try:
+            await client._generate_order_status_reports(OPEN_ONLY)
+        except Exception as e:  # noqa: BLE001 - the refusal's own class is the point
+            refused.append(e)
+
+    _tec.run_with_client(body, _tec.trader(idle=True))
+
+    assert len(refused) == 1 and type(refused[0]) is ValueError, refused
+    assert "tracing it failed" in str(refused[0]) and LEG_ID not in str(refused[0]), refused
+
+
+def test_a_client_that_disconnected_keeps_no_left_out_order(venue) -> None:
+    """A left-out order may end while the client is away: after a disconnect the client holds none, so
+    the next one after a reconnect is named with a true count."""
+    venue.trading.positions = [msft_position()]
+    clients: list = []
+
+    async def body(client) -> None:
+        clients.append(client)
+        venue.trading.orders.append(owner_leg())
+        await client._generate_order_status_reports(OPEN_ONLY)
+        assert client._left_out == {LEG_ID}
+
+    _tec.run_with_client(body, _tec.trader(idle=True))
+
+    assert clients[0]._left_out == set()
+
+
 def test_limit_with_open_check_open_only_off_an_owner_leg_still_fails_the_check(
     venue, capfd
 ) -> None:
