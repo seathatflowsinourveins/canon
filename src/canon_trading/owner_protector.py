@@ -827,9 +827,10 @@ class Holding:
     # Set when the owner's word held this holding after its sell was placed: its release re-places
     # the sell at the next step while the bid is above the level, with no new observation.
     rearm_at_step: bool = False
-    # The leg of a sale whose cancel the owner's hold requested (count one): when it ends, the sale
-    # ends with it, whether the hold still stands or not, so the release re-arms the trail and never
-    # sends the sale again (rd-owner-protector F1). A rejected cancel clears it.
+    # Our leg whose cancel the owner's hold requested (count one), a trail not yet released
+    # included: when it ends, a sale it became ends with it, whether the hold still stands or not,
+    # so the release re-arms the trail and never sends the sale again (rd-owner-protector F1). A
+    # rejected cancel clears it.
     held_cancel: ClientOrderId | None = None
     # Every leg of a sale ended under the hold: a late fill on one is still ours, and re-evaluates
     # the holding in its own event (rd-owner-protector F2).
@@ -2207,8 +2208,7 @@ class OwnerProtector(Strategy):
         if self.frozen.get(instrument_id, "").startswith(WAITING):
             self.frozen.pop(instrument_id)
         if order is not None:
-            if slot.sale is not None:
-                slot.held_cancel = order.client_order_id
+            slot.held_cancel = order.client_order_id
             self._cancel_own(
                 slot,
                 reason=f"{instrument_id}: {symbol_hold.HELD}: canceling our own sell only "
@@ -3539,14 +3539,21 @@ class OwnerProtector(Strategy):
                 slot.level = trigger
             if (
                 order.is_closed
-                and slot.sale is not None
                 and order.client_order_id == slot.held_cancel
+                and (
+                    slot.sale is not None
+                    or order.status not in (OrderStatus.DENIED, OrderStatus.REJECTED)
+                )
             ):
-                # The leg the hold canceled has ended: so has its sale, though the hold may have
-                # been removed before this pass (F1); the trail is re-armed below.
+                # The leg the hold canceled has ended: so has a sale it was released into, though
+                # the hold may have been removed before this pass (F1); the trail is re-armed below.
+                # A trail the venue refused is still frozen by the refusal path.
                 self.cancel_requested.discard(order.client_order_id)
+                slot.held_ids.add(order.client_order_id)
                 slot.protect_id, order = None, None
-                self._end_held_sale(instrument_id, slot)
+                if slot.sale is not None:
+                    self._end_held_sale(instrument_id, slot)
+                slot.held_cancel = None
             elif order.is_closed:
                 if order.status in (OrderStatus.DENIED, OrderStatus.REJECTED):
                     if slot.sale is None:

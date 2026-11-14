@@ -23,11 +23,17 @@ from types import SimpleNamespace
 from typing import Any
 from typing import cast
 
+from nautilus_trader.core import UUID4
+from nautilus_trader.model import OrderReleased
+from nautilus_trader.model import OrderSide
 from nautilus_trader.model import OrderType
+from nautilus_trader.model import Price
 from nautilus_trader.model import Quantity
+from nautilus_trader.model import TimeInForce
 
 from canon_trading import symbol_hold
 from tests import test_owner_protector as h
+from tests.test_owner_protector_chase import accepted
 from tests.test_owner_protector_chase import filled
 from tests.test_owner_protector_chase import released
 from tests.test_owner_protector_chase import terminal
@@ -151,3 +157,61 @@ def test_a_rejected_hold_cancel_leaves_the_leg_working_and_a_held_step_cancels_i
     assert strategy.canceled.count(sale.client_order_id) == 2, "a held step cancels it again"
     assert strategy.slots[h.AAA].held_cancel == sale.client_order_id
     assert len(strategy.sent) == 1, "nothing is sent while held"
+
+
+def test_a_trail_held_before_its_release_and_canceled_as_a_limit_is_not_sent_again(tmp_path):
+    """F1 with the hold first: the hold cancels our trail before it is released, the emulator
+    releases it into a limit (same client ID) before the cancel lands, and the cancel lands and the
+    hold is removed with no pass between. The release re-arms the trail; the limit is not resent.
+    Whether the pinned emulator can release an order whose cancel is pending is UNVERIFIED."""
+    strategy = h.Harness()
+    strategy.settings.symbol_holds_dir = tmp_path / "holds"
+    strategy.test_clock.set_time(h.T0)
+    strategy.cached.latest = h.quote("10.00", h.T0)
+    strategy.adopt_holding(h.AAA, Price.from_str("9.95"))
+    h.new_quote(strategy)
+    trailing = strategy.sent[0]
+    symbol_hold.write_hold(strategy.settings.symbol_holds_dir, "AAA")
+    step(strategy, h.T0 + h.SECOND)
+    assert trailing.client_order_id in strategy.canceled
+    strategy.observe("10.00", h.T0 + h.SECOND + h.SECOND // 2)  # the bid, still held
+    at = h.T0 + 2 * h.SECOND
+    strategy.test_clock.set_time(at)
+    sale = strategy.order_factory.limit(
+        h.AAA,
+        OrderSide.SELL,
+        Quantity.from_int(10),
+        Price.from_str("9.90"),
+        time_in_force=TimeInForce.DAY,
+        reduce_only=True,
+        client_order_id=trailing.client_order_id,
+    )
+    event = OrderReleased(
+        sale.trader_id,
+        sale.strategy_id,
+        h.AAA,
+        sale.client_order_id,
+        Price.from_str("9.89"),
+        UUID4(),
+        at,
+        at,
+    )
+    sale.apply(event)
+    strategy.cached.working = [sale]
+    strategy.on_order_released(event)
+    accepted(sale, at)
+    # No pass runs between the release and the cancel landing, nor between that and the owner's
+    # release of the hold: no held pass ever sees the released limit.
+    terminal(sale, h.T0 + 3 * h.SECOND)
+    symbol_hold.remove_hold(strategy.settings.symbol_holds_dir, "AAA")
+    step(strategy, h.T0 + 4 * h.SECOND)
+    new_orders = strategy.sent[1:]
+    assert all(o.order_type != OrderType.LIMIT for o in new_orders), (
+        "the limit canceled under the hold was sent again after its release",
+        [(o.order_type, o.price) for o in new_orders],
+        strategy.said[-10:],
+    )
+    assert new_orders and new_orders[-1].order_type == OrderType.TRAILING_STOP_LIMIT, strategy.said[
+        -10:
+    ]
+    assert strategy.slots[h.AAA].sale is None
