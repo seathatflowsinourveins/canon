@@ -54,6 +54,7 @@ from tests.test_mover import SECOND
 from tests.test_mover import engine
 from tests.test_owner_protector_blind import owner_type
 from tests.test_owner_protector_blind import quote
+from tests.test_protect import _order
 from tests.test_protect import _position
 
 EXTERNAL = StrategyId("EXTERNAL")
@@ -76,6 +77,7 @@ class Account:
         self.unreadable: set[str] = set()
         self.failure: Exception | None = None
         self.reads = 0
+        self.orders: list[Any] = []
 
     def get_all_positions(self) -> list[Any]:
         self.reads += 1
@@ -86,6 +88,9 @@ class Account:
             _position(symbol, qty, available="-1" if symbol in self.unreadable else "all")
             for symbol, qty in sorted(self.held.items())
         ]
+
+    def get_orders(self, request) -> list[Any]:
+        return list(self.orders)
 
 
 class Owner(Strategy):
@@ -228,8 +233,7 @@ def test_the_account_is_read_at_the_first_step_then_every_poll_interval() -> Non
 
 
 def test_a_fractional_new_holding_is_named_and_the_run_goes_on() -> None:
-    """A successor could not start on a fractional holding (the adapter refuses it at start-up, review
-    F2), so ending would cost every other holding its protector: it is named, once, and the run goes on."""
+    """A successor skips a fractional holding by name, so it cannot justify ending this run."""
     account = Account(AAA="10", BBB="2.5")
     guard = protector(account, roster=(AAA,))
     eng = run((Owner(Account()), guard), tape(range(70), later_at=None))
@@ -273,11 +277,16 @@ def _ended(account: Account, seconds: int = 70) -> tuple[list[tuple[int, str | N
 def _start_refuses(account: Account) -> dict[str, str]:
     """What the start's own predicate refuses in this account (`session_window.start_account`)."""
     held, unread = session_window.position_reads(cast(Any, account))
-    return session_window.start_account(held, unread).refused
+    return session_window.start_account(held, unread, account.get_orders(None)).refused
 
 
 def _unread(account: Account, symbol: str) -> Account:
     account.unreadable.add(symbol)
+    return account
+
+
+def _unmappable(account: Account) -> Account:
+    account.orders = [_order("BBB", "0.5", "synthetic-owner-fractional-buy", side="buy")]
     return account
 
 
@@ -295,12 +304,22 @@ START_CASES = {
         lambda: Account(AAA="10", BBB="0", CCC="5"),
         False,
     ),
-    "refused: a fractional long outside the roster": (
+    "accepted: a fractional long outside the roster is skipped": (
         lambda: Account(AAA="10", BBB="2.5", CCC="5"),
+        False,
+    ),
+    "accepted: a roster long turned fractional is skipped": (
+        lambda: Account(AAA="10.5", CCC="5"),
+        False,
+    ),
+    "accepted: a fractional short is skipped": (
+        lambda: Account(AAA="10", BBB="-1.5", CCC="5"),
+        False,
+    ),
+    "refused: an unmappable open order in an unheld symbol": (
+        lambda: _unmappable(Account(AAA="10", CCC="5")),
         True,
     ),
-    "refused: a roster long turned fractional": (lambda: Account(AAA="10.5", CCC="5"), True),
-    "refused: a fractional short": (lambda: Account(AAA="10", BBB="-1.5", CCC="5"), True),
 }
 
 
@@ -324,10 +343,10 @@ def test_a_new_whole_share_long_ends_the_run_exactly_when_the_start_would_accept
 
 def test_the_run_calls_the_starts_predicate_and_the_adapters_whole_share_rule(monkeypatch) -> None:
     """Called, never copied: when the predicate, or the adapter's whole-share rule it calls, accepts a
-    fractional position, the run ends at once (review F2 narrows this guard by changing either)."""
+    fractional position instead of skipping it, the run ends at once for that new holding."""
     from canon_alpaca import execution
 
-    assert not _ended(Account(AAA="10", BBB="2.5", CCC="5"))[0]
+    assert not _ended(Account(AAA="10", BBB="2.5"))[0]
     with monkeypatch.context() as patch:
         accepted = session_window.StartAccount
         patch.setattr(
@@ -335,10 +354,10 @@ def test_the_run_calls_the_starts_predicate_and_the_adapters_whole_share_rule(mo
             "start_account",
             lambda held, unread, orders=(): accepted(dict(held), dict(unread), {}),
         )
-        assert _ended(Account(AAA="10", BBB="2.5", CCC="5"))[0]
+        assert _ended(Account(AAA="10", BBB="2.5"))[0]
     with monkeypatch.context() as patch:
         patch.setattr(execution, "whole_quantity", lambda value, field: value)
-        assert _ended(Account(AAA="10", BBB="2.5", CCC="5"))[0]
+        assert _ended(Account(AAA="10", BBB="2.5"))[0]
 
 
 def test_a_new_long_the_restart_cannot_take_is_named_unprotected_once_and_the_monitor_shows_it_uncovered() -> (
@@ -348,18 +367,18 @@ def test_a_new_long_the_restart_cannot_take_is_named_unprotected_once_and_the_mo
     across every read of the run, and the exit monitor shows it uncovered."""
     from canon_trading import exit_monitor
 
-    account = Account(AAA="10", BBB="2.5", CCC="5")
+    account = _unmappable(Account(AAA="10", BBB="2.5", CCC="5"))
     shutdowns, guard = _ended(account, seconds=95)
     assert not shutdowns and account.reads >= 3
     named = alerts(guard, "CCC")
     assert len(named) == 1, guard.said
     line = named[0][1]
     assert "unprotected" in line and "5 held" in line, line
-    assert "BBB position quantity 2.5 is fractional" in line, line
+    assert "BBB" in line and "quantity 0.5 is fractional" in line, line
     findings = exit_monitor.assess(
         "A",
         account.get_all_positions(),
-        [],
+        account.get_orders(None),
         [],
         exit_monitor.empty_memory("A"),
         datetime(2026, 11, 13, 10, tzinfo=ZoneInfo("America/New_York")),
@@ -369,16 +388,16 @@ def test_a_new_long_the_restart_cannot_take_is_named_unprotected_once_and_the_mo
 
 
 def test_the_run_ends_at_the_first_read_the_start_would_accept() -> None:
-    """The lead's term (b): decided at every read, never latched. A fractional holding that reads whole
-    at the next read lets that read end the run."""
+    """The lead's term (b): decided at every read, never latched. Once the unmappable order leaves the
+    account, the next read lets the run end."""
 
     class Rounds(Account):
-        def get_all_positions(self) -> list[Any]:
-            listed = super().get_all_positions()
-            self.held["BBB"] = "3"  # whole from the next read on
+        def get_orders(self, request) -> list[Any]:
+            listed = super().get_orders(request)
+            self.orders.clear()
             return listed
 
-    account = Rounds(AAA="10", BBB="2.5", CCC="5")
+    account = _unmappable(Rounds(AAA="10", BBB="3", CCC="5"))
     shutdowns, guard = _ended(account)
     assert account.reads >= 2
     assert [reason for _at, reason in shutdowns] == [
@@ -387,21 +406,25 @@ def test_the_run_ends_at_the_first_read_the_start_would_accept() -> None:
     assert shutdowns[0][0] - alerts(guard, "CCC")[0][0] >= owner_protector.ROSTER_POLL_SECS * SECOND
 
 
-def test_the_start_refuses_a_fractional_holding_by_name_before_any_node(
-    controls, tmp_path, monkeypatch
+def test_the_start_skips_a_fractional_holding_by_name_and_starts_the_rest(
+    controls, tmp_path, monkeypatch, capsys
 ) -> None:
-    """The start calls the same predicate: a fractional position, which the adapter's start-up refuses in
-    an instrument it loads, is refused by name before the node is built."""
+    """The start calls the same predicate: a fractional position is named and excluded from the node,
+    so the whole-share holding can start."""
     from tests.test_protector_node import Listing
     from tests.test_protector_node import listed
     from tests.test_protector_node import real_reader
-    from tests.test_protector_node import window
 
     module, settings, _strategy, _foreign, _reads, built = real_reader(monkeypatch, controls)
     trading = Listing(listed("AAA", "10"), listed("BBB", "2.5"))
-    with pytest.raises(window.WindowRefused, match="BBB position quantity 2.5 is fractional"):
-        module.run_protector(settings, trading=trading, lock_dir=tmp_path)
-    assert not built
+    module.run_protector(settings, trading=trading, lock_dir=tmp_path)
+    assert len(built) == 1 and built[0][1] == (AAA,)
+    lines = capsys.readouterr().out.splitlines()
+    assert any("BBB" in line and "fractional" in line and "skipped" in line for line in lines)
+    assert any(
+        "BBB" in line and "fractional" in line and "left unprotected by this node" in line
+        for line in lines
+    )
 
 
 def test_a_failed_read_is_an_alert_and_is_read_again_at_the_next_interval() -> None:

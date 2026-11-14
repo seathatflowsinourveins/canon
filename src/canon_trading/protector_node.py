@@ -528,9 +528,9 @@ def run_protector(
         # its label or by its sign, is below zero and never read as a long, and one that cannot be read
         # is named with an ALERT and skipped, its symbol and any level for it left out of the node, so
         # every other long is still covered (the lead, 2026-11-13 21:27 and 21:35).
-        # A zero quantity (a short read as -0 among them) is no holding this node can protect: it is
-        # named and skipped like an unreadable one, never a refusal of every other long. What the start
-        # skips and refuses is one predicate, `window.start_account`, which the running protector's
+        # A zero or fractional quantity is no holding this node can protect: it is named and skipped
+        # like an unreadable one, never a refusal of every other long (F3, the lead, 2026-11-14 12:08).
+        # What the start skips and refuses is one predicate, `window.start_account`, which the protector's
         # roster read calls too (review F1; the lead's term (a), 2026-11-13 23:49).
         start = window.start_account(*window.position_reads(trading))
         held, unread = dict(start.held), dict(start.skipped)
@@ -592,7 +592,8 @@ def run_protector(
                 except Exception as e:  # noqa: BLE001 - report and keep the final holdings read
                     errors.append(f"dispose failed: {type(e).__name__}")
             try:
-                remaining, unread_now = window.position_reads(trading)
+                final = window.start_account(*window.position_reads(trading))
+                remaining, unread_now = final.held, final.skipped
                 last_seen = ""
             except Exception as e:  # noqa: BLE001 - last seen is explicitly not a current account read
                 errors.append(f"end positions read failed: {type(e).__name__}")
