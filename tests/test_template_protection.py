@@ -11,6 +11,8 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from canon_alpaca.execution import SELL_TO_CLOSE_PROVEN
+from canon_alpaca.execution import AlpacaExecutionClient
 from nautilus_trader.model import Bar
 from nautilus_trader.model import BarType
 from nautilus_trader.model import ClientOrderId
@@ -24,6 +26,7 @@ from nautilus_trader.model import TimeInForce
 from canon_trading.mover import MoverConfig
 from canon_trading.mover import fill_trigger
 from canon_trading.mover import offsets
+from canon_trading.price_step import tick
 from canon_trading.session_window import DEFAULT_ARM
 from canon_trading.session_window import TRAIL_ARMS
 from tests.test_mover import AAA
@@ -64,6 +67,12 @@ def template(*, entry_limit=None, flatten_on_quote=None, start_entry=True, arm_o
         def close_all_positions(self, instrument_id, *args, **kwargs):
             self.stop_calls.append(("close", instrument_id))
             super().close_all_positions(instrument_id, *args, **kwargs)
+
+        def modify_order(self, client_order_id, *args, **kwargs):
+            if not self.is_running():
+                order = self.cache.order(client_order_id)
+                self.stop_calls.append(("close", order.instrument_id))
+            super().modify_order(client_order_id, *args, **kwargs)
 
         def on_start(self):
             super().on_start()
@@ -352,8 +361,8 @@ def opened(host, *, average="10.01", at=T0, entry="ENTRY"):
     )
 
 
-@pytest.mark.parametrize("source", ["spread", "atr", "rounding"])
-def test_r2_a_distance_over_the_ceiling_is_refused_and_named(source):
+@pytest.mark.parametrize("source", ["spread", "atr", "rounding", "minimum_step"])
+def test_r2_s3_a_filled_holding_over_the_ceiling_is_covered_and_named(source):
     part, host = holding_part()
     event = opened(host)
     if source == "spread":
@@ -361,13 +370,27 @@ def test_r2_a_distance_over_the_ceiling_is_refused_and_named(source):
     elif source == "atr":
         slot = part._position_slot(AAA, T0)
         slot.atr = SimpleNamespace(initialized=True, value=2)
+    elif source == "rounding":
+        event = opened(host, average="1.01")
+        host.tick = quote(0, 1.01, 1.02)
+        slot = part._position_slot(AAA, T0)
+        slot.atr = SimpleNamespace(initialized=True, value=0.1001)
     else:
         event = opened(host, average="0.0001")
         host.tick = quote(0, 0.0001, 0.0001)
     part.on_position_opened(event)
-    assert host.sent == [], "no over-ceiling trail may be armed"
+    assert host.sent, "an already filled long must have a protective sell"
     assert any("distance_over_ceiling" in message for message in host.said)
-    assert part._context.slots[AAA].trail_plan is None
+    slot = part._context.slots[AAA]
+    average = Decimal(str(event.avg_px_open))
+    distance = slot.sized_loss
+    assert distance <= average * Decimal("0.10")
+    assert distance % tick(average) == 0
+    if host.sent[-1].kind == "TRAILING":
+        assert host.sent[-1].trailing_offset == distance
+    else:
+        assert host.sent[-1].kind == "LIMIT"
+    assert host.sent[-1].quantity.as_decimal() == 10
 
 
 @pytest.mark.parametrize("pending_cancel", [False, True])
@@ -457,6 +480,16 @@ def test_r6_stopping_cancels_orders_then_closes_positions(drive):
     assert strategy.stop_calls == [("cancel", AAA), ("close", AAA)]
     assert working(eng.cache) == []
     assert eng.portfolio.net_position(AAA) == 0
+    (sale,) = [order for order in eng.cache.orders(strategy_id=SID) if order.side == OrderSide.SELL]
+    assert sale.order_type == OrderType.LIMIT
+    assert sale.time_in_force == TimeInForce.DAY and sale.is_reduce_only
+    adapter: Any = SimpleNamespace(
+        _provider=SimpleNamespace(find=eng.cache.instrument),
+        cache=eng.cache,
+        _reduce_only_sells=True,
+        _sell_to_close_order_types=SELL_TO_CLOSE_PROVEN,
+    )
+    assert AlpacaExecutionClient._denial(adapter, sale) is None
 
 
 def test_r7_a_first_live_bar_already_in_the_cache_keeps_its_close_once():
@@ -487,3 +520,200 @@ def test_r8_a_stop_already_held_sells_on_the_first_followed_breach():
     assert [order.kind for order in host.sent] == ["LIMIT"]
     assert slot.exiting
     assert slot.exit_record.trigger_reason.startswith("held stop")
+
+
+def entry_host(*, own_long=False, foreign_quantity=0):
+    """Only cache/indicator inputs are stood in; entry and planning run production methods."""
+    part, host = holding_part()
+    host.protection = part
+    host.settings = module().EMACrossProtectedConfig(
+        instrument_id=AAA, bar_type=bar_type(AAA), trade_size=Decimal(10)
+    )
+    host.entry_id = None
+    host.fast_ema = SimpleNamespace(value=11)
+    host.slow_ema = SimpleNamespace(value=10)
+    host.indicators_initialized = lambda: True
+    host.portfolio = SimpleNamespace(
+        is_net_flat=lambda _: (10 if own_long else 0) + foreign_quantity == 0
+    )
+    positions = []
+    if own_long:
+        positions.append(SimpleNamespace(strategy_id=MOVER_ID, signed_qty=Decimal(10)))
+    if foreign_quantity:
+        positions.append(
+            SimpleNamespace(strategy_id=StrategyId("Other-001"), signed_qty=foreign_quantity)
+        )
+    host.cache.positions_open = lambda **kw: [
+        position for position in positions if position.strategy_id == kw.get("strategy_id")
+    ]
+    host.order_factory.market = lambda instrument_id, side, quantity: host._new(
+        "MARKET", quantity=quantity, side=side
+    )
+    return host
+
+
+@pytest.mark.parametrize("source", ["spread", "atr", "rounding"])
+def test_s3_entry_over_the_ceiling_is_refused_before_sending(source):
+    host = entry_host()
+    slot = host.protection._position_slot(AAA, T0)
+    if source == "spread":
+        host.tick = quote(0, 9.0, 10.01)
+    elif source == "atr":
+        slot.atr = SimpleNamespace(initialized=True, value=2, handle_bar=lambda _: None)
+    else:
+        host.tick = quote(0, 1.00, 1.01)
+        slot.atr = SimpleNamespace(initialized=True, value=0.1001, handle_bar=lambda _: None)
+    module().EMACrossProtected.on_bar(host, minute_bar(0))
+    assert host.sent == [], "the entry itself must be refused, before a long exists"
+    assert any("distance_over_ceiling" in message for message in host.said)
+
+
+@pytest.mark.parametrize("own_long,foreign_quantity,entries", [(False, 10, 1), (True, -10, 0)])
+def test_s4_entry_uses_only_its_own_open_positions(own_long, foreign_quantity, entries):
+    host = entry_host(own_long=own_long, foreign_quantity=foreign_quantity)
+    module().EMACrossProtected.on_bar(host, minute_bar(0))
+    assert len(host.sent) == entries
+
+
+@pytest.mark.parametrize("size", ["1.5", "0.4", "0", "-1", "NaN", "Infinity"])
+def test_s5_trade_size_must_be_finite_positive_whole_shares(size):
+    with pytest.raises(ValueError, match="trade_size"):
+        module().EMACrossProtectedConfig(
+            instrument_id=AAA, bar_type=bar_type(AAA), trade_size=Decimal(size)
+        )
+
+
+@pytest.mark.parametrize("size", [1, 1.0, True, "1"])
+def test_s5_trade_size_refuses_other_types_by_name(size):
+    with pytest.raises(TypeError, match="trade_size"):
+        module().EMACrossProtectedConfig(instrument_id=AAA, bar_type=bar_type(AAA), trade_size=size)
+
+
+def test_s6_missing_instrument_raises_its_name_without_stopping():
+    stopped = []
+    host = SimpleNamespace(
+        settings=SimpleNamespace(instrument_id=AAA),
+        cache=SimpleNamespace(instrument=lambda _: None),
+        log=SimpleNamespace(error=lambda _: None),
+        stop=lambda: stopped.append(True),
+    )
+    with pytest.raises(RuntimeError, match="AAA.ALPACA"):
+        module().EMACrossProtected.on_start(host)
+    assert stopped == []
+
+
+@pytest.mark.parametrize("fast,slow", [(20, 10), (10, 10), (0, 10), (-1, 10), (1, 0)])
+def test_s8_ema_periods_must_be_positive_and_ordered(fast, slow):
+    with pytest.raises(ValueError, match="fast_period.*slow_period"):
+        module().EMACrossProtectedConfig(
+            instrument_id=AAA,
+            bar_type=bar_type(AAA),
+            trade_size=Decimal(10),
+            fast_ema_period=fast,
+            slow_ema_period=slow,
+        )
+
+
+@pytest.mark.parametrize("fast,slow", [(3.0, 10), (2, 10.0), (True, 10), (2, False)])
+def test_s8_ema_periods_refuse_other_types_by_name(fast, slow):
+    with pytest.raises(TypeError, match="ema_period"):
+        module().EMACrossProtectedConfig(
+            instrument_id=AAA,
+            bar_type=bar_type(AAA),
+            trade_size=Decimal(10),
+            fast_ema_period=fast,
+            slow_ema_period=slow,
+        )
+
+
+@pytest.mark.parametrize("pending_modify", [False, True])
+def test_s2_stop_closes_through_adapter_or_preserves_cover(drive, pending_modify):
+    """Run the actual pre-transport check, execution.py:2557-2636, without a client/transport.
+
+    Acknowledged and pending modifications are stood in; the real engine case above
+    exercises shutdown and checks its released order against the adapter too.
+    """
+    strategy = template()
+    eng = drive(strategy, [quote(0, 9.99, 10.01), quote(1, 9.99, 10.01)])
+    (original,) = working(eng.cache)
+    active = {original.client_order_id: original}
+    submissions = []
+    held = [Decimal(10)]
+    adapter: Any = SimpleNamespace(
+        _provider=SimpleNamespace(find=eng.cache.instrument),
+        cache=eng.cache,
+        _reduce_only_sells=True,
+        _sell_to_close_order_types=SELL_TO_CLOSE_PROVEN,
+    )
+
+    def submit(order, position_id=None, client_id=None, params=None):
+        denial = AlpacaExecutionClient._denial(adapter, order)
+        submissions.append((order, params, denial))
+        if denial is None:
+            held[0] = Decimal(0)
+
+    def cancel_all(instrument_id, order_side=None, **kwargs):
+        for cid, order in list(active.items()):
+            if order_side is None or order.side == order_side:
+                del active[cid]
+
+    def close_all(instrument_id, **kwargs):
+        submit(
+            strategy.order_factory.market(
+                instrument_id,
+                OrderSide.SELL,
+                Quantity.from_int(10),
+                time_in_force=kwargs.get("time_in_force", TimeInForce.GTC),
+                reduce_only=kwargs.get("reduce_only", True),
+            )
+        )
+
+    def modify(cid, *, quantity=None, price=None, trigger_price=None, **kwargs):
+        assert cid == original.client_order_id
+        assert trigger_price is not None
+        assert trigger_price.as_decimal() >= eng.cache.quote(AAA).bid_price.as_decimal()
+        if pending_modify:
+            return
+        # The pin's emulator.rs:814-917 matches immediately after ModifyOrder;
+        # :1450-1487,1522-1536 transforms to LIMIT, retaining its ID/params.
+        released = strategy.order_factory.limit(
+            AAA,
+            OrderSide.SELL,
+            original.quantity if quantity is None else quantity,
+            price,
+            time_in_force=original.time_in_force,
+            reduce_only=original.is_reduce_only,
+            client_order_id=cid,
+        )
+        submit(released, params={"extended_hours": True})
+        if held[0] == 0:
+            active.pop(cid)
+
+    host = SimpleNamespace(
+        settings=strategy.settings,
+        strategy_id=SID,
+        order_factory=strategy.order_factory,
+        protection=strategy.protection,
+        log=SimpleNamespace(info=lambda _: None),
+        cache=SimpleNamespace(
+            positions_open=lambda **kw: eng.cache.positions_open(**kw) if held[0] else [],
+            instrument=eng.cache.instrument,
+            quote=eng.cache.quote,
+            order=eng.cache.order,
+            orders=lambda **kw: list(active.values()),
+        ),
+        cancel_all_orders=cancel_all,
+        cancel_order=lambda cid: active.pop(cid, None),
+        close_all_positions=close_all,
+        modify_order=modify,
+        submit_order=submit,
+    )
+    module().EMACrossProtected.on_stop(host)
+    assert held[0] == 0 or original.client_order_id in active, (
+        "stop canceled protection without a close accepted by the adapter",
+        [denial for _, _, denial in submissions],
+    )
+    if submissions:
+        assert all(denial is None for _, _, denial in submissions)
+        assert all(order.client_order_id == original.client_order_id for order, _, _ in submissions)
+    assert len(submissions) == (0 if pending_modify else 1)

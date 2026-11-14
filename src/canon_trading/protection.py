@@ -22,6 +22,7 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass
 from dataclasses import replace
+from decimal import ROUND_FLOOR
 from decimal import Decimal
 from typing import Any
 
@@ -71,6 +72,7 @@ from .mover import up_on_step
 from .price_step import down_on_step
 from .price_step import exit_price
 from .price_step import stop_trigger_price
+from .price_step import tick
 
 
 @dataclass(frozen=True)
@@ -226,6 +228,34 @@ class Protection:
     def _cold_plan(self, *args: Any, **kwargs: Any) -> TrailPlan:
         return mover.Mover._cold_plan(self._context, *args, **kwargs)
 
+    def _plan_distance(self, plan: TrailPlan, price: Decimal) -> Decimal:
+        return offsets(
+            price,
+            plan.trail,
+            plan.exit_through,
+            least=None if plan.spread is None else self.config.spread_floor_m * plan.spread,
+            chase_cap=plan.chase_cap,
+        )[0]
+
+    def entry_allowed(self, instrument_id: InstrumentId, now: int) -> bool:
+        """Check the shared plan at the entry's ask, before there is a holding to protect."""
+        slot = self._position_slot(instrument_id, now)
+        quote = self.strategy.cache.quote(instrument_id)
+        if quote is None or quote.ask_price.as_decimal() <= 0:
+            self._holding_note(slot, f"{instrument_id}: entry refused: no positive ask")
+            return False
+        price = quote.ask_price.as_decimal()
+        plan = self._entry_trail(slot, price, quote, now=now)
+        distance = self._plan_distance(plan, price)
+        if plan.trail > sizing.DISTANCE_CEILING or distance > price * sizing.DISTANCE_CEILING:
+            self._holding_note(
+                slot,
+                f"{instrument_id}: distance_over_ceiling: entry refused; trail {plan.trail} "
+                f"({plan.bound}), distance {distance} at {price}, ceiling {sizing.DISTANCE_CEILING}",
+            )
+            return False
+        return True
+
     def on_position_closed(self, event: Any) -> None:
         if event.strategy_id != self.strategy.strategy_id:
             return
@@ -279,25 +309,27 @@ class Protection:
             # No template distance: the shared Mover plan supplies L under the fill,
             # including its ATR fallback and the spread floor it selected. Without
             # a quote the existing _hold path protects the known holding meanwhile.
-            distance = offsets(
-                average,
-                plan.trail,
-                plan.exit_through,
-                least=None
-                if plan.spread is None
-                else self._context.settings.spread_floor_m * plan.spread,
-                chase_cap=plan.chase_cap,
-            )[0]
+            distance = self._plan_distance(plan, average)
             # _entry_trail(found_holding=True) leaves this caller's ceiling to it,
             # as protect.row_distance does, before and after price-step rounding.
             if plan.trail > sizing.DISTANCE_CEILING or distance > average * sizing.DISTANCE_CEILING:
+                capped = (average * sizing.DISTANCE_CEILING).quantize(
+                    tick(average), rounding=ROUND_FLOOR
+                )
                 self._holding_note(
                     slot,
                     f"{slot.instrument_id}: distance_over_ceiling: the trail {plan.trail} "
                     f"({plan.bound}), distance {distance} at {average}, exceeds "
-                    f"{sizing.DISTANCE_CEILING}; protection refused",
+                    f"{sizing.DISTANCE_CEILING}; protecting at capped distance {capped}",
                 )
-                return
+                plan = replace(plan, trail=capped / average, bound="distance ceiling")
+                distance = capped
+                # The long already exists. A breached capped level sells now;
+                # with no whole price step below the ceiling, use the existing
+                # positive-price limit exit instead of an unarmable zero trail.
+                self._arming_quotes.pop(slot.instrument_id, None)
+                if capped == 0:
+                    slot.exiting = True
             slot.trail_plan = slot.initial_trail = plan
             slot.sized_loss = distance
         if slot.held_since is not None or slot.exiting:
