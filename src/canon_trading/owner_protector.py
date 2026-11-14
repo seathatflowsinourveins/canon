@@ -2065,19 +2065,28 @@ class OwnerProtector(Strategy):
                     f"its roster; read again in {ROSTER_POLL_SECS} s"
                 )
             return
-        if start.refused:
+        # A roster long the start would now skip (read, not zero: fractional) keeps this run, which
+        # protects it, as the start's refusal of it did before F3: an end would drop its stop (review
+        # finding 1, 2026-11-14).
+        blocked = dict(start.refused) | {
+            symbol: f"roster holding {start.skipped[symbol]}, which the next start skips"
+            for symbol in sorted(loaded)
+            if symbol in start.skipped and symbol not in unread and held.get(symbol, 0) != 0
+        }
+        if blocked:
             # An end into a start that refuses leaves every holding, the roster's too, with no stop of
-            # ours: the run goes on, protects its roster, and names each new holding once. Decided at
-            # every read, never latched (term (b)): the first read the start would accept ends it.
-            because = "; ".join(start.refused[symbol] for symbol in sorted(start.refused))
+            # ours: the run goes on, protects its roster, and names each new holding once per reason.
+            # Decided at every read, never latched (term (b)): the first read the start would accept
+            # ends it.
+            because = "; ".join(blocked[symbol] for symbol in sorted(blocked))
             for symbol, qty in whole:
-                if (symbol, "blocked") not in self.roster_named:
-                    self.roster_named.add((symbol, "blocked"))
+                if (symbol, f"blocked: {because}") not in self.roster_named:
+                    self.roster_named.add((symbol, f"blocked: {because}"))
                     self._say(
                         f"{symbol}.ALPACA: ALERT: unprotected: {qty} held, bought after this run's "
                         "start outside the roster; this run does not end, since the next start would "
-                        f"refuse the account ({because}); it protects its roster to its planned end "
-                        "and ends at the first read the start would accept"
+                        f"refuse the account or drop a roster holding ({because}); it protects its "
+                        "roster to its planned end and ends at the first read the start would accept"
                     )
             return
         for symbol, qty in whole:

@@ -298,3 +298,98 @@ def test_unprotected_order_blocks_mass_status_even_outside_reconciliation_roster
     assert "Python on_" not in logs.out + logs.err
     print(f"STOP: {count_settings} roster=AAA strategy_starts={len(starts)} engine={refused.value}")
     print(f"MAPPER: {mapper_errors[0]}")
+
+
+class Turned(Account):
+    """AAA, the roster's holding, listed fractional beside a new whole-share CCC."""
+
+    def __init__(self, aaa="10.5", **kwargs):
+        super().__init__(**kwargs)
+        self.aaa = aaa
+
+    def get_all_positions(self):
+        return [_position("AAA", self.aaa), _position("CCC", "5")]
+
+
+def test_a_roster_long_turned_fractional_keeps_the_run_beside_a_new_whole_long(count_settings):
+    """Review finding 1: the successor would skip AAA at 10.5, so ending this run for CCC would leave
+    AAA with no stop; the run goes on, names CCC and why, and ends once AAA is whole again."""
+    account = Turned()
+    guard = Roster(**count_settings, roster=(h.AAA,), trading=account)
+    guard.adopt_holding(h.AAA, h.Price.from_str("9.90"))
+    guard.observe("10.00", h.T0 + h.SECOND)
+    guard._read_roster(h.T0 + 2 * h.SECOND)
+    assert guard.shutdowns == []
+    assert any(
+        "CCC" in line and "unprotected" in line and "AAA" in line and "fractional" in line
+        for line in guard.said
+    ), guard.said
+    guard.observe("9.89", h.T0 + 3 * h.SECOND)
+    guard.observe("9.88", h.T0 + 4 * h.SECOND)
+    assert len(guard.sent) == 1 and guard.sent[0].instrument_id == h.AAA
+    account.aaa = "11"
+    guard._read_roster(h.T0 + 32 * h.SECOND)
+    assert guard.shutdowns == ["new holding outside the roster: CCC 5"]
+
+
+def test_a_changed_blocking_order_is_named_again(count_settings):
+    """Review finding 4: the alert is named once per reason, so a new blocking order is named."""
+    account = Account(bad_order=True)
+    guard = Roster(**count_settings, roster=(h.AAA,), trading=account)
+    guard._read_roster(h.T0)
+    account.orders = [_order("BBB", "0.25", "synthetic-owner-other-buy", side="buy")]
+    guard._read_roster(h.T0 + 30 * h.SECOND)
+    guard._read_roster(h.T0 + 60 * h.SECOND)
+    blocked = [line for line in guard.said if "BBB" in line and "would refuse" in line]
+    assert len(blocked) == 2, guard.said
+    assert "synthetic-owner-other-buy" in blocked[1]
+
+
+def test_every_unmappable_order_in_a_symbol_is_named():
+    """Review finding 6: two unmappable orders in one symbol both reach the refusal."""
+    orders = [
+        _order("BBB", "0.5", "synthetic-owner-first-buy", side="buy"),
+        _order("BBB", "0.25", "synthetic-owner-second-buy", side="buy"),
+    ]
+    start = w.start_account({"AAA": Decimal(10)}, {}, orders)
+    assert set(start.refused) == {"BBB"}
+    assert "synthetic-owner-first-buy" in start.refused["BBB"]
+    assert "synthetic-owner-second-buy" in start.refused["BBB"]
+
+
+class Ending(Account):
+    """AAA whole at the start's read; `end` from the second read on."""
+
+    def __init__(self, end, **kwargs):
+        super().__init__(fractional_position=True, **kwargs)
+        self.end, self.reads = end, 0
+
+    def get_all_positions(self):
+        self.reads += 1
+        positions = super().get_all_positions()
+        if self.reads > 1:
+            positions[0] = _position("AAA", self.end)
+        return positions
+
+
+@pytest.mark.parametrize("end", ["10.5", "0"])
+def test_the_final_report_names_a_fresh_read_as_read(
+    end, count_settings, tmp_path, monkeypatch, capfd
+):
+    """Review finding 3: a holding read at the end is not 'current quantity UNVERIFIED'."""
+    account = Ending(end)
+    native_clients(monkeypatch, account)
+    clock, calendar = n.market("2026-11-13T10:00:00")
+    monkeypatch.setattr(w, "session_now", lambda trading: (clock, calendar, w.time.monotonic()))
+    monkeypatch.setattr(p, "_book_settings", lambda settings: count_settings)
+    monkeypatch.setattr(w, "_run_node", run_node)
+    p.run_protector(config(tmp_path), trading=cast(Any, account), lock_dir=tmp_path)
+    logging_sync_to_disk()
+    logs = capfd.readouterr()
+    lines = [
+        line
+        for line in (logs.out + logs.err).splitlines()
+        if "AAA" in line and "left unprotected by this node" in line
+    ]
+    assert len(lines) == 1, lines
+    assert end in lines[0] and "UNVERIFIED" not in lines[0], lines

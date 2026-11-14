@@ -308,10 +308,8 @@ START_CASES = {
         lambda: Account(AAA="10", BBB="2.5", CCC="5"),
         False,
     ),
-    "accepted: a roster long turned fractional is skipped": (
-        lambda: Account(AAA="10.5", CCC="5"),
-        False,
-    ),
+    # A roster long turned fractional is skipped by the start but keeps the run (review finding 1):
+    # tests/test_protector_node_roster_continuity.py::test_a_roster_long_turned_fractional_keeps_the_run_beside_a_new_whole_long.
     "accepted: a fractional short is skipped": (
         lambda: Account(AAA="10", BBB="-1.5", CCC="5"),
         False,

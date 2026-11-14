@@ -2459,7 +2459,8 @@ def start_account(
         try:
             order_status_report(order, ts_init=0, trailing=True)
         except ValueError as exc:
-            refused[str(order.symbol)] = str(exc)
+            symbol = str(order.symbol)
+            refused[symbol] = f"{refused[symbol]}; {exc}" if symbol in refused else str(exc)
     return StartAccount(kept, skipped, refused)
 
 
