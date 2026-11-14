@@ -693,6 +693,11 @@ class OwnerProtector(Strategy):
         self.overnight_unread: dict[InstrumentId, tuple[int, str]] = {}
         self.history_bars: dict[InstrumentId, dict[int, Bar]] = {}
         self.request_failures: dict[str, str] = {}
+        # Each seed request in flight, per instrument, with the holding that sent it and when.
+        # The pin hands a reply's quotes to the hook before its metadata and callback
+        # (response.rs:153-167), so a reply cannot be matched to its request when it arrives
+        # (Codex's P2-a on 62941f39, the lead's rule of 19:49 as meant, 20:31).
+        self.seeds_in_flight: dict[InstrumentId, list[tuple[Holding, int]]] = {}
         self.stamp_counts: dict[InstrumentId, list[int]] = {}
         self.fallbacks: dict[InstrumentId, int] = {}
         self.flat_fallbacks: dict[InstrumentId, int] = {}
@@ -779,9 +784,15 @@ class OwnerProtector(Strategy):
                 slot.seed_requested_at is not None
                 and slot.seed_requested_at >= slot.opened_at
                 and newest is not None
+                and all(
+                    sender is slot and sent >= slot.opened_at
+                    for sender, sent in self.seeds_in_flight.get(instrument_id, ())
+                )
             ):
                 # (ii): the venue's latest, read after the holding opened, whatever its stamp;
-                # the maximum held is at least as new, so it is current too.
+                # the maximum held is at least as new, so it is current too. Only when every
+                # seed in flight was sent by this holding since it opened: a reply to an earlier
+                # holding's request, or one sent before this opening, certifies nothing.
                 slot.current_from = newest.ts_event
             if newest == tick:
                 age = (self.clock.timestamp_ns() - min(tick.ts_event, tick.ts_init)) / SECOND_NS
@@ -824,7 +835,15 @@ class OwnerProtector(Strategy):
             slot.history_ready = failure is None
             self._plan_from_maximum(instrument_id, slot)
 
+        token = (slot, slot.seed_requested_at)
+
+        def landed() -> None:
+            # By identity: two holdings' tokens may compare equal field by field.
+            flying = self.seeds_in_flight.get(instrument_id, [])
+            flying[:] = [sent for sent in flying if sent is not token]
+
         def seed_done(request_id: str) -> None:
+            landed()
             failure = self.request_failures.pop(request_id, None)
             if self.slots.get(instrument_id) is not slot or self.stopping:
                 return
@@ -843,6 +862,7 @@ class OwnerProtector(Strategy):
             )
         except (ValueError, RuntimeError) as exc:
             slot.history_error = str(exc)
+        self.seeds_in_flight.setdefault(instrument_id, []).append(token)
         try:
             self.request_quotes(
                 instrument_id,
@@ -860,6 +880,7 @@ class OwnerProtector(Strategy):
                 callback=seed_done,
             )
         except (ValueError, RuntimeError) as exc:
+            landed()
             slot.seed_error = f"seed failed: {exc}; wait"
 
     def set_external_order_instrument_ids(self, instrument_ids: Sequence[InstrumentId]) -> None:

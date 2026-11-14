@@ -506,7 +506,7 @@ def test_a_previous_entry_with_a_smaller_quantity_counts_and_names_added_shares(
 
 
 # landing lane, 2026-11-13: the floor A case at bid 1.75; see FIXROUND-L1.md §2
-def test_a_carried_level_under_the_self_arm_floor_arms_at_the_floor(tmp_path: Path) -> None:
+def test_a_carried_level_under_the_self_arm_floor_arms_at_the_carried_level(tmp_path: Path) -> None:
     """At bid 1.75 unit 10's self-arm floor, bid less the row distance rounded up (1.71), is above
     the carried 1.70 and the rebuilt level. Since the lead's ruling of 2026-11-13 17:43 the armed
     trigger is the carried 1.70: nothing re-derives a carried level, and the first bid raises it

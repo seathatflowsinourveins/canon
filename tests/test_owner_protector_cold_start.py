@@ -845,3 +845,41 @@ def test_a_plan_on_the_receipt_clause_alone_is_named_with_both_stamps_and_counte
     assert len(said(strategy, "planned on its receipt alone")) == 1
     strategy.on_stop()
     assert said(strategy, "AAA.ALPACA: END", "receipt-clause plans=1"), strategy.said
+
+
+def test_previous_holdings_pending_seed_cannot_certify_a_reopening():
+    """Codex's P2-a on 62941f39 (its drop-in, verbatim): request 1, sent for the holding that went
+    flat, answers with a quote stamped before the re-opening while the new holding's request 2 is
+    still in flight. The lead's rule of 19:49 as meant (20:31): a seed certifies only when every
+    request in flight for the instrument was sent by the present holding at or after its opening."""
+    strategy = Cold()
+    strategy.on_start()
+    strategy.cached.held = []
+    strategy.step()
+    reopened = position()
+    reopened.ts_opened = reopened.ts_init = AFTER_HOURS + 2 * SECOND
+    strategy.cached.held = [reopened]
+    strategy.step()
+    assert len(strategy.quote_requests) == 2
+    strategy.answer("bars", [], index=1)
+    strategy.answer("quotes", [quote("10.00", AFTER_HOURS - 20 * SECOND)], index=0)
+    assert strategy.slots[AAA].level is None, strategy.said
+
+
+def test_once_the_old_request_lands_the_present_holdings_own_seed_certifies():
+    """The token of a landed request leaves with its callback, so the present holding's own read,
+    sent after it opened, still certifies the venue's latest whatever its stamp (clause ii)."""
+    strategy = Cold()
+    strategy.on_start()
+    strategy.cached.held = []
+    strategy.step()
+    reopened = position()
+    reopened.ts_opened = reopened.ts_init = AFTER_HOURS + 2 * SECOND
+    strategy.cached.held = [reopened]
+    strategy.step()
+    strategy.answer("bars", [], index=1)
+    strategy.answer("quotes", [quote("10.00", AFTER_HOURS - 20 * SECOND)], index=0)
+    assert strategy.slots[AAA].level is None
+    strategy.answer("quotes", [quote("10.00", AFTER_HOURS - 10 * SECOND)], index=1)
+    assert strategy.slots[AAA].level is not None, strategy.said
+    assert strategy.seeds_in_flight[AAA] == []
