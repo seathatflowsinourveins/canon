@@ -4,7 +4,7 @@
     "M": "crates/model/src/orders/mod.rs",
     "S": "crates/trading/src/strategy/mod.rs"
   },
-  "applies": "a count above one (the default, 2); count one is not touched and keeps the emulator path",
+  "applies": "a count above one; count one is not touched and keeps the emulator path",
   "rows": {
     "G": {
       "phase": "none",
@@ -59,7 +59,7 @@
     "FZ": {
       "phase": "none",
       "engine_status": "no open sale",
-      "meaning": "FROZEN. Nothing is sent before the runner's next start (a named limit)."
+      "meaning": "FROZEN BY A FAULT OF OURS. Nothing is sent before the runner's next start (a named limit)."
     },
     "FZW": {
       "phase": "mixed",
@@ -70,6 +70,21 @@
       "phase": "pc",
       "engine_status": "PENDING_CANCEL",
       "meaning": "FROZEN, cancel of our sale asked."
+    },
+    "FC": {
+      "phase": "none",
+      "engine_status": "no open sale",
+      "meaning": "COVER UNREAD, WAITING. The account's cover or position cannot be read (a cause outside the protector); nothing of ours is open and nothing is sent. It ends when the cover reads again (ruling 17)."
+    },
+    "FCW": {
+      "phase": "mixed",
+      "engine_status": "any open status, no cancel pending",
+      "meaning": "COVER UNREAD, and a sale of ours is still open. It ends when the cover reads again."
+    },
+    "FCP": {
+      "phase": "pc",
+      "engine_status": "PENDING_CANCEL",
+      "meaning": "COVER UNREAD, cancel of our sale asked. It waits for the acknowledgement."
     },
     "PCT": {
       "phase": "pc",
@@ -135,7 +150,11 @@
     },
     "FRZ": {
       "kind": "account",
-      "meaning": "a FREEZE begins for a cause other than a refusal of our sale"
+      "meaning": "the COVER CANNOT BE READ: the account's cover or the position cannot be read in this step (outside)"
+    },
+    "UFZ": {
+      "kind": "account",
+      "meaning": "the COVER READS AGAIN: emitted in every step in which the row is FC, FCW or FCP and the read succeeds"
     },
     "oUPD": {
       "kind": "order",
@@ -206,8 +225,8 @@
     "cancelable": "the engine reads our sale ACCEPTED or PARTIALLY_FILLED",
     "reprice_due": "the chase function, called in this counted quote's handler, gives a price under our working leg's limit: the chase interval has passed since this leg's price was set, and the price a tick through this quote's bid, held at the episode's floor until the floor's wait has run, is lower than the leg's limit",
     "leg_positive": "the leg's quantity is above zero. For the first leg it is the uncovered quantity read in this step; for the next leg, and for a leg sent again after a refusal, it is the quantity at the episode's opening less the shares sold, and never more than the uncovered quantity read in this step",
-    "refusal_told": "an ALERT for a refusal of this holding's sale has been written and no leg of it has been ACCEPTED or filled since (held by the glue for the holding; a new run starts with none told)",
-    "resend_due": "the venue has refused no leg of this holding's sale in the last RESEND_SECS (60 s, a named constant); true when none was refused in this run; judged in this counted quote's handler and never on a timer",
+    "refusal_told": "an ALERT that a sale of this holding could not be placed (the venue refused a leg, or a leg could not be formed) has been written and no leg of it has been ACCEPTED or filled since (held by the glue for the holding; a new run starts with none told)",
+    "resend_due": "in the last RESEND_SECS (60 s, a named constant) the venue has refused no leg of this holding's sale and no leg of it was canceled by another hand; true when neither happened in this run; judged in this counted quote's handler and never on a timer",
     "flight_alert_due": "our leg has had no answer of any kind (no Accepted, Rejected, Denied, fill, cancel or expiry) for FLIGHT_SECS (60 s, a named constant) since it was sent, and no ALERT has been written for this leg's silence; judged in a quote's handler and never on a timer",
     "long_remains": "a long of this holding is still held after the fill",
     "ends_filled": "after this Updated the engine reads our sale FILLED: a reconciliation update whose quantity equals a filled quantity above zero (M:1322-1324)"
@@ -220,6 +239,7 @@
     "CP",
     "CL",
     "FRZ",
+    "UFZ",
     "our order's events, as they arrived",
     "MO",
     "QU, QA or NQ"
@@ -384,8 +404,10 @@
     "no_timer_transition": "a timer step changes no row, asks no cancel and sends nothing; the floor's wait is started and judged only in the handler of a counted quote under the level",
     "row_stored_before_actions": "the row a transition leads to is stored BEFORE its actions are carried out: the engine publishes Initialized inside our submit and PendingCancel inside our cancel, so the echo of a send meets the in-flight row and the echo of a cancel meets its cancel-asked row, and each does nothing",
     "one_alert_per_holding_until_accepted": "a venue's refusal of a leg writes ONE ALERT for the holding; no second ALERT for a refusal of it is written until a leg of it has been accepted, however often the price crosses the level or the leg is refused again; each further refusal is a counted line",
-    "resend_no_sooner_than_the_interval": "a leg is sent again only on a counted quote under the level and only when RESEND_SECS have passed since the last refusal, so a standing refusal costs at most about sixty refused orders an hour; never on a timer step and never on a quote above the level",
+    "resend_no_sooner_than_the_interval": "no leg of a holding's sale leaves within RESEND_SECS of a venue's refusal of one or of a cancel of one by another hand, from any row; a leg is sent again only on a counted quote under the level, so a standing refusal costs at most about sixty refused orders an hour; never on a timer step and never on a quote above the level",
     "resend_never_more_than_held": "the leg sent again is sized like any leg: the episode's remainder, never more than the uncovered quantity read in that step, and nothing when that is zero",
+    "an_outside_freeze_ends_when_its_cause_ends": "a holding frozen by the cover's read (FC, FCW, FCP) leaves the freeze when the cover reads again: FC to G at zero or the covered row, FCW to the row its leg's state gives, FCP after its cancel's acknowledgement; a fault of ours (FZ, FZW, FZP) is never ended before the next start",
+    "never_more_working_than_held_whatever_the_cover": "where the long less foreign sells cannot be computed, our cancelable sale is cut (MO) in the step of the freeze whenever the base's own check says an oversell is possible",
     "a_silent_leg_is_told_once_and_never_resent": "a leg with no answer of any kind for FLIGHT_SECS writes ONE ALERT, on a quote; nothing is sent, canceled or changed for it, and no second sell is ever sent beside it",
     "every_kind_has_a_column": "each kind of order event the pin can deliver to a strategy is named to a column by order_event_inventory and by nothing else; a kind the inventory does not know answers as the catch-all"
   },
@@ -404,6 +426,129 @@
       "row": "PCR",
       "event": "oCXL",
       "when": "leg_positive and formable"
+    }
+  ],
+  "freeze_causes": [
+    {
+      "event": "FRZ",
+      "from": [
+        "G",
+        "GC",
+        "RW"
+      ],
+      "into": "FC",
+      "cause": "outside: it ends when the cover reads again (UFZ)"
+    },
+    {
+      "event": "FRZ",
+      "from": [
+        "PCO",
+        "PCR"
+      ],
+      "into": "FCP",
+      "cause": "outside: it ends when the cover reads again (UFZ)"
+    },
+    {
+      "event": "FRZ",
+      "from": [
+        "FL",
+        "PF",
+        "WK"
+      ],
+      "into": "FCW",
+      "cause": "outside: it ends when the cover reads again (UFZ)"
+    },
+    {
+      "event": "oDEN",
+      "from": [
+        "FCW",
+        "FL"
+      ],
+      "into": "FZ",
+      "cause": "ours: it holds to the next start"
+    },
+    {
+      "event": "oINI",
+      "from": [
+        "FCP",
+        "PCO",
+        "PCR"
+      ],
+      "into": "FZP",
+      "cause": "ours: it holds to the next start"
+    },
+    {
+      "event": "oINI",
+      "from": [
+        "FCW",
+        "PF",
+        "WK"
+      ],
+      "into": "FZW",
+      "cause": "ours: it holds to the next start"
+    },
+    {
+      "event": "oOTH",
+      "from": [
+        "FCP",
+        "PCO",
+        "PCR"
+      ],
+      "into": "FZP",
+      "cause": "ours: it holds to the next start"
+    },
+    {
+      "event": "oOTH",
+      "from": [
+        "FCW",
+        "FL",
+        "PF",
+        "WK"
+      ],
+      "into": "FZW",
+      "cause": "ours: it holds to the next start"
+    },
+    {
+      "event": "oPCN",
+      "from": [
+        "FCW",
+        "FL",
+        "PF",
+        "WK"
+      ],
+      "into": "FZW",
+      "cause": "ours: it holds to the next start"
+    },
+    {
+      "event": "oVOID",
+      "from": [
+        "FC",
+        "G",
+        "GC",
+        "RW"
+      ],
+      "into": "FZ",
+      "cause": "outside, HELD to the next start by name: a voided fill: what the engine reads as held after it has never been observed here, and a sale sized from a wrong holding could sell more than is held"
+    },
+    {
+      "event": "oVOID",
+      "from": [
+        "FCP",
+        "PCO",
+        "PCR"
+      ],
+      "into": "FZP",
+      "cause": "outside, HELD to the next start by name: a voided fill: what the engine reads as held after it has never been observed here, and a sale sized from a wrong holding could sell more than is held"
+    },
+    {
+      "event": "oVOID",
+      "from": [
+        "FCW",
+        "PF",
+        "WK"
+      ],
+      "into": "FZW",
+      "cause": "outside, HELD to the next start by name: a voided fill: what the engine reads as held after it has never been observed here, and a sale sized from a wrong holding could sell more than is held"
     }
   ],
   "cells": {
@@ -435,11 +580,20 @@
             "alert": false
           },
           {
-            "when": "count_complete and resend_due and leg_positive and not formable",
-            "next": "FZ",
+            "when": "count_complete and resend_due and leg_positive and not formable and not refusal_told",
+            "next": "G",
             "send": false,
             "cancel": false,
-            "alert": true
+            "alert": true,
+            "count": "="
+          },
+          {
+            "when": "count_complete and resend_due and leg_positive and not formable and refusal_told",
+            "next": "G",
+            "send": false,
+            "cancel": false,
+            "alert": false,
+            "count": "="
           },
           {
             "when": "count_complete and resend_due and not leg_positive and whole_cover",
@@ -457,7 +611,7 @@
             "count": "0"
           }
         ],
-        "note": "S1, THE FIRST LEG: the episode opens; a plain LIMIT straight to the venue for the uncovered quantity read in this step. THE SEND GUARD: a size of zero or less sends nothing, with no freeze and no alert, and the row is the one the cover gives. THE INTERVAL (ruling 15): while a venue's refusal of this holding's sale is younger than RESEND_SECS nothing is sent and the count stands as it is, so every later counted quote is judged again; with no refusal in this run the interval has passed"
+        "note": "S1, THE FIRST LEG: the episode opens; a plain LIMIT straight to the venue for the uncovered quantity read in this step. THE SEND GUARD: a size of zero or less sends nothing, with no freeze and no alert, and the row is the one the cover gives. THE INTERVAL (ruling 15): while a venue's refusal of this holding's sale is younger than RESEND_SECS nothing is sent and the count stands as it is, so every later counted quote is judged again; with no refusal in this run the interval has passed; a leg that cannot be formed at this quote is NOT a freeze (ruling 17): nothing is sent, ONE ALERT per holding until a sale of it is accepted, and the next counted quote under the level is judged again"
       },
       "QA": {
         "occurs": "yes",
@@ -612,12 +766,26 @@
         "branches": [
           {
             "when": "always",
-            "next": "FZ",
+            "next": "FC",
             "send": false,
             "cancel": false,
             "alert": true
           }
-        ]
+        ],
+        "note": "the cover cannot be read: an outside cause; it ends when the cover reads again (UFZ)"
+      },
+      "UFZ": {
+        "occurs": "n/a",
+        "branches": [
+          {
+            "when": "always",
+            "next": "G",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "note": "emitted only in a row frozen by the cover's read"
       },
       "oUPD": {
         "occurs": "unexpected",
@@ -1009,12 +1177,26 @@
         "branches": [
           {
             "when": "always",
-            "next": "FZ",
+            "next": "FC",
             "send": false,
             "cancel": false,
             "alert": true
           }
-        ]
+        ],
+        "note": "the cover cannot be read: an outside cause; it ends when the cover reads again (UFZ)"
+      },
+      "UFZ": {
+        "occurs": "n/a",
+        "branches": [
+          {
+            "when": "always",
+            "next": "GC",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "note": "emitted only in a row frozen by the cover's read"
       },
       "oUPD": {
         "occurs": "unexpected",
@@ -1261,11 +1443,18 @@
             "alert": false
           },
           {
-            "when": "resend_due and leg_positive and not formable",
-            "next": "FZ",
+            "when": "resend_due and leg_positive and not formable and not refusal_told",
+            "next": "RW",
             "send": false,
             "cancel": false,
             "alert": true
+          },
+          {
+            "when": "resend_due and leg_positive and not formable and refusal_told",
+            "next": "RW",
+            "send": false,
+            "cancel": false,
+            "alert": false
           },
           {
             "when": "resend_due and not leg_positive and whole_cover",
@@ -1283,7 +1472,7 @@
             "count": "0"
           }
         ],
-        "note": "S3, THE LEG SENT AGAIN: a plain LIMIT straight to the venue, priced at this counted quote, for the episode's remainder and never more than the uncovered quantity read in this step; no new count is needed, the episode's count stands. Before the interval has passed: nothing"
+        "note": "S3, THE LEG SENT AGAIN: a plain LIMIT straight to the venue, priced at this counted quote, for the episode's remainder and never more than the uncovered quantity read in this step; no new count is needed, the episode's count stands. Before the interval has passed: nothing; a leg that cannot be formed at this quote is NOT a freeze (ruling 17): nothing is sent, ONE ALERT per holding until a sale of it is accepted, and the next counted quote under the level is judged again"
       },
       "QA": {
         "occurs": "yes",
@@ -1445,12 +1634,26 @@
         "branches": [
           {
             "when": "always",
-            "next": "FZ",
+            "next": "FC",
             "send": false,
             "cancel": false,
             "alert": true
           }
-        ]
+        ],
+        "note": "the cover cannot be read: an outside cause; it ends when the cover reads again (UFZ)"
+      },
+      "UFZ": {
+        "occurs": "n/a",
+        "branches": [
+          {
+            "when": "always",
+            "next": "RW",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "note": "emitted only in a row frozen by the cover's read"
       },
       "oUPD": {
         "occurs": "unexpected",
@@ -1827,12 +2030,26 @@
         "branches": [
           {
             "when": "always",
-            "next": "FZW",
+            "next": "FCW",
             "send": false,
             "cancel": false,
             "alert": true
           }
-        ]
+        ],
+        "note": "the cover cannot be read: an outside cause; it ends when the cover reads again (UFZ); our sale stays; it is cut only by MO"
+      },
+      "UFZ": {
+        "occurs": "n/a",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FL",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "note": "emitted only in a row frozen by the cover's read"
       },
       "oUPD": {
         "occurs": "unexpected",
@@ -1913,15 +2130,23 @@
         "occurs": "yes",
         "branches": [
           {
-            "when": "always",
-            "next": "FZ",
+            "when": "whole_cover",
+            "next": "GC",
             "send": false,
             "cancel": false,
             "alert": true
+          },
+          {
+            "when": "not whole_cover",
+            "next": "G",
+            "send": false,
+            "cancel": false,
+            "alert": true,
+            "count": "0"
           }
         ],
         "pin": "model/src/orders/mod.rs:232",
-        "note": "canceled when we asked for no cancel (it may be the owner's own hand): frozen with the alert, at any leg"
+        "note": "canceled when we asked for no cancel (the venue's act, or the owner's own hand: the protector cannot tell them apart): neither a latch nor an instant re-sell (ruling 17). With the alert, which says what happened and how the owner holds this one symbol; no leg of this holding leaves within RESEND_SECS of it (`resend_due`), and a sale then needs the full new count"
       },
       "oCRJ": {
         "occurs": "unexpected",
@@ -2219,13 +2444,26 @@
         "branches": [
           {
             "when": "always",
-            "next": "FZW",
+            "next": "FCW",
             "send": false,
             "cancel": false,
             "alert": true
           }
         ],
-        "note": "our sale stays; it is cut only by MO"
+        "note": "the cover cannot be read: an outside cause; it ends when the cover reads again (UFZ); our sale stays; it is cut only by MO"
+      },
+      "UFZ": {
+        "occurs": "n/a",
+        "branches": [
+          {
+            "when": "always",
+            "next": "WK",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "note": "emitted only in a row frozen by the cover's read"
       },
       "oUPD": {
         "occurs": "unexpected",
@@ -2305,15 +2543,23 @@
         "occurs": "yes",
         "branches": [
           {
-            "when": "always",
-            "next": "FZ",
+            "when": "whole_cover",
+            "next": "GC",
             "send": false,
             "cancel": false,
             "alert": true
+          },
+          {
+            "when": "not whole_cover",
+            "next": "G",
+            "send": false,
+            "cancel": false,
+            "alert": true,
+            "count": "0"
           }
         ],
         "pin": "model/src/orders/mod.rs:241",
-        "note": "canceled when we asked for no cancel (it may be the owner's own hand): frozen with the alert, at any leg"
+        "note": "canceled when we asked for no cancel (the venue's act, or the owner's own hand: the protector cannot tell them apart): neither a latch nor an instant re-sell (ruling 17). With the alert, which says what happened and how the owner holds this one symbol; no leg of this holding leaves within RESEND_SECS of it (`resend_due`), and a sale then needs the full new count"
       },
       "oCRJ": {
         "occurs": "unexpected",
@@ -2611,13 +2857,26 @@
         "branches": [
           {
             "when": "always",
-            "next": "FZW",
+            "next": "FCW",
             "send": false,
             "cancel": false,
             "alert": true
           }
         ],
-        "note": "our sale stays; it is cut only by MO"
+        "note": "the cover cannot be read: an outside cause; it ends when the cover reads again (UFZ); our sale stays; it is cut only by MO"
+      },
+      "UFZ": {
+        "occurs": "n/a",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PF",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "note": "emitted only in a row frozen by the cover's read"
       },
       "oUPD": {
         "occurs": "unexpected",
@@ -2720,15 +2979,23 @@
         "occurs": "yes",
         "branches": [
           {
-            "when": "always",
-            "next": "FZ",
+            "when": "whole_cover",
+            "next": "GC",
             "send": false,
             "cancel": false,
             "alert": true
+          },
+          {
+            "when": "not whole_cover",
+            "next": "G",
+            "send": false,
+            "cancel": false,
+            "alert": true,
+            "count": "0"
           }
         ],
         "pin": "model/src/orders/mod.rs:287",
-        "note": "canceled when we asked for no cancel (it may be the owner's own hand): frozen with the alert, at any leg"
+        "note": "canceled when we asked for no cancel (the venue's act, or the owner's own hand: the protector cannot tell them apart): neither a latch nor an instant re-sell (ruling 17). With the alert, which says what happened and how the owner holds this one symbol; no leg of this holding leaves within RESEND_SECS of it (`resend_due`), and a sale then needs the full new count"
       },
       "oCRJ": {
         "occurs": "unexpected",
@@ -3017,12 +3284,26 @@
         "branches": [
           {
             "when": "always",
-            "next": "FZP",
+            "next": "FCP",
             "send": false,
             "cancel": false,
             "alert": true
           }
-        ]
+        ],
+        "note": "the cover cannot be read: an outside cause; it ends when the cover reads again (UFZ)"
+      },
+      "UFZ": {
+        "occurs": "n/a",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PCR",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "note": "emitted only in a row frozen by the cover's read"
       },
       "oUPD": {
         "occurs": "unexpected",
@@ -3105,15 +3386,22 @@
         "occurs": "yes",
         "branches": [
           {
-            "when": "always",
-            "next": "FZ",
+            "when": "not refusal_told",
+            "next": "RW",
             "send": false,
             "cancel": false,
             "alert": true
+          },
+          {
+            "when": "refusal_told",
+            "next": "RW",
+            "send": false,
+            "cancel": false,
+            "alert": false
           }
         ],
         "pin": "model/src/orders/mod.rs:263",
-        "note": "frozen with the alert: a definitive refusal is not cured by sending again"
+        "note": "the venue refused the leg whose re-price cancel was pending: nothing of ours is open; THE VENUE'S REFUSAL is not definitive (ruling 15: a wash-trade refusal lasts only as long as the resting order): ONE ALERT per holding until a sale of it is accepted, then the leg is sent again from the waiting row"
       },
       "oDEN": {
         "occurs": "no",
@@ -3139,11 +3427,18 @@
             "alert": false
           },
           {
-            "when": "leg_positive and not formable",
-            "next": "FZ",
+            "when": "leg_positive and not formable and not refusal_told",
+            "next": "RW",
             "send": false,
             "cancel": false,
             "alert": true
+          },
+          {
+            "when": "leg_positive and not formable and refusal_told",
+            "next": "RW",
+            "send": false,
+            "cancel": false,
+            "alert": false
           },
           {
             "when": "not leg_positive and whole_cover",
@@ -3162,7 +3457,7 @@
           }
         ],
         "pin": "model/src/orders/mod.rs:267; trading/src/strategy/mod.rs:818-865",
-        "note": "S2, THE NEXT LEG: priced from the newest counted quote held at this step (the one that asked or a newer one), for the quantity at the episode's opening less the shares sold and never more than the uncovered quantity read in this step. PROPERTY (the lead's Q3): the replaced leg's final filled quantity is known before this sizes; the means (every fill emitted before Canceled, or one status read first) is open"
+        "note": "S2, THE NEXT LEG: priced from the newest counted quote held at this step (the one that asked or a newer one), for the quantity at the episode's opening less the shares sold and never more than the uncovered quantity read in this step. PROPERTY (the lead's Q3): the replaced leg's final filled quantity is known before this sizes; the means (every fill emitted before Canceled, or one status read first) is open; a leg that cannot be formed at this quote is NOT a freeze (ruling 17): nothing is sent, ONE ALERT per holding until a sale of it is accepted, and the next counted quote under the level is judged again"
       },
       "oCRJ": {
         "occurs": "yes",
@@ -3453,12 +3748,26 @@
         "branches": [
           {
             "when": "always",
-            "next": "FZP",
+            "next": "FCP",
             "send": false,
             "cancel": false,
             "alert": true
           }
-        ]
+        ],
+        "note": "the cover cannot be read: an outside cause; it ends when the cover reads again (UFZ)"
+      },
+      "UFZ": {
+        "occurs": "n/a",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PCO",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "note": "emitted only in a row frozen by the cover's read"
       },
       "oUPD": {
         "occurs": "unexpected",
@@ -3541,15 +3850,23 @@
         "occurs": "yes",
         "branches": [
           {
-            "when": "always",
-            "next": "FZ",
+            "when": "whole_cover",
+            "next": "GC",
             "send": false,
             "cancel": false,
             "alert": true
+          },
+          {
+            "when": "not whole_cover",
+            "next": "G",
+            "send": false,
+            "cancel": false,
+            "alert": true,
+            "count": "0"
           }
         ],
         "pin": "model/src/orders/mod.rs:263",
-        "note": "frozen with the alert: a definitive refusal is not cured by sending again"
+        "note": "the venue refused the leg we were cutting: it is gone, as the acknowledgement would have left it; with the alert"
       },
       "oDEN": {
         "occurs": "no",
@@ -3888,6 +4205,19 @@
             "alert": false
           }
         ]
+      },
+      "UFZ": {
+        "occurs": "n/a",
+        "branches": [
+          {
+            "when": "always",
+            "next": "OX",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "note": "emitted only in a row frozen by the cover's read"
       },
       "oUPD": {
         "occurs": "unexpected",
@@ -4230,6 +4560,19 @@
             "alert": false
           }
         ]
+      },
+      "UFZ": {
+        "occurs": "n/a",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PCX",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "note": "emitted only in a row frozen by the cover's read"
       },
       "oUPD": {
         "occurs": "unexpected",
@@ -4578,6 +4921,19 @@
             "alert": false
           }
         ]
+      },
+      "UFZ": {
+        "occurs": "n/a",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZ",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "note": "emitted only in a row frozen by the cover's read"
       },
       "oUPD": {
         "occurs": "unexpected",
@@ -4939,6 +5295,19 @@
           }
         ]
       },
+      "UFZ": {
+        "occurs": "n/a",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZW",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "note": "emitted only in a row frozen by the cover's read"
+      },
       "oUPD": {
         "occurs": "unexpected",
         "branches": [
@@ -5297,6 +5666,19 @@
           }
         ]
       },
+      "UFZ": {
+        "occurs": "n/a",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZP",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "note": "emitted only in a row frozen by the cover's read"
+      },
       "oUPD": {
         "occurs": "unexpected",
         "branches": [
@@ -5532,6 +5914,1158 @@
         "note": "an event the table has no column for (none is produced for a plain limit we never modify): named once, nothing else"
       }
     },
+    "FC": {
+      "QU": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FC",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "QA": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FC",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "NQ": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FC",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "HG": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FC",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "HS": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FC",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "CP": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FC",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "CL": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FC",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "MO": {
+        "occurs": "n/a",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FC",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "note": "emitted only for a cancelable sale of ours with no cancel pending"
+      },
+      "HE": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "X",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "ST": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "T0",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "FRZ": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FC",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "UFZ": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "whole_cover",
+            "next": "GC",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          },
+          {
+            "when": "not whole_cover",
+            "next": "G",
+            "send": false,
+            "cancel": false,
+            "alert": false,
+            "count": "0"
+          }
+        ],
+        "note": "THE COVER READS AGAIN: the freeze ends; the cover is read, and a sale needs the full new count"
+      },
+      "oUPD": {
+        "occurs": "unexpected",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FC",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:249, 294, 297",
+        "note": "allowed on a closed order; no effect"
+      },
+      "oSUB": {
+        "occurs": "no",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FC",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:247-249, 293-299",
+        "note": "a closed order takes only a fill, a void or an update; or no order exists"
+      },
+      "oACC": {
+        "occurs": "no",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FC",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:247-249, 293-299",
+        "note": "a closed order takes only a fill, a void or an update; or no order exists"
+      },
+      "oREJ": {
+        "occurs": "no",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FC",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:247-249, 293-299",
+        "note": "a closed order takes only a fill, a void or an update; or no order exists"
+      },
+      "oDEN": {
+        "occurs": "no",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FC",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:247-249, 293-299",
+        "note": "a closed order takes only a fill, a void or an update; or no order exists"
+      },
+      "oCXL": {
+        "occurs": "no",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FC",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:247-249, 293-299",
+        "note": "a closed order takes only a fill, a void or an update; or no order exists"
+      },
+      "oCRJ": {
+        "occurs": "no",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FC",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:247-249, 293-299",
+        "note": "a closed order takes only a fill, a void or an update; or no order exists"
+      },
+      "oEXP": {
+        "occurs": "no",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FC",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:247-249, 293-299",
+        "note": "a closed order takes only a fill, a void or an update; or no order exists"
+      },
+      "oPF": {
+        "occurs": "no",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FC",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:247, 295; a part leaves the status ended, model/src/orders/mod.rs:1375-1376",
+        "note": "no leg of ours is open to fill; a fill of an ended leg is the event oLF"
+      },
+      "oFF": {
+        "occurs": "no",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FC",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:247, 295; a part leaves the status ended, model/src/orders/mod.rs:1375-1376",
+        "note": "no leg of ours is open to fill; a fill of an ended leg is the event oLF"
+      },
+      "oVOID": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZ",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:248, 293, 296, 298",
+        "note": "held by name (a voided fill: what the engine reads as held after it has never been observed here, and a sale sized from a wrong holding could sell more than is held): FROZEN to the next start, with the alert"
+      },
+      "oLF": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "not long_remains",
+            "next": "X",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          },
+          {
+            "when": "long_remains",
+            "next": "FC",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:247, 295, 1375-1376",
+        "note": "quantities re-read from every leg of ours; the fill is ours, not a shrink"
+      },
+      "oINI": {
+        "occurs": "unexpected",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FC",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:227, 229, 237, 239, 242, 283, 285",
+        "note": "an event the table has no column for (none is produced for a plain limit we never modify): named once, nothing else; an echo not expected in this row answers as the catch-all does"
+      },
+      "oPCN": {
+        "occurs": "unexpected",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FC",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:227, 229, 237, 239, 242, 283, 285",
+        "note": "an event the table has no column for (none is produced for a plain limit we never modify): named once, nothing else; an echo not expected in this row answers as the catch-all does"
+      },
+      "oOTH": {
+        "occurs": "unexpected",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FC",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:227, 229, 237, 239, 242, 283, 285",
+        "note": "an event the table has no column for (none is produced for a plain limit we never modify): named once, nothing else"
+      }
+    },
+    "FCW": {
+      "QU": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FCW",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "QA": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FCW",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "NQ": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FCW",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "HG": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FCW",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "HS": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FCW",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "CP": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FCW",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "CL": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FCW",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "MO": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FCP",
+            "send": false,
+            "cancel": true,
+            "alert": false
+          }
+        ],
+        "note": "the cut holds while frozen: a cancel is not a send"
+      },
+      "HE": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "OX",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "note": "the freeze ends with the holding; MO follows"
+      },
+      "ST": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "cancelable",
+            "next": "PCT",
+            "send": false,
+            "cancel": true,
+            "alert": false
+          },
+          {
+            "when": "not cancelable",
+            "next": "TW",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          }
+        ]
+      },
+      "FRZ": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FCW",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "UFZ": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "not cancelable",
+            "next": "FL",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          },
+          {
+            "when": "cancelable and not filled_part",
+            "next": "WK",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          },
+          {
+            "when": "cancelable and filled_part",
+            "next": "PF",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "note": "THE COVER READS AGAIN: the freeze ends and our leg, kept working through it, is in the row its state gives; MO follows in the same step when it is then too large"
+      },
+      "oUPD": {
+        "occurs": "unexpected",
+        "branches": [
+          {
+            "when": "ends_filled and not long_remains",
+            "next": "X",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          },
+          {
+            "when": "ends_filled and long_remains",
+            "next": "FC",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          },
+          {
+            "when": "not ends_filled",
+            "next": "FCW",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:243, 291, 1322-1324",
+        "note": "a reconciliation update can end the leg as sold; any other changes no row"
+      },
+      "oSUB": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FCW",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "oACC": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FCW",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "oREJ": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FC",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:209, 231-232, 236, 241, 244, 287-288"
+      },
+      "oDEN": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZ",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:209",
+        "note": "a fault of ours while the cover was unread: FROZEN to the next start, with the alert"
+      },
+      "oCXL": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FC",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:209, 231-232, 236, 241, 244, 287-288"
+      },
+      "oCRJ": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FCW",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "oEXP": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FC",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:209, 231-232, 236, 241, 244, 287-288"
+      },
+      "oPF": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FCW",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "oFF": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "not long_remains",
+            "next": "X",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          },
+          {
+            "when": "long_remains",
+            "next": "FC",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:235, 245, 289"
+      },
+      "oVOID": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZW",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:246, 292",
+        "note": "held by name (a voided fill: what the engine reads as held after it has never been observed here, and a sale sized from a wrong holding could sell more than is held): FROZEN to the next start, with the alert"
+      },
+      "oLF": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "not long_remains",
+            "next": "OX",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          },
+          {
+            "when": "long_remains",
+            "next": "FCW",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:247, 295, 1375-1376",
+        "note": "quantities re-read from every leg of ours; the fill is ours, not a shrink; MO follows in the same step when ours is then too large"
+      },
+      "oINI": {
+        "occurs": "unexpected",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZW",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:227, 229, 237, 239, 242, 283, 285",
+        "note": "a fault of ours while the cover was unread: FROZEN to the next start, with the alert"
+      },
+      "oPCN": {
+        "occurs": "unexpected",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZW",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:227, 229, 237, 239, 242, 283, 285",
+        "note": "a fault of ours while the cover was unread: FROZEN to the next start, with the alert"
+      },
+      "oOTH": {
+        "occurs": "unexpected",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZW",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:227, 229, 237, 239, 242, 283, 285",
+        "note": "a fault of ours while the cover was unread: FROZEN to the next start, with the alert"
+      }
+    },
+    "FCP": {
+      "QU": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FCP",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "QA": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FCP",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "NQ": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FCP",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "HG": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FCP",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "HS": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FCP",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "CP": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FCP",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "CL": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FCP",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "MO": {
+        "occurs": "n/a",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FCP",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "note": "emitted only for a cancelable sale of ours with no cancel pending"
+      },
+      "HE": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PCX",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "ST": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PCT",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "FRZ": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FCP",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "UFZ": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FCP",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "note": "the cancel we asked is still pending: nothing; after its acknowledgement the row is FC, and this event, emitted again at the next step, ends the freeze there"
+      },
+      "oUPD": {
+        "occurs": "unexpected",
+        "branches": [
+          {
+            "when": "ends_filled and not long_remains",
+            "next": "X",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          },
+          {
+            "when": "ends_filled and long_remains",
+            "next": "FC",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          },
+          {
+            "when": "not ends_filled",
+            "next": "FCW",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:270, 1313-1320, 1322-1324",
+        "note": "a reconciliation update whose quantity equals the filled quantity ENDS the leg as sold; any other restores the status from before the cancel request and is read as a refusal"
+      },
+      "oSUB": {
+        "occurs": "no",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FCP",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:263-272"
+      },
+      "oACC": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FCW",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:269",
+        "note": "the engine's 'failed cancel request': read as a refusal"
+      },
+      "oREJ": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FC",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:263",
+        "note": "frozen with the alert: a definitive refusal is not cured by sending again"
+      },
+      "oDEN": {
+        "occurs": "no",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FCP",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:263-272"
+      },
+      "oCXL": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FC",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:267; trading/src/strategy/mod.rs:818-865",
+        "note": "THE acknowledgement"
+      },
+      "oCRJ": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FCW",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:266, 943-951, 1067-1068",
+        "note": "our cancel REFUSED; the engine restores the status it had"
+      },
+      "oEXP": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FC",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:268",
+        "note": "ended, but not by our cancel: NEVER the acknowledgement (D3); no next leg"
+      },
+      "oPF": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FCP",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:271, 1378-1386",
+        "note": "stays pending; quantities re-read"
+      },
+      "oFF": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "not long_remains",
+            "next": "X",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          },
+          {
+            "when": "long_remains",
+            "next": "FC",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:271, 1369-1371"
+      },
+      "oVOID": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZP",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:272",
+        "note": "held by name (a voided fill: what the engine reads as held after it has never been observed here, and a sale sized from a wrong holding could sell more than is held): FROZEN to the next start, with the alert"
+      },
+      "oLF": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "not long_remains",
+            "next": "PCX",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          },
+          {
+            "when": "long_remains",
+            "next": "FCP",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:247, 295, 1375-1376",
+        "note": "quantities re-read from every leg of ours; the fill is ours, not a shrink"
+      },
+      "oINI": {
+        "occurs": "unexpected",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZP",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:227, 229, 237, 239, 242, 283, 285",
+        "note": "a fault of ours while the cover was unread: FROZEN to the next start, with the alert"
+      },
+      "oPCN": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FCP",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "trading/src/strategy/mod.rs:836-862",
+        "note": "the echo of the cancel that entered this row: nothing"
+      },
+      "oOTH": {
+        "occurs": "unexpected",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZP",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:227, 229, 237, 239, 242, 283, 285",
+        "note": "a fault of ours while the cover was unread: FROZEN to the next start, with the alert"
+      }
+    },
     "PCT": {
       "QU": {
         "occurs": "yes",
@@ -5665,6 +7199,19 @@
             "alert": false
           }
         ]
+      },
+      "UFZ": {
+        "occurs": "n/a",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PCT",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "note": "emitted only in a row frozen by the cover's read"
       },
       "oUPD": {
         "occurs": "unexpected",
@@ -6014,6 +7561,19 @@
           }
         ]
       },
+      "UFZ": {
+        "occurs": "n/a",
+        "branches": [
+          {
+            "when": "always",
+            "next": "TW",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "note": "emitted only in a row frozen by the cover's read"
+      },
       "oUPD": {
         "occurs": "unexpected",
         "branches": [
@@ -6353,6 +7913,19 @@
             "alert": false
           }
         ]
+      },
+      "UFZ": {
+        "occurs": "n/a",
+        "branches": [
+          {
+            "when": "always",
+            "next": "T0",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "note": "emitted only in a row frozen by the cover's read"
       },
       "oUPD": {
         "occurs": "unexpected",
@@ -6698,6 +8271,19 @@
             "alert": false
           }
         ]
+      },
+      "UFZ": {
+        "occurs": "n/a",
+        "branches": [
+          {
+            "when": "always",
+            "next": "X",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "note": "emitted only in a row frozen by the cover's read"
       },
       "oUPD": {
         "occurs": "unexpected",

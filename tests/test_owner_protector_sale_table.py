@@ -446,6 +446,8 @@ def test_above_level_raises_without_order_and_clears_count():
 @pytest.mark.parametrize("target", sale_table.TABLE.rows)
 def test_timer_is_inert_in_every_row(target):
     strategy = counted()
+    if target in {"FC", "FCW", "FCP"}:
+        strategy.cached.working.append(h.working_sell("foreign", qty="1", filled="0"))
     strategy.slots[h.AAA].sale_state = sale_table.State(target, 1 if target == "G" else None)
     before = row(strategy)
     strategy._sale_step(h.AAA, ["NQ"])
@@ -511,13 +513,15 @@ def test_every_row_round_trips_real_level_book(target, tmp_path):
             assert (entry.state, entry.count) == ("counting", 1)
         elif target == "RW":
             assert (entry.state, entry.count) == ("counting", 0)
-        elif target in {"FL", "WK", "PF", "GC"}:
+        elif target in {"FL", "WK", "PF"}:
             assert entry.state == "armed"
+        elif target in {"FZ", "FZW", "FZP", "FC", "FCW", "FCP"}:
+            assert entry.state == "frozen" and entry.reason
         else:
             assert entry.state in {"waiting", "frozen"} and entry.reason
 
 
-@pytest.mark.parametrize("target", ["G", "WK", "PCR", "FZ", "RW"])
+@pytest.mark.parametrize("target", ["G", "GC", "WK", "PCR", "FZ", "RW", "FC", "FCW", "FCP"])
 def test_real_start_keeps_saved_level_and_resets_count(target, tmp_path):
     path = tmp_path / "book"
     previous = counted(account_label="example", level_book_path=path)
@@ -529,9 +533,17 @@ def test_real_start_keeps_saved_level_and_resets_count(target, tmp_path):
     saved = LevelBook.read(path)["example", h.AAA]
     assert (
         saved.state
-        == {"G": "counting", "WK": "armed", "PCR": "waiting", "FZ": "frozen", "RW": "counting"}[
-            target
-        ]
+        == {
+            "G": "counting",
+            "GC": "waiting",
+            "WK": "armed",
+            "PCR": "waiting",
+            "FZ": "frozen",
+            "RW": "counting",
+            "FC": "frozen",
+            "FCW": "frozen",
+            "FCP": "frozen",
+        }[target]
     )
     assert saved.count == {"G": 1, "RW": 0}.get(target)
     strategy = Counted(
@@ -569,6 +581,12 @@ def history_time(now, slot, when):
         at += 60 * h.SECOND
     if "resend_due" in when and "not resend_due" not in when and slot.refusal_last_ns is not None:
         at = max(at, slot.refusal_last_ns + RESEND_SECS * h.SECOND)
+    if (
+        "resend_due" in when
+        and "not resend_due" not in when
+        and getattr(slot, "external_cancel_ns", None) is not None
+    ):
+        at = max(at, slot.external_cancel_ns + RESEND_SECS * h.SECOND)
     if when == "flight_alert_due":
         at = max(at, slot.flight_sent_ns + FLIGHT_SECS * h.SECOND)
     return at
@@ -584,6 +602,8 @@ def history_observation(strategy, step):
     held = strategy.cached.held[0]
     if code in {"QU", "QA"}:
         bid = slot.level.as_decimal() + (Decimal(1) if code == "QA" else Decimal("-0.10"))
+        if "not formable" in when:
+            bid = Decimal("0.001")  # Positive quote, but the exit price cannot be formed.
         if when == "reprice_due":
             bid -= Decimal("0.10")
         strategy.observe(str(bid), at)
@@ -607,7 +627,23 @@ def history_observation(strategy, step):
     elif code == "ST":
         strategy.stop_instrument(h.AAA)
     elif code == "FRZ":
-        strategy._freeze(h.AAA, "synthetic freeze")
+        foreign = next(
+            (o for o in strategy.cached.working if getattr(o, "history_cover", False)), None
+        )
+        if foreign is None:
+            foreign = h.working_sell("unread-cover", qty="1", filled="0")
+            strategy.cached.working.append(foreign)
+        else:
+            foreign.status = h.OrderStatus.PENDING_CANCEL
+        strategy._sale_step(h.AAA, [])
+    elif code == "UFZ":
+        for order in strategy.cached.working:
+            if getattr(order, "history_cover", False):
+                order.status = h.OrderStatus.ACCEPTED
+        strategy.cached.working = [
+            o for o in strategy.cached.working if str(o.client_order_id) != "unread-cover"
+        ]
+        strategy._sale_step(h.AAA, [])
     elif code == "NQ":
         strategy._sale_step(h.AAA, ["NQ"])
     else:
@@ -649,6 +685,14 @@ def history_observation(strategy, step):
 @pytest.mark.parametrize("group,name,history", CASES, ids=[name for _, name, _ in CASES])
 def test_tracked_history_through_glue(group, name, history, monkeypatch):
     strategy = counted()
+    if name in {"cover-restores-working-sale", "fault-during-unread-cover"}:
+        strategy.cached.working.append(h.working_sell("unread-cover", qty="1", filled="0"))
+        # This is a predecessor's summable sell until its cancel becomes pending.
+        strategy.cached.working[-1].client_order_id = h.ClientOrderId(
+            "canon-protect-20260101T000000Z-99-12345678"
+        )
+        strategy.cached.working[-1].history_cover = True
+        strategy._sale_step(h.AAA, [])
     if name in {"expired-late-fill-covered", "refused-then-covered"}:
         strategy.cached.working.append(
             h.working_sell(qty="9" if name == "refused-then-covered" else "1", filled="0")
@@ -701,7 +745,7 @@ def test_tracked_history_through_glue(group, name, history, monkeypatch):
             # Engine echoes occur inside the action. Some recorded paths spell them out;
             # every other path has the same inert echoes implicitly.
             if (
-                code in {"oINI", "oPCN"}
+                code in {"oINI", "oPCN", "FRZ", "UFZ"}
                 and not result.actions
                 and not result.named
                 and (index >= len(steps) or steps[index]["event"] != code)
@@ -739,6 +783,10 @@ def test_no_action_transition_cannot_send_or_cancel_in_any_history(
     group, name, history, monkeypatch
 ):
     strategy = counted()
+    if name in {"cover-restores-working-sale", "fault-during-unread-cover"}:
+        strategy.cached.working.append(h.working_sell(qty="1", filled="0"))
+        strategy.cached.working[-1].history_cover = True
+        strategy._sale_step(h.AAA, [])
     original = sale_table.transition
     observed = []
     if name in {"expired-late-fill-covered", "refused-then-covered"}:
@@ -759,6 +807,13 @@ def test_no_action_transition_cannot_send_or_cancel_in_any_history(
         history_observation(strategy, steps[index])
         assert observed
         for state, code, result in observed:
+            if (
+                code in {"FRZ", "UFZ"}
+                and result.state == state
+                and not result.actions
+                and (index >= len(steps) or steps[index]["event"] != code)
+            ):
+                continue
             wanted = steps[index]
             assert (state.row, code, result.when) == (
                 wanted["row"],
@@ -774,6 +829,8 @@ def test_no_action_transition_cannot_send_or_cancel_in_any_history(
                 quantity = strategy.cached.held[0].signed_qty
                 if name in {"expired-late-fill-covered", "refused-then-covered"}:
                     quantity -= 9 if name == "refused-then-covered" else 1
+                if name in {"cover-restores-working-sale", "fault-during-unread-cover"}:
+                    quantity -= 1
                 if state.row == "G":
                     slot.opening_quantity = quantity
                     price = slot.counted_quote.bid_price.as_decimal()
@@ -806,7 +863,7 @@ def test_no_action_transition_cannot_send_or_cancel_in_any_history(
                 )
             elif sale_table.Action.ALERT in result.actions:
                 slot = strategy.slots.get(h.AAA) or strategy.stopped_sales.get(h.AAA)
-                if result.state.row == "RW":
+                if result.state.row == "RW" or "not formable" in result.when:
                     slot.refusal_told = True
                 elif state.row == "FL" and code in {"QU", "QA"}:
                     slot.flight_told = True
@@ -887,6 +944,11 @@ def test_sale_through_real_engine(scenario, monkeypatch):
                 and self.cache.positions_open(instrument_id=h.AAA, strategy_id=h.EXTERNAL)
             ):
                 self.adopt_holding(h.AAA, h.Price.from_str("9.90"))
+                if scenario == "filled":
+                    slot = self.slots[h.AAA]
+                    slot.gain_armed_at = self.clock.timestamp_ns()
+                    slot.gain_entry = Decimal("9.00")
+                    slot.gain_floor = h.Price.from_str("9.50")
             super().on_quote(quote)
             quotes.append(quote)
             self.check_timer()
@@ -1014,6 +1076,15 @@ def test_sale_through_real_engine(scenario, monkeypatch):
             assert last == sale_table.State("G", 0)
         if scenario == "filled":
             assert last.row == "X"
+            assert len(probe.gain_lock_sales) == 1
+            assert probe.gain_lock_sales[0]["quantity"] == "10"
+            assert probe.gain_lock_sales[0]["spread_at_release"] is not None
+            ended_records = [
+                json.loads(note.split("sale record ", 1)[1])
+                for note in probe.notes
+                if "sale record " in note
+            ]
+            assert sum(record["trigger_to_fill_ns"] is not None for record in ended_records) == 1
         if scenario in {"first", "reprice"}:
             assert not any(note.startswith("ALERT") for note in probe.notes), probe.notes
         assert "G" in timers and "FL" in timers
@@ -1066,10 +1137,24 @@ ENGINE_CASES = [
             FIRST[:5],
             [
                 ("PCR", "FRZ", "always"),
-                ("FZP", "oCXL", "always"),
+                ("FCP", "oCXL", "always"),
             ],
+            "FC",
+        ),
+    ),
+    (
+        "timer",
+        "pending-fault",
+        extra_engine_history(
+            FIRST[:5],
+            [("PCR", "oOTH", "always"), ("FZP", "oCXL", "always")],
             "FZ",
         ),
+    ),
+    (
+        "cover",
+        "pending-predecessor-new-count",
+        HISTORIES["named_paths"]["unread-cover-new-count"],
     ),
 ]
 ENGINE_TIMERS = set()
@@ -1213,14 +1298,16 @@ def test_tracked_history_through_native_cache_and_dispatch(group, name, history,
             assert order is not None
             return order
 
-        async def cover(self, quantity):
+        async def cover(self, quantity, *, foreign=False):
             order = owner.order_factory.limit(
                 h.AAA,
                 h.OrderSide.SELL,
                 h.Quantity.from_str(str(quantity)),
                 h.Price.from_str("20.00"),
                 client_order_id=h.ClientOrderId(
-                    f"canon-protect-20260101T000000Z-{len(self.covers)}-12345678"
+                    f"foreign-{len(self.covers)}"
+                    if foreign
+                    else f"canon-protect-20260101T000000Z-{len(self.covers)}-12345678"
                 ),
             )
             self.covers.append(order.client_order_id)
@@ -1237,6 +1324,8 @@ def test_tracked_history_through_native_cache_and_dispatch(group, name, history,
             if code in {"QU", "QA"}:
                 assert slot.level is not None
                 bid = slot.level.as_decimal() + (Decimal(1) if code == "QA" else Decimal("-0.10"))
+                if "not formable" in when:
+                    bid = Decimal("0.001")
                 if when == "reprice_due":
                     bid -= Decimal("0.10")
                 self._handle_data(h.quote(str(bid), now))
@@ -1265,7 +1354,51 @@ def test_tracked_history_through_native_cache_and_dispatch(group, name, history,
             elif code == "ST":
                 probe.stop_instrument(h.AAA)
             elif code == "FRZ":
-                probe._freeze(h.AAA, "synthetic freeze")
+                if name in {"cover-restores-working-sale", "fault-during-unread-cover"}:
+                    cover = self.cached_order(self.covers[-1])
+                    client._handle_event(
+                        OrderPendingCancel(
+                            cover.trader_id,
+                            cover.strategy_id,
+                            h.AAA,
+                            cover.client_order_id,
+                            cover.account_id,
+                            h.UUID4(),
+                            now,
+                            now,
+                            False,
+                            cover.venue_order_id,
+                        )
+                    )
+                    await self.pause()
+                else:
+                    await self.cover(1, foreign=name != "pending-predecessor-new-count")
+                    if name == "pending-predecessor-new-count":
+                        cover = self.cached_order(self.covers[-1])
+                        client._handle_event(
+                            OrderPendingCancel(
+                                cover.trader_id,
+                                cover.strategy_id,
+                                h.AAA,
+                                cover.client_order_id,
+                                cover.account_id,
+                                h.UUID4(),
+                                now,
+                                now,
+                                False,
+                                cover.venue_order_id,
+                            )
+                        )
+                        await self.pause()
+                probe._sale_step(h.AAA, [])
+            elif code == "UFZ":
+                cover = self.cached_order(self.covers[-1])
+                if name in {"cover-restores-working-sale", "fault-during-unread-cover"}:
+                    client.generate_order_accepted(cover, cover.venue_order_id, now)
+                else:
+                    client.generate_order_canceled(cover, cover.venue_order_id, now)
+                await self.pause()
+                probe._sale_step(h.AAA, [])
             elif code == "NQ":
                 probe._sale_step(h.AAA, ["NQ"])
             else:
@@ -1342,6 +1475,8 @@ def test_tracked_history_through_native_cache_and_dispatch(group, name, history,
             await self.pause()
             if name in {"expired-late-fill-covered", "refused-then-covered"}:
                 await self.cover(9 if name == "refused-then-covered" else 1)
+            if name in {"cover-restores-working-sale", "fault-during-unread-cover"}:
+                await self.cover(1)
             probe.adopt_holding(h.AAA, h.Price.from_str("9.90"))
             await self.pause()
             index = 0
@@ -1354,7 +1489,7 @@ def test_tracked_history_through_native_cache_and_dispatch(group, name, history,
                 expected = []
                 for state, code, result in transitions:
                     if (
-                        code in {"oINI", "oPCN"}
+                        code in {"oINI", "oPCN", "FRZ", "UFZ"}
                         and not result.actions
                         and not result.named
                         and (index >= len(steps) or steps[index]["event"] != code)
@@ -1383,9 +1518,24 @@ def test_tracked_history_through_native_cache_and_dispatch(group, name, history,
                     index += 1
                 assert effects[previous:] == expected
                 assert row(probe) == transitions[-1][2].state
+                if name == "unread-cover-cuts-working-sale" and steps[index - 1]["event"] == "oCXL":
+                    assert len(probe.legs) == 1
+                    assert self.cached_order(probe.legs[0]).status == h.OrderStatus.CANCELED
+                    assert self.cached_order(self.covers[0]).status == h.OrderStatus.ACCEPTED
                 probe.check_timer()
             assert row(probe).row == history["ends_in"]
             assert len(probe.legs) == history["sends"]
+            if name in {"unread-cover-new-count", "pending-predecessor-new-count"}:
+                assert self.cached_order(probe.legs[-1]).quantity.as_decimal() == 10
+            if name == "fault-during-unread-cover":
+                reason = probe.frozen[h.AAA]
+                cover = self.cached_order(self.covers[-1])
+                clients[0].generate_order_accepted(
+                    cover, cover.venue_order_id, probe.clock.timestamp_ns()
+                )
+                await self.pause()
+                probe._sale_step(h.AAA, ["NQ"])
+                assert row(probe).row == "FZW" and probe.frozen[h.AAA] == reason
             completed.append((name, sorted(timers)))
             ENGINE_TIMERS.update(timers)
 
@@ -1511,7 +1661,7 @@ def test_unformable_native_quantity_is_a_table_refusal(monkeypatch):
         ),
     )
     strategy.observe("9.88", h.T0 + 2 * h.SECOND)
-    assert row(strategy).row == "FZ" and not strategy.sent
+    assert row(strategy).row == "G" and not strategy.sent
     assert any(line.startswith("ALERT") and "G x QU" in line for line in strategy.said)
 
 
@@ -1638,7 +1788,7 @@ def test_snapshot_freeze_alert_names_the_unchanged_cover_refusal():
     strategy.cached.working.append(h.working_sell("external-order-not-ours", qty="1", filled="0"))
     strategy._on_step(SimpleNamespace(ts_event=h.T0 + h.SECOND))
     alerts = [line for line in strategy.said if line.startswith("ALERT")]
-    assert row(strategy).row == "FZ" and not strategy.effects
+    assert row(strategy).row == "FC" and not strategy.effects
     assert len(alerts) == 1 and "covered in part by a foreign sell" in alerts[0]
 
 

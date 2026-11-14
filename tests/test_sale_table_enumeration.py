@@ -25,8 +25,12 @@ import pytest
 from canon_trading import sale_table as sale
 
 DATA = json.loads(Path(sale.__file__).with_suffix(".json").read_text())
-NO_SALE = {"G", "GC", "RW", "FZ", "T0", "X"}
-CANCEL_ASKED = {"PCR", "PCO", "PCX", "FZP", "PCT"}
+NO_SALE = {"G", "GC", "RW", "FZ", "FC", "T0", "X"}
+CANCEL_ASKED = {"PCR", "PCO", "PCX", "FZP", "FCP", "PCT"}
+FAULT = {"FZ", "FZW", "FZP"}
+COVER = {"FC", "FCW", "FCP"}
+ENDS = {"X", "T0", "OX", "PCX", "PCT", "TW"}
+LIVE = {"G", "GC", "RW", "FL", "WK", "PF", "PCR", "PCO"}
 INVALIDATES = {"ST", "HE", "HS", "CP", "FRZ"}
 MAX_QUANTITY = 3
 DEPTH = 8
@@ -61,6 +65,7 @@ class Account:
     total_sold: int = 0
     told: bool = False
     young: bool = False
+    unread: bool = False
 
     @property
     def uncovered(self):
@@ -117,6 +122,10 @@ def account_event(account, seen):
     """Apply event meaning BEFORE asking the table, especially every actual fill."""
     event = seen.code
     leg = account.legs[0] if account.legs else None
+    if event == "FRZ":
+        return replace(account, unread=True)
+    if event == "UFZ":
+        return replace(account, unread=False)
     if event == "HG":
         return replace(account, long=account.long + 1)
     if event == "HS":
@@ -168,8 +177,13 @@ def account_event(account, seen):
     if event in {"oCXL", "oEXP", "oREJ", "oDEN"}:
         owed = leg.remaining if event in {"oCXL", "oEXP"} else 0
         # A venue's refusal starts the interval; time passing (the "~" step) ends it.
+        # A venue's refusal, or a cancel by another hand, starts the interval; time passing ends it.
+        elsewhere = event == "oCXL" and not leg.pending
         return replace(
-            account, legs=(), owed=account.owed + owed, young=account.young or event == "oREJ"
+            account,
+            legs=(),
+            owed=account.owed + owed,
+            young=account.young or event == "oREJ" or elsewhere,
         )
     if event == "oUPD" and seen.ends_filled:
         # Reconciliation sets quantity to the ALREADY filled quantity, not a new fill.
@@ -215,17 +229,50 @@ def advance(world, seen, n, table):
         world.state, n, event, facts(account, seen, world.state.row), table=table
     )
     count = world.counted
-    if event == "oREJ" and result.state.row == "RW":
+    origin = world.state.row
+    unformed = "not formable" in result.when.split(" and ") or " and not formable" in result.when
+    if origin in FAULT:
+        assert result.state.row in FAULT | ENDS, "a_fault_of_ours_holds_to_the_next_start"
+    if event == "FRZ" and origin in LIVE:
+        assert result.state.row in COVER, "an_unread_cover_is_not_a_fault"
+    if (
+        origin in COVER
+        and (event in {"oDEN", "oVOID"} or (event in {"oOTH", "oINI", "oPCN"} and result.named))
+        and before.legs
+    ):
+        assert result.state.row in FAULT, "a_fault_while_unread_leaves_the_cover_rows"
+    if event == "UFZ":
+        leg = before.legs[0] if before.legs else None
+        if origin == "FC":
+            expected = "GC" if account.foreign >= account.long else "G"
+            assert result.state.row == expected, "cover_read_again_ends_the_freeze"
+        elif origin == "FCW":
+            assert leg is not None
+            expected = "FL" if not leg.cancelable else ("PF" if leg.filled else "WK")
+            assert result.state.row == expected, "cover_read_again_restores_the_row"
+        else:
+            assert result.state.row == origin == "FCP", "cover_read_again_waits_for_the_cancel"
+        assert not result.actions, "cover_read_again_does_nothing_else"
+    if unformed:
+        assert result.state.row not in FAULT, "a_leg_that_cannot_be_formed_is_not_a_freeze"
+        assert sale.Action.SEND not in result.actions, "a_leg_that_cannot_be_formed_is_not_sent"
+    if event == "oCXL" and origin in {"FL", "WK", "PF"}:
+        assert result.state.row in {"G", "GC"}, "a_cancel_from_elsewhere_is_not_a_freeze"
+    if event == "oREJ" and origin in {"FL", "WK", "PF", "PCR"}:
+        assert result.state.row == "RW", "a_venue_refusal_waits"
+    if (event == "oREJ" and result.state.row == "RW") or unformed:
         assert (sale.Action.ALERT in result.actions) == (not before.told), (
             "one_alert_per_holding_until_accepted"
         )
         account = replace(account, told=True)
-    elif result.state.row == "RW" and world.state.row != "RW":
+    elif result.state.row == "RW" and origin != "RW":
         raise AssertionError("waiting_only_after_a_venue_refusal")
-    if world.state.row == "RW":
-        assert sale.Action.ALERT not in result.actions or result.state.row == "FZ", (
+    if origin == "RW" and not unformed:
+        assert sale.Action.ALERT not in result.actions or result.state.row in FAULT | COVER, (
             "one_alert_per_holding_until_accepted"
         )
+    if origin in FAULT | COVER:
+        assert sale.Action.SEND not in result.actions, "no_send_from_a_frozen_row"
     if world.state.row == "FL" and event in {"QU", "QA"}:
         due = facts(account, seen, "FL")["flight_alert_due"]
         assert (sale.Action.ALERT in result.actions) == due, "a_silent_leg_is_told_once"
@@ -284,7 +331,7 @@ def advance(world, seen, n, table):
         count = 0
     elif world.state.row == "G" and event == "QU" and count == n:
         # Complete, and held by the interval: the count stands; the next counted quote is judged again.
-        assert account.young, "a_complete_count_is_held_only_by_the_interval"
+        assert account.young or unformed, "a_complete_count_is_held_only_by_the_interval"
         count = n - 1
     after = World(result.state, account, count)
     for action, echo in ((sale.Action.SEND, "oINI"), (sale.Action.CANCEL, "oPCN")):
@@ -337,6 +384,9 @@ def alternatives(world):
     if account.young:
         yield (Seen("~"),)
     codes = ["QU", "QA", "NQ", "ST", "FRZ"]
+    if world.state.row in COVER:
+        # The read may succeed at any step, and the event is emitted in every such step.
+        codes.append("UFZ")
     if 0 < account.long < MAX_QUANTITY:
         codes.append("HG")
     if account.long > 1:
@@ -425,6 +475,7 @@ def enumerate_sequences(depth=DEPTH, table=sale.TABLE):
 
 def test_bounded_account_enumeration(record_property, tmp_path):
     stats = enumerate_sequences()
+    print("ENUM", json.dumps({**stats, "echoes": ECHOES}, sort_keys=True))
     record_property("enumeration", json.dumps(stats, sort_keys=True))
     (tmp_path / "enumeration.json").write_text(json.dumps(stats, indent=2, sort_keys=True) + "\n")
     assert stats["states"] > 100
@@ -658,15 +709,6 @@ def mutated_branch(row, event, when, **changes):
 @pytest.mark.parametrize(
     "row,event,when,changes,history,property_name",
     [
-        # A completed count may stand only while a refusal is still young.
-        (
-            "G",
-            "QU",
-            "count_complete and resend_due and leg_positive and formable",
-            {"next": "G", "send": False, "count": "="},
-            (Seen("QU"), Seen("QU")),
-            "a_complete_count_is_held_only_by_the_interval",
-        ),
         # A resend before the interval has passed.
         (
             "RW",
@@ -731,7 +773,7 @@ def mutated_branch(row, event, when, **changes):
             "send_requires_counted_quote_or_reprice_ack",
         ),
         # A row with no sale of ours that the table says holds one.
-        ("FL", "oREJ", "not refusal_told", {"next": "WK"}, REFUSED, "row_account_agree"),
+        ("FL", "oREJ", "not refusal_told", {"next": "WK"}, REFUSED, "a_venue_refusal_waits"),
     ],
 )
 def test_refusal_mutations_have_teeth(row, event, when, changes, history, property_name):
@@ -752,15 +794,7 @@ def test_resend_of_nothing_mutation_has_teeth():
 def test_resend_is_the_episode_remainder_within_what_is_uncovered():
     # Two of three sold, then refused: the resend is one share, and none when a foreign sell covers it.
     world = walk(
-        (
-            Seen("QU"),
-            Seen("QU"),
-            Seen("oACC"),
-            Seen("oPF"),
-            Seen("oPF"),
-            Seen("oACC"),
-            Seen("oREJ"),
-        )
+        (Seen("QU"), Seen("QU"), Seen("oACC"), Seen("oPF"), Seen("oPF"), Seen("oACC"), Seen("oREJ"))
     )
     assert world.state.row == "RW" and world.account.long == 1 and world.account.told
     world = step(world, (Seen("~"),))
@@ -839,3 +873,162 @@ def test_a_silent_leg_is_told_once_and_works_when_its_answer_comes():
     assert step(world, (Seen("oACC"),)).state.row == "WK"
     refused = step(world, (Seen("oREJ"),))
     assert refused.state.row == "RW" and refused.account.told
+
+
+UNREAD = WORKING + (Seen("FRZ"),)
+
+
+@pytest.mark.parametrize(
+    "row,event,when,changes,history,property_name",
+    [
+        # An unread cover that latches as a fault.
+        ("G", "FRZ", "always", {"next": "FZ"}, (Seen("FRZ"),), "an_unread_cover_is_not_a_fault"),
+        ("WK", "FRZ", "always", {"next": "FZW"}, UNREAD, "an_unread_cover_is_not_a_fault"),
+        # The cover reads again and nothing ends.
+        (
+            "FC",
+            "UFZ",
+            "not whole_cover",
+            {"next": "FC"},
+            (Seen("FRZ"), Seen("UFZ")),
+            "cover_read_again_ends_the_freeze",
+        ),
+        # The leg kept working comes back in a row its state does not give.
+        (
+            "FCW",
+            "UFZ",
+            "cancelable and not filled_part",
+            {"next": "PF"},
+            UNREAD + (Seen("UFZ"),),
+            "cover_read_again_restores_the_row",
+        ),
+        # The cover reading again sends.
+        (
+            "FC",
+            "UFZ",
+            "not whole_cover",
+            {"next": "FL", "send": True},
+            (Seen("FRZ"), Seen("UFZ")),
+            "cover_read_again_ends_the_freeze",
+        ),
+        # A fault of ours ended by a quote.
+        (
+            "FZW",
+            "QU",
+            "always",
+            {"next": "WK"},
+            WORKING + (Seen("oOTH"), Seen("QU")),
+            "a_fault_of_ours_holds_to_the_next_start",
+        ),
+        # A fault of ours while the cover is unread stays among the rows the cover's read ends.
+        (
+            "FCW",
+            "oOTH",
+            "always",
+            {"next": "FCW", "alert": False},
+            UNREAD + (Seen("oOTH"),),
+            "a_fault_while_unread_leaves_the_cover_rows",
+        ),
+        # The leg our cut left working beside an unread cover.
+        (
+            "FCW",
+            "MO",
+            "always",
+            {"next": "FCW", "cancel": False},
+            UNREAD + (Seen("HS"),),
+            "mismatch_cancels_in_same_step",
+        ),
+        # A leg that cannot be formed freezes.
+        (
+            "G",
+            "QU",
+            "count_complete and resend_due and leg_positive and not formable and not refusal_told",
+            {"next": "FZ"},
+            (Seen("QU"), Seen("QU", formable=False)),
+            "a_leg_that_cannot_be_formed_is_not_a_freeze",
+        ),
+        # A cancel from elsewhere freezes.
+        (
+            "WK",
+            "oCXL",
+            "not whole_cover",
+            {"next": "FZ"},
+            WORKING + (Seen("oCXL"),),
+            "a_cancel_from_elsewhere_is_not_a_freeze",
+        ),
+        # A venue's refusal of a leg whose re-price cancel is pending freezes.
+        (
+            "PCR",
+            "oREJ",
+            "not refusal_told",
+            {"next": "FZ"},
+            REPRICING + (Seen("oREJ"),),
+            "a_venue_refusal_waits",
+        ),
+    ],
+)
+def test_freeze_class_mutations_have_teeth(row, event, when, changes, history, property_name):
+    with pytest.raises(AssertionError, match=property_name):
+        walk(history, table=mutated_branch(row, event, when, **changes))
+
+
+def test_an_unread_cover_ends_when_it_reads_and_a_new_count_sells():
+    world = walk((Seen("QU"), Seen("FRZ")))
+    assert world.state.row == "FC" and world.account.unread
+    world = walk((Seen("QU"), Seen("NQ")), initial=world)
+    assert world.state.row == "FC" and not world.account.legs
+    world = walk((Seen("UFZ"),), initial=world)
+    assert world.state == sale.State("G", 0) and not world.account.unread
+    world = walk((Seen("QU"), Seen("QU")), initial=world)
+    assert world.state.row == "FL" and world.account.legs == (Leg(MAX_QUANTITY),)
+
+
+def test_an_unread_cover_beside_a_leg_too_large_cuts_the_leg_then_ends_at_zero():
+    world = walk(UNREAD)
+    assert world.state.row == "FCW"
+    world = walk((Seen("CP"),), initial=world)
+    assert world.state.row == "FCP" and world.account.legs[0].pending
+    world = walk((Seen("UFZ"),), initial=world)
+    assert world.state.row == "FCP"
+    world = walk((Seen("oCXL"),), initial=world)
+    assert world.state.row == "FC" and not world.account.legs
+    world = walk((Seen("UFZ"),), initial=world)
+    assert world.state == sale.State("G", 0)
+
+
+def test_a_cancel_from_elsewhere_starts_the_interval_and_then_a_new_count_sells():
+    world = walk(WORKING + (Seen("oCXL"),))
+    assert world.state == sale.State("G", 0) and world.account.young
+    world = walk((Seen("QU"), Seen("QU"), Seen("QU")), initial=world)
+    assert world.state.row == "G" and not world.account.legs
+    world = walk((Seen("~"), Seen("QU")), initial=world)
+    assert world.state.row == "FL" and world.account.legs == (Leg(MAX_QUANTITY),)
+
+
+def test_a_sale_inside_the_interval_after_a_cancel_from_elsewhere_has_teeth():
+    table = mutated_branch("G", "QU", "count_complete and not resend_due", next="FL", send=True)
+    with pytest.raises(AssertionError, match="resend_no_sooner_than_the_interval"):
+        walk(WORKING + (Seen("oCXL"), Seen("QU"), Seen("QU")), table=table)
+
+
+@pytest.mark.parametrize("row", sorted(FAULT | COVER))
+def test_nothing_sent_from_any_frozen_row_has_teeth(row):
+    leg = () if row in NO_SALE else (Leg(3, status="working", pending=row in CANCEL_ASKED),)
+    world = World(sale.State(row), Account(legs=leg, opening=3))
+    with pytest.raises(AssertionError, match="no_send_from_a_frozen_row"):
+        step(world, (Seen("QU"),), table=mutated(row, "QU", send=True))
+
+
+def test_unformable_send_and_cover_read_side_effect_mutations_have_teeth():
+    with pytest.raises(AssertionError, match="a_leg_that_cannot_be_formed_is_not_sent"):
+        walk(
+            (Seen("QU"), Seen("QU", formable=False)),
+            table=mutated_branch(
+                "G",
+                "QU",
+                "count_complete and resend_due and leg_positive and not formable and not refusal_told",
+                send=True,
+            ),
+        )
+    with pytest.raises(AssertionError, match="cover_read_again_does_nothing_else"):
+        walk((Seen("FRZ"), Seen("UFZ")), table=mutated("FC", "UFZ", alert=True))

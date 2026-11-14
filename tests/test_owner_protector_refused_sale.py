@@ -607,7 +607,7 @@ def test_t2_every_send_price_assertion_rejects_an_old_price_above_a_lower_level(
 
 
 def test_t7_count_one_carried_sale_floor_uses_its_plan_cap(tmp_path):
-    """Same carried holding as the unchanged chase regression at its line 704."""
+    """Same carried holding as the chase test of a carried level far above the bid."""
     path = tmp_path / "levels.json"
     path.write_text(json.dumps({"schema": 2, "entries": [h.restart_record(last_level="1.10")]}))
     strategy = h.restart_harness(path)

@@ -744,7 +744,12 @@ def test_a_carried_level_far_above_the_bid_chases_to_the_chase_price_within_one_
     strategy.on_order_released(event)
     accepted(order, at)
     strategy.observe("0.99", at)
-    floor = chase_floor(order.price.as_decimal(), Decimal("0.04"))
+    # The floor's cap is the larger of the holding's own plan's and the registered row's.
+    distance = strategy.slots[h.AAA].distance
+    assert distance is not None
+    plan_cap = distance.plan.chase_cap
+    assert plan_cap > ROWS.chase_cap, "the carried plan here is wider than the row"
+    floor = chase_floor(order.price.as_decimal(), max(plan_cap, ROWS.chase_cap))
     strategy.observe("0.99", at + CHASE + h.SECOND)
     assert strategy.canceled == [order.client_order_id], "the released sale did not chase"
     terminal(order, at + CHASE + h.SECOND)

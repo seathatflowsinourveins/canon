@@ -21,7 +21,7 @@ from canon_trading import sale_table as sale
 DATA_PATH = Path(__file__).resolve().parents[1] / "src/canon_trading/sale_table.json"
 DATA = json.loads(DATA_PATH.read_text())
 HISTORIES = json.loads(Path(__file__).with_name("sale_table_histories.json").read_text())
-CELLS_HASH = "62cbf127b4557660a3e00e6e2e36938f1d1dbc4803cd21d2dfe0e66dd0d6a158"
+CELLS_HASH = "ee8b277596cf8f1630a03beed06ee3767c1aeed05631cfe69e89f67e1f64f38b"
 CELLS = [(r, e, c) for r, row in DATA["cells"].items() for e, c in row.items()]
 BRANCHES = [(r, e, b) for r, e, c in CELLS for b in c["branches"]]
 
@@ -107,13 +107,14 @@ def test_tracked_table_has_exact_contract_and_cells():
         "order_event_inventory",
         "properties_for_step_d",
         "sending_transitions",
+        "freeze_causes",
         "cells",
     }
     encoded = json.dumps(DATA["cells"], sort_keys=True, separators=(",", ":")).encode()
     assert hashlib.sha256(encoded).hexdigest() == CELLS_HASH
-    assert len(DATA["rows"]) == 17
-    assert len(DATA["events"]) == 26
-    assert len(CELLS) == 442
+    assert len(DATA["rows"]) == 20
+    assert len(DATA["events"]) == 27
+    assert len(CELLS) == 540
     assert set(sale.TABLE.rows) == set(DATA["rows"])
     assert set(sale.TABLE.events) == set(DATA["events"])
 
@@ -123,9 +124,85 @@ def test_module_header_names_current_cells():
 
 
 def test_quantity_and_cover_properties_are_in_the_contract():
-    assert {"no_leg_of_size_zero", "nothing_for_a_whole_cover"} <= set(
-        DATA["properties_for_step_d"]
-    )
+    assert {
+        "no_leg_of_size_zero",
+        "nothing_for_a_whole_cover",
+        "an_outside_freeze_ends_when_its_cause_ends",
+        "never_more_working_than_held_whatever_the_cover",
+    } <= set(DATA["properties_for_step_d"])
+
+
+FAULT = {"FZ", "FZW", "FZP"}
+COVER = {"FC", "FCW", "FCP"}
+
+
+def test_every_freeze_cause_is_listed_and_classified():
+    actual = set()
+    for row, event, cell in CELLS:
+        if cell["occurs"] in {"no", "n/a"}:
+            continue
+        for branch in cell["branches"]:
+            into = branch["next"]
+            family = FAULT if into in FAULT else COVER if into in COVER else set()
+            if family and row not in family:
+                actual.add((row, event, into))
+    listed = set()
+    for cause in DATA["freeze_causes"]:
+        assert cause["cause"] and "UNCLASSIFIED" not in cause["cause"]
+        if cause["into"] in COVER:
+            assert cause["event"] == "FRZ" and cause["cause"].startswith("outside:")
+        elif cause["event"] == "oVOID":
+            assert "HELD" in cause["cause"]
+        else:
+            assert cause["event"] in {"oDEN", "oOTH", "oINI", "oPCN"}
+            assert cause["cause"].startswith("ours:")
+        listed.update((r, cause["event"], cause["into"]) for r in cause["from"])
+    assert actual == listed
+
+
+def test_freeze_cells_obey_ruling_seventeen():
+    live = {
+        "G": "FC",
+        "GC": "FC",
+        "RW": "FC",
+        "FL": "FCW",
+        "WK": "FCW",
+        "PF": "FCW",
+        "PCR": "FCP",
+        "PCO": "FCP",
+    }
+    for row, event, branch in BRANCHES:
+        if event == "FRZ":
+            assert branch["next"] not in FAULT or row in FAULT
+            if row in live:
+                assert branch["next"] == live[row] and branch["alert"]
+        if row in FAULT:
+            assert branch["next"] in FAULT | {"X", "T0", "OX", "PCX", "PCT", "TW"}
+            assert DATA["cells"][row]["UFZ"]["occurs"] == "n/a"
+        if row in FAULT | COVER:
+            assert not branch["send"]
+        if "not formable" in branch["when"]:
+            assert branch["next"] not in FAULT | COVER and not branch["send"]
+            assert branch["alert"] == ("not refusal_told" in branch["when"])
+        if event == "UFZ":
+            assert (DATA["cells"][row][event]["occurs"] == "yes") == (row in COVER)
+            assert not (branch["send"] or branch["cancel"] or branch["alert"])
+
+
+@pytest.mark.parametrize("row", sorted(COVER))
+def test_cover_reads_again_restores_only_the_cover_or_leg_state(row):
+    cell = DATA["cells"][row]["UFZ"]
+    for facts in assignments(cell):
+        expected = (
+            ("GC" if facts["whole_cover"] else "G")
+            if row == "FC"
+            else ("FL" if not facts["cancelable"] else "PF" if facts["filled_part"] else "WK")
+            if row == "FCW"
+            else "FCP"
+        )
+        result = sale.transition(sale.State(row), 2, "UFZ", facts)
+        assert result.state == sale.State(expected, 0 if expected == "G" else None)
+        assert not result.actions
 
 
 def test_refusal_and_silence_properties_are_in_the_contract():
@@ -140,12 +217,16 @@ def test_refusal_and_silence_properties_are_in_the_contract():
 def test_refusal_cells_and_waiting_row_obey_ruling_fifteen():
     for row, event, branch in BRANCHES:
         if branch["next"] == "RW" and row != "RW":
-            assert event == "oREJ" and row in {"FL", "WK", "PF"}
-        if row in {"FL", "WK", "PF"} and event == "oREJ":
+            assert (event == "oREJ" and row in {"FL", "WK", "PF", "PCR"}) or (
+                (row, event) == ("PCR", "oCXL") and "not formable" in branch["when"]
+            )
+        if row in {"FL", "WK", "PF", "PCR"} and event == "oREJ":
             assert branch["next"] == "RW"
             assert branch["alert"] == (branch["when"] == "not refusal_told")
         if row == "RW" and branch["alert"]:
-            assert branch["next"] == "FZ"
+            assert branch["next"] in {"FZ", "FC"} or (
+                branch["next"] == "RW" and "not formable" in branch["when"]
+            )
         if row in {"RW", "G"} and branch["send"]:
             assert event == "QU" and "resend_due" in branch["when"].split(" and ")
         if row == "RW" and event in {"QA", "NQ"}:
@@ -161,7 +242,13 @@ def test_silent_flight_alert_is_the_only_change(event):
 
 
 def test_complete_count_waits_for_interval_without_counting_past_n():
-    facts = {"resend_due": False, "leg_positive": True, "whole_cover": False, "formable": True}
+    facts = {
+        "resend_due": False,
+        "leg_positive": True,
+        "whole_cover": False,
+        "formable": True,
+        "refusal_told": False,
+    }
     for n in (2, 3):
         result = sale.transition(sale.State("G", n - 1), n, "QU", facts)
         assert result.state == sale.State("G", n - 1) and not result.actions
@@ -170,13 +257,14 @@ def test_complete_count_waits_for_interval_without_counting_past_n():
 def test_first_send_branches_use_the_modules_count():
     cell = DATA["cells"]["G"]["QU"]
     # A complete count stands while the refusal interval has not passed.
-    assert len(cell["branches"]) == 6
+    assert len(cell["branches"]) == 7
     assert set().union(*(names(b["when"]) for b in cell["branches"])) == {
         "count_complete",
         "leg_positive",
         "formable",
         "whole_cover",
         "resend_due",
+        "refusal_told",
     }
     for n in (2, 3):
         for count in range(n):
@@ -257,7 +345,13 @@ def test_transition_and_step_do_not_read_resources(monkeypatch):
         raise AssertionError("transition read a resource")
 
     monkeypatch.setattr(Path, "read_text", refused)
-    facts = {"formable": True, "leg_positive": True, "whole_cover": False, "resend_due": True}
+    facts = {
+        "formable": True,
+        "leg_positive": True,
+        "whole_cover": False,
+        "resend_due": True,
+        "refusal_told": False,
+    }
     state = sale.State("G", 0)
     events = (sale.Event("QU", facts), sale.Event("oOTH", {}))
     before = deepcopy(facts)
@@ -308,7 +402,7 @@ def test_count_reentry_is_zero_and_cancel_has_no_send():
         if row != "G" and branch["next"] == "G":
             assert branch["count"] == "0"
         if branch["cancel"]:
-            assert row in {"WK", "PF", "OX", "FZW", "TW"}
+            assert row in {"WK", "PF", "OX", "FZW", "FCW", "TW"}
             assert DATA["rows"][branch["next"]]["phase"] == "pc"
             assert not branch["send"]
 
@@ -338,7 +432,7 @@ def test_invalidation_precedes_send_trigger(invalidation, row, trigger):
 
 
 def test_step_order_preserves_order_event_arrivals():
-    codes = ["QU", "oPF", "CL", "MO", "FRZ", "oCXL", "HG", "CP", "ST", "HS", "HE"]
+    codes = ["QU", "oPF", "CL", "MO", "UFZ", "FRZ", "oCXL", "HG", "CP", "ST", "HS", "HE"]
     events = [sale.Event(code, {}) for code in codes]
     assert tuple(e.code for e in sale.order_step(events)) == (
         "ST",
@@ -348,6 +442,7 @@ def test_step_order_preserves_order_event_arrivals():
         "CP",
         "CL",
         "FRZ",
+        "UFZ",
         "oPF",
         "oCXL",
         "MO",
@@ -388,7 +483,7 @@ def test_recorded_history(group, name, history):
 
 
 def test_all_histories_are_present_with_public_names():
-    assert len(HISTORIES["named_paths"]) == 22
+    assert len(HISTORIES["named_paths"]) == 29
     assert len(HISTORIES["histories_walked"]) == 10
     for group in HISTORIES.values():
         for name in group:
