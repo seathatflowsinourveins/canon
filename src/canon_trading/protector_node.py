@@ -28,6 +28,14 @@ C's go is procedural in ADR 0142, not an existing code token: --lead-go carries 
 caller must still run C from reviewed main. The base session has no holds/inbox paths, so both
 are required inputs and unread/nonempty controls refuse. No default empty folder is invented.
 A new owner fill after start on B is SIMULATION ONLY today; its paper showing comes later on A.
+
+Review F1 of #443's max review: the roster is the start's instruments, handed to the protector, which
+reads the account at its first step and every owner_protector.ROSTER_POLL_SECS, names a long outside
+the roster by an ALERT and, for a whole-share one, ends the run by name (owner_protector.ROSTER_ENDED,
+through Strategy.shutdown_system; module header there). The run then returns as at its planned end,
+saying `paper:protector: ended: <reason>`, and exits 0, since the runner launches its successor once a
+run exits, on any exit code (scripts/automation, do_run_protector), and that successor reads the
+account at its start. The runner records the end as a boundary; naming it there is the runner's.
 """
 
 from __future__ import annotations
@@ -186,6 +194,8 @@ def protector_node(
         # The span's part (window.protection_span), so U-e's overnight eligibility check runs on an
         # overnight run (OwnerProtectorConfig.session_part; composition, L6 2026-11-13).
         session_part=session_part,
+        # Review F1: the instruments this node loads; a long outside them is named, the run ended.
+        roster=tuple(instruments),
         **book_settings,
     )
     node = paper_node.alpaca_paper_builder(
@@ -535,6 +545,9 @@ def run_protector(
                 errors.append(f"end orders read failed: {type(e).__name__}")
             if errors:
                 print(f"paper:protector: {'; '.join(errors)}; no cleanup sale", file=sys.stderr)
+            ended = getattr(strategy, "ended_for", None)
+            if ended:
+                print(f"paper:protector: ended: {ended}; the next start reads the account fresh")
         if failure is not None:
             raise failure
         if errors:
