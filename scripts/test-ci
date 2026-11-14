@@ -423,7 +423,7 @@ for i in 1 2 3; do
   check "part $i of 3 leaves the test scripts to part rest" has '^  skip  test-hooks \(part rest of this run runs it\)$'
   check "part $i of 3 leaves gitleaks to part rest" has '^  skip  gitleaks \(git history\) \(part rest of this run runs it\)$'
   check "part $i of 3 passes its tests as one argument file" \
-    test "$(grep -cE '^run --locked pytest -q -rfEs --no-fold-skipped @[^ ]+$' "$C.uv.log")" = 1
+    test "$(grep -cE '^run --locked pytest -q --color=no -rfEs --no-fold-skipped @[^ ]+$' "$C.uv.log")" = 1
   check "part $i of 3 shows its count"           has "^        part $i of 3: [0-9]+ test functions, of 9 collected tests\$"
   check "and pytest's summary line"                has '^        1 passed, 1 skipped$'
   sed -n 's/^arg: //p' "$C.uv.log" >>"$all"; sed -n 's/^arg: //p' "$C.uv.log" >"$C.ids.$i"
@@ -486,7 +486,8 @@ for r in failure cancelled skipped; do
 done
 verdict '{"plan":{"result":"cancelled"},"check":{"result":"skipped"}}'
 check "a cancelled plan, its check skipped, fails" test "$RC" = 1
-check "naming both"                                has '^plan: cancelled$'
+check "naming the plan"                            has '^plan: cancelled$'
+check "and the check"                              has '^check: skipped$'
 for r in '' '{}' 'not json' '[]'; do
   verdict "$r"
   check "NEEDS_JSON '$r' fails"                    test "$RC" = 1

@@ -237,8 +237,8 @@ runs ruff, ty and the test scripts; a malformed part (`0/3`, `4/3`, `3`, `x/y`, 
 name; a failed collection fails the part and the run, and so does a count of node IDs that differs from
 the count pytest reports; `--list-parts` prints `rest` and `1/4` to `4/4`. Case `verdict`: the verdict
 passes only when every job needed succeeded, and fails naming a part's `failure`, `cancelled` or
-`skipped`, and fails on a missing or malformed `NEEDS_JSON`. 477 passed and 0 failed on 2026-11-14; against
-`main`'s `scripts/ci` 37 fail, and against a version that hashed whole files 12 fail.
+`skipped`, and fails on a missing or malformed `NEEDS_JSON`. 510 passed and 0 failed on 2026-11-14; against
+`main`'s `scripts/ci` 58 fail, and against this amendment's first version, before its review's fixes, 25 fail.
 
 **Evidence** (read 2026-11-14):
 

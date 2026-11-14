@@ -337,7 +337,7 @@ now() {
 # collection order, as a plain run does. They reach pytest as one argument file, read by pytest's own
 # parser (`fromfile_prefix_chars="@"`, pytest 9.2.0 _pytest/config/argparsing.py:509). A part with no
 # function passes, saying so; a collection that fails fails the part. The part prints its count and
-# pytest's summary line, so the hosted parts' cases can be summed against the collected count.
+# pytest's summary line, uncoloured so the notes below read it, so the hosted parts' cases can be summed against the collected count.
 pytest_part() {
   local i=$1 n=$2 ids="$WORK/part.ids" fns="$WORK/part.fns" want got
   tool uv run --locked pytest --collect-only -q --color=no -rs --no-fold-skipped >"$WORK/part.collect" 2>&1 \
@@ -359,7 +359,7 @@ pytest_part() {
           if (h % n == i - 1) print }' >"$fns"
   if [ ! -s "$fns" ]; then echo "part $i of $n: no test function falls in this part, of $want collected tests"; return 0; fi
   echo "part $i of $n: $(wc -l <"$fns" | tr -d ' ') test functions, of $want collected tests"
-  tool uv run --locked pytest -q -rfEs --no-fold-skipped "@$fns"
+  tool uv run --locked pytest -q --color=no -rfEs --no-fold-skipped "@$fns"
 }
 
 # Shell files: regular files in the index (so staged new files are included) whose first line is a sh or
