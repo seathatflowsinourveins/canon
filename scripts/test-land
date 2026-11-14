@@ -34,7 +34,9 @@ PATH="$TMP/bin:$PATH"; export PATH
 # commit and another one); checks
 # (the failed required checks `gh pr checks --jq` would print). A file named for a call's answer on stderr
 # makes that call fail with it: view_err (the wait's `pr view`), checks_err, merge_err (the direct merge,
-# with merge_rc), pr_info_err (`pr view` for --pr).
+# with merge_rc), pr_info_err (`pr view` for --pr). draft: the open pull request is a draft, made by
+# `pr create --draft` and removed by `pr ready`; while it is there both merge calls are refused, as GitHub
+# refuses a draft ("Draft pull requests cannot be merged", docs.github.com, about-pull-requests).
 cat > "$TMP/bin/mise" <<'FAKE'
 #!/bin/bash
 [ "${1:-} ${2:-} ${3:-}" = "exec -- gh" ] || { echo "fake mise: unexpected call: $*" >&2; exit 99; }
@@ -44,10 +46,18 @@ rc() { if [ -f "$FAKE/$1" ]; then cat "$FAKE/$1"; else echo 0; fi; }
 case "${1:-} ${2:-}" in
   "auth status") [ ! -f "$FAKE/auth_err" ] || cat "$FAKE/auth_err" >&2; exit "$(rc auth_rc)" ;;
   "pr list")     [ ! -f "$FAKE/pr_open" ] || cat "$FAKE/pr_open" ;;
-  "pr create")   echo "7 https://github.example/o/r/pull/7" > "$FAKE/pr_open" ;;
+  "pr create")   echo "7 https://github.example/o/r/pull/7" > "$FAKE/pr_open"
+                 case "$*" in *--draft*) : > "$FAKE/draft" ;; esac
+                 prev=""; for a in "$@"; do
+                   [ "$prev" != "--title" ] || printf '%s\n' "$a" > "$FAKE/pr_title"
+                   [ "$prev" != "--body-file" ] || cp "$a" "$FAKE/pr_body"; prev=$a
+                 done ;;
+  "pr ready")    if [ -f "$FAKE/ready_err" ]; then cat "$FAKE/ready_err" >&2; exit 1; fi
+                 rm -f "$FAKE/draft" ;;
   "pr checks")   if [ -f "$FAKE/checks_err" ]; then cat "$FAKE/checks_err" >&2; exit 1; fi
                  [ ! -f "$FAKE/checks" ] || cat "$FAKE/checks" ;;
-  "pr merge")    prev=""; for a in "$@"; do [ "$prev" != "--body-file" ] || cp "$a" "$FAKE/merge_body"; prev=$a; done
+  "pr merge")    if [ -f "$FAKE/draft" ]; then echo "GraphQL: Pull Request is still a draft (mergePullRequest)" >&2; exit 1; fi
+                 prev=""; for a in "$@"; do [ "$prev" != "--body-file" ] || cp "$a" "$FAKE/merge_body"; prev=$a; done
                  case "$*" in
                    *--auto*) r=$(rc auto_rc);  [ "$r" -eq 0 ] || echo "auto-merge refused by the fake" >&2 ;;
                    *)        r=$(rc merge_rc)
@@ -59,6 +69,10 @@ case "${1:-} ${2:-}" in
   "pr checkout") b=$(cat "$FAKE/pr_head")
                  git fetch -q origin "+refs/heads/$b:refs/heads/$b" && git worktree add -q "$5" "$b" ;;
   "pr view")
+    case "$*" in *isDraft*)
+      if [ -f "$FAKE/draft_err" ]; then cat "$FAKE/draft_err" >&2; exit 1; fi
+      if [ -f "$FAKE/draft" ]; then echo true; else echo false; fi; exit 0 ;;
+    esac
     case "$*" in *headRefName*)
       if [ -f "$FAKE/pr_info_err" ]; then cat "$FAKE/pr_info_err" >&2; exit 1; fi
       cat "$FAKE/pr_info"; exit 0 ;;
@@ -733,7 +747,7 @@ t_pr_view_fails() {     # t_pr_view_fails <title|body>: each check names itself 
 }
 t_existing_title() {
   new_repo; change README.md "Commit subject"; echo "7 https://github.example/o/r/pull/7" > "$FAKE/pr_open"
-  echo "Title on GitHub" > "$FAKE/pr_title"; land
+  echo "Title on GitHub" > "$FAKE/pr_title"; echo "Body on GitHub" > "$FAKE/pr_body"; land
   [ "$rc" -eq 0 ] && logged "--subject Title on GitHub (#7) --body-file" && ! logged "pr create"
 }
 t_pr_dry_closed() {
@@ -1069,6 +1083,122 @@ case_ "src/canon_trading/trail_profile.py is on the trading path" t_fix_protecto
 case_ "mise.toml is on the trading path" t_fix_protector_path mise.toml
 case_ "src/canon_trading/movers_rank_actor.py is on the trading path" t_fix_protector_path src/canon_trading/movers_rank_actor.py
 case_ "every trading-path glob matches a tracked file"      t_trading_globs
+
+# --- a draft: pushed and opened for review, never signed off or merged; the landing takes it over ---
+t_draft_opens() {
+  new_repo; change src/a.py
+  local sha; sha=$(git -C "$W" rev-parse topic)
+  land --draft
+  [ "$rc" -eq 0 ] || { why="a draft without --reviewed did not succeed"; return 1; }
+  quick_ci_ran || return 1
+  why="the draft was not pushed and opened as a draft"
+  pushed topic && [ "$(git -C "$C/origin.git" rev-parse topic)" = "$sha" ] && logged "pr create --draft" || return 1
+  why="a draft posted a status or asked for a merge"
+  ! logged "statuses" && ! logged "pr merge" && ! logged "pr ready"
+}
+t_draft_noremote() {
+  new_repo noremote; change src/a.py
+  local before; before=$(git -C "$W" rev-parse main)
+  land --draft
+  why="a draft with no origin was not refused, or moved main"
+  [ "$rc" -ne 0 ] && has "no origin" && [ "$(git -C "$W" rev-parse main)" = "$before" ] && ! ci_ran
+}
+t_draft_refused_with() {   # t_draft_refused_with <args...>: --draft does not combine with these
+  new_repo; change src/a.py
+  land --draft "$@"
+  why="--draft $* was not refused before anything ran"
+  [ "$rc" -ne 0 ] && ! ci_ran && ! pushed topic && ! logged "pr create"
+}
+t_draft_again() {
+  new_repo; change src/a.py; land --draft; [ "$rc" -eq 0 ] || { why="the first draft failed"; return 1; }
+  change src/a.py; local sha; sha=$(git -C "$W" rev-parse topic)
+  land --draft
+  why="a second draft did not push to the open pull request alone"
+  [ "$rc" -eq 0 ] && [ "$(grep -c 'pr create' "$FAKE/log")" -eq 1 ] \
+    && [ "$(git -C "$C/origin.git" rev-parse topic)" = "$sha" ] && ! logged "pr merge"
+}
+t_draft_checks_fail() {
+  new_repo; change src/a.py; echo 1 > "$FAKE/ci_rc"
+  land --draft
+  why="a draft whose checks failed was pushed or opened"
+  [ "$rc" -ne 0 ] && ! pushed topic && ! logged "pr create"
+}
+t_draft_taken_over() {
+  new_repo; change src/a.py; printf 'Draft text\n' > "$C/body.md"; land --draft --body "$C/body.md"; [ "$rc" -eq 0 ] || { why="the draft failed"; return 1; }
+  local sha; sha=$(git -C "$W" rev-parse topic)
+  land --reviewed "code-review ran, nothing found"
+  why="the landing did not mark the draft ready and merge it"
+  [ "$rc" -eq 0 ] && has "landed" && logged "pr ready 7" \
+    && logged "statuses/$sha -f state=success -f context=signoff" && logged "pr merge 7 --squash --match-head-commit $sha" || return 1
+  why="the draft was not marked ready after the signoff status and before the merge"
+  local ready signoff merge
+  ready=$(grep -n 'pr ready' "$FAKE/log" | cut -d: -f1); signoff=$(grep -n 'context=signoff' "$FAKE/log" | cut -d: -f1)
+  merge=$(grep -n 'pr merge' "$FAKE/log" | head -1 | cut -d: -f1)
+  [ "$signoff" -lt "$ready" ] && [ "$ready" -lt "$merge" ] || return 1
+  why="the landing did not use the draft's description"
+  grep -qF "Draft text" "$FAKE/merge_body"
+}
+t_existing_draft_lands() { # a draft opened by hand, before this script had --draft: the landing takes it over
+  new_repo; change src/a.py; git -C "$W" push -q origin topic
+  echo "7 https://github.example/o/r/pull/7" > "$FAKE/pr_open"; : > "$FAKE/draft"; echo "A title" > "$FAKE/pr_title"
+  echo "A body" > "$FAKE/pr_body"
+  land --reviewed "code-review ran, nothing found"
+  why="an open draft was not marked ready before its merge"
+  [ "$rc" -eq 0 ] && has "landed" && logged "pr ready 7" && [ ! -f "$FAKE/draft" ]
+}
+t_draft_onto_ready_pr() { # --draft never publishes to an open pull request that is ready for review
+  new_repo; change src/a.py; echo "7 https://github.example/o/r/pull/7" > "$FAKE/pr_open"; echo "A title" > "$FAKE/pr_title"
+  land --draft
+  why="--draft pushed to a pull request that is ready for review"
+  [ "$rc" -ne 0 ] && has "not a draft" && ! pushed topic && ! ci_ran
+}
+t_draft_ready_refused() { # a refused ready names GitHub's answer and asks for no merge; the draft stays
+  new_repo; change src/a.py; land --draft; [ "$rc" -eq 0 ] || { why="the draft failed"; return 1; }
+  echo "gh: API rate limit exceeded for user ID 1. (HTTP 403)" > "$FAKE/ready_err"
+  land --reviewed "code-review ran, nothing found"
+  why="a refused ready was not named, or a merge was asked for"
+  [ "$rc" -ne 0 ] && has "ready for review" && has "rate limit" && ! logged "pr merge" && [ -f "$FAKE/draft" ]
+}
+t_draft_read_fails() {    # a failed read of the draft state stops before anything is pushed
+  new_repo; change src/a.py; land --draft; [ "$rc" -eq 0 ] || { why="the draft failed"; return 1; }
+  change src/a.py; local before; before=$(git -C "$C/origin.git" rev-parse topic)
+  echo "HTTP 502" > "$FAKE/draft_err"
+  land --reviewed "code-review ran, nothing found"
+  why="a failed draft read did not stop before the push and statuses"
+  [ "$rc" -ne 0 ] && has "is a draft" && [ "$(git -C "$C/origin.git" rev-parse topic)" = "$before" ] && ! logged "statuses"
+}
+t_draft_note_without_review() { # a documentation-only draft is not told to give a review note
+  new_repo; change README.md; land --draft
+  why="a draft that needs no review was told to give --reviewed"
+  [ "$rc" -eq 0 ] && has "draft:" && ! has "--reviewed"
+}
+t_draft_dry_landing() {
+  new_repo; change src/a.py; land --draft; [ "$rc" -eq 0 ] || { why="the draft failed"; return 1; }
+  land --dry-run --reviewed "code-review ran, nothing found"
+  why="a dry run marked the draft ready or posted a status"
+  [ "$rc" -eq 0 ] && ! logged "pr ready" && ! logged "statuses"
+}
+t_draft_failed_checks_stay_draft() {
+  new_repo; change src/a.py; land --draft; [ "$rc" -eq 0 ] || { why="the draft failed"; return 1; }
+  echo 1 > "$FAKE/ci_rc"
+  land --reviewed "code-review ran, nothing found"
+  why="a landing whose checks failed marked the draft ready"
+  [ "$rc" -ne 0 ] && ! logged "pr ready" && [ -f "$FAKE/draft" ]
+}
+case_ "a draft runs the landing set, pushes, opens a draft and posts nothing" t_draft_opens
+case_ "a draft with no origin is refused and main is not moved" t_draft_noremote
+case_ "--draft with --pr is refused" t_draft_refused_with --pr 5
+case_ "--draft with --reviewed is refused" t_draft_refused_with --reviewed "a note"
+case_ "a second draft pushes to the same pull request" t_draft_again
+case_ "a draft whose checks fail pushes nothing" t_draft_checks_fail
+case_ "the landing marks an open draft ready, then signs off and merges" t_draft_taken_over
+case_ "a landing takes over a draft it did not open" t_existing_draft_lands
+case_ "--draft refuses an open pull request that is ready for review" t_draft_onto_ready_pr
+case_ "a refused ready is named, and nothing is merged" t_draft_ready_refused
+case_ "a failed read of the draft state stops before the push" t_draft_read_fails
+case_ "a draft that needs no review is not told to give a note" t_draft_note_without_review
+case_ "a dry-run landing leaves the draft as it is" t_draft_dry_landing
+case_ "a landing whose checks fail leaves the draft a draft" t_draft_failed_checks_stay_draft
 
 wait
 pass=0; fail=0

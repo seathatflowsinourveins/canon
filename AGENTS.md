@@ -48,7 +48,7 @@ dependency, pattern and practice traces to a pinned upstream or a dated source. 
 | `scripts/canon list` | Show every upstream, its role and pinned commit |
 | `scripts/canon lint` | Check registry, lock and ADRs for required evidence (offline) |
 | `scripts/ci` | Run every check: registry, shell, self-tests and `scripts/test-*`, lockfile, ruff, ty, pytest, workflow, secrets; and for a project kept apart (a `uv.lock` below the root), its own lockfile, ty and pytest in its own environment |
-| `scripts/land` | Land the current branch on `main` once its checks pass here and GitHub's required check passes; no manual merge step. `--pr <n>` lands a pull request the dependency bot opened |
+| `scripts/land` | Land the current branch on `main` once its checks pass here and GitHub's required check passes; no manual merge step. `--pr <n>` lands a pull request the dependency bot opened; `--draft` runs the same checks, pushes, opens a draft pull request or pushes to the open draft (it refuses one ready for review), and stops, with no status and no merge |
 | `scripts/canon src [id]` | Fetch one pin's repository (every git pin without an id) at its locked commit into `~/.cache/canon/upstream-src/<id>@<commit>`, read-only, and print the path; a folder already there is checked against the lock |
 | `scripts/canon check` | Compare pins with live upstream; exit 3 if a pinned release tag was re-pointed, 4 if the lock is stale against the registry |
 | `scripts/canon outdated` | Show upstreams that have a newer release tag than the one pinned |
@@ -207,6 +207,12 @@ The owner's standing instruction (2026-11-09): work lands automatically once its
    once the checks pass, so look at the pull request. With no `origin` remote
    it fast-forwards the local `main`. The same checks run on this machine and on GitHub's runners
    (ADR 0014).
+   A unit in review can be published first with `scripts/land --draft`: the same address check and
+   landing checks, a push and a draft pull request, so the owner sees it; that GitHub's check runs on a draft
+   during the review is `UNVERIFIED` until the first one. It posts no status and nothing can merge from
+   it. Its landing is `scripts/land` on the same branch, which uses the draft's description unless
+   `--body` is given, and marks the draft ready after its checks pass and its statuses are posted. Once pushed, a branch that falls behind
+   `main` is no longer rebased: merge `origin/main` into it before it lands.
 3. Every change needs an independent review before it lands, unless every path it changes is
    `README.md`, `packages/*/README.md`, `catalog/README.md`, an edit to an existing
    `docs/adr/NNNN-*.md` or an edit to `uv.lock`; a new or renamed record needs one. `/code-review` reads
