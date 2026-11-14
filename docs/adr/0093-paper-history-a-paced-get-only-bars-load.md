@@ -7,6 +7,8 @@ review-by: 2026-12-11
 
 # paper:history: a paced, GET-only load of SIP bars and trades or IEX quotes into the catalog
 
+*Amended in part 2026-11-12 by ADR 0151 (proposed): clause 10's quote root may be SIP, in its own root.*
+
 ## Context and Problem Statement
 
 The movers work needs minute and day bars for a few thousand symbols. The baseline is five sessions over

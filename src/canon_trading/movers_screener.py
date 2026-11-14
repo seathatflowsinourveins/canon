@@ -7,6 +7,9 @@ Contract: alpaca-py 0.45.0 (the pin), used as shipped: `alpaca.data.historical.s
 Alpaca's pages: "Movers" (`GET /v1beta1/screener/{market_type}/movers`, `top` at most 50, gainers and losers
 from the previous close, reset at market open) and "Most Actives" (`GET /v1beta1/screener/stocks/most-actives`,
 `by` volume or trades, `top` at most 100). Nothing here computes a screen; each answer is logged as it came.
+Each complete poll also publishes `screener-board.json` in the board folder (`screener_board`, display only,
+loaded here only when a poll runs, so a module that imports this one for `movers_line` does not load it);
+this adds no request, and a failed write is named on stderr and the polling goes on.
 
 How it is kept from trading (ADR 0070, terms 3 and 5): it runs in data-only mode, which `mise run paper:data`
 sets and `main` sets again; its one REST client goes through `canon_alpaca.providers.with_http_timeout`, whose
@@ -153,11 +156,17 @@ def run(
     minutes: int,
     log: Path,
     *,
+    board_dir: Path | None = None,
     clock: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
 ) -> int:
     """Poll `minutes` times, `POLL_SECS` apart on `clock`, one JSON line each in `log`; then a summary line
     with the requests counted. Returns how many reads failed."""
+    from canon_trading.screener_board import default_board_dir
+    from canon_trading.screener_board import write_board
+
+    if board_dir is None:
+        board_dir = default_board_dir()
     start = clock()
     failed = 0
     with log.open("a", encoding="utf-8") as out:
@@ -170,6 +179,11 @@ def run(
             record = {"poll": n + 1, "at": datetime.now(UTC).isoformat(), "failed": bad, **line}
             out.write(json.dumps(record) + "\n")
             out.flush()
+            if not bad:
+                try:
+                    write_board(board_dir, record)
+                except Exception as error:  # noqa: BLE001 - the display never stops the record
+                    print(f"screener board not written: {error}", file=sys.stderr, flush=True)
         summary = {
             "summary": True,
             "polls": minutes,
@@ -199,6 +213,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--log-dir", type=Path, required=True, help="an absolute folder outside the repository"
     )
+    parser.add_argument(
+        "--board-dir",
+        type=Path,
+        default=None,
+        help="board folder (default: ~/.claude/canon/watch/)",
+    )
     args = parser.parse_args(argv)
     if not 1 <= args.minutes <= MAX_MINUTES:
         parser.error(f"--minutes must be 1 to {MAX_MINUTES}")
@@ -211,7 +231,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args.log_dir.mkdir(parents=True, exist_ok=True)
     log = log_path(args.log_dir, datetime.now(UTC))
     print(f"movers-screener: {args.minutes} polls, log {log}", flush=True)
-    failed = run(client, args.minutes, log)
+    failed = run(client, args.minutes, log, board_dir=args.board_dir)
     print(f"movers-screener: done, {failed} read(s) failed", flush=True)
     return 1 if failed else 0
 
