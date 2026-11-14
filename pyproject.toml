@@ -31,6 +31,7 @@ canon-alpaca = { workspace = true }
 [dependency-groups]
 dev = [
     "pytest==9.2.0",
+    "pytest-xdist==3.8.0",
     "ruff==0.17.4",
     "ty==0.0.101",
 ]
