@@ -190,23 +190,29 @@ matrix of five parts that run at once on their own runners, `part: [rest, 1/4, 2
   fails. The part prints how many functions it holds, of how many collected tests, and pytest's summary
   line. A collection that fails fails the part.
 
-Together the five parts run what one plain `scripts/ci` runs, each check and each collected test once.
-The `all required checks passed` job needs `parts` and `check` and runs `scripts/ci --verdict`, which
+Together the five parts run what one plain `scripts/ci` runs, each collected test once and each check once
+but the lock check and the environment, which every part runs. One gate of a plain run is not kept: there a
+failed ruff or ty check skips the root pytest, while in a pytest part those checks are skip lines, so the
+pytest parts run even when part `rest` fails them. The `all required checks passed` job needs `plan`
+(named `parts`) and `check` and runs `scripts/ci --verdict`, which
 fails, naming each, unless every job it needs has the result `success`: a part that failed, was cancelled
 or timed out leaves `check`'s result otherwise. The ruleset's two required contexts, `signoff` and `all
 required checks passed`, are unchanged, and so is the way `scripts/land` reads them, by bucket and not by
 name. Each part's limit is 30 minutes, the lead's cap, to be set to about twice the slowest part once a
-hosted run of the parts names it; `scripts/land`'s wait is 45 minutes, above it (rule 4). Local runs
+hosted run of the parts names it; `scripts/land`'s wait is 45 minutes, above it (rule 4). The required
+context resolves only after three jobs in series, `plan` (at most 5 minutes), the slowest part (at most 30)
+and the aggregator (at most 5), so at the limits the wait leaves about 5 minutes for runners to queue; a
+wait that runs out stops `scripts/land`, while GitHub may still merge. Local runs
 (`--staged`, `--landing`, plain) are unchanged.
 
 **Why.** The one job's run took 33 to 38 minutes on 2026-11-14 when it passed (`gh run list --workflow
 ci.yml`: on `main` 43617194822 33.9 min, 43614583851 36.5, 43611536636 35.4; pull request runs 32.9 to
-37.9), and three runs were cancelled at the 40-minute timeout, 40.4 min each (`main` at `fa321292`,
+38.4), and three runs were cancelled at the 40-minute timeout, 40.4 min each (`main` at `fa321292`,
 43621264808, and two pull request runs). Its log prints no per-check time, but the root pytest alone ran
 for 1,862.72 s (31 min 3 s) in one local run at `fa321292` (`pytest --durations=0` under `nice -n 15`,
 12,466 passed, 66 skipped, 30 xfailed), so it is the run's long pole. The split is by test, not by file:
 one file, `packages/canon-alpaca/tests/test_execution_client.py`, took 551 of the 1,834 s the durations
-list sums, and the four parts a hash of each file would have made summed 167, 504, 305 and 859 s. Hashed
+list sums, and the four parts a hash of each file would have made summed 167, 504, 305 and 859 s (1,835 s, by rounding). Hashed
 by test function, the same durations sum to 474, 420, 486 and 454 s, each part under nine minutes of test
 time before its environment install and collection. At `fa321292` the four parts' argument files,
 collected by pytest, held 2,782, 2,513, 3,562 and 3,705 tests, 12,562 together with no ID in two parts,
@@ -222,9 +228,10 @@ run's jobs list show it.
 
 **Not verified.** GitHub's matrix and contexts pages say nothing about the `needs.<job>.result` of a matrix
 job one of whose legs failed (read 2026-11-14). That a failed, cancelled or timed-out part makes `check`'s
-result other than `success` rests on uv's practice below and is UNVERIFIED by such a hosted run here;
+result other than `success` is UNVERIFIED by such a hosted run here (uv's practice below is about a
+reusable workflow's result, not a direct matrix job's);
 `scripts/test-ci` shows that the verdict fails on any result but `success`.
-That every part ends within fifteen minutes is shown by the first landing under this amendment, whose pull
+That every part ends within fifteen minutes is UNVERIFIED, to be shown by the first landing under this amendment, whose pull
 request names each part's wall time and the summed count against one collection at the same commit; the
 time of part `rest`, whose checks the one job's log does not time, is UNVERIFIED until that run.
 
@@ -245,9 +252,11 @@ passes only when every job needed succeeded, and fails naming a part's `failure`
 * uv at its pin `316c827e058c`, `.github/workflows/test.yml:243-248,318`: the `cargo-test-windows` job is
   a matrix `partition: [1, 2, 3]` with `fail-fast: false`, each leg running
   `--partition hash:${{ matrix.partition }}/3`, cargo-nextest's hash partition, which hashes each test;
-  this repository applies the same form to each pytest test function. `.github/workflows/ci.yml:440-495`: uv's
-  `required-checks-passed` job runs `if: always()`, needs `test`, the workflow holding that matrix job,
-  and fails unless each need's result is `success`.
+  this repository applies the same form to each pytest test function. `.github/workflows/ci.yml:440-490`: uv's
+  `required-checks-passed` job runs `if: ${{ always() && github.ref != 'refs/heads/main' }}`, needs
+  `test`, a reusable workflow holding that matrix job, and fails on a need whose result is neither
+  `success` nor `skipped` (and on `skipped` for `check-vet` and `check-cargo-cooldowns`). This
+  repository's verdict is stricter: it fails on `skipped` too.
 * pytest 9.2.0, as `uv.lock` pins it: `_pytest/config/argparsing.py:509` builds its parser with
   `fromfile_prefix_chars="@"`, so `@<file>` reads one argument per line; `_pytest/main.py:1155` splits a
   node ID's parametrization off at its first `[` before splitting the rest at `::`, so an ID whose
@@ -255,8 +264,10 @@ passes only when every job needed succeeded, and fails naming a part's `failure`
   under `--no-fold-skipped` as `SKIPPED <node ID> - <reason>`.
 * https://docs.github.com/en/actions/using-jobs/using-a-matrix-for-your-jobs — a matrix runs one job per
   combination; with `fail-fast: true` "all jobs that are in progress or queued will be cancelled" once one
-  fails, which `fail-fast: false` turns off. The workflow syntax reference gives `fail-fast` a default of
-  `true` (read through a summary of that page, so its wording is UNVERIFIED).
+  fails, which `fail-fast: false` turns off. The workflow syntax reference,
+  https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax, says of
+  `jobs.<job_id>.strategy.fail-fast`: "This property defaults to `true`" (read 2026-11-14 through a
+  page extractor's quote).
 * https://docs.github.com/en/actions/how-tos/write-workflows/choose-what-workflows-do/run-job-variations,
   "Using an output to define two matrices" — a job's output, `fromJSON(needs.<job>.outputs.<name>)`, as a
   later job's matrix. https://docs.github.com/en/actions/reference/workflows-and-actions/contexts —

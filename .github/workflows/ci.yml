@@ -42,7 +42,10 @@ jobs:
           persist-credentials: false
       - name: List the parts
         id: parts
-        run: echo "parts=$(scripts/ci --list-parts)" >> "$GITHUB_OUTPUT"
+        # Assigned first, so a failing scripts/ci fails this job by name rather than leaving the output empty.
+        run: |
+          parts=$(scripts/ci --list-parts)
+          echo "parts=$parts" >> "$GITHUB_OUTPUT"
 
   # One job per part, a matrix as uv's own workflow splits its tests (`fail-fast: false` and
   # `partition: [1, 2, 3]`, pinned uv, .github/workflows/test.yml:244-248;

@@ -439,7 +439,6 @@ FAKE_PART_NODES=$C.quiet FAKE_PART_COUNT=4; export FAKE_PART_COUNT
 runci --part 2/3
 unset FAKE_PART_COUNT
 check "a list with no node IDs (another verbosity) fails the part, not passes" has '^  FAIL  pytest, part 2 of 3$'
-FAKE_PART_NODES=$nodes
 unset FAKE_PART_NODES
 check "the parts run every collected test function once, and the file of a module skipped at collection" \
   test "$(sort "$all" | tr '\n' '|')" = \
