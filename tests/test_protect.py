@@ -2626,3 +2626,26 @@ def test_a_send_the_close_would_overtake_is_refused_by_name_and_not_sent(
     assert code == 2 and [r.symbol for r in paper.submitted] == ["AAA"]
     (line,) = [x for x in lines if x.startswith("unprotected BBB:")]
     assert "20 s to the close" in line
+
+
+def test_a_read_in_the_send_step_that_eats_the_margin_stops_the_send(capsys, monkeypatch) -> None:
+    """The check just before the send is its own: a symbol that had the margin before its reads, and
+    lost it to a slow position read in the send step, is named unprotected by the send, nothing sent."""
+    passed = [0.0]
+    monkeypatch.setattr(protect, "monotonic", lambda: passed[0])
+    margin = int(protect.SEND_MARGIN.total_seconds())
+    paper = Paper(
+        positions=[_position("AAA", "10")],
+        next_close=(NOW + timedelta(seconds=margin + 5)).isoformat(),
+    )
+    original = paper.get_open_position
+
+    def slow(symbol):
+        passed[0] += 10.0  # the send step's position read took 10 s, leaving margin - 5 s
+        return original(symbol)
+
+    paper.get_open_position = slow  # type: ignore[method-assign]
+    code, lines = _run(paper, Data({"AAA": AAA_BOOK}), capsys)
+    assert code == 2 and not paper.submitted, lines
+    (line,) = [x for x in lines if x.startswith("unprotected AAA:")]
+    assert f"{margin - 5} s to the close by the send" in line
