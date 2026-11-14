@@ -64,6 +64,8 @@ from tests.test_owner_protector import SyntheticExecution
 from tests.test_owner_protector import quote
 from tests.test_protector_node import config
 
+pytestmark = pytest.mark.usefixtures("new_york_regular_hours")
+
 SHARES = 30_000  # about $300,000 at $10
 ASSET_AAA = {
     "class": "us_equity",
