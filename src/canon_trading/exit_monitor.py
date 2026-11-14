@@ -1,4 +1,13 @@
-"""Display-only exit monitor, unit one of the lead's 2026-11-13 properties.
+"""Display-only exit monitor, including the lead's frozen third-line brief.
+
+Third-line contract: packages/canon-alpaca/README.md, "Wash trades", OBSERVED
+2026-11-13 post-market. Blocking buys are separate from coverage and use only
+the existing open-order/position reads (alpaca-py models.py:150-199,217-304).
+The observed table defines the two blocking kinds. The price cut for a limit buy
+(SALE_REACH) is this monitor's rule, not an observation, and each line says which is which;
+a holding covered only by a node's own stop is still told, since that stop is no order at the venue.
+Python b703b2c5e704 Doc/library/hashlib.rst:98-116: SHA-256 episode identities
+keep venue/client order IDs out of every output, including local memory.
 
 Contracts read at the pins on 2026-11-13:
 * alpaca-py c42add7c0a70: trading/client.py:107-131,235-247,422-463;
@@ -63,6 +72,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import hashlib
 import json
 import os
 import signal
@@ -128,6 +138,15 @@ ACKNOWLEDGED = frozenset({"new", "partially_filled"})
 STATES = ("covered", "dormant", "uncovered", "unknown")
 PARTS = frozenset({"regular", "pre-market", "after-hours", "overnight"})
 DENIED_LIMIT = "no node report: a locally denied sell is alerted at the alert age, not at once"
+# Source: packages/canon-alpaca/README.md, "Wash trades"; observations, not documentation.
+WASH_TRADE_CODE = 40_310_000  # OBSERVED 2026-11-13 post-market.
+WASH_TRADE_MESSAGE = "potential wash trade detected"  # OBSERVED 2026-11-13 post-market.
+BLOCKING_BUY_KINDS = frozenset({"market", "limit"})  # OBSERVED 2026-11-13 post-market.
+# UNCALIBRATED: frozen brief's default; no measured source or protector limit offset
+# is exposed at this base. This monitor does not know the protector's sale limit.
+SALE_REACH = Decimal("0.02")
+NODE_STOP = "node engine stop"
+"""The cover a node report gives: a stop the node holds itself, with no order at the venue."""
 
 
 class ReadFailed(RuntimeError):
@@ -264,7 +283,7 @@ def _cover(symbol: str, orders: Sequence[Any], reports: Sequence[Any], now: date
             report_notes.add("report not added: its stop cannot be distinguished from another exit")
             continue
         cover += qty
-        kinds.add("node engine stop")
+        kinds.add(NODE_STOP)
         if part in sessions:
             active += qty
     return (
@@ -420,6 +439,7 @@ def empty_memory(account: str) -> dict[str, Any]:
         "blind_alerted": False,
         "blind_since": None,
         "boundaries": {},
+        "exit_blocks": {},
     }
 
 
@@ -461,11 +481,35 @@ def _load_memory(path: Path, account: str):
             _stamp(entry["at"])
             if not isinstance(entry["symbol"], str) or not isinstance(entry["message"], str):
                 raise TypeError
+        # Older unit-one memory remains valid; this fact owns a separate episode map, and a map
+        # that cannot be read is dropped ALONE: the coverage episodes and ages above are kept.
+        value.pop("exit_blocks_lost", None)
+        try:
+            _check_block_memory(value.setdefault("exit_blocks", {}))
+        except ValueError, KeyError, TypeError, ReadFailed:
+            value["exit_blocks"], value["exit_blocks_lost"] = {}, True
         return value, ""
     except FileNotFoundError:
         return empty_memory(account), "no memory file"
     except OSError, ValueError, KeyError, TypeError, ReadFailed:
         return empty_memory(account), "memory unreadable"
+
+
+def _check_block_memory(episodes: Any) -> None:
+    if not isinstance(episodes, dict):
+        raise TypeError
+    for key, episode in episodes.items():
+        if not isinstance(key, str) or not isinstance(episode, dict):
+            raise TypeError
+        _stamp(episode["since"])
+        _stamp(episode["last_alert"])
+        if episode.get("cleared"):
+            _stamp(episode["cleared"])
+        if not isinstance(episode["alert_count"], int) or episode["alert_count"] < 1:
+            raise ValueError
+        row = episode["row"]
+        if row["kind"] != "exit blocked" or not isinstance(row["message"], str):
+            raise ValueError
 
 
 def _root(account: str) -> Path:
@@ -825,6 +869,160 @@ def _notice(account: str, now: datetime, key: str, message: str, state: str) -> 
     }
 
 
+def _blocking_buys(account, positions, orders, findings, part):
+    """Pure third-line assessment; a buy's status never limits it to routed orders."""
+    # T5: a long whose exit is already PLACED at the venue gets no telling. A node's own stop is no
+    # order at the venue: its sale is a new sell, the kind the table shows refused, so a holding
+    # covered that way is still told.
+    holdings = {
+        f["symbol"]: f
+        for f in findings
+        if f["side"] == "long" and (f["state"] != "covered" or NODE_STOP in f["exit"])
+    }
+    prices = {_field(p, "symbol"): _field(p, "current_price") for p in positions}
+    rows = {}
+    for order in orders:
+        symbol = _field(order, "symbol")
+        status = _value(_field(order, "status"))
+        if (
+            symbol not in holdings
+            or _value(_field(order, "side")) != "buy"
+            or status in custody.ENDED_AT
+        ):
+            continue
+        identity = json.dumps(("exit blocked", account, symbol, str(_field(order, "id"))))
+        key = hashlib.sha256(identity.encode()).hexdigest()
+        kind = _value(_field(order, "type") or _field(order, "order_type"))
+        order_class = _value(_field(order, "order_class", "simple"))
+        complex_order = order_class not in ("simple", "") or bool(_field(order, "group_id"))
+        blocked = kind in BLOCKING_BUY_KINDS and not complex_order
+        unavailable = False
+        limit = None
+        try:
+            if _field(order, "limit_price") is not None:
+                limit = _decimal(_field(order, "limit_price"))
+            if blocked and kind == "limit":
+                current = _decimal(prices.get(symbol))
+                if not current or not limit:
+                    raise ReadFailed("limit comparison unavailable")
+                if limit < current * (1 - SALE_REACH):
+                    continue
+        except ReadFailed:
+            blocked, unavailable = False, True
+        owner = custody.lineage(_field(order, "client_order_id"))
+        whose = (
+            "ours"
+            if owner in (custody.OURS, custody.PROTECT)
+            else "owner's (foreign lineage)"
+            if owner == custody.FOREIGN
+            else "ownership not shown"
+        )
+        label = "exit blocked" if blocked else "not observed: may block"
+        detail = (
+            f"resting buy {kind}, time in force {_value(_field(order, 'time_in_force'))}, "
+            f"status {status}, {whose}"
+        )
+        if limit is not None:
+            detail += f", limit {limit}"
+        if complex_order:
+            detail += f", order class {order_class}; grouped order not observed"
+        if unavailable:
+            detail += "; comparison unavailable: current price or buy limit not shown as positive"
+        if kind == "stop" and not complex_order:
+            detail += (
+                "; documented to block (Alpaca's page: a new order is rejected when either order "
+                "is a market or stop order), not observed"
+            )
+        message = f"{symbol} quantity {holdings[symbol]['quantity']}: {label.upper() if blocked else label}; {detail}"
+        if blocked:
+            refused = (
+                "extended-hours limit sell, with or without sell_to_close, and market sell refused "
+                f'(HTTP 403, code {WASH_TRADE_CODE}, "{WASH_TRADE_MESSAGE}"); '
+                "Alpaca's own trailing stop accepted beside it"
+            )
+            if kind == "limit":
+                # The table's refusals beside a limit buy are one row: queued, not extended, over
+                # the sell's limit. The price rule is this monitor's, not an observation.
+                message += (
+                    "; by this monitor's rule (a limit buy at or over where our sale would go: "
+                    f"current price less SALE_REACH {SALE_REACH}, UNCALIBRATED); OBSERVED 2026-11-13 "
+                    "post-market only beside a queued limit buy not marked for extended hours, "
+                    f"priced over the sell's limit: {refused}; a live extended-hours limit buy "
+                    "under the market was observed NOT to block a market sell"
+                )
+            else:
+                message += f"; OBSERVED 2026-11-13 post-market: {refused}"
+            if NODE_STOP in holdings[symbol]["exit"] and holdings[symbol]["state"] == "covered":
+                message += (
+                    f"; covered only by a {NODE_STOP}, which is no order at the venue: its sale "
+                    "is a new sell"
+                )
+            if part != "after-hours":
+                message += "; not observed in this session"
+        rows[key] = {
+            "account": account,
+            "symbol": symbol,
+            "quantity": holdings[symbol]["quantity"],
+            "kind": label,
+            "message": message,
+            "comparison_unavailable": unavailable,
+        }
+    return {key: rows[key] for key in sorted(rows)}
+
+
+def _block_events(account, now, rows, memory, complete):
+    """Independent order episodes: immediate, repeat, and one silent clear."""
+    if not complete:
+        # A failed read cannot establish that a previously blocking order is gone.
+        return [], []
+    previous = memory.get("exit_blocks", {})
+    episodes = {}
+    lines = list(rows.values())
+    events = []
+    for key, row in rows.items():
+        old = previous.get(key)
+        if row["comparison_unavailable"]:
+            if old:
+                episodes[key] = old
+            continue
+        if row["kind"] != "exit blocked":
+            continue
+        # `old` may be an episode that cleared inside the repeat interval (kept below): the same
+        # order blocking again is the same telling, so a price at the reach's edge tells once.
+        episode = {
+            "since": old["since"] if old else now.isoformat(),
+            "last_alert": old["last_alert"] if old else None,
+            "alert_count": old["alert_count"] if old else 0,
+            "row": row,
+        }
+        if old is None or (now - _stamp(old["last_alert"])).total_seconds() >= REPEAT_SECONDS:
+            notice_key = f"exit blocked:{key}:{episode['since']}:{episode['alert_count']}"
+            events.append(_notice(account, now, notice_key, row["message"], "exit blocked"))
+            episode["last_alert"] = now.isoformat()
+            episode["alert_count"] += 1
+        episodes[key] = episode
+    for key in sorted(set(previous) - set(episodes)):
+        old = previous[key]
+        row = old["row"]
+        if not old.get("cleared"):
+            lines.append(
+                {
+                    **row,
+                    "kind": "cleared",
+                    "message": row["message"].replace("EXIT BLOCKED", "exit blocked cleared", 1),
+                }
+            )
+        if (now - _stamp(old["last_alert"])).total_seconds() < REPEAT_SECONDS:
+            episodes[key] = {**old, "cleared": old.get("cleared") or now.isoformat()}
+    memory["exit_blocks"] = episodes
+    return lines, events
+
+
+def _blocks_kept(memory) -> int:
+    """The block episodes that are ongoing: kept in memory and not cleared."""
+    return sum(not episode.get("cleared") for episode in memory.get("exit_blocks", {}).values())
+
+
 def _boundary_warnings(account, now, clock, days, positions, orders, reports, memory, reader):
     edges: list[dict[str, Any]]
     if days is None:
@@ -1014,8 +1212,11 @@ def _finish(
     boundary_events,
     boundary_warnings,
     notes,
+    blocking_buys,
 ):
     events = list(boundary_events)
+    exit_blocks, block_notices = _block_events(account, now, blocking_buys, memory, not error)
+    events.extend(block_notices)
     old_episodes = memory["episodes"]
     current = {f["symbol"]: f for f in findings if f["state"] != "covered"}
     cleared = sorted(set(old_episodes) - set(current))
@@ -1083,6 +1284,8 @@ def _finish(
             **counts,
             "oldest_uncovered_age": oldest,
             "boundary_warnings": boundary_warnings,
+            "exit_blocked": None if error else _blocks_kept(memory),
+            "exit_blocks_observed": not bool(error),
             "error": error,
             "interval_seconds": INTERVAL_SECONDS,
         },
@@ -1097,6 +1300,8 @@ def _finish(
         if all(f["state"] == "covered" for f in findings)
         else ", ".join(f"{n} {state}" for state, n in counts.items() if n)
     )
+    if memory.pop("exit_blocks_lost", False):
+        notes.append("exit-block memory unreadable: its episodes start again; coverage memory kept")
     if memory_note:
         notes.append(
             f"{memory_note}: ages from the venue's fills where shown, else from first seen"
@@ -1117,6 +1322,7 @@ def _finish(
         "ok": not error,
         "summary": summary,
         "findings": findings,
+        "exit_blocks": exit_blocks,
         "status": status,
         "alerts": events,
         "cleared": cleared,
@@ -1283,6 +1489,11 @@ def run_pass(
                 rejected=rejected,
                 read_error=error,
             )
+            blocking_buys = (
+                _blocking_buys(account, positions, orders, findings, _part(now, clock, days))
+                if clock and not error
+                else {}
+            )
             memory["positions"] = {_field(p, "symbol"): _snapshot(p) for p in positions}
             if not fresh_reports or any(
                 finding["side"] == "long"
@@ -1309,6 +1520,7 @@ def run_pass(
                 boundary_events,
                 boundary_warnings,
                 notes,
+                blocking_buys,
             )
     except (ReadFailed, OSError, ValueError) as exc:
         # Output failures are visible to the caller; never claim a successful
