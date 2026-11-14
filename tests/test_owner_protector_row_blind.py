@@ -45,7 +45,7 @@ from nautilus_trader.model import TimeInForce
 from nautilus_trader.trading import Strategy
 
 from canon_trading import protect
-from canon_trading.price_step import entry_price
+from canon_trading.price_step import up_on_step
 from tests.test_mover import AAA
 from tests.test_mover import MINUTE
 from tests.test_mover import T0
@@ -247,8 +247,8 @@ def protective_sell(strategy: Any) -> Any:
 def distances(order: Any, bid: Decimal, ask: Decimal) -> list[Decimal]:
     """The distance the armed sell carries: its trailing offset where the seam gives one, else the
     gap from either price `paper:protect` names as its reference (the bid less the distance, or the
-    entry the distance is planned against). Both references are one tick apart in the narrow quote,
-    so accepting either costs one tick and no more."""
+    reference price the distance is planned against, `up_on_step` of the ask). Both references are
+    one tick apart in the narrow quote, so accepting either costs one tick and no more."""
     offset = getattr(order, "trailing_offset", None)
     if offset is not None:
         return [Decimal(str(offset))]
@@ -257,7 +257,7 @@ def distances(order: Any, bid: Decimal, ask: Decimal) -> list[Decimal]:
         trigger = getattr(order, "price", None)
     assert trigger is not None, f"the armed sell carries no price or trailing offset: {order}"
     level = Decimal(str(trigger))
-    entry = entry_price(ask, protect.PLANNER.entry_ticks)
+    entry = up_on_step(ask)
     return [abs(bid - level), abs(entry - level)]
 
 

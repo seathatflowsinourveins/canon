@@ -43,9 +43,14 @@ Contracts, read 2026-11-12:
   entry; no row is calibrated for a
   standing holding (all UNCALIBRATED, ADR 0088, ADR 0142); then the sizing unit's
   `sizing.sized_stop`, the one computation of the stop a long at `entry` is sized
-  against at that fraction, so the distance is entry less that stop, as `Mover._buy` takes L. The entry is
-  `price_step.entry_price` of the ask at the Mover's `entry_ticks`, as `_buy` prices
-  one. The ATR is NautilusTrader's `AverageTrueRange` at the pin `d53849b216e2`, fed by `update_raw(high,
+  against at that fraction, so the planned distance is price less that stop, as `Mover._buy` takes L.
+  A distance off the reference price's step is rounded to the nearest step (ties upward), never under
+  the spread floor or `venue_smallest`; the report keeps both distances (the lead's 2026-11-14 ruling).
+  The reference is the ask through `price_step.up_on_step`, including above the entry table's bound:
+  this plans protection for shares already held. Alpaca's "Sub-penny increments" for limit and stop
+  prices (same order documentation, read 2026-11-14) give two decimals at or above $1 and four below;
+  this retains the existing distance step at the reference price even when the trigger crosses $1.
+  The ATR is NautilusTrader's `AverageTrueRange` at the pin `d53849b216e2`, fed by `update_raw(high,
   low, close)`, which is what its `handle_bar` calls (`crates/indicators/src/volatility/atr.rs:84-86`),
   on the last `atr_n` complete minute bars that exist in the session day (`session_bars`), its period
   their count when fewer exist (`warm_atr`). With no usable spread an ATR row's ATR distance stands
@@ -116,6 +121,7 @@ from datetime import datetime
 from datetime import timedelta
 from decimal import ROUND_CEILING
 from decimal import ROUND_FLOOR
+from decimal import ROUND_HALF_UP
 from decimal import Decimal
 from time import monotonic
 from time import sleep
@@ -170,8 +176,8 @@ from .custody import describe
 from .custody import lineage
 from .custody import open_orders
 from .movers_rank import DAY_START
-from .price_step import entry_price
 from .price_step import tick
+from .price_step import up_on_step
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -214,7 +220,7 @@ def planner_config(row: str) -> mover.MoverConfig:
 
 
 PLANNER = planner_config(session_window.DEFAULT_ARM)
-"""The rows the planning shares whatever the trail row: `atr_n`, `entry_ticks`, `spread_floor_m`."""
+"""The rows the planning shares whatever the trail row: `atr_n`, `spread_floor_m`."""
 ATR_BARS = PLANNER.atr_n + 1
 """The most bars an ATR is warmed on: `atr_n` + 1, as `Mover._warm_atr` feeds, so each of the `atr_n`
 ranges has a previous close."""
@@ -363,9 +369,9 @@ class Distance:
     """The spread floor in dollars; None with no usable spread."""
     quote_age: timedelta
     distance: Decimal
-    """What is sent: the Mover's distance, or Alpaca's smallest trail where that is the larger."""
+    """What is sent: the planned distance on the price step, never under either floor."""
     planned: Decimal
-    """The Mover's own distance, before Alpaca's smallest trail."""
+    """The Mover's own distance, before rounding to the reference price's step or either floor."""
     row: str = ""
     bid: Decimal = Decimal(0)
     bars: int = 0
@@ -383,14 +389,25 @@ class Distance:
             if plan.bound == "fixed" and not plan.note
             else f"from {plan.bound}"
         )
-        bound = (
-            own
-            if self.distance == self.planned
-            else (
+        step = tick(self.price)
+        rounded = self.planned.quantize(step, rounding=ROUND_HALF_UP)
+        if self.distance == self.planned:
+            bound = own
+        elif self.distance == rounded:
+            bound = (
+                f"rounded to the price step {step}: distance {self.distance}, "
+                f"from the Mover's {self.planned} {own}, never under the floors"
+            )
+        elif self.distance == venue_smallest(self.price):
+            bound = (
                 f"bound by Alpaca's smallest trail ({VENUE_SMALLEST:.1%} of the price, up to the step "
                 f"and one step over), over the Mover's {self.planned} {own}"
             )
-        )
+        else:
+            bound = (
+                f"raised to the spread floor up to the price step {step}: distance "
+                f"{self.distance}, over the Mover's {self.planned} {own}"
+            )
         opens = f"the bid {self.bid} less the distance; Alpaca sets it from its own mark"
         at = (
             f"stop opens about {self.bid - self.distance} ({opens})"
@@ -563,7 +580,7 @@ def row_distance(
         deque(),
         atr=book.atr,
     )
-    price = entry_price(ask, PLANNER.entry_ticks)
+    price = up_on_step(ask)
     touch = SimpleNamespace(bid_price=Price.from_str(str(bid)), ask_price=Price.from_str(str(ask)))
     plan = planner._entry_trail(slot, price, touch, found_holding=True)
     fixed_row = planner.settings.trail_mode == "fixed"
@@ -580,7 +597,7 @@ def row_distance(
             plan = _atr_alone(planner, atr, price, unusable)
     else:
         # with a usable spread its floor is held for every row here, the fixed row included
-        floor = PLANNER.spread_floor_m * plan.spread / price if plan.floor is None else plan.floor
+        floor = planner.settings.spread_floor_m * plan.spread
     if fallback:
         plan = replace(
             plan,
@@ -602,20 +619,26 @@ def row_distance(
     distance = price - sizing.sized_stop(price, plan.trail)
     if distance <= 0:
         raise ValueError(f"the distance {distance} at {price} leaves no room for a trail")
-    if distance != distance.quantize(tick(price)):
-        raise ValueError(f"the distance {distance} is off the step {tick(price)} of {price}")
-    if distance / price < floor:
+    if distance < floor:
         raise ValueError(f"the distance {distance} is under the spread floor at {price}")
-    sent = max(distance, venue_smallest(price))
+    step = tick(price)
+    sent = max(
+        distance.quantize(step, rounding=ROUND_HALF_UP),
+        floor.quantize(step, rounding=ROUND_CEILING),
+        venue_smallest(price),
+    )
+    if sent == distance:
+        sent = distance  # Keep the existing report's precision when no rounding was needed.
     if own and sent > price * sizing.DISTANCE_CEILING:
         raise ValueError(
-            f"distance_over_ceiling: the distance {sent} ({plan.bound}, after the price step and "
-            f"Alpaca's smallest trail) is over the {sizing.DISTANCE_CEILING} ceiling at {price}"
+            f"distance_over_ceiling: the distance {sent} ({plan.bound}, after the price step, the "
+            f"spread floor and Alpaca's smallest trail) is over the {sizing.DISTANCE_CEILING} "
+            f"ceiling at {price}"
         )
     return sent, Distance(
         price,
         plan,
-        None if plan.spread is None else PLANNER.spread_floor_m * plan.spread,
+        None if plan.spread is None else floor,
         book.age,
         sent,
         distance,
