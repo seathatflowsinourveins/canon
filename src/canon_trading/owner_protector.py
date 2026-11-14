@@ -204,7 +204,7 @@ one file per account label, and each read, merge and replace holds LevelBook.loc
 A write failure is named once per kind.
 An armed long, carried or armed this run, breached through its limit offset is named once at
 ERROR and keeps its level and distances. Once two new observations at or below its level confirm
-the breach (the guard before a first placing, or a count of their own once our cover has ended),
+the breach (each breach counts its own two, cleared by a quote above the level or our new order),
 it starts a DAY limit sale using the same exit_price and chase_floor rules as a released sale,
 including the lowest positive venue tick; it never submits a trailing order whose bid-derived
 limit would be nonpositive (F15 and its review).
@@ -563,8 +563,9 @@ class Holding:
     distance: protect.Distance | None = None
     limit_offset: Decimal | None = None
     offset_breach_named: bool = False
-    # F15's review, 1: once our cover has ended, the first new observation through the offset
-    # and at or below the level; a second newer one starts the sale.
+    # F15's review, 1 (and land-f15's two): the first new sane observation at or below the level
+    # in the current breach; a second newer one starts the sale. Cleared by a new sane observation
+    # above the level and by every trailing order of ours placed, so each breach counts its own two.
     breach_observation: int | None = None
     fresh: bool = False
     ended: bool = False
@@ -2049,6 +2050,8 @@ class OwnerProtector(Strategy):
         )
         # F15's review, 4: any armed long, carried or armed this run, can gap through its offset.
         offset_breached = bid <= slot.limit_offset
+        if advanced and _sane(tick) and bid > slot.level.as_decimal():
+            slot.breach_observation = None  # This breach, if any, has ended.
         if offset_breached and not slot.offset_breach_named:
             slot.offset_breach_named = True
             carried = (self.settings.account_label or "", instrument_id) in self.carried
@@ -2075,6 +2078,8 @@ class OwnerProtector(Strategy):
                 return
             if slot.last_observation is None and (slot.fresh or bid <= slot.level.as_decimal()):
                 slot.last_observation = tick.ts_event
+                if bid <= slot.level.as_decimal():
+                    slot.breach_observation = tick.ts_event
                 self._say(
                     f"{instrument_id}: holding level {slot.level}; one observation cannot elect"
                 )
@@ -2086,21 +2091,18 @@ class OwnerProtector(Strategy):
         if bid - limit <= 0:
             if offset_breached and bid <= slot.level.as_decimal():
                 # A fresh trailing order would derive a nonpositive limit from this bid; start
-                # the existing sale path instead, on two observations (ruling 6). Before a first
-                # placing the guard above counted them; after our cover ended it is skipped, so
-                # they are counted here, each a new sane quote at or below the level.
-                if slot.placed:
-                    if not advanced or not _sane(tick):
-                        self._wait(instrument_id, "a new observation to confirm the breach")
-                        return
-                    if slot.breach_observation is None:
-                        slot.breach_observation = tick.ts_event
-                        self._say(
-                            f"{instrument_id}: holding level {slot.level}; one observation "
-                            "cannot elect"
-                        )
-                        self._wait(instrument_id, "a second observation to confirm")
-                        return
+                # the existing sale path instead, on two new sane observations at or below the
+                # level in this breach (ruling 6), whether or not a sell of ours was placed.
+                if not advanced or not _sane(tick):
+                    self._wait(instrument_id, "a new observation to confirm the breach")
+                    return
+                if slot.breach_observation is None or slot.breach_observation >= tick.ts_event:
+                    slot.breach_observation = tick.ts_event
+                    self._say(
+                        f"{instrument_id}: holding level {slot.level}; one observation cannot elect"
+                    )
+                    self._wait(instrument_id, "a second observation to confirm")
+                    return
                 first = exit_price(bid, protect.PLANNER.exit_ticks, None)
                 now = self.clock.timestamp_ns()
                 slot.sale = Sale(
@@ -2140,6 +2142,7 @@ class OwnerProtector(Strategy):
             self._freeze(instrument_id, "generated client order ID already exists; left untouched")
             return
         slot.protect_id, slot.placed = order.client_order_id, True
+        slot.breach_observation = None  # A breach after this order counts its own two.
         self.sent_ids.add(order.client_order_id)
         self.submit_order(order, params={"extended_hours": True})
 

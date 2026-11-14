@@ -203,3 +203,58 @@ def test_a_holding_armed_this_run_that_gaps_through_its_offset_sells(monkeypatch
     alerts = [text for level, text in strategy.logged if "ALERT:" in text]
     assert len(alerts) == 1 and "carried" not in alerts[0], alerts
     assert not any("frozen: no positive protective limit" in note for note in strategy.said)
+
+
+def test_a_second_breach_after_a_recovery_counts_its_own_two_observations(
+    tmp_path, monkeypatch
+) -> None:
+    """land-f15, finding 1: the breach count was never cleared, so after a recovery and a new
+    expiry the first quote of a second gap sold."""
+    strategy = carried_gap(tmp_path, monkeypatch, "2.50")
+    step(strategy)
+    strategy.observe("2.50", START + h.SECOND)
+    strategy.observe("2.50", START + 2 * h.SECOND)
+    (first,) = strategy.sent
+    assert first.order_type == OrderType.TRAILING_STOP_LIMIT
+    accepted(first, START + 2 * h.SECOND)
+    terminal(first, START + 3 * h.SECOND, expired=True)
+    strategy.observe("0.35", START + 4 * h.SECOND)  # one breach observation, no sale
+    assert len(strategy.sent) == 1, strategy.said
+    strategy.observe("2.50", START + 5 * h.SECOND)  # recovers: a new trailing order
+    assert len(strategy.sent) == 2, strategy.said
+    second = strategy.sent[1]
+    assert second.order_type == OrderType.TRAILING_STOP_LIMIT, second
+    accepted(second, START + 5 * h.SECOND)
+    terminal(second, START + 6 * h.SECOND, expired=True)
+    strategy.observe("0.35", START + 7 * h.SECOND)  # a new gap: its first observation
+    assert len(strategy.sent) == 2, ("a sale on one observation of a second breach", strategy.sent)
+    strategy.observe("0.35", START + 8 * h.SECOND)
+    assert len(strategy.sent) == 3, strategy.said
+
+
+def test_a_level_below_its_offset_never_sells_on_one_observation_at_the_level(
+    tmp_path, monkeypatch
+) -> None:
+    """land-f15, finding 2: a quote between the level and the offset was counted as the first
+    observation, so the first quote at the level sold."""
+    path = tmp_path / "levels.json"
+    record = h.restart_record(last_level="0.30", distance="0.05", limit_offset="0.38")
+    path.write_text(json.dumps({"schema": 2, "entries": [record]}))
+    strategy = Recording(
+        account_label="shape",
+        level_book_path=path,
+        run="shape-next",
+        session_part="regular",
+        trading=h.VenueOrders(),
+    )
+    monkeypatch.setattr(strategy.cached, "instrument", lambda iid: h.equity(iid, precision=4))
+    strategy.cached.latest = h.quote("0.35", START)
+    strategy.test_clock.set_time(START)
+    strategy.on_start()
+    step(strategy)
+    strategy.observe("0.35", START + h.SECOND)  # between level and offset
+    strategy.observe("0.29", START + 2 * h.SECOND)  # first observation at or below the level
+    assert not strategy.sent, ("a sale on one observation at the level", strategy.said)
+    strategy.observe("0.29", START + 3 * h.SECOND)
+    (sale,) = strategy.sent
+    assert sale.order_type == OrderType.LIMIT and sale.price.as_decimal() == Decimal("0.2899")
