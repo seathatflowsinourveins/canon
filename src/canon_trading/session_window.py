@@ -1993,6 +1993,12 @@ class WindowRefused(RuntimeError):
     open when one was named). Nothing was placed. Recorded as the latest result; the run exits 1."""
 
 
+class PositionUnread(WindowRefused, ValueError):
+    """A position whose quantity cannot be read by custody's one rule (`custody._listed`): before the
+    window's start a refusal naming the symbol (`WindowRefused`); after the stop a failed read
+    (`ValueError`, in `FAILED`), which the account check notes and polls past, since a window ran."""
+
+
 class StopTimedOut(RuntimeError):
     """The node did not stop within `STOP_TIMEOUT_SECS`. Recorded as failed after the account check;
     `main` then ends the process, since the node's task still runs and nothing can end it (module header)."""
@@ -2256,15 +2262,21 @@ def open_orders(trading: TradingClient) -> list:
 
 def positions(trading: TradingClient) -> dict[str, Decimal]:
     """The signed quantity Alpaca holds in each symbol of the account (alpaca-py's `get_all_positions`,
-    `GET /v2/positions`); a symbol with none is absent."""
+    `GET /v2/positions`); a symbol with none is absent. Each is read by custody's one quantity rule
+    (`custody._listed`): a short, by its side or by its sign, is below zero and never read as a long, and
+    a quantity that is no finite number, or a listed `qty_available` that is not one custody accepts,
+    raises `PositionUnread` naming the symbol."""
+    from .custody import _listed  # imported here: custody imports this module as it loads
+
     found = trading.get_all_positions()
     assert isinstance(found, list)
     held: dict[str, Decimal] = {}
     for position in found:
         assert isinstance(position, AlpacaPosition)
-        qty = abs(Decimal(str(position.qty)))
-        short = getattr(position.side, "value", position.side) == "short"
-        held[position.symbol] = -qty if short else qty
+        listed = _listed(position)
+        if listed.held is None or listed.unknown:
+            raise PositionUnread(str(listed.unknown))
+        held[position.symbol] = listed.held
     return held
 
 
