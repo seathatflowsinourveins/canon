@@ -1,0 +1,216 @@
+#!/bin/bash
+# account-lock — run one command while holding one Alpaca account's lock, and that account's market-data stream
+# lock when asked, to a deadline (docs/adr/0110, change (g): "the live account's own account lock and stream
+# lock"; the paper accounts' locks are docs/adr/0069's, clause 3).
+#
+# Usage: scripts/account-lock <account> [--stream] --wait <secs> --deadline <secs> [--grace <secs>] -- <command...>
+#   <account>   live: the owner's live account, canon-live.lock and canon-alpaca-stream-live.lock, which nothing
+#               else in this repository names; or a paper account, by the name and the lock files mise.toml's
+#               paper tasks use, so the same task shape can be proven on paper first and excludes a paper run
+#               there: tests (account A), windows (account B) or protect (account C, ADR 0114). A paper
+#               account's stream lock is canon-alpaca-stream-<account>.lock, the name the Python holder builds
+#               (session_window.paper_start, under which paper:protector starts), account C's included
+#   --stream    also take the account's stream lock, after the account's lock, so no run waits for an account's
+#               lock while it holds a stream (ADR 0069)
+#   --wait      seconds to wait for the lock, or for both; when it runs out nothing is run, exit 1
+#   --deadline  seconds the command may run; then it is stopped, its whole process group with it, from a
+#               person's terminal as from anywhere else
+#   --grace     0, the default: SIGKILL at the deadline, and a stop (below) bounded by the deadline alone.
+#               Above 0: SIGTERM at the deadline, then SIGKILL that many seconds later, for a command that
+#               cancels what it sent when it is told to end (as paper:close's uv runs under
+#               `timeout -s TERM -k 30`); and after a stop the group is sent SIGKILL once timeout has ended, at
+#               most that many seconds later
+#   A stop: a SIGTERM, SIGINT or SIGHUP to this script, a Ctrl-C at its terminal included, is passed on to the
+#   command, once, as the same signal; a second stop meanwhile is only noted.
+#   Each number of seconds is whole, of at most six digits, with no leading zero.
+# Exit: the command's own status; 1 for each refusal that is not a wrong call: a lock stayed held, a lock step
+# failed or the shell ended inside one, a lock file could not be opened, the temporary folder is not known, the
+# clock gave no time, or CANON_PAPER_SESSION_DIR is set; 3 for a wrong call; timeout(1)'s status when the
+# deadline stopped the command (124, or 137 for a SIGKILL). After a stop, too, the status is the command's: its
+# own if it ended by itself, 128 + the signal's number if a signal ended it (143, 130 or 129 when it died of
+# the stop, 137 when the grace's SIGKILL ended it), since timeout ends with the command's status or "terminate[s]
+# itself with the same signal" (man timeout). A command that itself ends 1 or 3 reads the same as a refusal here: each refusal
+# says so on stderr, in a line that ends "nothing was run", and that line, not the status, tells them apart.
+# One end has no such line: with POSIXLY_CORRECT set, bash 3.2 ends itself with status 1, under its own message,
+# at an arithmetic it cannot read. The checks of the numbers keep every call from reaching that.
+# The command reads this script's own standard input. It runs in a process group of its own, which is not a
+# terminal's foreground group. So a task that prompts for typed input, a password included, does not run
+# under this lock (ADR 0163): it asks before this script, or runs off a terminal. From a terminal the command
+# can write to the terminal (while the terminal's `tostop` is off: by reading, not run) but cannot read it or
+# change its settings: a read stops it (SIGTTIN; man timeout: the group would "cause reads from the terminal
+# to stop the command with SIGTTIN"), as does a change of settings such as `stty -echo` (SIGTTOU), timeout(1)
+# takes the stop for its end and exits 1 (observed on macOS 27.2: `timeout -v` "child terminated: ...
+# reason=5, status=21", and status=22), and the group is killed, so the run ends at once with status 1 and no
+# "nothing was run" line, the read unanswered or the change not made (scripts/test-account-lock holds both on
+# a pseudo-terminal).
+#
+# How the lock is held, as in mise.toml's paper tasks (the note above paper:test): the lock file is opened on
+# descriptor 9 (the stream lock on 7) and that descriptor is locked (lockf(1): "Protect a section of a shell
+# script with a lock"; BSD-style, flock(2)), so every process the command starts inherits the lock and it is
+# free only once the last of them has ended. This script's own shell keeps both descriptors until the run ends,
+# so a command that closes or reopens 9 or 7 does not free a lock while it runs; the command is never exec'd,
+# from a terminal or not. The command runs under timeout(1), which "makes itself the leader of a process group
+# that the command inherits"; once timeout has ended, the group is killed, and this script ends only when the
+# group is gone, so nothing the command left in that group outlives the lock, a child that ignores SIGTERM
+# included (one that left the group and closed 9 and 7 is neither killed nor waited for). The
+# group is not the terminal's foreground group, so a Ctrl-C at the terminal reaches this script alone, which
+# passes it on, and the command is told once, as a stop from anywhere else is. timeout is started under job
+# control (set -m), since without it "asynchronous commands ignore SIGINT and SIGQUIT" (man bash, SIGNALS),
+# and timeout passes the dispositions it inherits on to the command (man timeout). Under job control bash may
+# print a line of its own on stderr when timeout ends ("a line containing their exit status is printed upon
+# their completion", man bash; seen at a deadline's SIGKILL: "Killed: 9"); no status changes. The lock
+# files are in the per-user temporary folder, the same for every process of the user whatever TMPDIR a session
+# sets, and are kept, as a descriptor implies and lockf(1) advises when processes contend.
+# No option or variable moves the lock folder: two runs that named different folders would not exclude each
+# other. One variable moves the folder on the other side, the Python holder's, and a run with it set is refused
+# by name (below). scripts/test-account-lock runs a copy with getconf swapped for a stand-in.
+set -uo pipefail
+# usage <what was wrong>: a wrong call, refused by name, then the usage line; exit 3
+usage() {
+  echo "account-lock: $1; nothing was run" >&2
+  echo "account-lock: usage: scripts/account-lock <live|tests|windows|protect> [--stream] --wait <secs> --deadline <secs> [--grace <secs>] -- <command...>" >&2
+  exit 3
+}
+[ $# -ge 1 ] || usage "no account was named"
+account=$1; shift
+case "$account" in
+  live) alock=canon-live.lock; slock=canon-alpaca-stream-live.lock ;;
+  tests) alock=canon-paper-test.lock; slock=canon-alpaca-stream-tests.lock ;;
+  windows) alock=canon-paper-windows.lock; slock=canon-alpaca-stream-windows.lock ;;
+  protect) alock=canon-paper-protect.lock; slock=canon-alpaca-stream-protect.lock ;;
+  *) echo "account-lock: no account named '$account'; the names are live, tests, windows and protect; nothing was run" >&2; exit 3 ;;
+esac
+stream=0; lockwait=""; deadline=""; grace=0; sep=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --stream) stream=1; shift ;;
+    --wait) [ $# -ge 2 ] || usage "--wait is given no seconds"; lockwait=$2; shift 2 ;;
+    --deadline) [ $# -ge 2 ] || usage "--deadline is given no seconds"; deadline=$2; shift 2 ;;
+    --grace) [ $# -ge 2 ] || usage "--grace is given no seconds"; grace=$2; shift 2 ;;
+    --) sep=1; shift; break ;;
+    *) usage "'$1' is not an option of this script, and the command comes after --" ;;
+  esac
+done
+# whole <value>: a whole number of seconds, digits only and at most six of them
+whole() { case "$1" in ''|*[!0-9]*|???????*) return 1 ;; esac; }
+whole "$lockwait" || usage "--wait takes a whole number of seconds, of at most six digits, and was given '$lockwait'"
+whole "$deadline" || usage "--deadline takes a whole number of seconds, of at most six digits, and was given '$deadline'"
+whole "$grace" || usage "--grace takes a whole number of seconds, of at most six digits, and was given '$grace'"
+# No leading zero: the shell's arithmetic reads one as octal, where 010 is eight and 08 is an error. Every
+# number that reaches an arithmetic below (the wait, the grace) or timeout (the deadline) is therefore the
+# decimal that was written, or the call is refused here by name.
+for secs in "$lockwait" "$deadline" "$grace"; do
+  case "$secs" in 0?*) echo "account-lock: '$secs' has a leading zero, which the shell's arithmetic would read as octal; write the seconds without it; nothing was run" >&2; exit 3 ;; esac
+done
+[ "$deadline" -gt 0 ] || usage "--deadline takes at least 1 second"
+[ "$sep" = 1 ] || usage "there is no --, after which the command comes"
+[ $# -gt 0 ] || usage "there is no command after --"
+# The one variable that moves a lock on the other side: the Python holder that paper:protector starts under
+# (session_window.paper_start) locks in the parent of its records folder, and CANON_PAPER_SESSION_DIR names that
+# folder. With it set, a run here and a run there would each hold a lock the other never asks for.
+if [ -n "${CANON_PAPER_SESSION_DIR:-}" ]; then
+  echo "account-lock: CANON_PAPER_SESSION_DIR is set, which moves the folder paper:protector takes its locks in, so a run here and a run there would not exclude each other; unset it; nothing was run" >&2; exit 1
+fi
+start=$(/bin/date +%s)
+# a clock that gives no time cannot bound a wait: refused here, before any lock. The reading is checked this
+# once. A later empty one inside lock_wait ends that wait at its first look (a lock that is free then is still
+# taken); at the stream step's own reading alone it leaves that wait without its bound, under the account's
+# lock. Neither runs the command without its locks.
+case "$start" in ''|*[!0-9]*) echo "account-lock: the clock gave no time (/bin/date +%s printed '$start'), so no wait can be bounded; nothing was run" >&2; exit 1 ;; esac
+# the folder's name, or a stop: none would leave a lock file of this run's own, beside no other run's
+tmp="$(/usr/bin/getconf DARWIN_USER_TEMP_DIR)" || tmp=""
+case "$tmp" in /*/) ;; *) echo "account-lock: the per-user temporary folder is not known (DARWIN_USER_TEMP_DIR gave '$tmp'), so there is no lock to take; nothing was run" >&2; exit 1 ;; esac
+# lock_wait <fd> <secs>: the exclusive lock on an open descriptor, waiting at most <secs>; 0 when held, 1 when the
+# bound ran out (a bound can run over by up to a second), or at once when lockf fails for any reason but the
+# lock being held (exit 75, EX_TEMPFAIL). lockf(1)'s descriptor form (`lockf -t <secs> <fd>`, man lockf) busy-loops
+# while it waits (measured; ADR 0065), so this polls `lockf -t 0 <fd>` with a one-second sleep. The text is
+# paper:test's own in mise.toml (scripts/test-account-lock compares them).
+lock_wait() {
+  lw_end=$(( $(/bin/date +%s) + $2 ))
+  while :; do
+    /usr/bin/lockf -t 0 "$1" 2>/dev/null; lw_rc=$?
+    [ "$lw_rc" = 0 ] && return 0
+    [ "$lw_rc" = 75 ] || return 1
+    [ "$(/bin/date +%s)" -lt "$lw_end" ] || return 1
+    sleep 1
+  done
+}
+# No failure in a lock step lets the command run. An error inside lock_wait (an arithmetic the shell cannot
+# read) ends the whole command it was called from, a refusal written after `||` on the same line included, and
+# the script goes on at the next one. So each step only notes its result, `yes` when lock_wait returned 0 and
+# `no` when it returned 1, and the lines after it, commands of their own, refuse on anything but `yes`.
+# And a shell that ends inside a step (bash 3.2 ends itself, with status 0, at a word in an arithmetic that it
+# takes for an unset variable) must not read as a run that succeeded: until `locked` is set, after both
+# steps, an exit with status 0 is turned into a refusal by name.
+held=failed; sheld=failed; locked=""
+trap '[ "$?" != 0 ] || [ -n "$locked" ] || { echo "account-lock: the run ended inside a lock step, before its locks were held; nothing was run" >&2; exit 1; }' EXIT
+# an open that fails must end the run: descriptor 9 or 7 may be one the caller passed down, on another file
+exec 9>>"${tmp}${alock}" || { echo "account-lock: account ${account}'s lock file could not be opened in the per-user temporary folder; nothing was run" >&2; exit 1; }
+if lock_wait 9 "$lockwait"; then held=yes; else held=no; fi
+case "$held" in
+  yes) ;;
+  no) echo "account-lock: account ${account}'s lock stayed held for $lockwait s; nothing was run" >&2; exit 1 ;;
+  *) echo "account-lock: the step that takes account ${account}'s lock failed, so the lock is not held; nothing was run" >&2; exit 1 ;;
+esac
+if [ "$stream" = 1 ]; then
+  left=$(( lockwait - ($(/bin/date +%s) - start) )); [ "$left" -ge 0 ] || left=0
+  exec 7>>"${tmp}${slock}" || { echo "account-lock: account ${account}'s market-data stream lock file could not be opened in the per-user temporary folder; nothing was run" >&2; exit 1; }
+  if lock_wait 7 "$left"; then sheld=yes; else sheld=no; fi
+fi
+case "$stream$sheld" in
+  0*|1yes) ;;
+  1no) echo "account-lock: account ${account}'s market-data stream lock stayed held ($lockwait s for both locks); nothing was run" >&2; exit 1 ;;
+  *) echo "account-lock: the step that takes account ${account}'s market-data stream lock failed, so the lock is not held; nothing was run" >&2; exit 1 ;;
+esac
+locked=1
+# bounded <command...>: the command under timeout(1), in the process group timeout leads, held to the deadline;
+# a stop passed on; the group killed once timeout has ended, and waited for until it is gone. `g` is timeout's
+# pid, and its group's.
+bounded() {
+  g=""; stopping=""; pending=""; trapped=0
+  # pass_on <signal>: the first stop is passed on, as the same signal, to timeout alone, which propagates it to
+  # the command ("For any other signals delivered to timeout, it will propagate them to command", man timeout),
+  # so the command is told once. With a grace, up to `grace` seconds for timeout to end, then SIGKILL to what
+  # is left of the group; with none, the deadline bounds the rest. A stop while one is under way is only noted,
+  # the traps left as they are (bash 3.2 kills itself with a trap changed from inside one, the note in
+  # paper:test's own `bounded` in mise.toml). A stop before timeout's pid is known is passed on once it is.
+  pass_on() {
+    trapped=$((trapped + 1))
+    [ -n "$g" ] || { [ -n "$pending" ] || pending=$1; return 0; }
+    [ -z "$stopping" ] || return 0; stopping=1
+    kill -s "$1" "$g" 2>/dev/null
+    if [ "$grace" -gt 0 ]; then
+      s_end=$(( $(/bin/date +%s) + grace ))
+      # until timeout has ended: gone, or its zombie (ps STAT Z), which `kill -0` would count as running
+      while [ "$(/bin/date +%s)" -lt "$s_end" ]; do
+        case "$(/bin/ps -o stat= -p "$g" 2>/dev/null)" in ""|Z*) break ;; esac
+        sleep 0.2
+      done
+      kill -KILL -- "-$g" 2>/dev/null || kill -KILL "$g" 2>/dev/null
+    fi
+    return 0
+  }
+  # traps first, so a stop at any point after this reaches what has started
+  trap 'pass_on TERM' TERM; trap 'pass_on HUP' HUP; trap 'pass_on INT' INT
+  set -m
+  if [ "$grace" -gt 0 ]; then /usr/bin/timeout -s TERM -k "$grace" "$deadline" "$@" <&0 & g=$!
+  else /usr/bin/timeout -s KILL "$deadline" "$@" <&0 & g=$!; fi
+  set +m
+  [ -z "$pending" ] || pass_on "$pending"
+  # a trapped signal ends `wait` early, with a status above 128; so `wait` again until one returns with no trap
+  # run during it: timeout's own status (bash keeps a reaped child's status for a later `wait` of its pid)
+  while :; do
+    t0=$trapped; rc=0; wait "$g" || rc=$?
+    [ "$trapped" != "$t0" ] || break
+  done
+  # what of the group outlived timeout, killed, and waited for until none of it is left: the lock is free only
+  # after that. The group's id is timeout's pid, which the system does not hand out again while the group lives.
+  # A limit, by reading: a first stop that lands between the group's end and the traps' removal below is still
+  # sent to that pid, which this run no longer owns, and with a grace so is a SIGKILL, to its group or to it;
+  # they reach another process only if the system has handed the pid out again within those lines (ADR 0163).
+  kill -KILL -- "-$g" 2>/dev/null || :
+  while kill -0 -- "-$g" 2>/dev/null; do kill -KILL -- "-$g" 2>/dev/null; sleep 0.1; done
+  trap - TERM HUP INT
+  return "$rc"
+}
+bounded "$@"

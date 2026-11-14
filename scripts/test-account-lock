@@ -1,0 +1,671 @@
+#!/bin/bash
+# test-account-lock — checks of scripts/account-lock, which holds one Alpaca account's lock, and its stream lock
+# when asked, while a command runs (docs/adr/0110, change (g); the paper locks are docs/adr/0069's).
+#
+# The cases are the ones scripts/test-lanes has for the paper locks ("paper lock deadline", "two accounts"):
+# the lock is held while the command runs and free after it, a second run waits its bound and runs nothing, the
+# deadline and a stop leave nothing running and the lock free, the live locks and the paper locks do not wait
+# for each other, and a temporary folder that is not known stops the run before any lock.
+# No case touches a real lock: every run is a copy of the script whose getconf is swapped for a stand-in that
+# names a folder of the test's own, and a copy that still names the real getconf is a failed case and is not
+# run. No case reads a credential or reaches the network; the commands run are stand-ins.
+# Exit 0 if every case behaves as expected, 1 otherwise.
+# shellcheck disable=SC2016  # stand-in bodies and eval'd checks are single-quoted so they expand when they run
+set -uo pipefail
+# run from a git hook, git exports GIT_DIR and friends; clear them
+# shellcheck disable=SC2046  # one variable name per word
+unset $(git rev-parse --local-env-vars 2>/dev/null)
+# the script refuses a run while this is set (the case below sets it itself); a caller's own must not reach the rest
+unset CANON_PAPER_SESSION_DIR
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/canon-test-account-lock.XXXXXX") \
+  || { echo "test-account-lock: could not create a temp folder under ${TMPDIR:-/tmp}; nothing was written" >&2; exit 1; }
+trap 'rm -rf "$TMP"' EXIT
+TMP=$(cd "$TMP" && pwd -P)
+pass=0; fail=0; skipped=0; skips=""
+t_pass() { pass=$((pass+1)); echo "  pass  $1"; }
+t_fail() { fail=$((fail+1)); echo "  FAIL  $1"; }
+# skip <case> <why>: the case checked nothing here. A case name holds no " (", which scripts/ci reads as the
+# start of the reason.
+skip()   { skipped=$((skipped+1)); skips="$skips; $1"; echo "  skip  $1 ($2)"; }
+check()  { local label="$1"; shift; if "$@"; then t_pass "$label"; else t_fail "$label"; fi; }
+
+AL="$ROOT/scripts/account-lock"; MT="$ROOT/mise.toml"
+# shellcheck disable=SC2034  # read by the eval'd checks
+SW="$ROOT/src/canon_trading/session_window.py"
+LIVE_LOCK=canon-live.lock; LIVE_STREAM=canon-alpaca-stream-live.lock
+
+# ---------- the names, as written ----------
+echo "account-lock, as written:"
+check "the live account's locks are $LIVE_LOCK and $LIVE_STREAM" \
+      grep -qx "  live) alock=$LIVE_LOCK; slock=$LIVE_STREAM ;;" "$AL"
+# named apart from every paper lock: no task, runner or module of the paper side names either file
+# shellcheck disable=SC2034  # read by the eval'd check
+others=$(grep -rlE "canon-live\.lock|canon-alpaca-stream-live\.lock" "$MT" "$ROOT/home" "$ROOT/scripts" "$ROOT/src" "$ROOT/packages" "$ROOT/tests" 2>/dev/null \
+  | grep -v -e '/scripts/account-lock$' -e '/scripts/test-account-lock$' -e '__pycache__' -e '/\.venv/' | tr '\n' ' ')
+check "... and nothing else in mise.toml, home/, scripts/, src/, packages/ or tests/ names either (named in: ${others:-none})" test -z "$others"
+check "the paper accounts' locks are the ones mise.toml's paper tasks open: tests and windows, each with its stream lock" \
+      eval 'grep -qx "  tests) alock=canon-paper-test.lock; slock=canon-alpaca-stream-tests.lock ;;" "$AL" && grep -qx "  windows) alock=canon-paper-windows.lock; slock=canon-alpaca-stream-windows.lock ;;" "$AL" && grep -qF "exec 9>>\"\${tmp}canon-paper-test.lock\"" "$MT" && grep -qF "exec 9>>\"\${tmp}canon-paper-windows.lock\"" "$MT" && grep -qF "exec 7>>\"\${tmp}canon-alpaca-stream-tests.lock\"" "$MT" && grep -qF "exec 7>>\"\${tmp}canon-alpaca-stream-windows.lock\"" "$MT"'
+check "account C's lock is the one mise.toml's paper tasks open for protect, and its stream lock the one paper_start takes for it" \
+      eval 'grep -qx "  protect) alock=canon-paper-protect.lock; slock=canon-alpaca-stream-protect.lock ;;" "$AL" && grep -qF "protect) svc=canon-alpaca-paper-protect; lock=canon-paper-protect.lock ;;" "$MT" && grep -qxF "    \"protect\": \"canon-paper-protect.lock\"," "$SW"'
+# the Python holder (session_window.paper_start, which paper:protector starts under) builds each paper
+# account's stream lock from the account's name, so no search for a literal name finds it there
+check "... as it takes every paper account's: the account lock by these names, then canon-alpaca-stream-<account>.lock" \
+      eval 'grep -qF "for name in (PAPER_ACCOUNT_LOCKS[account], f\"canon-alpaca-stream-{account}.lock\"):" "$SW" && grep -qxF "    \"tests\": \"canon-paper-test.lock\"," "$SW" && grep -qxF "    \"windows\": \"canon-paper-windows.lock\"," "$SW"'
+check "... and it knows no account but live, tests, windows and protect" \
+      eval '[ "$(grep -cE "^  [a-z]+\) alock=" "$AL")" = 4 ]'
+# shellcheck disable=SC2034  # read by the eval'd check
+lw_paper=$(awk -v q="'''" '$0 == "[tasks.\"paper:test\"]" {t=1; next} /^\[/ {t=0} t && $0 == "run = " q {b=1; next} b && $0 == q {exit} b' "$MT" | sed -n '/^lock_wait() {/,/^}/p')
+# shellcheck disable=SC2034  # read by the eval'd check
+lw_script=$(sed -n '/^lock_wait() {/,/^}/p' "$AL")
+check "its lock_wait is paper:test's own text, so a wait does not spin a core (ADR 0065)" \
+      eval '[ -n "$lw_paper" ] && [ "$lw_script" = "$lw_paper" ]'
+check "the account's lock is taken on descriptor 9, then the stream lock on 7, each by lock_wait, and never lockf's descriptor form with a wait" \
+      eval '[ "$(grep -n "^exec 9>>\"\${tmp}\${alock}\" || " "$AL" | cut -d: -f1)" -lt "$(grep -n "^  exec 7>>\"\${tmp}\${slock}\" || " "$AL" | cut -d: -f1)" ] && grep -qxF "if lock_wait 9 \"\$lockwait\"; then held=yes; else held=no; fi" "$AL" && grep -qxF "  if lock_wait 7 \"\$left\"; then sheld=yes; else sheld=no; fi" "$AL" && ! grep -Eq "/usr/bin/lockf -t [^0 ]" "$AL"'
+check "the lock folder is the per-user temporary folder and nothing else: one assignment, from getconf, and no variable or option moves it" \
+      eval '[ "$(grep -c "^tmp=" "$AL")" = 1 ] && grep -qxF "tmp=\"\$(/usr/bin/getconf DARWIN_USER_TEMP_DIR)\" || tmp=\"\"" "$AL" && ! grep -Eq "\\\$\{?(TMPDIR|LOCK)" "$AL"'
+check "... and the one variable of the environment it reads is the one it refuses a run for: CANON_PAPER_SESSION_DIR, which moves the Python holder's folder" \
+      eval '[ "$(LC_ALL=C grep -cE "\\\$\{?[A-Z][A-Z_]+" "$AL")" = 1 ] && grep -qxF "if [ -n \"\${CANON_PAPER_SESSION_DIR:-}\" ]; then" "$AL" && grep -qxF "PAPER_DIR_ENV = \"CANON_PAPER_SESSION_DIR\"" "$SW"'
+# an exec'd command holds the only copy of descriptors 9 and 7, so one that closes or reopens either frees the
+# lock while it runs (the high read's P2-1); the script's own shell keeps both until the run ends, from a terminal too
+check "the command is never exec'd, from a terminal or not: the script's shell keeps descriptors 9 and 7 until the run ends" \
+      eval '! grep -Eq "exec \"\\\$@\"" "$AL" && ! grep -Eq "^[^#]*\[ (! )?-t 0 \]" "$AL"'
+# timeout passes a SIGTERM it gets on to the command (man timeout), so a SIGTERM to its whole group as well would
+# tell the command twice, and break off a cancel that a plain handler had begun
+check "a stop is passed on, as the signal it is, to timeout alone and never its whole group, so the command is told once" \
+      eval 'grep -qxF "    kill -s \"\$1\" \"\$g\" 2>/dev/null" "$AL" && [ "$(grep -cE "kill -(s )?(TERM|INT|HUP|\"\\\$1\")" "$AL")" = 1 ]'
+
+# ---------- a wrong call ----------
+echo "a wrong call:"
+G="$TMP/getconf"; L="$TMP/locks"; W="$TMP/work"; mkdir -p "$G" "$L" "$W"
+printf '#!/bin/bash\necho "%s/"\n' "$L" > "$G/names-the-test-folder"; chmod +x "$G/names-the-test-folder"
+# copy_with <getconf stand-in> <to>: the script with its getconf swapped; fails unless the real one is gone
+copy_with() {
+  sed "s#/usr/bin/getconf DARWIN_USER_TEMP_DIR#$1#" "$AL" > "$2" && chmod +x "$2" \
+    && ! grep -q "/usr/bin/getconf" "$2" && grep -qF "tmp=\"\$($1)\"" "$2"
+}
+if ! copy_with "$G/names-the-test-folder" "$TMP/account-lock"; then
+  t_fail "a copy of scripts/account-lock with its getconf swapped for the test's stand-in"
+  echo "test-account-lock: $pass passed, $fail failed, 0 skipped"; exit 1
+fi
+C="$TMP/account-lock"
+printf '#!/bin/bash\necho ran >> "%s/ran"\n' "$W" > "$W/noted"; chmod +x "$W/noted"
+# wrong <label> <arguments...>: exit 3, refused by name (a line that ends "nothing was run"), nothing run, no lock
+# file made
+wrong() {
+  local label="$1"; shift
+  rm -f "${W:?}/ran" "${L:?}"/*
+  "$C" "$@" > "$W/out" 2>&1 < /dev/null; rc=$?
+  check "$label: exit 3, refused by name, nothing run, no lock file made" eval '[ "$rc" = 3 ] && grep -q "^account-lock: .*; nothing was run\$" "$W/out" && [ ! -e "$W/ran" ] && [ -z "$(ls -A "$L")" ]'
+}
+wrong "no argument"
+wrong "an account that is not one" other --wait 1 --deadline 5 -- "$W/noted"
+check "... refused by name" grep -q "no account named 'other'; the names are live, tests, windows and protect" "$W/out"
+wrong "no deadline" live --wait 1 -- "$W/noted"
+wrong "no wait" live --deadline 5 -- "$W/noted"
+wrong "a deadline of 0" live --wait 1 --deadline 0 -- "$W/noted"
+wrong "a wait that is not a whole number" live --wait 1.5 --deadline 5 -- "$W/noted"
+wrong "a grace that is not a whole number" live --wait 1 --deadline 5 --grace soon -- "$W/noted"
+# a leading zero: the shell's arithmetic reads it as octal, where 08 is an error that skips the refusal of a
+# held lock and 010 is eight
+wrong "a wait with a leading zero (08)" live --wait 08 --deadline 5 -- "$W/noted"
+check "... refused by name" grep -q "'08' has a leading zero, which the shell's arithmetic would read as octal" "$W/out"
+wrong "a deadline with a leading zero (010)" live --wait 1 --deadline 010 -- "$W/noted"
+wrong "a grace with a leading zero (09)" live --wait 1 --deadline 5 --grace 09 -- "$W/noted"
+wrong "an option it does not have" live --wait 1 --deadline 5 --lock-dir "$W" -- "$W/noted"
+wrong "no -- before the command" live --wait 1 --deadline 5 "$W/noted"
+wrong "no command" live --wait 1 --deadline 5 --
+
+# ---------- the temporary folder, when getconf gives none ----------
+echo "per-user temporary folder:"
+printf '#!/bin/bash\nexit 1\n' > "$G/fails"; printf '#!/bin/bash\nexit 0\n' > "$G/says-nothing"; printf '#!/bin/bash\necho relative/\n' > "$G/says-relative"
+chmod +x "$G/fails" "$G/says-nothing" "$G/says-relative"
+for how in fails says-nothing says-relative; do
+  mkdir -p "$W/cwd-$how"; rm -f "${W:?}/ran"
+  if ! copy_with "$G/$how" "$W/account-lock-$how"; then t_fail "a copy whose getconf $how"; continue; fi
+  (cd "$W/cwd-$how" && "$W/account-lock-$how" live --stream --wait 1 --deadline 5 -- "$W/noted" > "$W/out" 2>&1 < /dev/null); rc=$?
+  check "a getconf that $how: refused before any lock, nothing run, nothing made in its folder, exit 1" \
+        eval '[ "$rc" = 1 ] && grep -q "per-user temporary folder is not known" "$W/out" && [ ! -e "$W/ran" ] && [ -z "$(ls -A "$W/cwd-$how")" ]'
+done
+
+# ---------- a lock file that cannot be opened ----------
+# The folder getconf names is not there, and the caller has passed descriptors 9 and 7 down, open on files of
+# its own (a paper task's body and an outer run of this script hold 9 and 7): the run must end at the failed
+# open, not lock what the caller passed and carry on.
+echo "a lock file that cannot be opened:"
+printf '#!/bin/bash\necho "%s/"\n' "$W/no-such-folder" > "$G/names-no-folder"; chmod +x "$G/names-no-folder"
+if ! copy_with "$G/names-no-folder" "$W/account-lock-no-folder"; then t_fail "a copy whose getconf names a folder that is not there"
+else
+  rm -f "${W:?}/ran"
+  "$W/account-lock-no-folder" live --stream --wait 1 --deadline 5 -- "$W/noted" > "$W/out" 2>&1 < /dev/null 9>> "$W/callers-9" 7>> "$W/callers-7"; rc=$?
+  check "the account's lock file cannot be opened, with the caller's own descriptors 9 and 7 passed down: refused by name, nothing run, exit 1" \
+        eval '[ "$rc" = 1 ] && grep -q "account live.s lock file could not be opened in the per-user temporary folder; nothing was run" "$W/out" && [ ! -e "$W/ran" ] && [ ! -e "$W/no-such-folder" ]'
+fi
+
+# ---------- a clock that gives no time ----------
+# swapped <sed expression> <to> <gone>: the script with its getconf swapped for the test folder's stand-in, as every
+# copy is, and one more change; fails unless the real getconf is gone, no line matches <gone> (what the change takes
+# out, an extended regular expression) and the copy differs from the plain copy
+swapped() {
+  sed -e "s#/usr/bin/getconf DARWIN_USER_TEMP_DIR#$G/names-the-test-folder#" -e "$1" "$AL" > "$2" && chmod +x "$2" \
+    && ! grep -q "/usr/bin/getconf" "$2" && grep -qF "tmp=\"\$($G/names-the-test-folder)\"" "$2" \
+    && ! grep -Eq -e "$3" "$2" && ! cmp -s "$2" "$C"
+}
+echo "a clock that gives no time:"
+printf '#!/bin/bash\nexit 0\n' > "$G/no-clock"; chmod +x "$G/no-clock"
+if ! swapped "s#/bin/date +%s#$G/no-clock#g" "$W/account-lock-no-clock" "/bin/date"; then
+  t_fail "a copy whose clock is swapped for one that prints nothing"
+else
+  rm -f "${W:?}/ran" "${L:?}"/*
+  "$W/account-lock-no-clock" live --stream --wait 1 --deadline 5 -- "$W/noted" > "$W/out" 2>&1 < /dev/null; rc=$?
+  check "a clock read that returns nothing: refused by name before any lock, nothing run, no lock file made, exit 1" \
+        eval '[ "$rc" = 1 ] && grep -q "the clock gave no time" "$W/out" && grep -q "nothing was run" "$W/out" && [ ! -e "$W/ran" ] && [ -z "$(ls -A "$L")" ]'
+fi
+
+# ---------- a variable that moves the Python holder's lock folder ----------
+# CANON_PAPER_SESSION_DIR names the records folder whose parent paper:protector's holder locks in
+# (session_window.default_log_dir, protector_node.run), so with it set a run here and a run there would each
+# hold a lock the other never asks for: refused by name, for every account, before any lock
+echo "a variable that would move a paper task's lock:"
+for acct in live tests windows protect; do
+  rm -f "${W:?}/ran" "${L:?}"/*; rm -rf "${W:?}/elsewhere"
+  CANON_PAPER_SESSION_DIR="$W/elsewhere/records" "$C" "$acct" --stream --wait 1 --deadline 5 -- "$W/noted" > "$W/out" 2>&1 < /dev/null; rc=$?
+  check "$acct with CANON_PAPER_SESSION_DIR set: refused by name, nothing run, no lock file made here or there, exit 1" \
+        eval '[ "$rc" = 1 ] && grep -q "CANON_PAPER_SESSION_DIR is set" "$W/out" && grep -q "nothing was run" "$W/out" && [ ! -e "$W/ran" ] && [ -z "$(ls -A "$L")" ] && [ ! -e "$W/elsewhere" ]'
+done
+
+# ---------- the locks held and waited for ----------
+if [ ! -x /usr/bin/lockf ] || [ ! -x /usr/bin/timeout ]; then
+  skip "account-lock under lockf and timeout" "no /usr/bin/lockf or /usr/bin/timeout here (macOS only)"
+else
+  echo "the locks, held and waited for:"
+  # probe: a command that notes, for each lock file, whether another open of it can take the lock (0) or it is
+  # held (75), as the next run would find it, and ends 7
+  cat > "$W/probe" <<PROBE
+#!/bin/bash
+for f in $LIVE_LOCK $LIVE_STREAM canon-paper-test.lock canon-alpaca-stream-tests.lock canon-paper-windows.lock canon-alpaca-stream-windows.lock canon-paper-protect.lock canon-alpaca-stream-protect.lock; do
+  /usr/bin/lockf -k -t 0 "$L/\$f" true 2>/dev/null; echo "\$f \$?"
+done > "$W/probed"
+exit 7
+PROBE
+  chmod +x "$W/probe"
+  probed() { grep -qx "$1 $2" "$W/probed"; }   # probed <lock file> <0|75>
+  free() { /usr/bin/lockf -k -t 0 "$L/$1" true 2>/dev/null; }
+  # hold <lock file>: another process holds it until `release`
+  hold() { /usr/bin/lockf -k "$L/$1" sleep 60 & hp="$hp $!"; for _ in $(seq 50); do free "$1" || break; sleep 0.1; done; }
+  release() { for p in $hp; do kill "$p" 2>/dev/null; wait "$p" 2>/dev/null; done; hp=""; }
+  hp=""
+  run() { rm -f "${W:?}/probed" "${W:?}/ran"; s0=$(date +%s); "$C" "$@" > "$W/out" 2>&1 < /dev/null; rc=$?; took=$(( $(date +%s) - s0 )); }
+
+  run live --wait 2 --deadline 30 -- "$W/probe"
+  check "live: the command runs holding the live account's lock and no other, and its exit status (7) is the run's" \
+        eval '[ "$rc" = 7 ] && probed $LIVE_LOCK 75 && probed $LIVE_STREAM 0 && probed canon-paper-test.lock 0 && probed canon-paper-windows.lock 0'
+  check "... and the lock is free once it has ended" free "$LIVE_LOCK"
+  run live --stream --wait 2 --deadline 30 -- "$W/probe"
+  check "live --stream: it holds the live account's lock and the live stream lock, and no paper lock" \
+        eval '[ "$rc" = 7 ] && probed $LIVE_LOCK 75 && probed $LIVE_STREAM 75 && probed canon-paper-test.lock 0 && probed canon-alpaca-stream-tests.lock 0 && probed canon-paper-windows.lock 0 && probed canon-alpaca-stream-windows.lock 0'
+  check "... both free once it has ended" eval 'free $LIVE_LOCK && free $LIVE_STREAM'
+  run tests --stream --wait 2 --deadline 30 -- "$W/probe"
+  check "tests --stream: account A's lock and stream lock, as paper:test and paper:data take them, and no other" \
+        eval '[ "$rc" = 7 ] && probed canon-paper-test.lock 75 && probed canon-alpaca-stream-tests.lock 75 && probed $LIVE_LOCK 0 && probed $LIVE_STREAM 0 && probed canon-paper-windows.lock 0'
+  run windows --stream --wait 2 --deadline 30 -- "$W/probe"
+  check "windows --stream: account B's lock and stream lock, as paper:session takes them, and no other" \
+        eval '[ "$rc" = 7 ] && probed canon-paper-windows.lock 75 && probed canon-alpaca-stream-windows.lock 75 && probed $LIVE_LOCK 0 && probed canon-paper-test.lock 0'
+
+  run protect --wait 2 --deadline 30 -- "$W/probe"
+  check "protect: account C's lock, as paper:protect takes it, and no other" \
+        eval '[ "$rc" = 7 ] && probed canon-paper-protect.lock 75 && probed canon-alpaca-stream-protect.lock 0 && probed $LIVE_LOCK 0 && probed canon-paper-test.lock 0 && probed canon-paper-windows.lock 0'
+  run protect --stream --wait 2 --deadline 30 -- "$W/probe"
+  check "protect --stream: account C's lock and its stream lock, the two paper:protector's holder takes, and no other" \
+        eval '[ "$rc" = 7 ] && probed canon-paper-protect.lock 75 && probed canon-alpaca-stream-protect.lock 75 && probed $LIVE_LOCK 0 && probed $LIVE_STREAM 0 && probed canon-paper-test.lock 0 && probed canon-paper-windows.lock 0'
+  hold canon-alpaca-stream-protect.lock
+  run protect --stream --wait 2 --deadline 30 -- "$W/noted"
+  check "protect --stream while another run holds account C's stream lock: it waits out its 2 s (${took} s), runs nothing, exit 1" \
+        eval '[ "$rc" = 1 ] && [ "$took" -lt 20 ] && [ ! -e "$W/ran" ] && grep -q "account protect.s market-data stream lock stayed held (2 s for both locks); nothing was run" "$W/out"'
+  release
+
+  hold "$LIVE_LOCK"
+  run live --wait 2 --deadline 30 -- "$W/noted"
+  check "live while another run holds the live account's lock: it waits its 2 s (${took} s), runs nothing, exit 1" \
+        eval '[ "$rc" = 1 ] && [ "$took" -lt 20 ] && [ ! -e "$W/ran" ] && grep -q "account live.s lock stayed held for 2 s; nothing was run" "$W/out"'
+  run tests --stream --wait 2 --deadline 30 -- "$W/probe"
+  check "... and a run on paper account A meanwhile runs at once (${took} s): the live lock is no paper run's" \
+        eval '[ "$rc" = 7 ] && [ "$took" -lt 20 ] && probed canon-paper-test.lock 75'
+  # the folder is not the environment's: with TMPDIR naming another folder the run still finds the held lock
+  mkdir -p "$W/other-tmp"; rm -f "${W:?}/ran"
+  s0=$(date +%s); TMPDIR="$W/other-tmp/" "$C" live --wait 2 --deadline 30 -- "$W/noted" > "$W/out" 2>&1 < /dev/null; rc=$?; took=$(( $(date +%s) - s0 ))
+  check "... and so does a run whose TMPDIR names another folder (${took} s): nothing run, no lock file made there, exit 1" \
+        eval '[ "$rc" = 1 ] && [ ! -e "$W/ran" ] && [ -z "$(ls -A "$W/other-tmp")" ] && grep -q "account live.s lock stayed held for 2 s; nothing was run" "$W/out"'
+  release
+  hold "$LIVE_STREAM"
+  run live --stream --wait 2 --deadline 30 -- "$W/noted"
+  check "live --stream while another run holds the live stream lock: it waits out its 2 s (${took} s), runs nothing, exit 1" \
+        eval '[ "$rc" = 1 ] && [ "$took" -lt 20 ] && [ ! -e "$W/ran" ] && grep -q "account live.s market-data stream lock stayed held (2 s for both locks); nothing was run" "$W/out"'
+  check "... and the live account's lock is free again" free "$LIVE_LOCK"
+  run live --wait 2 --deadline 30 -- "$W/probe"
+  check "... while a run that asks for no stream runs at once under the account's lock" eval '[ "$rc" = 7 ] && probed $LIVE_LOCK 75 && probed $LIVE_STREAM 75'
+  release
+  # the stream lock's file cannot be opened (a folder has its name), the account's lock already held by this run
+  mkdir -p "$TMP/locks-stream-blocked/$LIVE_STREAM"
+  printf '#!/bin/bash\necho "%s/"\n' "$TMP/locks-stream-blocked" > "$G/names-blocked-stream"; chmod +x "$G/names-blocked-stream"
+  if ! copy_with "$G/names-blocked-stream" "$W/account-lock-blocked-stream"; then t_fail "a copy whose getconf names a folder where the stream lock cannot be opened"
+  else
+    rm -f "${W:?}/ran"
+    "$W/account-lock-blocked-stream" live --stream --wait 1 --deadline 5 -- "$W/noted" > "$W/out" 2>&1 < /dev/null 7>> "$W/callers-7"; rc=$?
+    check "the stream lock's file cannot be opened, with the caller's own descriptor 7 passed down: refused by name, nothing run, exit 1" \
+          eval '[ "$rc" = 1 ] && grep -q "account live.s market-data stream lock file could not be opened in the per-user temporary folder; nothing was run" "$W/out" && [ ! -e "$W/ran" ]'
+  fi
+  # the command reads the run's own standard input, not an empty one
+  out=$(echo "a line on standard input" | "$C" live --wait 2 --deadline 30 -- /bin/cat 2> "$W/err"); rc=$?
+  check "live with a line piped in: the command reads it (read: '${out}'), exit 0" eval '[ "$rc" = 0 ] && [ "$out" = "a line on standard input" ]'
+
+  # ---------- a lock step that fails ----------
+  # The command runs only past a marker each lock step sets when it holds its lock, so a step that breaks in any
+  # way refuses. First the call that broke it as first written: another run holds both live locks and the wait
+  # is padded. It is now refused as a wrong call, before any lock step, so this case shows the call, not a step.
+  echo "a lock step that fails:"
+  hold "$LIVE_LOCK"; hold "$LIVE_STREAM"
+  run live --stream --wait 09 --deadline 30 -- "$W/noted"
+  check "live --stream --wait 09 while another run holds both live locks: nothing run, refused by name, a non-zero exit ($rc)" \
+        eval '[ "$rc" != 0 ] && [ ! -e "$W/ran" ] && grep -q "nothing was run" "$W/out"'
+  release
+  # Then with two checks taken out of a copy, the whole-number check of the wait and the leading-zero check (in
+  # either form: as first written they were one line), so that a wait the shell's arithmetic cannot read reaches
+  # lock_wait itself: a padded one, one that is not a number, and a word (at which bash 3.2 ends the whole shell,
+  # with status 0). Each broke the step in the script as first written, and the command ran or the run read as done.
+  # Each is run without --stream and with it. Without it nothing after the account's step refuses, so that step's
+  # own refusal is all that stands between the broken step and the command; with it, the account's step must
+  # still be the one that refuses. So the line asked for is that step's own, or, for the word, the exit's.
+  if ! swapped '/^whole "\$lockwait" || usage/d; /^if ! whole "\$lockwait"/d; s/case "\$secs" in 0?\*)/case "$secs" in no-such-value)/' "$W/account-lock-unchecked" \
+       '^whole "\$lockwait" [|][|] usage|^if ! whole "\$lockwait"|in 0[?][*][)]'; then
+    t_fail "a copy with the checks of its numbers taken out"
+  else
+    for how in "" " --stream"; do
+      for w in 08 1.5 soon; do
+        # shellcheck disable=SC2034  # read by the eval'd check
+        case "$w" in
+          soon) line="the run ended inside a lock step, before its locks were held; nothing was run" ;;
+          *) line="the step that takes account live.s lock failed, so the lock is not held; nothing was run" ;;
+        esac
+        rm -f "${W:?}/ran"
+        # shellcheck disable=SC2086  # $how is --stream or nothing
+        "$W/account-lock-unchecked" live $how --wait "$w" --deadline 5 -- "$W/noted" > "$W/out" 2>&1 < /dev/null; rc=$?
+        check "with the checks of its numbers taken out, --wait $w$how breaks the account's lock step: refused at that step by its own line, or for a word by the exit's, nothing run, exit 1, both locks free" \
+              eval '[ "$rc" = 1 ] && [ ! -e "$W/ran" ] && grep -q "^account-lock: $line\$" "$W/out" && free $LIVE_LOCK && free $LIVE_STREAM'
+      done
+      rm -f "${W:?}/ran"
+      # shellcheck disable=SC2086  # $how is --stream or nothing
+      "$W/account-lock-unchecked" live $how --wait 2 --deadline 5 -- "$W/noted" > "$W/out" 2>&1 < /dev/null; rc=$?
+      check "... and the same copy, called well$how, runs its command (so it is the broken step that was refused)" eval '[ "$rc" = 0 ] && [ -e "$W/ran" ]'
+    done
+  fi
+  # and the stream lock's step alone, the account's lock already held: its wait swapped for one the shell cannot read
+  if ! swapped 's/lock_wait 7 "\$left"/lock_wait 7 "08"/' "$W/account-lock-stream-step" 'lock_wait 7 "\$left"'; then
+    t_fail "a copy whose stream lock step is given a wait the shell cannot read"
+  else
+    rm -f "${W:?}/ran"
+    "$W/account-lock-stream-step" live --stream --wait 2 --deadline 5 -- "$W/noted" > "$W/out" 2>&1 < /dev/null; rc=$?
+    check "the stream lock's step breaks after the account's lock is held: refused by name, nothing run, exit 1, both locks free" \
+          eval '[ "$rc" = 1 ] && [ ! -e "$W/ran" ] && grep -q "the step that takes account live.s market-data stream lock failed, so the lock is not held; nothing was run" "$W/out" && free $LIVE_LOCK && free $LIVE_STREAM'
+  fi
+  for f in canon-paper-test.lock canon-alpaca-stream-tests.lock canon-paper-windows.lock canon-alpaca-stream-windows.lock canon-paper-protect.lock canon-alpaca-stream-protect.lock; do hold "$f"; done
+  run live --stream --wait 2 --deadline 30 -- "$W/probe"
+  check "live --stream while every paper account's lock and stream lock is held: it runs at once (${took} s), under its own" \
+        eval '[ "$rc" = 7 ] && [ "$took" -lt 20 ] && probed $LIVE_LOCK 75 && probed $LIVE_STREAM 75'
+  release
+
+  # ---------- the deadline, and a stop before it ----------
+  # hang <folder> <trap line>: a command that hangs, with a child that ignores SIGTERM (scripts/test-lanes'
+  # stand-in for uv); cleans <folder>: one that, told to end, notes it and ends, its child still ignoring SIGTERM
+  echo "the deadline, and a stop before it:"
+  hang() {
+    mkdir -p "$1"
+    cat > "$1/cmd" <<HANG
+#!/bin/bash
+$2
+echo \$\$ > "$1/cmd.pid"
+/bin/bash -c 'trap "" TERM; echo \$\$ > "$1/child.pid"; sleep 60' &
+wait
+HANG
+    chmod +x "$1/cmd"
+  }
+  cleans() {
+    mkdir -p "$1"
+    cat > "$1/cmd" <<CLEANS
+#!/bin/bash
+trap 'echo cleaned > "$1/cleaned"; exit 0' TERM
+echo \$\$ > "$1/cmd.pid"
+/bin/bash -c 'trap "" TERM; echo \$\$ > "$1/child.pid"; sleep 60' &
+while :; do sleep 0.2; done
+CLEANS
+    chmod +x "$1/cmd"
+  }
+  # ready <folder> <pid>: until the stand-in's child has started, or the run has ended (a readiness signal, not
+  # a wall-clock bound)
+  ready() { while [ ! -s "$1/child.pid" ] && kill -0 "$2" 2>/dev/null; do sleep 0.1; done; }
+  left_up() { local f up=""; for f in cmd.pid child.pid; do [ -s "$1/$f" ] && kill -0 "$(cat "$1/$f")" 2>/dev/null && up="$up ${f%.pid}"; done; echo "$up"; }
+  settle() { for _ in $(seq 300); do [ -z "$(left_up "$1")" ] && break; sleep 0.1; done; }   # a ceiling a real hang alone reaches
+  reap() {
+    local f g
+    for f in cmd.pid child.pid; do
+      [ -s "$1/$f" ] || continue
+      g=$(ps -o pgid= -p "$(cat "$1/$f")" 2>/dev/null | tr -d ' ')
+      [ -z "$g" ] || kill -KILL -- "-$g" 2>/dev/null; kill -KILL "$(cat "$1/$f")" 2>/dev/null
+    done
+  }
+  # shellcheck disable=SC2034  # held, orc, up and took are read by the eval'd checks
+  for how in "the command ignores SIGTERM" "the command keeps SIGTERM's default"; do
+    D="$TMP/deadline-${how##* }"; trapline=""; [ "$how" = "the command ignores SIGTERM" ] && trapline="trap '' TERM"
+    hang "$D" "$trapline"
+    "$C" live --stream --wait 2 --deadline 4 -- "$D/cmd" > "$D/out" 2>&1 < /dev/null & op=$!
+    ready "$D" "$op"
+    free "$LIVE_LOCK"; held=$?
+    wait "$op"; orc=$?
+    settle "$D"; up=$(left_up "$D")
+    check "live, $how: a second run cannot take the lock while it runs" eval '[ -s "$D/child.pid" ] && [ "$held" != 0 ]'
+    check "... the deadline stops it and fails the run (exit $orc)" test "$orc" != 0
+    check "... nothing it started is left running (left:${up:- none})" test -z "$up"
+    check "... and both locks are free for the next run" eval 'free $LIVE_LOCK && free $LIVE_STREAM'
+    reap "$D"
+  done
+  # with a grace: SIGTERM at the deadline, so a command that cancels what it sent can; SIGKILL after it
+  # shellcheck disable=SC2034  # orc, up and took are read by the eval'd checks
+  {
+    D="$TMP/grace-cleans"; cleans "$D"
+    "$C" live --wait 2 --deadline 3 --grace 10 -- "$D/cmd" > "$D/out" 2>&1 < /dev/null & op=$!
+    ready "$D" "$op"; s0=$(date +%s); wait "$op"; orc=$?; took=$(( $(date +%s) - s0 ))
+    settle "$D"; up=$(left_up "$D")
+    check "live --grace 10, a command that cleans up when told to end: it is told at the deadline and cleans up, well inside the grace (${took} s)" \
+          eval '[ -s "$D/cleaned" ] && [ "$took" -lt 10 ] && [ "$orc" != 0 ]'
+    check "... its child that ignored SIGTERM is not left (left:${up:- none}), and the lock is free" eval '[ -z "$up" ] && free $LIVE_LOCK'
+    reap "$D"
+    D="$TMP/grace-ignores"; hang "$D" "trap '' TERM"
+    "$C" live --wait 2 --deadline 2 --grace 2 -- "$D/cmd" > "$D/out" 2>&1 < /dev/null & op=$!
+    ready "$D" "$op"; s0=$(date +%s); wait "$op"; orc=$?; took=$(( $(date +%s) - s0 ))
+    settle "$D"; up=$(left_up "$D")
+    check "live --grace 2, a command that ignores SIGTERM: killed once the grace is over (${took} s), nothing left (left:${up:- none}), the lock free" \
+          eval '[ "$orc" != 0 ] && [ "$took" -lt 20 ] && [ -z "$up" ] && free $LIVE_LOCK'
+    reap "$D"
+  }
+  # a stop before the deadline: a SIGTERM to the script (a mise task's timeout, launchd, a person's kill) or to
+  # the leader of the command's process group
+  # shellcheck disable=SC2034  # orc, up and took are read by the eval'd checks
+  for to in "the script" "the group's leader"; do
+    D="$TMP/early-${to##* }"; hang "$D" ""
+    "$C" live --stream --wait 2 --deadline 60 -- "$D/cmd" > "$D/out" 2>&1 < /dev/null & op=$!
+    ready "$D" "$op"; s0=$(date +%s)
+    if [ "$to" = "the script" ]; then kill -TERM "$op" 2>/dev/null
+    else kill -TERM "$(ps -o pgid= -p "$(cat "$D/cmd.pid" 2>/dev/null)" 2>/dev/null | tr -d ' ')" 2>/dev/null; fi
+    wait "$op"; orc=$?; took=$(( $(date +%s) - s0 ))
+    settle "$D"; up=$(left_up "$D")
+    check "live, a SIGTERM to $to before the deadline: the run fails, nothing it started is left (left:${up:- none}), both locks free, in ${took} s" \
+          eval '[ -s "$D/child.pid" ] && [ "$orc" != 0 ] && [ -z "$up" ] && free $LIVE_LOCK && free $LIVE_STREAM && [ "$took" -lt 30 ]'
+    reap "$D"
+  done
+  # shellcheck disable=SC2034  # orc, up and took are read by the eval'd check
+  {
+    D="$TMP/early-grace"; cleans "$D"
+    "$C" live --wait 2 --deadline 60 --grace 10 -- "$D/cmd" > "$D/out" 2>&1 < /dev/null & op=$!
+    ready "$D" "$op"; s0=$(date +%s); kill -TERM "$op" 2>/dev/null; wait "$op"; orc=$?; took=$(( $(date +%s) - s0 ))
+    settle "$D"; up=$(left_up "$D")
+    # the run's status is the command's (the lead's property 2, 2026-11-14): it cleaned up and ended 0, so 0, where
+    # it was 143, the stop's, before
+    check "live --grace 10, a SIGTERM to the script: the command is told to end and cleans up (${took} s), the run ends with its status, 0 ($orc), then nothing is left (left:${up:- none}), the lock free" \
+          eval '[ -s "$D/cleaned" ] && [ "$orc" = 0 ] && [ "$took" -lt 10 ] && [ -z "$up" ] && free $LIVE_LOCK'
+    reap "$D"
+  }
+  # a second stop while the first is under way (a task's timeout, then a closed terminal's SIGHUP) is only noted:
+  # the script does not signal the command a second time, and the run ends as the first stop's grace ends it.
+  # lingers <folder>: a command that, told to end, notes it and keeps running, as a cleanup that takes its time
+  lingers() {
+    mkdir -p "$1"
+    cat > "$1/cmd" <<LINGERS
+#!/bin/bash
+trap 'echo told >> "$1/told"' TERM
+echo \$\$ > "$1/cmd.pid"
+/bin/bash -c 'trap "" TERM; echo \$\$ > "$1/child.pid"; sleep 60' &
+while :; do sleep 0.2; done
+LINGERS
+    chmod +x "$1/cmd"
+  }
+  # shellcheck disable=SC2034  # orc, up and took are read by the eval'd check
+  {
+    D="$TMP/early-twice"; lingers "$D"
+    "$C" live --wait 2 --deadline 60 --grace 4 -- "$D/cmd" > "$D/out" 2>&1 < /dev/null & op=$!
+    ready "$D" "$op"; s0=$(date +%s); kill -TERM "$op" 2>/dev/null
+    # until the command has been told to end, which the first stop does (a readiness signal, not a wall-clock bound)
+    while [ ! -s "$D/told" ] && kill -0 "$op" 2>/dev/null; do sleep 0.1; done
+    kill -HUP "$op" 2>/dev/null; wait "$op"; orc=$?; took=$(( $(date +%s) - s0 ))
+    settle "$D"; up=$(left_up "$D")
+    # shellcheck disable=SC2034  # read by the eval'd check
+    told=$(wc -l 2>/dev/null < "$D/told" | tr -d ' ')
+    # the status is the command's: the grace's SIGKILL ended it, so 137, where it was 143, the first stop's, before
+    check "live --grace 4, a SIGTERM to the script and then a SIGHUP during the grace: the command is told once (${told:-0}), and the grace's SIGKILL ends it (exit $orc, 137 expected), in ${took} s, nothing left (left:${up:- none}), the lock free" \
+          eval '[ "${told:-0}" = 1 ] && [ "$orc" = 137 ] && [ "$took" -lt 20 ] && [ -z "$up" ] && free $LIVE_LOCK'
+    reap "$D"
+  }
+  # one stop tells the command once: timeout passes on the SIGTERM it gets, so one more from the script to the
+  # whole group would reach the command as a second, and break off a cancel that a plain handler had begun. The
+  # stand-in counts each SIGTERM as it arrives (perl's sigaction, not its deferred %SIG) and ends by itself.
+  if [ ! -x /usr/bin/perl ]; then
+    skip "account-lock tells the command to end once" "no /usr/bin/perl here"
+  else
+    D="$TMP/told-once"; mkdir -p "$D"
+    cat > "$D/cmd" <<ONCE
+#!/usr/bin/perl
+use strict; use POSIX;
+sigaction(SIGTERM, POSIX::SigAction->new(sub { open(my \$f, '>>', "$D/terms"); print \$f "t\n"; close \$f; }));
+open(my \$p, '>', "$D/child.pid"); print \$p "\$\$\n"; close \$p;
+my \$end = time + 2; while (time < \$end) { select(undef, undef, undef, 0.05); }
+ONCE
+    chmod +x "$D/cmd"
+    "$C" live --wait 2 --deadline 60 --grace 10 -- "$D/cmd" > "$D/out" 2>&1 < /dev/null & op=$!
+    ready "$D" "$op"; kill -TERM "$op" 2>/dev/null; wait "$op"; orc=$?
+    # shellcheck disable=SC2034  # read by the eval'd check
+    told=$(wc -l 2>/dev/null < "$D/terms" | tr -d ' ')
+    # the status is the command's: it ended by itself, 0, where it was 143, the stop's, before
+    check "live --grace 10, one SIGTERM to the script: the command is told to end once (told ${told:-0} times), and the run ends with its status, 0 ($orc)" \
+          eval '[ "${told:-0}" = 1 ] && [ "$orc" = 0 ]'
+  fi
+
+  # ---------- the lock outlives all the command started; a stop reaches the command ----------
+  # The lead's three properties for the wrapper (2026-11-14): (1) the locks are held until the command and all it
+  # started have ended, whatever it does with descriptors 9 and 7 and whatever child it leaves running; (2) a
+  # SIGTERM or SIGINT to the script reaches the command, the script ends only after it, and with its status
+  # (128 + the signal where the command dies of it); (3) both the same with and without a terminal on stdin.
+  # Each stand-in writes cmd.pid once its traps are set, so a signal sent after that finds them.
+  # alive <pid file>: the process is running (a zombie, ps STAT Z, is not)
+  alive() { [ -s "$1" ] || return 1; case "$(/bin/ps -o stat= -p "$(cat "$1")" 2>/dev/null)" in ""|Z*) return 1 ;; esac; }
+  # drops <folder> <close|reopen>: a command that closes, or reopens on files of its own, descriptors 9 and 7;
+  # starts a child (descriptors as the command left them, SIGTERM and SIGHUP ignored, so neither a stop nor a
+  # terminal's hangup at its session leader's end ends it, nothing on the terminal) that it leaves
+  # running; notes, while it runs, whether each live lock is held (75) or free (0), and whether a second run on the
+  # live account, with a wait of 1 s, runs its command; and ends 7
+  drops() {
+    mkdir -p "$1"
+    cat > "$1/cmd" <<DROPS
+#!/bin/bash
+case "$2" in close) exec 9>&- 7>&- ;; *) exec 9>>"$1/own-9" 7>>"$1/own-7" ;; esac
+echo \$\$ > "$1/cmd.pid"
+/bin/bash -c 'trap "" TERM HUP; echo \$\$ > "$1/child.pid"; exec /bin/sleep 60' < /dev/null > /dev/null 2>&1 &
+while [ ! -s "$1/child.pid" ]; do /bin/sleep 0.05; done
+for f in $LIVE_LOCK $LIVE_STREAM; do /usr/bin/lockf -k -t 0 "$L/\$f" true 2>/dev/null; echo "\$f \$?"; done > "$1/probed"
+"$C" live --stream --wait 1 --deadline 5 -- /usr/bin/touch "$1/second-ran" < /dev/null > "$1/second.out" 2>&1; echo \$? > "$1/second.rc"
+exit 7
+DROPS
+    chmod +x "$1/cmd"
+  }
+  # notes <folder>: a command that, told to end by SIGINT or SIGTERM, notes which and ends 3 or 4
+  notes() {
+    mkdir -p "$1"
+    cat > "$1/cmd" <<NOTES
+#!/bin/bash
+trap 'echo INT >> "$1/got"; exit 3' INT
+trap 'echo TERM >> "$1/got"; exit 4' TERM
+echo \$\$ > "$1/cmd.pid"
+while :; do /bin/sleep 0.2; done
+NOTES
+    chmod +x "$1/cmd"
+  }
+  # dies <folder>: a command that keeps every signal's default action, so a SIGINT or SIGTERM ends it
+  dies() {
+    mkdir -p "$1"
+    printf '#!/bin/bash\necho $$ > "%s/cmd.pid"\nexec /bin/sleep 60\n' "$1" > "$1/cmd"; chmod +x "$1/cmd"
+  }
+  # held_through <folder> <how> <where>: property 1's checks of a drops run, its status in rc
+  held_through() {
+    # shellcheck disable=SC2034  # read by the eval'd checks
+    local D="$1" inside; inside=$(tr '\n' ' ' 2>/dev/null < "$1/probed")
+    check "live --stream$3, a command that ${2}s descriptors 9 and 7: while it runs both live locks are held (${inside:-not probed})" \
+          eval 'grep -qx "$LIVE_LOCK 75" "$D/probed" && grep -qx "$LIVE_STREAM 75" "$D/probed"'
+    check "... a second run on the live account meanwhile waits its 1 s and runs nothing (exit $(cat "$D/second.rc" 2>/dev/null))" \
+          eval '[ "$(cat "$D/second.rc" 2>/dev/null)" = 1 ] && [ ! -e "$D/second-ran" ]'
+    check "... the run ends with the command's status, 7 ($rc), only once the child it left running has ended, and both locks are free" \
+          eval '[ "$rc" = 7 ] && [ -s "$D/child.pid" ] && ! alive "$D/child.pid" && free $LIVE_LOCK && free $LIVE_STREAM'
+  }
+  # stopped <folder> <signal> <expected status> <where>: property 2's checks, the run's status in rc
+  stopped() {
+    # shellcheck disable=SC2034  # read by the eval'd checks
+    local D="$1" sig="$2" want="$3" got; got=$(tr '\n' ' ' 2>/dev/null < "$1/got")
+    case "$want" in
+      3|4) check "live --stream$4, a SIG$sig to the script: the command is told by SIG$sig once (told: ${got:-nothing}), and the run ends after it with its status, $want ($rc)" \
+                 eval '[ "$got" = "$sig " ] && [ "$rc" = "$want" ] && ! alive "$D/cmd.pid" && free $LIVE_LOCK && free $LIVE_STREAM' ;;
+      *) check "live --stream$4, a SIG$sig to the script, a command that keeps its default action: it dies of SIG$sig and the run ends after it with $want ($rc)" \
+               eval '[ "$rc" = "$want" ] && [ -s "$D/cmd.pid" ] && ! alive "$D/cmd.pid" && free $LIVE_LOCK && free $LIVE_STREAM' ;;
+    esac
+  }
+  # signalled <folder> <signal>: the stand-in in <folder> under the script, not on a terminal, sent <signal> once
+  # it runs; status in rc. The copy starts through perl, which puts SIGINT back at its default and execs it (the
+  # same pid): without job control an asynchronous command starts with SIGINT ignored, which bash then cannot
+  # trap (man bash, SIGNALS), so a SIGINT to it would test nothing. `set -m` here is not enough: this test is
+  # itself such a command when scripts/ci starts it as a job, and an ignore it inherited stays
+  signalled() {
+    set -m; /usr/bin/perl -e '$SIG{INT} = "DEFAULT"; exec @ARGV; exit 127' "$C" live --stream --wait 2 --deadline 60 -- "$1/cmd" > "$1/out" 2>&1 < /dev/null & op=$!; set +m
+    while [ ! -s "$1/cmd.pid" ] && kill -0 "$op" 2>/dev/null; do sleep 0.1; done
+    kill -"$2" "$op" 2>/dev/null; wait "$op"; rc=$?
+  }
+  echo "the lock outlives all the command started, and a stop reaches the command (not on a terminal):"
+  # a command that ignores SIGTERM, told to stop: the lock stays held until the grace's SIGKILL, or with no grace
+  # the deadline's, ends the group, and is free only once none of the group is left (the coordinator's condition,
+  # 2026-11-14). Nothing is waited for between the run's end and the checks of what is left.
+  # shellcheck disable=SC2034  # orc, held, up and took are read by the eval'd checks
+  for g_d in "2 60" "0 4"; do
+    gr=${g_d% *}; dl=${g_d#* }; D="$TMP/ignores-stop-$gr"; hang "$D" "trap '' TERM"
+    set -m; "$C" live --stream --wait 2 --deadline "$dl" --grace "$gr" -- "$D/cmd" > "$D/out" 2>&1 < /dev/null & op=$!; set +m
+    ready "$D" "$op"; s0=$(date +%s); kill -TERM "$op" 2>/dev/null; sleep 1
+    free "$LIVE_LOCK"; held=$?
+    wait "$op"; orc=$?; took=$(( $(date +%s) - s0 )); up=$(left_up "$D")
+    check "live --stream --grace $gr --deadline $dl, a command that ignores SIGTERM, a SIGTERM to the script: 1 s later the lock is still held" \
+          eval '[ "$held" != 0 ] && [ -s "$D/child.pid" ]'
+    check "... the $([ "$gr" = 0 ] && echo "deadline's" || echo "grace's") SIGKILL ends it (exit $orc, 137 expected, in ${took} s), and at the run's end none of its group is left (left:${up:- none}) and both locks are free" \
+          eval '[ "$orc" = 137 ] && [ "$took" -ge $(( (gr > 0 ? gr : dl) - 1 )) ] && [ "$took" -lt 20 ] && [ -z "$up" ] && free $LIVE_LOCK && free $LIVE_STREAM'
+    reap "$D"
+  done
+  for how in close reopen; do
+    D="$TMP/drops-$how"; drops "$D" "$how"
+    "$C" live --stream --wait 2 --deadline 30 -- "$D/cmd" > "$D/out" 2>&1 < /dev/null; rc=$?
+    held_through "$D" "$how" ""; reap "$D"
+  done
+  for sig in TERM INT; do
+    D="$TMP/notes-$sig"; notes "$D"; signalled "$D" "$sig"
+    stopped "$D" "$sig" "$([ "$sig" = INT ] && echo 3 || echo 4)" ""; reap "$D"
+    D="$TMP/dies-$sig"; dies "$D"; signalled "$D" "$sig"
+    stopped "$D" "$sig" "$([ "$sig" = INT ] && echo 130 || echo 143)" ""; reap "$D"
+  done
+
+  # ---------- from a terminal ----------
+  echo "from a terminal:"
+  if [ ! -x /usr/bin/expect ] || ! /usr/bin/expect -c 'spawn -noecho true; expect eof' >/dev/null 2>&1; then
+    skip "account-lock from a terminal" "no /usr/bin/expect that can open a pseudo-terminal here"
+  else
+    rm -f "${W:?}/probed"
+    # bounded <secs> <since>: a driver is run under `timeout --foreground -s KILL <secs>`, past every wait of its
+    # own, since expect's `timeout` bounds its `expect` and not its `wait`, and a run that never ends would hang
+    # this test. --foreground keeps the driver in this test's process group, so a Ctrl-C at a person's terminal
+    # still ends the test; timeout then ends 124 at the bound, <secs> after <since>, which is put in words
+    bounded() { [ "$rc" != 124 ] || [ $(( $(date +%s) - $2 )) -lt "$1" ] || rc="none: the driver was stopped at its $1 s bound"; }
+    # shellcheck disable=SC2034  # rc is read by the eval'd check
+    { t0=$(date +%s); AL_COPY="$C" AL_PROBE="$W/probe" /usr/bin/timeout --foreground -s KILL 60 /usr/bin/expect -c 'set timeout 30; spawn -noecho $env(AL_COPY) live --stream --wait 2 --deadline 30 -- $env(AL_PROBE); expect eof; lassign [wait] p s o v; exit $v' > "$W/out" 2>&1; rc=$?; bounded 60 "$t0"; }
+    check "live --stream on a pseudo-terminal: the command runs holding both locks, and its exit status (7) is the run's" \
+          eval '[ "$rc" = 7 ] && probed $LIVE_LOCK 75 && probed $LIVE_STREAM 75 && probed canon-paper-test.lock 0'
+    check "... both free once it has ended" eval 'free $LIVE_LOCK && free $LIVE_STREAM'
+    # on_term <folder> <none|TERM|INT|ctrl-c>: the stand-in in <folder> under the script on a pseudo-terminal; once
+    # it runs, a signal to the script's pid, or a Ctrl-C typed at the terminal (to its foreground process group);
+    # status in rc (128 + the signal's number, as a shell reports it, if the process was killed by one), 198 if the
+    # run outlived expect's 40 s, 199 if another signal killed it (never 1, expect's own status for an error of
+    # the driver, which a case may expect of the run), and a word in place of a number if the driver itself met
+    # its bound of 90 s. The terminal it opens has `tostop` off whatever the tester's own has (stty_init)
+    cat > "$W/on-term.exp" <<'EXP'
+set timeout 40
+set d $env(AL_DIR); set act $env(AL_ACT)
+set stty_init -tostop
+spawn -noecho {*}$argv
+set p [exp_pid]
+if {$act ne "none"} {
+  set n 0
+  while {(![file exists $d/cmd.pid] || [file size $d/cmd.pid] == 0) && $n < 300} { after 100; incr n }
+  if {$act eq "ctrl-c"} { send "\003" } else { exec kill -$act $p }
+}
+expect { eof {} timeout { exit 198 } }
+set r [wait]
+set sigs {SIGHUP 1 SIGINT 2 SIGKILL 9 SIGTERM 15}
+if {[lindex $r 4] eq "CHILDKILLED"} {
+  if {[dict exists $sigs [lindex $r 5]]} { exit [expr {128 + [dict get $sigs [lindex $r 5]]}] }
+  exit 199
+}
+exit [lindex $r 3]
+EXP
+    on_term() {
+      local d="$1" act="$2" t0; shift 2; t0=$(date +%s)
+      AL_DIR="$d" AL_ACT="$act" /usr/bin/timeout --foreground -s KILL 90 /usr/bin/expect -f "$W/on-term.exp" -- "$C" live --stream --wait 2 --deadline 60 -- "$d/cmd" > "$d/out" 2>&1 < /dev/null; rc=$?
+      bounded 90 "$t0"
+    }
+    for how in close reopen; do
+      D="$TMP/term-drops-$how"; drops "$D" "$how"; on_term "$D" none
+      held_through "$D" "$how" " on a pseudo-terminal"; reap "$D"
+    done
+    for sig in TERM INT; do
+      D="$TMP/term-notes-$sig"; notes "$D"; on_term "$D" "$sig"
+      stopped "$D" "$sig" "$([ "$sig" = INT ] && echo 3 || echo 4)" " on a pseudo-terminal"; reap "$D"
+      D="$TMP/term-dies-$sig"; dies "$D"; on_term "$D" "$sig"
+      stopped "$D" "$sig" "$([ "$sig" = INT ] && echo 130 || echo 143)" " on a pseudo-terminal"; reap "$D"
+    done
+    # one Ctrl-C at the terminal reaches the command once: a second would cut its cleanup short (the note above
+    # paper:test in mise.toml)
+    D="$TMP/term-ctrl-c"; notes "$D"; on_term "$D" ctrl-c
+    # shellcheck disable=SC2034  # read by the eval'd check
+    got=$(tr '\n' ' ' 2>/dev/null < "$D/got")
+    check "live --stream on a pseudo-terminal, one Ctrl-C typed there: the command is told by SIGINT once (told: ${got:-nothing}), and the run ends after it with its status, 3 ($rc)" \
+          eval '[ "$got" = "INT " ] && [ "$rc" = 3 ] && ! alive "$D/cmd.pid" && free $LIVE_LOCK && free $LIVE_STREAM'
+    reap "$D"
+    # What the command can do with the terminal (the script's header, and ADR 0163's clause 5): in a process
+    # group of its own it is not the terminal's foreground group, so it writes there, but a read of the terminal
+    # (SIGTTIN) or a change of its settings (SIGTTOU) stops it, timeout takes the stop for its end, and the run
+    # ends at once with status 1, long before the deadline's 60 s, nothing left and both locks free. A task that
+    # prompts therefore does not run under this lock.
+    # asks <folder> <one line of shell>: a command that runs the line, notes its status in `after`, and ends 7
+    asks() {
+      mkdir -p "$1"
+      printf '#!/bin/bash\necho $$ > "%s/cmd.pid"\n%s\necho $? > "%s/after"\nexit 7\n' "$1" "$2" "$1" > "$1/cmd"; chmod +x "$1/cmd"
+    }
+    D="$TMP/term-writes"; asks "$D" 'echo to the terminal > /dev/tty'; on_term "$D" none
+    check "live --stream on a pseudo-terminal, a command that writes to the terminal: it does (status $(cat "$D/after" 2>/dev/null)), and the run ends with its status, 7 ($rc)" \
+          eval '[ "$rc" = 7 ] && [ "$(cat "$D/after" 2>/dev/null)" = 0 ] && grep -q "to the terminal" "$D/out" && free $LIVE_LOCK && free $LIVE_STREAM'
+    reap "$D"
+    # shellcheck disable=SC2034  # took is read by the eval'd checks
+    for ask in "read -r answer:reads the terminal" "stty -echo:changes the terminal's settings"; do
+      D="$TMP/term-asks-${ask%% *}"; asks "$D" "${ask%%:*}"; s0=$(date +%s); on_term "$D" none; took=$(( $(date +%s) - s0 ))
+      check "live --stream on a pseudo-terminal, a command that ${ask#*:} (${ask%%:*}): the run ends at once with status 1 ($rc, in $took s), the line never returned, nothing left, both locks free" \
+            eval '[ "$rc" = 1 ] && [ "$took" -lt 30 ] && [ -s "$D/cmd.pid" ] && [ ! -e "$D/after" ] && ! alive "$D/cmd.pid" && free $LIVE_LOCK && free $LIVE_STREAM'
+      reap "$D"
+    done
+  fi
+fi
+
+# A skipped case checked nothing: one line, last, with the count and the names (as scripts/test-lanes ends).
+if [ "$skipped" -gt 0 ]; then
+  echo "test-account-lock: $pass passed, $fail failed, $skipped skipped, so NOT CHECKED here:${skips#;}"
+else
+  echo "test-account-lock: $pass passed, $fail failed, 0 skipped"
+fi
+[ "$fail" -eq 0 ]
