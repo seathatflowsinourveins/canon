@@ -89,3 +89,9 @@ def test_a_second_start_of_the_same_protector_is_refused_by_name() -> None:
     with pytest.raises(RuntimeError, match="OwnerProtector starts once"):
         strategy.on_start()
     assert strategy.sent == sent, "the refused start sent something"
+
+
+@pytest.fixture(autouse=True)
+def alpaca_stream_lock() -> None:
+    """Synthetic only, as the sibling owner-protector files: never inspect a credential environment
+    or a paper lock (tests/conftest.py's autouse fixture reads the key variables)."""

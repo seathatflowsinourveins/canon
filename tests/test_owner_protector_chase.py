@@ -700,3 +700,56 @@ def test_a_late_fill_on_an_ended_leg_withdraws_the_working_leg_in_that_event(lat
     filled(strategy, first, late, at + 4 * h.SECOND)
     assert second.client_order_id in strategy.canceled, "withdrawn in the fill's own event"
     assert len(strategy.sent) == 2, "nothing new is sent until the replacement's cancel is final"
+
+
+def test_a_carried_level_far_above_the_bid_chases_to_the_chase_price_within_one_interval(
+    tmp_path,
+) -> None:
+    """The lead's composed case (2026-11-13 19:11): a carried level above the bid by more than its
+    limit offset and more than the chase cap. The guard elects (count one) and the emulator releases a
+    limit at the carried trigger less the offset, far above the bid. U-d's pricing governs the sale
+    (the lead's 18:36 terms): within one chase interval of its release it is at the chase price."""
+    path = tmp_path / "levels.json"
+    path.write_text(json.dumps({"schema": 2, "entries": [h.restart_record(last_level="1.10")]}))
+    strategy = h.restart_harness(path)
+    strategy.cached.latest = h.quote("1.00", h.T0 + 180 * h.SECOND)
+    strategy.on_start()
+    assert strategy.slots[h.AAA].level == Price.from_str("1.10"), strategy.said
+    for n, bid in ((181, "1.00"), (182, "0.99")):
+        strategy.observe(bid, h.T0 + n * h.SECOND)
+    assert len(strategy.sent) == 1, strategy.said
+    trailing = strategy.sent[0]
+    assert trailing.trigger_price == Price.from_str("1.10")
+    gap = Decimal("1.10") - Decimal("0.99")
+    assert gap > Decimal(str(trailing.limit_offset)) and gap > Decimal("1.10") * ROWS.chase_cap
+    at = h.T0 + 183 * h.SECOND
+    strategy.test_clock.set_time(at)
+    # The emulator releases a limit at the trigger less the limit offset.
+    released_at = trailing.trigger_price.as_decimal() - Decimal(str(trailing.limit_offset))
+    order = strategy.order_factory.limit(
+        h.AAA,
+        OrderSide.SELL,
+        trailing.quantity,
+        Price.from_str(str(released_at)),
+        time_in_force=TimeInForce.DAY,
+        reduce_only=True,
+        client_order_id=trailing.client_order_id,
+    )
+    event = OrderReleased(
+        order.trader_id, order.strategy_id, h.AAA, order.client_order_id,
+        Price.from_str("0.99"), UUID4(), at, at,
+    )  # fmt: skip
+    order.apply(event)
+    strategy.cached.working = [order]
+    strategy.on_order_released(event)
+    accepted(order, at)
+    strategy.observe("0.99", at)
+    floor = chase_floor(order.price.as_decimal(), ROWS.chase_cap)
+    strategy.observe("0.99", at + CHASE + h.SECOND)
+    assert strategy.canceled == [order.client_order_id], "the released sale did not chase"
+    terminal(order, at + CHASE + h.SECOND)
+    strategy.observe("0.99", at + CHASE + 2 * h.SECOND)
+    second = strategy.sent[-1]
+    assert second is not order and second.order_type == OrderType.LIMIT
+    assert second.price.as_decimal() == expected_price("0.99", floor), (second.price, floor)
+    assert second.price.as_decimal() <= order.price.as_decimal()

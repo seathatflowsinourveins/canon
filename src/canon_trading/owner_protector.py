@@ -209,6 +209,7 @@ There is no runner here to start nodes back to back or supply their history and 
 from __future__ import annotations
 
 import json
+import logging
 from collections import deque
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -594,6 +595,26 @@ class Holding:
     current_from: int | None = None
 
 
+STREAM_LOGGER = "alpaca.data.live.websocket"
+STREAM_ERROR = "error during websocket communication"
+
+
+class _StreamErrors(logging.Handler):
+    """Test b (the lead, 2026-11-13 19:01:48), an upstream named limit: a stream message alpaca-py
+    cannot parse ends its received batch, and the rest of that batch is lost, logged as STREAM_ERROR
+    by STREAM_LOGGER with the socket kept up (alpaca/data/live/websocket.py:284-297, :568-575 at
+    c42add7c). This counts those lines for the node; there is no patch to the client."""
+
+    def __init__(self) -> None:
+        super().__init__(logging.ERROR)
+        self.lines: list[str] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        message = record.getMessage()
+        if message.startswith(STREAM_ERROR):
+            self.lines.append(message)
+
+
 def _known_current(slot: Holding, tick: QuoteTick, streamed: bool) -> bool:
     """The lead's ruling, 2026-11-13 19:23: a holding with no level plans only from a quote known
     current for it: (i) stamped at or after the holding opened, or (ii) at or after the stamp its own
@@ -641,6 +662,9 @@ class OwnerProtector(Strategy):
         self.started_once = False
         self.streamed_max: dict[InstrumentId, bool] = {}
         self.receipt_plans: dict[InstrumentId, int] = {}
+        self.alerted: set[InstrumentId] = set()
+        self.stream_errors = _StreamErrors()
+        self.stream_errors_said = 0
         self.run = ""
         self.overnight_checks: dict[InstrumentId, str | None] = {}
         # P10: what the book on disk holds, per holding, as this run last wrote or read it.
@@ -1101,6 +1125,7 @@ class OwnerProtector(Strategy):
             )
         self.started_once = True
         self.settings.validate_protection()
+        logging.getLogger(STREAM_LOGGER).addHandler(self.stream_errors)
         self.overnight_checks.clear()
         self.overnight_unread.clear()
         self._bound_reader()
@@ -1353,6 +1378,16 @@ class OwnerProtector(Strategy):
     def _on_step(self, event: TimeEvent) -> None:
         if self.stopping:
             return
+        lost = len(self.stream_errors.lines)
+        if lost > self.stream_errors_said:
+            # Said once per new stream error, for each holding: its quotes may be among those lost.
+            last = self.stream_errors.lines[-1].splitlines()[0][:200]
+            for instrument_id in list(self.slots):
+                self._say(
+                    f"{instrument_id}: quotes may have been lost: the stream dropped the rest of a "
+                    f"batch ({lost} so far): {last}"
+                )
+            self.stream_errors_said = lost
         for instrument_id in list(self.slots):
             try:
                 self._manage(instrument_id)
@@ -1821,9 +1856,29 @@ class OwnerProtector(Strategy):
             if order.is_closed:
                 if order.status in (OrderStatus.DENIED, OrderStatus.REJECTED):
                     if slot.sale is None:
-                        self._freeze(
-                            instrument_id, f"our protective sell ended {order.status}; inspect it"
+                        # C1's P2-1, the ruled design (the lead, 2026-11-13 19:11): a 403 or 422 is
+                        # definitive. Frozen with the venue's own reason, never sent again in this
+                        # run, one ALERT; the next start re-arms the holding from the book.
+                        venue = next(
+                            (
+                                str(event.reason)
+                                for event in reversed(order.events())
+                                if getattr(event, "reason", None)
+                            ),
+                            "no reason given",
                         )
+                        reason = (
+                            f"our protective sell ended {order.status.name}: {venue}; not sent "
+                            "again this run; the next start re-arms it from the book"
+                        )
+                        if instrument_id not in self.alerted:
+                            self.alerted.add(instrument_id)
+                            self._say(
+                                f"{instrument_id}: ALERT: our protective sell was refused by the "
+                                f"venue ({order.status.name}: {venue}); the holding is unprotected "
+                                "until the next start"
+                            )
+                        self._freeze(instrument_id, reason)
                         return
                     # As main's chase does (mover.py:4002-4007): a refused sale is sent again
                     # once per chase interval, never left without one.
@@ -2201,6 +2256,7 @@ class OwnerProtector(Strategy):
 
     def on_stop(self) -> None:
         self.stopping = True
+        logging.getLogger(STREAM_LOGGER).removeHandler(self.stream_errors)
         self._save_levels(final=True)
         self._name_unapplied()
         if STEP_TIMER in self.clock.timer_names():
@@ -2214,6 +2270,7 @@ class OwnerProtector(Strategy):
                 f"{instrument_id}: END refused-ahead={ahead}, not-raised={not_raised}, "
                 f"refused-redeliveries={redelivered}; "
                 f"receipt-clause plans={self.receipt_plans.get(instrument_id, 0)}; "
+                f"stream-errors (node)={len(self.stream_errors.lines)}; "
                 f"fixed fallback={fallbacks}, "
                 f"no history={fallbacks - flat}, flat session day={flat}; "
                 f"first_quote={None if slot is None else slot.first_quote}, "
