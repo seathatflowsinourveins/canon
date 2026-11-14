@@ -332,7 +332,11 @@ LATENCY = {"insert_ns": 5 * MS, "update_ns": 7 * MS, "delete_ns": 7 * MS}
 
 
 def _event_times(order) -> dict[str, int]:
-    return {type(event).__name__: event.ts_event for event in order.events()}
+    """Each event type's first time, so a later partial fill never stands for the first."""
+    times: dict[str, int] = {}
+    for event in order.events():
+        times.setdefault(type(event).__name__, event.ts_event)
+    return times
 
 
 def _latency_run(alpaca_bars, latency) -> tuple[dict[str, int], dict[str, int]]:
@@ -370,7 +374,37 @@ def _latency_run(alpaca_bars, latency) -> tuple[dict[str, int], dict[str, int]]:
         engine.dispose()
 
 
-def test_a_released_order_meets_the_insert_latency_from_its_release(alpaca_bars):
+def _bounds(**extra) -> dict[str, Any]:
+    return {
+        "trade_date": START.date().isoformat(),
+        "window_start": START.isoformat(),
+        "window_end": END.isoformat(),
+        "wind_down_at": (END - timedelta(seconds=2)).isoformat(),
+        "trail_arm": "OWN1",
+        **extra,
+    }
+
+
+@pytest.mark.parametrize(
+    "spec,reason",
+    [
+        (_bounds(latancy=LATENCY), "unknown latency key"),
+        (_bounds(latency_ms=27), "unknown latency key"),
+        (_bounds(latency={**LATENCY, "insert_ns": 2 * SECOND}), "longest latency"),
+        (_bounds(latency={**LATENCY, "insert_ns": 2**64}), "nanoseconds from 0"),
+    ],
+)
+def test_a_latency_the_window_cannot_honour_is_refused_before_any_read(spec, reason):
+    """A misnamed key is never a silent zero-latency run; a delay that would land the wind-down's
+    exit after the replay's flat check (one market-exit interval before window_end) is refused; a
+    delay beyond the module's bound never reaches upstream's u64 arithmetic mid-run."""
+    from canon_trading.window_replay import _run_replay
+
+    with pytest.raises(ValueError, match=reason):
+        _run_replay(spec)
+
+
+def test_a_released_order_meets_the_insert_latency_from_its_release(alpaca_bars, monkeypatch):
     """The emulator resends a released order's first SubmitOrder, keeping its ts_init
     (emulator.rs:1522-1594), so a fixed latency, counted from that ts_init, is past by the release.
     The replay's model counts from the send: the released SELL is accepted no sooner than the insert
@@ -395,11 +429,8 @@ def test_a_released_order_meets_the_insert_latency_from_its_release(alpaca_bars)
         kwargs["latency_model"] = static
         return original(self, *args, **kwargs)
 
-    window_replay.BacktestEngine.add_venue = fixed
-    try:
-        fixed_buy, fixed_sell = _latency_run(alpaca_bars, LATENCY)
-    finally:
-        window_replay.BacktestEngine.add_venue = original
+    monkeypatch.setattr(window_replay.BacktestEngine, "add_venue", fixed)
+    fixed_buy, fixed_sell = _latency_run(alpaca_bars, LATENCY)
     assert fixed_buy == buy
     # The upstream behaviour this model corrects: under a fixed latency the release is accepted at once.
     assert fixed_sell["OrderAccepted"] == fixed_sell["OrderReleased"]

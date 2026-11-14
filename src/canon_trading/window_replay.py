@@ -74,6 +74,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import difflib
 import hashlib
 import json
 import re
@@ -549,10 +550,22 @@ def _run_replay(spec: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError("window bounds must be ordered within one regular session")
     if not start < wind_down < end or end - start > timedelta(minutes=60):
         raise ValueError("a window lasts at most 60 minutes and includes its wind-down")
-    if end - wind_down < timedelta(milliseconds=EXIT_INTERVAL_MS):
+    stray = sorted(
+        key
+        for key in spec
+        if key != "latency"
+        and ("latenc" in key.lower() or difflib.get_close_matches(key.lower(), ["latency"]))
+    )
+    if stray:
+        raise ValueError(f"unknown latency key(s) {stray}; the spec's key is latency")
+    delay = send_latency.longest(spec.get("latency"))
+    if end - wind_down < timedelta(milliseconds=EXIT_INTERVAL_MS) + timedelta(
+        microseconds=delay // 1000
+    ):
         raise ValueError(
             "wind_down_at must be at least one market-exit interval "
-            f"({EXIT_INTERVAL_MS} ms) before window_end, where the replay stops the Mover"
+            f"({EXIT_INTERVAL_MS} ms) and the venue's longest latency ({delay} ns) before "
+            "window_end, where the replay stops the Mover"
         )
     arm = spec["trail_arm"]
     if arm not in session_window.TRAIL_ARMS:

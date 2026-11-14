@@ -950,16 +950,19 @@ def replay(spec: Any, *, base: Path | None = None) -> dict[str, Any]:
         **{
             key: value.name if hasattr(value, "name") else value
             for key, value in _venue(checked["fill_arm"]).items()
+            if key != "latency_model"
         },
         "fee_rates": {key: str(value) for key, value in FEE_RATES.items()},
         "fill_model": "DefaultFillModel",
         "fee_model": "MakerTakerFeeModel",
-        **({"latency_ns": 0} if latency is None else {"latency_model": latency}),
+        **({"latency_model": None, "latency_ns": 0} if latency is None else {"latency": latency}),
     }
     if latency is not None:
         report["limits"] = [
             limit.replace(
-                "Zero latency; ", "Latency counted from each send, as the spec names it; "
+                "Zero latency; ",
+                "Latency counted from each send, as the spec names it; a command still in "
+                "flight at a segment's end never reaches that segment's venue; ",
             )
             for limit in report["limits"]
         ]

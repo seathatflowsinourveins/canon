@@ -229,12 +229,13 @@ def test_a_spec_latency_reaches_each_segment_venue_counted_from_send(shape, monk
         (5_000_000, 7_000_000, 7_000_000)
     ] * len(models)
     venue = report["venue"]
-    assert venue["latency_model"] == {
+    assert venue["latency"] == {
         "model": "SendLatency",
         "kind": "counted from send",
         **latency,
     }
     assert "latency_ns" not in venue
+    assert "latency_model" not in venue
     assert venue["departures"] == [
         (
             "latency: SendLatency, counted from send "
@@ -242,6 +243,7 @@ def test_a_spec_latency_reaches_each_segment_venue_counted_from_send(shape, monk
         )
     ]
     assert not any("Zero latency" in limit for limit in report["limits"])
+    assert any("in flight at a segment's end" in limit for limit in report["limits"])
     json.dumps(report, allow_nan=False)
 
 
@@ -253,6 +255,8 @@ def test_a_spec_latency_reaches_each_segment_venue_counted_from_send(shape, monk
         {"insert_ns": -1, "update_ns": 7, "delete_ns": 7},
         {"insert_ns": 5.0, "update_ns": 7, "delete_ns": 7},
         {"insert_ns": True, "update_ns": 7, "delete_ns": 7},
+        {"insert_ns": 2**64, "update_ns": 7, "delete_ns": 7},
+        {"insert_ns": 60_000_000_001, "update_ns": 7, "delete_ns": 7},
         [5, 7, 7],
     ],
 )

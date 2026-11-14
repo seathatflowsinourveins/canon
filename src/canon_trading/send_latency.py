@@ -33,6 +33,10 @@ from typing import Any
 from nautilus_trader.execution import LatencyModel
 
 KEYS = ("insert_ns", "update_ns", "delete_ns")
+# A bound far above any venue answer, and far inside upstream's u64 nanosecond delay and its
+# checked ts_init addition (python/latency.rs, exchange.rs:952), so a figure no run means is
+# refused with the spec rather than failing the engine mid-run.
+MAX_NS = 60_000_000_000
 KIND = "counted from send"
 
 
@@ -41,8 +45,10 @@ class SendLatency(LatencyModel):
 
     def __init__(self, insert_ns: int, update_ns: int, delete_ns: int) -> None:
         for name, value in zip(KEYS, (insert_ns, update_ns, delete_ns), strict=True):
-            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-                raise ValueError(f"latency {name} must be a whole number of nanoseconds, 0 or more")
+            if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= MAX_NS:
+                raise ValueError(
+                    f"latency {name} must be a whole number of nanoseconds from 0 to {MAX_NS}"
+                )
         self.insert_ns = insert_ns
         self.update_ns = update_ns
         self.delete_ns = delete_ns
@@ -72,6 +78,12 @@ def checked(value: Any) -> dict[str, int] | None:
         raise ValueError(f"latency must map exactly {list(KEYS)} to nanoseconds")
     SendLatency(*(value[key] for key in KEYS))
     return {key: value[key] for key in KEYS}
+
+
+def longest(value: Mapping[str, int] | None) -> int:
+    """The largest of the three delays, 0 when the spec names none."""
+    delays = checked(value)
+    return 0 if delays is None else max(delays.values())
 
 
 def model(value: Mapping[str, int] | None) -> SendLatency | None:
