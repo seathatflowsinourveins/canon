@@ -196,16 +196,18 @@ limit offset beside level and distance; an entry with none takes today's quarter
 (ruling (c)). The runner supplies session_part and a raw asset reader for overnight runs; an
 answered eligibility is kept for the run, an unread one retried at most once a minute (review F7),
 with refusals named and old entries untouched.
-A carried long breached through its limit offset is named once at ERROR and keeps its level and
-distances. Once the observation guard confirms the breach, it starts a DAY limit sale using the
-same exit_price and chase_floor rules as a released sale, including the lowest positive venue tick;
-it never submits a trailing order whose bid-derived limit would be nonpositive (F15).
 The book is also the node report (the lead, 2026-11-13 17:13): each entry carries its holding's
 state (_holding_state maps this strategy's records to armed, guarded, counting, waiting, frozen),
 written when it changes, and the file carries last_step_ns per account label, written at most
 once per 1 s step, so a killed run shows as a step time that stops advancing. The default book is
 one file per account label, and each read, merge and replace holds LevelBook.locked (review F5).
 A write failure is named once per kind.
+An armed long, carried or armed this run, breached through its limit offset is named once at
+ERROR and keeps its level and distances. Once two new observations at or below its level confirm
+the breach (the guard before a first placing, or a count of their own once our cover has ended),
+it starts a DAY limit sale using the same exit_price and chase_floor rules as a released sale,
+including the lowest positive venue tick; it never submits a trailing order whose bid-derived
+limit would be nonpositive (F15 and its review).
 An omitted account label disables persistence by name; no guessed account shares a book key.
 There is no runner here to start nodes back to back or supply their history and session bounds.
 """
@@ -561,6 +563,9 @@ class Holding:
     distance: protect.Distance | None = None
     limit_offset: Decimal | None = None
     offset_breach_named: bool = False
+    # F15's review, 1: once our cover has ended, the first new observation through the offset
+    # and at or below the level; a second newer one starts the sale.
+    breach_observation: int | None = None
     fresh: bool = False
     ended: bool = False
     # The host clock when the level was fixed; it never orders venue observations.
@@ -2042,15 +2047,14 @@ class OwnerProtector(Strategy):
         assert (
             slot.level is not None and slot.distance is not None and slot.limit_offset is not None
         )
-        offset_breached = (
-            bid <= slot.limit_offset
-            and (self.settings.account_label or "", instrument_id) in self.carried
-        )
+        # F15's review, 4: any armed long, carried or armed this run, can gap through its offset.
+        offset_breached = bid <= slot.limit_offset
         if offset_breached and not slot.offset_breach_named:
             slot.offset_breach_named = True
+            carried = (self.settings.account_label or "", instrument_id) in self.carried
             self._say(
-                f"{instrument_id}: ALERT: carried long breached through its offset "
-                f"{slot.limit_offset} at bid {bid}; level {slot.level} kept; "
+                f"{instrument_id}: ALERT: {'carried ' if carried else ''}long breached through "
+                f"its offset {slot.limit_offset} at bid {bid}; level {slot.level} kept; "
                 "sale follows the observation count and existing chase price rules"
             )
         if not slot.placed and not advanced and instrument_id in self.quote_refusals:
@@ -2081,8 +2085,22 @@ class OwnerProtector(Strategy):
         trailing, limit = slot.distance.distance, slot.limit_offset
         if bid - limit <= 0:
             if offset_breached and bid <= slot.level.as_decimal():
-                # The guard above confirmed the carried breach. A fresh trailing order would
-                # derive a nonpositive limit from this bid; start the existing sale path instead.
+                # A fresh trailing order would derive a nonpositive limit from this bid; start
+                # the existing sale path instead, on two observations (ruling 6). Before a first
+                # placing the guard above counted them; after our cover ended it is skipped, so
+                # they are counted here, each a new sane quote at or below the level.
+                if slot.placed:
+                    if not advanced or not _sane(tick):
+                        self._wait(instrument_id, "a new observation to confirm the breach")
+                        return
+                    if slot.breach_observation is None:
+                        slot.breach_observation = tick.ts_event
+                        self._say(
+                            f"{instrument_id}: holding level {slot.level}; one observation "
+                            "cannot elect"
+                        )
+                        self._wait(instrument_id, "a second observation to confirm")
+                        return
                 first = exit_price(bid, protect.PLANNER.exit_ticks, None)
                 now = self.clock.timestamp_ns()
                 slot.sale = Sale(

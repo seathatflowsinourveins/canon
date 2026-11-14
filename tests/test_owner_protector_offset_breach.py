@@ -160,3 +160,46 @@ def test_carried_offset_breach_uses_the_existing_chase_floor_and_cancel_ack(
     assert strategy.sent[-1].price.as_decimal() == Decimal("0.3430")
     assert strategy.sent[-1].quantity == Quantity.from_int(10)
     assert len([text for _, text in strategy.logged if "ALERT:" in text]) == 1
+
+
+def test_after_our_trailing_order_expires_one_observation_through_the_offset_never_sells(
+    tmp_path, monkeypatch
+) -> None:
+    """F15's review, 1: the guard is skipped once a sell has been placed, so after our trailing
+    order expired one quote through the offset started a sale (ruling 6: no election on one)."""
+    strategy = carried_gap(tmp_path, monkeypatch, "2.50")
+    step(strategy)
+    strategy.observe("2.50", START + h.SECOND)
+    strategy.observe("2.50", START + 2 * h.SECOND)
+    (trailing,) = strategy.sent
+    assert trailing.order_type == OrderType.TRAILING_STOP_LIMIT
+    accepted(trailing, START + 2 * h.SECOND)
+    terminal(trailing, START + 3 * h.SECOND, expired=True)
+    strategy.observe("0.35", START + 4 * h.SECOND)
+    step(strategy)
+    strategy.observe("0.35", START + 4 * h.SECOND)
+    assert len(strategy.sent) == 1, ("a sale on one observation", strategy.said)
+    strategy.observe("0.35", START + 5 * h.SECOND)
+    assert len(strategy.sent) == 2, strategy.said
+    sale = strategy.sent[1]
+    assert sale.order_type == OrderType.LIMIT and sale.price.as_decimal() == Decimal("0.3499")
+
+
+def test_a_holding_armed_this_run_that_gaps_through_its_offset_sells(monkeypatch) -> None:
+    """F15's review, 4: the sale was gated on a carried level, so a long armed this run from a
+    supplied level froze at every step once its bid fell through the planned offset."""
+    strategy = Recording()
+    monkeypatch.setattr(strategy.cached, "instrument", lambda iid: h.equity(iid, precision=4))
+    strategy.test_clock.set_time(START - h.SECOND)
+    strategy.cached.latest = h.quote("10.00", START - h.SECOND)
+    strategy.adopt_holding(h.AAA, Price.from_str("9.95"))
+    slot = strategy.slots[h.AAA]
+    assert slot.limit_offset is not None and slot.limit_offset > Decimal("0.14")
+    for n in (1, 2):
+        strategy.observe("0.14", START + n * h.SECOND)
+    (order,) = strategy.sent
+    assert order.order_type == OrderType.LIMIT and order.is_reduce_only
+    assert order.price.as_decimal() == Decimal("0.1399")
+    alerts = [text for level, text in strategy.logged if "ALERT:" in text]
+    assert len(alerts) == 1 and "carried" not in alerts[0], alerts
+    assert not any("frozen: no positive protective limit" in note for note in strategy.said)
