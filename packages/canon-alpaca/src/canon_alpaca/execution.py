@@ -387,8 +387,10 @@ Known limits:
   for that symbol (ADR 0075). Each such request spends its `FILL_READ_TRIES` reads before it fails, and
   the position check's requests share one deadline (`timeout_reconciliation`, 30 s by default), so enough
   of them can run the stage out of time for every symbol, as before this leave-out. A replace chain is
-  traced through an order whose client order ID NautilusTrader cannot hold, so the node's own order is
-  found past it.
+  traced through an order whose client order ID NautilusTrader cannot hold, so an outside chain is rooted
+  at its first holdable client order ID, one before such an order included: its later orders are reported
+  under that ID, and while that lineage is left to reconciliation their stream updates are left to it too,
+  as in a chain with no such order.
 * Timestamps lose sub-microsecond precision: alpaca-py parses them into `datetime`.
 * A trading client given to the constructor is the caller's: every connect uses it, a disconnect does not
   drop it, and nothing is built from the environment in its place (the adapter guide closes in
