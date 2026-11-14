@@ -42,6 +42,7 @@ from canon_trading import custody
 from canon_trading import mover
 from canon_trading import protect
 from canon_trading import sizing
+from tests.test_owner_protector import alpaca_stream_lock  # noqa: F401 -- offline autouse fixture
 
 ROOT = Path(__file__).resolve().parents[1]
 D = Decimal
@@ -641,7 +642,7 @@ def test_plan_only_keeps_f2_and_names_the_found_longs_own_atr_distance(capsys) -
         "trailing stop sell 10 AAA, GTC, sell_to_close, distance 0.2500 "
         "(row OWN1, 2.5000% of 10.0000, stop opens about 9.7400 "
         "(the bid 9.99 less the distance; Alpaca sets it from its own mark), from atr, "
-        "trail 0.025000 of entry 10.0000, spread 0.01, floor 0.02 (2 spreads), ATR 0.250000"
+        "trail 0.025000 of entry 10.0000, spread 0.01, floor 0.02 (2 spreads), ATR over 15 bars 0.250000"
     ) in own1
     (own3,) = [x for x in out if x.startswith("would send AAA under OWN3:")]
     assert "distance 0.7500 (row OWN3, 7.5000% of 10.0000" in own3
@@ -1177,18 +1178,12 @@ def test_a_full_page_of_open_orders_is_refused_since_a_covering_sell_may_be_miss
     ("book", "data_kw", "why"),
     [
         (("9.99", "10.00", "10.00", "0.04"), {"quoted": "2026-11-12T14:58:59Z"}, "61 s old"),
-        (("10.01", "10.00", "10.00", "0.04"), {}, "no usable sip spread"),
-        (("10.00", "10.00", "10.00", "0.04"), {}, "no usable sip spread"),
-        (("0", "10.00", "10.00", "0.04"), {}, "no usable sip spread"),
         (("9.99", "0", "10.00", "0.04"), {}, "has no ask"),
         (("9.40", "10.00", "10.00", "0.04"), {}, "distance_over_ceiling"),
         (None, {}, "no latest sip quote"),
     ],
     ids=[
         "stale-quote",
-        "crossed",
-        "locked",
-        "no-bid",
         "no-ask",
         "floor-over-the-ceiling",
         "no-quote",
@@ -1197,8 +1192,9 @@ def test_a_full_page_of_open_orders_is_refused_since_a_covering_sell_may_be_miss
 def test_a_long_with_no_sound_distance_gets_no_stop_and_is_named(
     capsys, book, data_kw, why
 ) -> None:
-    """A stop is never sent at a distance the planning could not stand behind: an old quote, a
-    crossed, locked or one-sided one, none at all, or a spread whose floor is over the ceiling."""
+    """A stop is never sent at a distance the planning could not stand behind: an old quote, one with
+    no ask, none at all, or a spread whose floor is over the ceiling. A quote with no usable spread is
+    planned on the ATR alone (`test_a_long_with_no_usable_spread_is_covered_by_its_atr_alone`)."""
     paper = Paper(positions=[_position("AAA", "10")])
     data = Data({} if book is None else {"AAA": book}, **data_kw)
     code, lines = _run(paper, data, capsys)
@@ -1207,15 +1203,49 @@ def test_a_long_with_no_sound_distance_gets_no_stop_and_is_named(
     assert "no distance" in line and why in line
 
 
-def test_a_cold_atr_takes_the_movers_named_fallback_never_under_the_floor(capsys) -> None:
-    """Fewer complete minutes than the ATR needs: the Mover's planning names its fixed fallback, and
-    the stop goes out at it."""
+def test_fewer_complete_minutes_than_the_atr_needs_take_the_atr_of_those_that_exist(capsys) -> None:
+    """Five complete minutes: the ATR is taken over those five, named, never the fixed fallback (U-h)."""
     paper = Paper(positions=[_position("AAA", "10")])
     code, lines = _run(paper, Data({"AAA": AAA_BOOK}, minutes=5), capsys)
     assert code == 0 and len(paper.submitted) == 1
     (line,) = [x for x in lines if x.startswith("sent AAA:")]
-    assert "ATR cold" in line
+    assert "ATR over 5 bars" in line and "fallback" not in line
+    assert D(str(paper.submitted[0].trail_price)) == D("0.04")
+
+
+def test_no_bar_in_the_session_day_takes_the_named_fallback_never_under_the_floor(capsys) -> None:
+    """No complete minute at all: the fixed fallback, named in the line and counted, and the stop goes
+    out at it."""
+    paper = Paper(positions=[_position("AAA", "10")])
+    report = protect.protect_longs(cast(Any, paper), Data({"AAA": AAA_BOOK}, minutes=0), row="OWN1")
+    assert report.exit_code == 0 and len(paper.submitted) == 1
+    (line,) = [x for x in report.lines() if x.startswith("sent AAA:")]
+    assert "ATR cold, no bar in the session day" in line
+    assert "no history in the session day: fixed fallback" in line
+    assert report.fallbacks == 1
+    assert report.lines()[-1] == "fixed fallback: 1 sent with no history in the session day"
     assert D(str(paper.submitted[0].trail_price)) >= 2 * D("0.01")
+
+
+@pytest.mark.parametrize(
+    "book",
+    [
+        ("10.01", "10.00", "10.00", "0.04"),
+        ("10.00", "10.00", "10.00", "0.04"),
+        ("0", "10.00", "10.00", "0.04"),
+    ],
+    ids=["crossed", "locked", "no-bid"],
+)
+@pytest.mark.no_position_without_its_exit(clause=2)
+def test_a_long_with_no_usable_spread_is_covered_by_its_atr_alone(capsys, book) -> None:
+    """A crossed, locked or bidless quote has no spread floor: the ATR distance stands alone, named,
+    and the stop goes out (U-h; the shape of the evening's two longs that fell to the fixed 2%)."""
+    paper = Paper(positions=[_position("AAA", "10")])
+    code, lines = _run(paper, Data({"AAA": book}), capsys)
+    assert code == 0 and len(paper.submitted) == 1, lines
+    (line,) = [x for x in lines if x.startswith("sent AAA:")]
+    assert "the ATR stands alone, with no spread floor" in line and "fallback" not in line
+    assert D(str(paper.submitted[0].trail_price)) == D("0.04")
 
 
 def test_nothing_is_ever_sold_opened_or_canceled_across_every_case(capsys) -> None:
@@ -1300,7 +1330,7 @@ def test_the_task_reads_account_as_pair_under_its_lock_without_waiting() -> None
 @pytest.mark.parametrize(
     ("account", "said"),
     [
-        ("windows", "account windows (B) is refused by name for now"),
+        ("windows", "account windows (B) takes only --cancel"),
         ("live", "no paper account named 'live'"),
     ],
 )
@@ -1310,6 +1340,56 @@ def test_the_task_refuses_windows_and_any_other_name_before_the_keychain(
     done, asked = _run_task(tmp_path, account)
     assert done.returncode == 3 and asked == ""
     assert said in done.stderr and "nothing was read" in done.stderr
+
+
+# The lead's ruling (d)3 (2026-11-13): a protect-lineage sell left working on B is closed before proof 3
+# by a cancel of that lineage on B. B takes `--cancel` alone; a send on B stays refused.
+def _run_cancel_on_b(tmp_path: Path, cancel: str) -> tuple[subprocess.CompletedProcess, str, Path]:
+    """The task's body on B with the keychain, the temporary folder and the final `exec` stood in
+    for: nothing reaches Alpaca, and the lock is taken in `tmp_path`."""
+    log, ran = tmp_path / "security.log", tmp_path / "ran.log"
+    security, runner = tmp_path / "security", tmp_path / "runner"
+    security.write_text(f'#!/bin/bash\necho "$*" >> {log}\necho "made-up-value-$5"\n')
+    runner.write_text(f'#!/bin/bash\necho "$*" > {ran}\n')
+    for stub in (security, runner):
+        stub.chmod(0o755)
+    body = (
+        _task()["run"]
+        .replace("/usr/bin/security", str(security))
+        .replace("/usr/bin/getconf DARWIN_USER_TEMP_DIR", f"echo {tmp_path}/")
+        .replace("exec /usr/bin/timeout", f"exec {runner}")
+    )
+    done = subprocess.run(
+        ["bash", "-c", body],
+        env={
+            "PATH": f"{tmp_path}:/usr/bin:/bin",
+            "usage_account": "windows",
+            "usage_cancel": cancel,
+        },
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    return done, log.read_text() if log.exists() else "", ran
+
+
+def test_a_cancel_on_b_reads_bs_pair_under_bs_lock_and_runs_only_the_cancel(tmp_path) -> None:
+    if not Path("/usr/bin/lockf").is_file():
+        pytest.skip("the paper task uses macOS /usr/bin/lockf")
+    done, asked, ran = _run_cancel_on_b(tmp_path, "true")
+    assert done.returncode == 0, done.stderr
+    assert "-s canon-alpaca-paper-windows " in asked and "canon-alpaca-paper-protect" not in asked
+    assert (tmp_path / "canon-paper-windows.lock").exists()
+    args = ran.read_text()
+    assert "task_from_flags" in args and args.rstrip().endswith("false  true")
+
+
+@pytest.mark.parametrize("cancel", ["false", ""])
+def test_a_send_on_b_stays_refused_before_the_keychain(tmp_path, cancel) -> None:
+    done, asked, ran = _run_cancel_on_b(tmp_path, cancel)
+    assert done.returncode == 3 and asked == "" and not ran.exists()
+    assert "account windows (B) takes only --cancel" in done.stderr
 
 
 # -- The cancel of protect stops, by name (`paper:protect <account> --cancel`) ------------------------

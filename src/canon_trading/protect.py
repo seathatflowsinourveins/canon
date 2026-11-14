@@ -44,7 +44,13 @@ Contracts, read 2026-11-12:
   `price_step.entry_price` of the ask at the Mover's `entry_ticks`, as `_buy` prices
   one. The ATR is NautilusTrader's `AverageTrueRange` at the pin `d53849b216e2`, fed by `update_raw(high,
   low, close)`, which is what its `handle_bar` calls (`crates/indicators/src/volatility/atr.rs:84-86`),
-  on alpaca-py's complete minute bars of the last `ATR_LOOKBACK`.
+  on the last `atr_n` complete minute bars that exist in the session day (`session_bars`), its period
+  their count when fewer exist (`warm_atr`). With no usable spread an ATR row's ATR distance stands
+  alone inside its cap arm (`_atr_alone`); the fixed trail is a fallback only for a symbol with no bar
+  in its session day, or with no spread and a flat session day (the lead's two kinds, 2026-11-13
+  18:17), each named in its line and counted (`ProtectReport.fallbacks`, `.flat_fallbacks`). `distance_for` is the
+  same distance from bars and a touch the caller holds, with no I/O, so a node's protector sends this
+  one distance and not a second (U-h, the lead's order of 2026-11-13).
 
 The run. It reads Alpaca's clock first and nothing else unless the regular session is open (`is_open`, as
 `custody._part` reads it) with at least `CLOSE_MARGIN` left to its close: a stop Alpaca holds works only
@@ -90,12 +96,14 @@ shares than are held."""
 
 from __future__ import annotations
 
+import math
 import signal
 import sys
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
 from dataclasses import field
+from dataclasses import replace
 from datetime import UTC
 from datetime import datetime
 from datetime import timedelta
@@ -109,6 +117,7 @@ from typing import TYPE_CHECKING
 from typing import Any
 from uuid import uuid4
 
+from alpaca.common.enums import Sort
 from alpaca.common.exceptions import APIError
 from alpaca.data.enums import DataFeed
 from alpaca.data.models import BarSet
@@ -151,10 +160,13 @@ from .custody import _value
 from .custody import describe
 from .custody import lineage
 from .custody import open_orders
+from .movers_rank import DAY_START
 from .price_step import entry_price
 from .price_step import tick
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from alpaca.trading.client import TradingClient
 
 __all__ = [
@@ -169,9 +181,13 @@ __all__ = [
 FEED = DataFeed.SIP
 """The quote and bars the distance is planned on: sip, the consolidated NBBO the spread floor is measured
 on (the lead, 2026-11-12: the third paper account runs on sip or not at all)."""
-ATR_LOOKBACK = timedelta(minutes=60)
-"""How far back the minute bars that warm the ATR are read; fewer than `atr_n` complete minutes in it
-leave the ATR cold, and the Mover's planning then names its fixed fallback. UNCALIBRATED."""
+SESSION_DAY_OPENS = DAY_START
+"""Where a session day's minute bars begin, New York wall clock: `movers_rank.DAY_START`, where sip's
+extended hours begin, the convention `session_window` reads the current day's history by too. A
+symbol's ATR is warmed on the last bars that exist since then, not on the last minutes by the clock, so
+a thin name after hours is planned on its own bars (U-h, the lead's order of 2026-11-13). The Mover's
+own warm-up counts only the session part open now (`Mover._warm_atr`); the lead's order names the
+session day, so a range here may span a part's seam."""
 ROWS = session_window.TRAIL_ARMS
 """The rows a stop's distance may be planned on: the Mover's registered trail arms, read from the registry
 a window uses and never a figure of this task's own (the lead's ruling, 2026-11-13). F2 is the fixed
@@ -190,6 +206,9 @@ def planner_config(row: str) -> mover.MoverConfig:
 
 PLANNER = planner_config(session_window.DEFAULT_ARM)
 """The rows the planning shares whatever the trail row: `atr_n`, `entry_ticks`, `spread_floor_m`."""
+ATR_BARS = PLANNER.atr_n + 1
+"""The most bars an ATR is warmed on: `atr_n` + 1, as `Mover._warm_atr` feeds, so each of the `atr_n`
+ranges has a previous close."""
 CLOSE_MARGIN = timedelta(seconds=300)
 """The least time left to the close for a run to start: the task's own bound (`paper:protect`'s
 `timeout`), so a run that began in the regular session ends in it."""
@@ -229,6 +248,11 @@ class ProtectReport:
     failed: list[str] = field(default_factory=list)
     said: list[str] = field(default_factory=list)
     say: Callable[[str], None] | None = None
+    fallbacks: int = 0
+    """Stops sent on the fixed fallback for a symbol with no bar in its session day."""
+    flat_fallbacks: int = 0
+    """Stops sent on the fixed fallback for a symbol with no usable spread whose session day's bars
+    show no range (the lead's second kind, 2026-11-13 18:17). Each of both is named in its line."""
 
     @property
     def exit_code(self) -> int:
@@ -251,7 +275,21 @@ class ProtectReport:
         if self.refused:
             return [f"refused: {self.refused}"]
         found = self.sent or self.planned or self.left_alone or self.unprotected or self.failed
-        return [*self.said, *([] if found else ["no long held"])]
+        counted = [
+            line
+            for n, line in (
+                (
+                    self.fallbacks,
+                    f"fixed fallback: {self.fallbacks} sent with no history in the session day",
+                ),
+                (
+                    self.flat_fallbacks,
+                    f"fixed fallback: {self.flat_fallbacks} sent with no spread on a flat session day",
+                ),
+            )
+            if n
+        ]
+        return [*self.said, *([] if found else ["no long held"]), *counted]
 
 
 def _remaining(order: Order) -> Decimal | None:
@@ -270,7 +308,8 @@ class Distance:
 
     price: Decimal
     plan: mover.TrailPlan
-    floor: Decimal
+    floor: Decimal | None
+    """The spread floor in dollars; None with no usable spread."""
     quote_age: timedelta
     distance: Decimal
     """What is sent: the Mover's distance, or Alpaca's smallest trail where that is the larger."""
@@ -278,6 +317,13 @@ class Distance:
     """The Mover's own distance, before Alpaca's smallest trail."""
     row: str = ""
     bid: Decimal = Decimal(0)
+    bars: int = 0
+    """The complete one-minute bars of the session day the ATR was warmed on, up to `atr_n`."""
+    fallback: bool = False
+    """The fixed fallback, taken only for a symbol with no bar in its session day, or with no spread
+    and a flat session day (`flat`); counted in the report."""
+    flat: bool = False
+    """The fallback's second kind: no usable spread and bars that show no range."""
 
     def source(self) -> str:
         plan = self.plan
@@ -295,6 +341,11 @@ class Distance:
             )
         )
         opens = f"the bid {self.bid} less the distance; Alpaca sets it from its own mark"
+        at = (
+            f"stop opens about {self.bid - self.distance} ({opens})"
+            if self.bid > 0
+            else "no bid, so the stop opens where Alpaca's own mark less the distance puts it"
+        )
         share = self.distance / self.price
         stepped = (
             f"{share:.4%} of {self.price}, over the {mover.TRAIL_CAP} cap by the price step"
@@ -304,12 +355,16 @@ class Distance:
         parts = [
             f"row {self.row}",
             stepped,
-            f"stop opens about {self.bid - self.distance} ({opens})",
+            at,
             bound,
             f"trail {plan.trail:.6f} of entry {self.price}",
             f"spread {plan.spread}",
-            f"floor {self.floor} ({PLANNER.spread_floor_m} spreads)",
-            f"ATR {'cold' if plan.atr is None else f'{plan.atr:.6f}'}",
+            "no spread floor"
+            if self.floor is None
+            else f"floor {self.floor} ({PLANNER.spread_floor_m} spreads)",
+            "ATR cold, no bar in the session day"
+            if plan.atr is None
+            else f"ATR over {self.bars} bars {plan.atr:.6f}",
             f"quote {max(self.quote_age.total_seconds(), 0.0):.0f} s old",
         ]
         if plan.source:
@@ -332,7 +387,8 @@ class Book:
 
     bid: Decimal
     ask: Decimal
-    atr: AverageTrueRange
+    atr: AverageTrueRange | None
+    """Warmed on `bars` bars; None when the session day has none."""
     age: timedelta
     read_at: float
     """`monotonic()` when the quote was read: its age is counted again just before the send."""
@@ -341,10 +397,72 @@ class Book:
         """The quote's age now: its age when read plus the time since."""
         return self.age + timedelta(seconds=monotonic() - self.read_at)
 
+    bars: int = 0
+
+
+def session_start(now: datetime) -> datetime:
+    """The start of `now`'s session day: the latest `SESSION_DAY_OPENS` in New York at or before it."""
+    here = now.astimezone(session_window.NEW_YORK)
+    opens = datetime.combine(here.date(), SESSION_DAY_OPENS, session_window.NEW_YORK)
+    if here < opens:
+        opens = datetime.combine(
+            here.date() - timedelta(days=1), SESSION_DAY_OPENS, session_window.NEW_YORK
+        )
+    return opens.astimezone(UTC)
+
+
+def session_bars(data: Any, symbol: str, now: datetime) -> list[Any]:
+    """`symbol`'s last `ATR_BARS` complete one-minute `FEED` bars that exist in `now`'s session day,
+    oldest first: the bars a distance is planned on whatever the clock says of the last hour. One
+    request by alpaca-py 0.45.0's `get_stock_bars`, newest first and limited (`BaseBarsRequest`'s
+    `sort` and `limit`, `data/requests.py:65-99`), one over `ATR_BARS` for a minute still open, so a
+    long day is not paged through while the quote ages. `TypeError` for raw data."""
+    found = data.get_stock_bars(
+        StockBarsRequest(
+            symbol_or_symbols=symbol,
+            timeframe=TimeFrame.Minute,
+            start=session_start(now),
+            end=now,
+            feed=FEED,
+            sort=Sort.DESC,
+            limit=ATR_BARS + 1,
+        )
+    )
+    if not isinstance(found, BarSet):
+        raise TypeError("alpaca-py returned raw bar data; the client must use raw_data=False")
+    complete = [
+        bar
+        for bar in sorted(found.data.get(symbol, []), key=lambda b: b.timestamp)
+        if bar.timestamp + timedelta(minutes=1) <= now
+    ]
+    return complete[-ATR_BARS:]
+
+
+def _sound(bar: Any) -> bool:
+    """A bar `update_raw` takes: finite, high over low, close between them; it skips any other
+    (`crates/indicators/src/volatility/atr.rs:143-151`), which would leave an ATR sized to it cold."""
+    high, low, close = float(bar.high), float(bar.low), float(bar.close)
+    return all(map(math.isfinite, (high, low, close))) and low <= close <= high
+
+
+def warm_atr(bars: Sequence[Any]) -> AverageTrueRange | None:
+    """NautilusTrader's `AverageTrueRange` over the last `ATR_BARS` sound `bars` (anything with `high`,
+    `low`, `close`, oldest first; `Price` or float), fed by `update_raw`, as its `handle_bar` does
+    (module header). Its period is `atr_n`, or the bars' count when fewer exist, so fewer bars still
+    give the symbol's own ATR, named by its count in the line (the lead's reading of U-h,
+    2026-11-13); it is initialized after exactly that many. None for no sound bar."""
+    used = [bar for bar in bars if _sound(bar)][-ATR_BARS:]
+    if not used:
+        return None
+    atr = AverageTrueRange(min(PLANNER.atr_n, len(used)))
+    for bar in used:
+        atr.update_raw(float(bar.high), float(bar.low), float(bar.close))
+    return atr
+
 
 def read_book(data: Any, symbol: str, now: datetime) -> Book:
-    """`symbol`'s latest quote and its ATR warmed on the complete minute bars of the last `ATR_LOOKBACK`:
-    `ValueError` or `TypeError` naming why there is none."""
+    """`symbol`'s latest quote and its ATR warmed on its session day's last bars (`session_bars`,
+    `warm_atr`): `ValueError` or `TypeError` naming why there is none."""
     asked = monotonic()
     found = data.get_stock_latest_quote(
         StockLatestQuoteRequest(symbol_or_symbols=symbol, feed=FEED)
@@ -366,22 +484,12 @@ def read_book(data: Any, symbol: str, now: datetime) -> Book:
     ask = Decimal(str(getattr(quote, "ask_price", None) or 0))
     if ask <= 0:
         raise ValueError(f"the latest {FEED.value} quote has no ask ({ask})")
-    bars = data.get_stock_bars(
-        StockBarsRequest(
-            symbol_or_symbols=symbol,
-            timeframe=TimeFrame.Minute,
-            start=now - ATR_LOOKBACK,
-            end=now,
-            feed=FEED,
-        )
-    )
-    if not isinstance(bars, BarSet):
-        raise TypeError("alpaca-py returned raw bar data; the client must use raw_data=False")
-    atr = AverageTrueRange(PLANNER.atr_n)
-    for bar in sorted(bars.data.get(symbol, []), key=lambda b: b.timestamp):
-        if bar.timestamp + timedelta(minutes=1) <= now:  # complete minutes only
-            atr.update_raw(bar.high, bar.low, bar.close)
-    return Book(bid, ask, atr, age, read_at)
+    return _book(bid, ask, session_bars(data, symbol, now), age, read_at)
+
+
+def _book(bid: Decimal, ask: Decimal, bars: Sequence[Any], age: timedelta, read_at: float) -> Book:
+    atr = warm_atr(bars)
+    return Book(bid, ask, atr, age, read_at, 0 if atr is None else atr.count)
 
 
 def row_distance(
@@ -390,7 +498,11 @@ def row_distance(
     """`symbol`'s trailing distance in dollars under `row`, by the Mover's planning (module header),
     never under the spread floor or Alpaca's smallest trail (`venue_smallest`): `ValueError` naming why
     there is none. An own-cap holding keeps its distance up to `sizing.DISTANCE_CEILING`; the entry
-    cap still applies to the other cap arms."""
+    cap still applies to the other cap arms. With no usable spread an ATR row's ATR distance stands
+    alone, with no floor, inside its cap arm (`_atr_alone`); the fixed trail is a fallback only for a
+    symbol with no sound bar in its session day, or whose bars show no range where no spread is
+    quoted, and `Distance.fallback` names it (U-h). The fixed row with no usable spread is sent with
+    no spread floor, named."""
     bid, ask = book.bid, book.ask
     instrument_id = InstrumentId.from_str(f"{symbol}.ALPACA")
     slot = mover.Slot(
@@ -403,12 +515,33 @@ def row_distance(
     price = entry_price(ask, PLANNER.entry_ticks)
     touch = SimpleNamespace(bid_price=Price.from_str(str(bid)), ask_price=Price.from_str(str(ask)))
     plan = planner._entry_trail(slot, price, touch, found_holding=True)
+    fixed_row = planner.settings.trail_mode == "fixed"
+    atr = None if book.atr is None else Decimal(str(book.atr.value))
+    no_range = atr is not None and atr <= 0
+    fallback = not fixed_row and (atr is None or (no_range and plan.spread is None))
     if plan.spread is None:
-        raise ValueError(
-            f"no usable {FEED.value} spread (bid {bid}, ask {ask}), so the spread floor is not known"
+        floor = Decimal(0)
+        unusable = f"no usable {FEED.value} spread (bid {bid}, ask {ask})"
+        if fixed_row or fallback:
+            plan = replace(plan, note=f"{unusable}: no spread floor")
+        else:
+            assert atr is not None
+            plan = _atr_alone(planner, atr, price, unusable)
+    else:
+        # with a usable spread its floor is held for every row here, the fixed row included
+        floor = PLANNER.spread_floor_m * plan.spread / price if plan.floor is None else plan.floor
+    if fallback:
+        plan = replace(
+            plan,
+            note=(
+                "no history in the session day"
+                if atr is None
+                else "the session day's bars show no range"
+            )
+            + ": fixed fallback"
+            + (", raised to the spread floor" if plan.bound == "spread floor" else "")
+            + ("" if plan.spread is not None else f"; {plan.note}"),
         )
-    # the fixed row carries no floor of its own; the spread floor is held for every row here
-    floor = PLANNER.spread_floor_m * plan.spread / price if plan.floor is None else plan.floor
     own = planner.settings.trail_cap == "own"
     if own and plan.trail > sizing.DISTANCE_CEILING:
         raise ValueError(
@@ -429,8 +562,66 @@ def row_distance(
             f"Alpaca's smallest trail) is over the {sizing.DISTANCE_CEILING} ceiling at {price}"
         )
     return sent, Distance(
-        price, plan, PLANNER.spread_floor_m * plan.spread, book.age, sent, distance, row, bid
+        price,
+        plan,
+        None if plan.spread is None else PLANNER.spread_floor_m * plan.spread,
+        book.age,
+        sent,
+        distance,
+        row,
+        bid,
+        book.bars,
+        fallback,
+        fallback and atr is not None,
     )
+
+
+def _atr_alone(
+    planner: mover.Mover, atr: Decimal, price: Decimal, unusable: str
+) -> mover.TrailPlan:
+    """An ATR row's plan with no usable spread: `atr_k` ATRs of `price`, with no spread floor, never
+    under Alpaca's smallest trail (`VENUE_SMALLEST`, which the send raises a distance to anyway), inside
+    the row's cap arm as the Mover's planning holds it (`clamp` to its cap, `refuse` over it; `own`
+    keeps it, and `row_distance` enforces the found holding's ceiling). The chase and exit fractions
+    follow the Mover's own (`_entry_trail`: a quarter of the trail through, a chase no shallower than
+    the row's)."""
+    settings = planner.settings
+    measure = settings.atr_k * atr / price
+    trail, bound = measure, "atr"
+    if trail < VENUE_SMALLEST:
+        trail, bound = VENUE_SMALLEST, "Alpaca's smallest trail"
+    if trail > mover.TRAIL_CAP and settings.trail_cap == "clamp":
+        trail, bound = mover.TRAIL_CAP, "0.02 cap"
+    if trail > mover.TRAIL_CAP and settings.trail_cap == "refuse":
+        raise ValueError(
+            f"the trail {trail} (atr) is over the 0.02 cap; refused (trail_cap refuse)"
+        )
+    return mover.TrailPlan(
+        trail=trail,
+        exit_through=trail / 4,
+        chase_cap=max(trail, settings.chase_cap),
+        atr=atr,
+        spread=None,
+        bound=bound,
+        note=f"{unusable}: the ATR stands alone, with no spread floor",
+        measure=measure,
+    )
+
+
+def distance_for(
+    symbol: str,
+    row: str,
+    bid: Decimal,
+    ask: Decimal,
+    bars: Sequence[Any],
+    planner: mover.Mover | None = None,
+) -> tuple[Decimal, Distance]:
+    """One symbol's distance under one row from what the caller already holds: the touch (`bid`, `ask`)
+    and the session day's bars (`session_bars`, or a node's own, oldest first, each with `high`, `low`
+    and `close`). No I/O: the one distance this task and a node's protector both send (U-h).
+    `ValueError` naming why there is none; `Distance.fallback` when the fixed fallback was taken."""
+    book = _book(bid, ask, bars, timedelta(0), monotonic())
+    return row_distance(book, symbol, row, planner or mover.Mover(planner_config(row)))
 
 
 def plan_distance(
@@ -813,6 +1004,8 @@ class _Protect:
                 "is not sent again (mise run paper:account)",
             )
             return
+        report.fallbacks += plan.fallback and not plan.flat
+        report.flat_fallbacks += plan.flat
         report.note(report.sent, f"sent {symbol}: {said}: answered {answered}")
 
 
