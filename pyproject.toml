@@ -10,6 +10,7 @@ requires-python = ">=3.14,<3.15"
 dependencies = [
     "arch==9.0.0",
     "canon-alpaca",
+    "duckdb==2.0.0",
     "nautilus-trader==2.0.0rc8",
     "optuna==5.0.0",
     "pandas==3.1.1",

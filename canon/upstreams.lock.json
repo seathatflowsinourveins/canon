@@ -297,6 +297,15 @@
       "sha": "8958f08e3ba09a3db37d35c490d9589c114e7136",
       "track": "tag:v0.20.0"
     },
+    "duckdb": {
+      "default_branch": "main",
+      "default_sha": "b418cbcbfc416787a873aa5c873e360f52c491c2",
+      "ref": "refs/tags/v2.0.0",
+      "repo": "duckdb/duckdb-python",
+      "resolved_at": "2026-11-14T05:28:45Z",
+      "sha": "83c719961098611e769dc4bab0bda2bf149a2d1e",
+      "track": "tag:v2.0.0"
+    },
     "edgartools": {
       "default_branch": "main",
       "default_sha": "479d350d453ce7676e6fd0d8e745e5423c182135",
@@ -494,6 +503,15 @@
       "resolved_at": "2026-11-10T21:34:03Z",
       "sha": "aa97047a81b4a7ed41f9a2f5479555ed7f7685b6",
       "track": "tag:v10.34.9"
+    },
+    "polars": {
+      "default_branch": "main",
+      "default_sha": "5c36cdd75a30a8ab12a9f70e251c0f267235b2a7",
+      "ref": "refs/tags/py-2.1.0",
+      "repo": "pola-rs/polars",
+      "resolved_at": "2026-11-14T05:28:45Z",
+      "sha": "7f902bd3ffd27ff82d14278a09a295ff2f7aed92",
+      "track": "tag:py-2.1.0"
     },
     "pytest": {
       "default_branch": "main",
