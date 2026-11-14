@@ -38,8 +38,8 @@ separately (ADR 0093).
 Which sessions, per feed (the coordinator's rule, 2026-11-11): `sip` serves the pre-market, regular and
 after-hours parts, and its baseline for trade date D is built from the five sip sessions before D, so it
 can be written once D-1's 20:00 bars are published. `boats` serves the overnight part, whose 20:00-04:00
-segments ADR 0087 now defines; but ADR 0093's loader reads sip only, so no boats root is loaded the way
-this writer needs, and `--feed boats` is refused by name until a boats history loader exists (the
+segments ADR 0087 now defines. history_load loads boats bars into `catalog/boats` (2026-11-13), but
+this writer does not read a boats root yet, so `--feed boats` stays refused by name until it does (the
 lead's ruling, 2026-11-11).
 """
 
@@ -135,8 +135,9 @@ def build_baseline(
         if feed not in FEED_HOURS:
             raise history_load.HistoryStopped(
                 f"a {feed} baseline serves the overnight part, 20:00-04:00 New York, and needs a {feed} "
-                "history loader, which ADR 0093's sip-only loader is not: refused until one exists "
-                "(the lead's ruling, 2026-11-11)"
+                "history loader's root read the way this writer reads sip; history_load now loads boats "
+                "into catalog/boats, but this writer does not read it yet: refused until it does (the "
+                "lead's ruling, 2026-11-11)"
             )
         days = _sessions(sessions, session)
         path = _outside_ledger(Path(catalog_path))

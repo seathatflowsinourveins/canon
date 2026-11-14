@@ -779,3 +779,31 @@ def test_an_indented_comment_in_a_symbols_file_is_not_a_symbol(monkeypatch, tmp_
         == 0
     )
     assert seen == [["AAPL"]]
+
+
+def test_boats_bars_are_asked_for_on_boats_and_claim_a_boats_root(venue, catalog) -> None:
+    """Alpaca's historical bars take `feed=boats` (https://docs.alpaca.markets/us/reference/stockbars.md,
+    read 2026-11-13); nothing else is asked."""
+    from alpaca.data.enums import DataFeed
+
+    assert run(catalog, feed=DataFeed.BOATS) > 0
+    assert {q["feed"][0] for q in venue.bars_sent()} == {"boats"}
+    assert (catalog / FEED_FILE).read_text() == "boats\n"
+
+
+def test_a_refused_boats_bars_request_fails_by_name_and_asks_no_other_feed(venue, catalog) -> None:
+    from alpaca.data.enums import DataFeed
+
+    venue.answers = [403]
+    with pytest.raises(HistoryStopped, match=r"feed boats.*403"):
+        run(catalog, feed=DataFeed.BOATS)
+    assert [q["feed"] for q in venue.bars_sent()] == [["boats"]]
+    assert not (catalog / FEED_FILE).exists()
+
+
+def test_a_feed_bars_do_not_take_is_refused_by_name_before_any_request(venue, catalog) -> None:
+    from alpaca.data.enums import DataFeed
+
+    with pytest.raises(HistoryStopped, match="bars feed iex is refused"):
+        run(catalog, feed=DataFeed.IEX)
+    assert venue.sent == []
