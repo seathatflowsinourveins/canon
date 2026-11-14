@@ -57,11 +57,11 @@ and a test to hold the copies equal; one script is tested once and names the liv
    above 0. (In POSIX mode bash 3.2 ends itself at such an error, status 1, under its own message alone;
    the checks of the numbers keep every call from it.)
 6. **How the command runs** under the lock, to its deadline, how a stop reaches it, and that it may not
-   prompt, are ADR 0154's.
+   prompt, are ADR 0163's.
 
 **The gap, and what would close it.** No task calls the script. Closed by the first `live:*` task that
 writes, proven on a paper account under that account's lock, with its paper run recorded in that task's
-record, and with the case ADR 0154 owes before that task runs.
+record, and with the case ADR 0163 owes before that task runs.
 
 ### Consequences
 
@@ -94,10 +94,10 @@ cannot be opened and a clock that gives no time each stop the run; a leading zer
 taken out of a copy, a wait of `08`, of `1.5` and of a word, each without `--stream` and with it, break
 the account's lock step and are refused there (the word by the exit's line, which names a lock step), as is
 a broken stream step. With the account step's own refusal taken out of a copy, 4 cases fail. 110 cases
-with ADR 0154's, on macOS 27.2 under bash 3.2.57, 2026-11-14, by hand and started as `scripts/ci` starts
+with ADR 0163's, on macOS 27.2 under bash 3.2.57, 2026-11-14, by hand and started as `scripts/ci` starts
 a job; the failing-first figures are in the landing's pull request. No case touches a real lock, a
-keychain or the network. No paper run applies: the script reaches no account. UNVERIFIED by a case: clause
-5's POSIX-mode end, shown on a stand-in of the script's shape.
+keychain or the network. No paper run applies: the script reaches no account. UNVERIFIED by a case: this
+record's clause 5 on POSIX mode, shown by a reader on a stand-in of the script's shape.
 
 ## Evidence
 
@@ -129,5 +129,5 @@ Read 2026-11-14 unless a line gives another date.
 * A third reader, 2026-11-14: no case failed with the account step's own refusal taken out, since each
   such case passed `--stream`. Closed by the same cases without it, asked for that step's own line.
 * A fifth reader, 2026-11-14: this record was past the length at which one is split, and its list of the
-  tests that set the variable was short by one. Its deadline and stop clauses are now ADR 0154, with the
+  tests that set the variable was short by one. Its deadline and stop clauses are now ADR 0163, with the
   fourth reader's correction; the list is completed.

@@ -35,7 +35,7 @@
 # at an arithmetic it cannot read. The checks of the numbers keep every call from reaching that.
 # The command reads this script's own standard input. It runs in a process group of its own, which is not a
 # terminal's foreground group. So a task that prompts for typed input, a password included, does not run
-# under this lock (ADR 0154): it asks before this script, or runs off a terminal. From a terminal the command
+# under this lock (ADR 0163): it asks before this script, or runs off a terminal. From a terminal the command
 # can write to the terminal (while the terminal's `tostop` is off: by reading, not run) but cannot read it or
 # change its settings: a read stops it (SIGTTIN; man timeout: the group would "cause reads from the terminal
 # to stop the command with SIGTTIN"), as does a change of settings such as `stty -echo` (SIGTTOU), timeout(1)
@@ -207,7 +207,7 @@ bounded() {
   # after that. The group's id is timeout's pid, which the system does not hand out again while the group lives.
   # A limit, by reading: a first stop that lands between the group's end and the traps' removal below is still
   # sent to that pid, which this run no longer owns, and with a grace so is a SIGKILL, to its group or to it;
-  # they reach another process only if the system has handed the pid out again within those lines (ADR 0154).
+  # they reach another process only if the system has handed the pid out again within those lines (ADR 0163).
   kill -KILL -- "-$g" 2>/dev/null || :
   while kill -0 -- "-$g" 2>/dev/null; do kill -KILL -- "-$g" 2>/dev/null; sleep 0.1; done
   trap - TERM HUP INT

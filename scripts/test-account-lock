@@ -438,7 +438,7 @@ LINGERS
     kill -HUP "$op" 2>/dev/null; wait "$op"; orc=$?; took=$(( $(date +%s) - s0 ))
     settle "$D"; up=$(left_up "$D")
     # shellcheck disable=SC2034  # read by the eval'd check
-    told=$(wc -l < "$D/told" 2>/dev/null | tr -d ' ')
+    told=$(wc -l 2>/dev/null < "$D/told" | tr -d ' ')
     # the status is the command's: the grace's SIGKILL ended it, so 137, where it was 143, the first stop's, before
     check "live --grace 4, a SIGTERM to the script and then a SIGHUP during the grace: the command is told once (${told:-0}), and the grace's SIGKILL ends it (exit $orc, 137 expected), in ${took} s, nothing left (left:${up:- none}), the lock free" \
           eval '[ "${told:-0}" = 1 ] && [ "$orc" = 137 ] && [ "$took" -lt 20 ] && [ -z "$up" ] && free $LIVE_LOCK'
@@ -462,7 +462,7 @@ ONCE
     "$C" live --wait 2 --deadline 60 --grace 10 -- "$D/cmd" > "$D/out" 2>&1 < /dev/null & op=$!
     ready "$D" "$op"; kill -TERM "$op" 2>/dev/null; wait "$op"; orc=$?
     # shellcheck disable=SC2034  # read by the eval'd check
-    told=$(wc -l < "$D/terms" 2>/dev/null | tr -d ' ')
+    told=$(wc -l 2>/dev/null < "$D/terms" | tr -d ' ')
     # the status is the command's: it ended by itself, 0, where it was 143, the stop's, before
     check "live --grace 10, one SIGTERM to the script: the command is told to end once (told ${told:-0} times), and the run ends with its status, 0 ($orc)" \
           eval '[ "${told:-0}" = 1 ] && [ "$orc" = 0 ]'
@@ -515,7 +515,7 @@ NOTES
   # held_through <folder> <how> <where>: property 1's checks of a drops run, its status in rc
   held_through() {
     # shellcheck disable=SC2034  # read by the eval'd checks
-    local D="$1" inside; inside=$(tr '\n' ' ' < "$1/probed" 2>/dev/null)
+    local D="$1" inside; inside=$(tr '\n' ' ' 2>/dev/null < "$1/probed")
     check "live --stream$3, a command that ${2}s descriptors 9 and 7: while it runs both live locks are held (${inside:-not probed})" \
           eval 'grep -qx "$LIVE_LOCK 75" "$D/probed" && grep -qx "$LIVE_STREAM 75" "$D/probed"'
     check "... a second run on the live account meanwhile waits its 1 s and runs nothing (exit $(cat "$D/second.rc" 2>/dev/null))" \
@@ -540,8 +540,7 @@ NOTES
   # trap (man bash, SIGNALS), so a SIGINT to it would test nothing. `set -m` here is not enough: this test is
   # itself such a command when scripts/ci starts it as a job, and an ignore it inherited stays
   signalled() {
-    # shellcheck disable=SC2016  # perl's own variables
-    set -m; /usr/bin/perl -e '$SIG{INT} = "DEFAULT"; exec @ARGV' "$C" live --stream --wait 2 --deadline 60 -- "$1/cmd" > "$1/out" 2>&1 < /dev/null & op=$!; set +m
+    set -m; /usr/bin/perl -e '$SIG{INT} = "DEFAULT"; exec @ARGV; exit 127' "$C" live --stream --wait 2 --deadline 60 -- "$1/cmd" > "$1/out" 2>&1 < /dev/null & op=$!; set +m
     while [ ! -s "$1/cmd.pid" ] && kill -0 "$op" 2>/dev/null; do sleep 0.1; done
     kill -"$2" "$op" 2>/dev/null; wait "$op"; rc=$?
   }
@@ -580,22 +579,26 @@ NOTES
     skip "account-lock from a terminal" "no /usr/bin/expect that can open a pseudo-terminal here"
   else
     rm -f "${W:?}/probed"
-    # bounded <secs> <since>: a driver is run under `timeout -s KILL <secs>`, past every wait of its own, since
-    # expect's `timeout` bounds its `expect` and not its `wait`, and a run that never ends would hang this test.
-    # A driver killed at that bound (status 137, <secs> after <since>) is told apart from a run that ended 137
-    bounded() { [ "$rc" != 137 ] || [ $(( $(date +%s) - $2 )) -lt "$1" ] || rc="none: the driver was stopped at its $1 s bound"; }
+    # bounded <secs> <since>: a driver is run under `timeout --foreground -s KILL <secs>`, past every wait of its
+    # own, since expect's `timeout` bounds its `expect` and not its `wait`, and a run that never ends would hang
+    # this test. --foreground keeps the driver in this test's process group, so a Ctrl-C at a person's terminal
+    # still ends the test; timeout then ends 124 at the bound, <secs> after <since>, which is put in words
+    bounded() { [ "$rc" != 124 ] || [ $(( $(date +%s) - $2 )) -lt "$1" ] || rc="none: the driver was stopped at its $1 s bound"; }
     # shellcheck disable=SC2034  # rc is read by the eval'd check
-    { t0=$(date +%s); AL_COPY="$C" AL_PROBE="$W/probe" /usr/bin/timeout -s KILL 60 /usr/bin/expect -c 'set timeout 30; spawn -noecho $env(AL_COPY) live --stream --wait 2 --deadline 30 -- $env(AL_PROBE); expect eof; lassign [wait] p s o v; exit $v' > "$W/out" 2>&1; rc=$?; bounded 60 "$t0"; }
+    { t0=$(date +%s); AL_COPY="$C" AL_PROBE="$W/probe" /usr/bin/timeout --foreground -s KILL 60 /usr/bin/expect -c 'set timeout 30; spawn -noecho $env(AL_COPY) live --stream --wait 2 --deadline 30 -- $env(AL_PROBE); expect eof; lassign [wait] p s o v; exit $v' > "$W/out" 2>&1; rc=$?; bounded 60 "$t0"; }
     check "live --stream on a pseudo-terminal: the command runs holding both locks, and its exit status (7) is the run's" \
           eval '[ "$rc" = 7 ] && probed $LIVE_LOCK 75 && probed $LIVE_STREAM 75 && probed canon-paper-test.lock 0'
     check "... both free once it has ended" eval 'free $LIVE_LOCK && free $LIVE_STREAM'
     # on_term <folder> <none|TERM|INT|ctrl-c>: the stand-in in <folder> under the script on a pseudo-terminal; once
     # it runs, a signal to the script's pid, or a Ctrl-C typed at the terminal (to its foreground process group);
     # status in rc (128 + the signal's number, as a shell reports it, if the process was killed by one), 198 if the
-    # run outlived expect's 40 s, and a word in place of a number if the driver itself met its bound of 90 s
+    # run outlived expect's 40 s, 199 if another signal killed it (never 1, expect's own status for an error of
+    # the driver, which a case may expect of the run), and a word in place of a number if the driver itself met
+    # its bound of 90 s. The terminal it opens has `tostop` off whatever the tester's own has (stty_init)
     cat > "$W/on-term.exp" <<'EXP'
 set timeout 40
 set d $env(AL_DIR); set act $env(AL_ACT)
+set stty_init -tostop
 spawn -noecho {*}$argv
 set p [exp_pid]
 if {$act ne "none"} {
@@ -605,12 +608,16 @@ if {$act ne "none"} {
 }
 expect { eof {} timeout { exit 198 } }
 set r [wait]
-if {[lindex $r 4] eq "CHILDKILLED"} { exit [expr {128 + [dict get {SIGHUP 1 SIGINT 2 SIGKILL 9 SIGTERM 15} [lindex $r 5]]}] }
+set sigs {SIGHUP 1 SIGINT 2 SIGKILL 9 SIGTERM 15}
+if {[lindex $r 4] eq "CHILDKILLED"} {
+  if {[dict exists $sigs [lindex $r 5]]} { exit [expr {128 + [dict get $sigs [lindex $r 5]]}] }
+  exit 199
+}
 exit [lindex $r 3]
 EXP
     on_term() {
       local d="$1" act="$2" t0; shift 2; t0=$(date +%s)
-      AL_DIR="$d" AL_ACT="$act" /usr/bin/timeout -s KILL 90 /usr/bin/expect -f "$W/on-term.exp" -- "$C" live --stream --wait 2 --deadline 60 -- "$d/cmd" > "$d/out" 2>&1 < /dev/null; rc=$?
+      AL_DIR="$d" AL_ACT="$act" /usr/bin/timeout --foreground -s KILL 90 /usr/bin/expect -f "$W/on-term.exp" -- "$C" live --stream --wait 2 --deadline 60 -- "$d/cmd" > "$d/out" 2>&1 < /dev/null; rc=$?
       bounded 90 "$t0"
     }
     for how in close reopen; do
@@ -627,11 +634,11 @@ EXP
     # paper:test in mise.toml)
     D="$TMP/term-ctrl-c"; notes "$D"; on_term "$D" ctrl-c
     # shellcheck disable=SC2034  # read by the eval'd check
-    got=$(tr '\n' ' ' < "$D/got" 2>/dev/null)
+    got=$(tr '\n' ' ' 2>/dev/null < "$D/got")
     check "live --stream on a pseudo-terminal, one Ctrl-C typed there: the command is told by SIGINT once (told: ${got:-nothing}), and the run ends after it with its status, 3 ($rc)" \
           eval '[ "$got" = "INT " ] && [ "$rc" = 3 ] && ! alive "$D/cmd.pid" && free $LIVE_LOCK && free $LIVE_STREAM'
     reap "$D"
-    # What the command can do with the terminal (the script's header, and ADR 0154's clause 5): in a process
+    # What the command can do with the terminal (the script's header, and ADR 0163's clause 5): in a process
     # group of its own it is not the terminal's foreground group, so it writes there, but a read of the terminal
     # (SIGTTIN) or a change of its settings (SIGTTOU) stops it, timeout takes the stop for its end, and the run
     # ends at once with status 1, long before the deadline's 60 s, nothing left and both locks free. A task that
@@ -643,7 +650,7 @@ EXP
     }
     D="$TMP/term-writes"; asks "$D" 'echo to the terminal > /dev/tty'; on_term "$D" none
     check "live --stream on a pseudo-terminal, a command that writes to the terminal: it does (status $(cat "$D/after" 2>/dev/null)), and the run ends with its status, 7 ($rc)" \
-          eval '[ "$rc" = 7 ] && [ "$(cat "$D/after" 2>/dev/null)" = 0 ] && free $LIVE_LOCK && free $LIVE_STREAM'
+          eval '[ "$rc" = 7 ] && [ "$(cat "$D/after" 2>/dev/null)" = 0 ] && grep -q "to the terminal" "$D/out" && free $LIVE_LOCK && free $LIVE_STREAM'
     reap "$D"
     # shellcheck disable=SC2034  # took is read by the eval'd checks
     for ask in "read -r answer:reads the terminal" "stty -echo:changes the terminal's settings"; do
