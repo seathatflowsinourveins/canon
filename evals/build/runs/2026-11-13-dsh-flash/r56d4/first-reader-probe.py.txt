@@ -1,0 +1,212 @@
+# The first reader ran these probes appended to a copy of the starting tree's
+# packages/canon-alpaca/tests/test_execution_client.py (lines 1-2180 of its probe module, identical to that file,
+# checked with cmp); only the appended lines 2181-2389 are kept here.
+
+
+# ---- r56d4 first-reader probes: appended to a copy of test_execution_client.py, run with -k probe ----
+
+
+def _second_replace_unseen(venue) -> None:
+    """The first replace's `replaced` is delivered; the second's is not (missed, or still to come)."""
+    original = venue.trading.replace_order_by_id
+
+    def replace(order_id, order_data=None):
+        venue.trading.replace_script = "silent" if venue.trading.replace_requests else "replaced"
+        return original(order_id, order_data)
+
+    venue.trading.replace_order_by_id = replace
+
+
+def _state(client, strategy) -> tuple:
+    order = client.cache.order(strategy.client_order_id)
+    return (order.status.name, order.venue_order_id.value if order.venue_order_id else None)
+
+
+@pytest.mark.parametrize("event", ["expired", "canceled"])
+def test_probe_f1_newer_replacement_closed_before_its_replaced(venue, event) -> None:
+    # A -> B, whose `replaced` arrives; B -> C, whose `replaced` does not (yet). Alpaca then closes C, the
+    # order it holds (a DAY order expiring at the close, or canceled).
+    venue.trading.script = "accept"
+    _second_replace_unseen(venue)
+    strategy = modifier(prices=["150.50", "151.00"])
+    seen: dict = {}
+
+    async def close_newest(client) -> None:
+        seen["ids"] = [placed_order(venue, i)["id"][:8] for i in range(3)]
+        seen["before"] = _state(client, strategy)
+        venue.trading.update(placed_order(venue, 2)["id"], event, status=event)
+        await asyncio.sleep(0.3)
+        await until_idle(client, venue)
+        seen["after"] = _state(client, strategy)
+
+    run_modify(
+        venue,
+        strategy,
+        lambda: len(venue.trading.replace_requests) == 2 and len(venue.trading._placed) == 3,
+        close_newest,
+    )
+    print("PROBE-F1", event, strategy.names(), seen)
+    expected = {"expired": "OrderExpired", "canceled": "OrderCanceled"}[event]
+    assert expected in strategy.names(), (strategy.names(), seen)
+
+
+def test_probe_f1_late_replaced_after_the_newest_expired(venue) -> None:
+    # As above, and then the second `replaced` arrives, late.
+    venue.trading.script = "accept"
+    _second_replace_unseen(venue)
+    strategy = modifier(prices=["150.50", "151.00"])
+    seen: dict = {}
+
+    async def close_then_replaced(client) -> None:
+        venue.trading.update(placed_order(venue, 2)["id"], "expired", status="expired")
+        await asyncio.sleep(0.3)
+        await until_idle(client, venue)
+        seen["after_expiry"] = _state(client, strategy)
+        venue.trading.confirm_replace(placed_order(venue, 1)["id"])
+        await asyncio.sleep(0.3)
+        await until_idle(client, venue)
+        seen["after_late_replaced"] = _state(client, strategy)
+
+    run_modify(
+        venue,
+        strategy,
+        lambda: len(venue.trading.replace_requests) == 2 and len(venue.trading._placed) == 3,
+        close_then_replaced,
+    )
+    print("PROBE-F1-LATE", strategy.names(), seen)
+    assert "OrderExpired" in strategy.names(), (strategy.names(), seen)
+
+
+def test_probe_f1_node_cancel_after_the_second_replace_unseen(venue, alpaca) -> None:
+    # The node cancels while it still names B. "Delete Order by ID" refuses an order no longer cancelable
+    # with 422 (a replaced order is one), so `_cancel_refused` cancels the replacement C instead, as its
+    # comment says ("The cancel named the order a replace has just replaced").
+    venue.trading.script = "accept"
+    _second_replace_unseen(venue)
+    venue.trading.refuse_cancel = lambda placed: (
+        alpaca.api_error(422, 42210000, "order is not cancelable")
+        if placed["status"] == "replaced"
+        else None
+    )
+    strategy = modifier(prices=["150.50", "151.00"])
+    seen: dict = {}
+
+    async def cancel(client) -> None:
+        strategy.cancel_order(strategy.client_order_id)
+        async with asyncio.timeout(5):
+            while len(venue.trading.cancels) < 2:
+                await asyncio.sleep(0.01)
+        await asyncio.sleep(0.3)
+        await until_idle(client, venue)
+        seen["cancels"] = [c[:8] for c in venue.trading.cancels]
+        seen["ids"] = [placed_order(venue, i)["id"][:8] for i in range(3)]
+        seen["alpaca_C"] = placed_order(venue, 2)["status"]
+        seen["after"] = _state(client, strategy)
+
+    run_modify(
+        venue,
+        strategy,
+        lambda: len(venue.trading.replace_requests) == 2 and len(venue.trading._placed) == 3,
+        cancel,
+    )
+    print("PROBE-F1-CANCEL", strategy.names(), seen)
+    assert "OrderCanceled" in strategy.names(), (strategy.names(), seen)
+
+
+@pytest.mark.parametrize("fail", [False, True], ids=["read-ok", "read-fails-once"])
+def test_probe_took_over_lookup_failure(venue, alpaca, capfd, fail) -> None:
+    # Statement item 1's sequence (`replaced` missed, the replacement filled), reported through the
+    # single-order report; with `fail`, the read of the old order inside `_replacement_took_over` fails.
+    venue.trading.script = "accept"
+    venue.trading.replace_script = "silent"
+    strategy = modifier()
+    reports: list = []
+    calls = {"old": 0}
+
+    async def reconcile(client) -> None:
+        old, new = placed_order(venue, 0), placed_order(venue, 1)
+        new.update(status="filled", filled_qty="2", filled_avg_price="150.5")
+        original = venue.trading.get_order_by_id
+
+        def get_order_by_id(order_id):
+            if str(order_id) == old["id"]:
+                calls["old"] += 1
+                if fail and calls["old"] == 2:
+                    raise alpaca.api_error(500, 50010000, "probe read failure")
+            return original(order_id)
+
+        venue.trading.get_order_by_id = get_order_by_id
+        command = SimpleNamespace(
+            venue_order_id=VenueOrderId(old["id"]), client_order_id=strategy.client_order_id
+        )
+        reports.append(await client._generate_order_status_report(command))
+
+    run_modify(venue, strategy, lambda: bool(venue.trading.replace_requests), reconcile)
+    text = logged(capfd)
+    said = [line[-160:] for line in text.splitlines() if "probe read failure" in line]
+    report = reports[0]
+    print(
+        "PROBE-TOOK-OVER",
+        "fail" if fail else "ok",
+        calls,
+        None if report is None else (report.venue_order_id.value[:8], report.order_status.name),
+        "logged:",
+        said,
+    )
+    assert report is not None or said, "the filled replacement is unreported and nothing says why"
+
+
+def test_probe_state_left_after_three_modifies_and_a_fill(venue) -> None:
+    # Statement item 9: answers must not build up for the session. What the change keeps once the
+    # node's order has ended.
+    venue.trading.script = "accept"
+    strategy = modifier(prices=["150.50", "151.00", "151.50"])
+    left: dict = {}
+
+    async def fill(client) -> None:
+        newest = placed_order(venue, 3)
+        venue.trading.update(newest["id"], "fill", 2, status="filled", filled_qty="2")
+        async with asyncio.timeout(10):
+            while "OrderFilled" not in strategy.names():
+                await asyncio.sleep(0.01)
+        await until_idle(client, venue)
+        for name in (
+            "_answers",
+            "_replacements",
+            "_adopted",
+            "_handled_replacements",
+            "_settled_modifies",
+            "_modifying",
+        ):
+            value = getattr(client, name, None)
+            left[name] = None if value is None else len(value)
+
+    run_modify(venue, strategy, lambda: strategy.names().count("OrderUpdated") == 3, fill)
+    print("PROBE-STATE", strategy.names().count("OrderUpdated"), left)
+
+
+def test_probe_fill_on_newer_replacement_before_its_replaced(venue) -> None:
+    # The F1 sequence with a fill on C instead of a close: the report says a fill, cancel or expiry
+    # "will move forward through a chain of replacements".
+    venue.trading.script = "accept"
+    _second_replace_unseen(venue)
+    strategy = modifier(prices=["150.50", "151.00"])
+    seen: dict = {}
+
+    async def fill_newest(client) -> None:
+        venue.trading.update(placed_order(venue, 2)["id"], "fill", 2, status="filled", filled_qty="2")
+        async with asyncio.timeout(10):
+            while "OrderFilled" not in strategy.names():
+                await asyncio.sleep(0.01)
+        await until_idle(client, venue)
+        seen["ids"] = [placed_order(venue, i)["id"][:8] for i in range(3)]
+        seen["after"] = _state(client, strategy)
+
+    run_modify(
+        venue,
+        strategy,
+        lambda: len(venue.trading.replace_requests) == 2 and len(venue.trading._placed) == 3,
+        fill_newest,
+    )
+    print("PROBE-FILL-CHAIN", strategy.names(), seen)
+    assert strategy.names().count("OrderUpdated") == 2, (strategy.names(), seen)

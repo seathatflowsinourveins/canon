@@ -1309,7 +1309,8 @@ def test_the_selection_time_counts_the_profile_read(monkeypatch, tmp_path):
 
 
 def test_an_auto_run_s_other_strategy_part_keeps_the_fixed_trail_and_says_so(tmp_path, capsys):
-    """An auto run's SessionMaCross part is not failed by the Mover's trail rows; it names them."""
+    """An auto run's SessionMaCross part is not failed by the Mover's trail rows. The one notice that
+    names them is `_main`'s, so `window_config` itself prints none."""
     args = session_window._args(
         [
             "--session",
@@ -1328,7 +1329,7 @@ def test_an_auto_run_s_other_strategy_part_keeps_the_fixed_trail_and_says_so(tmp
     args.strategy = "SessionMaCross"  # what _main resolves for the regular part
     config = session_window.window_config(args, "regular")
     assert config.trail_mode == "fixed" and config.profile_k == D(2)
-    assert "the trail rows are Mover's" in capsys.readouterr().err
+    assert "the trail rows are Mover's" not in capsys.readouterr().err
     args.strategy = "Mover"
     assert session_window.window_config(args, "extended").trail_mode == "profile"
 

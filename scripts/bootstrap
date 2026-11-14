@@ -60,9 +60,9 @@
 # DSH_TUI_BACKEND in this environment, a home-level ${DSH_HOME:-~/.dsh}/cordis.patch.yml, or a sandbox-policy,
 # dsh-tui or llm-deepseek row in the profile's patch.
 # --install also sets up the review-only workers (ADR 0045), each as its upstream documents: it adds
-# home/dsh/review.patch.yml's rows (session-log upload off, dsh-memento off, and approval requests refused
-# under every permission preset, ADR 0136) to the dsh-tui profile's user patch,
-# ${DSH_HOME:-~/.dsh}/profiles/dsh-tui/cordis.patch.yml, after the rows already there (dsh-TUI v0.17.0
+# home/dsh/review.patch.yml's rows (session-log upload off, dsh-memento off, approval requests refused
+# under every permission preset as ADR 0136 sets, and read-before-write on) to the dsh-tui profile's user patch,
+# ${DSH_HOME:-~/.dsh}/profiles/dsh-tui/cordis.patch.yml, after the rows already there (dsh-TUI v0.20.0
 # docs/configuration.en.md), and removes from ~/.zshrc the two lines an earlier --install wrote to turn
 # Antigravity's self-updater off (ADR 0065 reverses ADR 0045 on this), keeping a copy. A patch that already
 # names one of those rows, or is not a YAML block sequence or [], is left alone with
@@ -649,7 +649,7 @@ omniroute_row() {
 }
 
 # The review-only workers (ADR 0045). DeepSeek Harness reads its profile's user patch last, a YAML array
-# whose rows override a bundle's row by id, the config block replaced whole (dsh-TUI v0.17.0
+# whose rows override a bundle's row by id, the config block replaced whole (dsh-TUI v0.20.0
 # docs/configuration.en.md, "Profiles and patch layers").
 DSH_PATCH_SRC="$ROOT/home/dsh/review.patch.yml"
 DSH_MARK_BEGIN='# canon bootstrap: review settings'
@@ -661,7 +661,7 @@ dsh_profile_dir() { printf '%s/profiles/dsh-tui' "${DSH_HOME:-$HOME/.dsh}"; }
 # explicit ? key, an escape, the value on the next line) is not read: a limit ADR 0136 records.
 # dsh_id_re <ids>: that pattern for the ids given as grep -E alternatives
 dsh_id_re() { printf '(^|[[:space:]{[,])(id|"id"|'"'"'id'"'"')[[:space:]]*:[[:space:]]*["'"'"']?(%s)["'"'"']?([[:space:],}#]|]|$)' "$1"; }
-DSH_ID_RE=$(dsh_id_re 'session-log-deepseek|memento|approval|permission')
+DSH_ID_RE=$(dsh_id_re 'session-log-deepseek|memento|approval|permission|fs-observation-policy')
 # dsh_block <file>: the canon block in a patch file, marker to end marker; dsh_outside <file>: every other line
 # but a comment line, so a commented-out row is no row
 dsh_block() { awk -v b="$DSH_MARK_BEGIN" -v e="$DSH_MARK_END" 'index($0, b) == 1 && !on && !done { on = 1 } on { print } on && $0 == e { on = 0; done = 1 }' "$1"; }
@@ -684,8 +684,8 @@ dsh_row() {
   local dir dst; dir=$(dsh_profile_dir); dst="$dir/cordis.patch.yml"
   if [ ! -d "$dir" ]; then row "dsh-tui review patch" absent "no dsh-tui profile at $dir"; return; fi
   case "$(dsh_state "$dst")" in
-    current)  row "dsh-tui review patch" ok "session log and dsh-memento off, approval requests refused, in $dst" ;;
-    conflict) row "dsh-tui review patch" "NOT SET" "another row in $dst sets session-log-deepseek, memento, approval or permission; merge home/dsh/review.patch.yml by hand" ;;
+    current)  row "dsh-tui review patch" ok "session log and dsh-memento off, approval requests refused, read-before-write on, in $dst" ;;
+    conflict) row "dsh-tui review patch" "NOT SET" "another row in $dst sets session-log-deepseek, memento, approval, permission or fs-observation-policy; merge home/dsh/review.patch.yml by hand" ;;
     unreadable) row "dsh-tui review patch" UNKNOWN "$dst cannot be read" ;;
     stale)    row "dsh-tui review patch" "NOT SET" "$dst holds a canon block that differs from home/dsh/review.patch.yml; run: scripts/bootstrap --install, which replaces it where it stands and keeps a copy" ;;
     *)        row "dsh-tui review patch" "NOT SET" "home/dsh/review.patch.yml's rows are not in $dst; run: scripts/bootstrap --install" ;;
@@ -693,31 +693,31 @@ dsh_row() {
 }
 # What else decides how a dsh-tui worker starts: the sandbox and approval ADR 0136 sets, and the model and
 # effort ADR 0059 rule 7 keeps (deepseek-flash at max). Each item below carries into every later dsh-tui
-# session, Orca's workers among them; this reads them without running dsh. dsh-TUI at the v0.17.0 pin:
+# session, Orca's workers among them; this reads them without running dsh. dsh-TUI at the v0.20.0 pin:
 # ~/.dsh-tui is under the user's home, with no override (src/utils/paths.ts L13-22); a remembered /permission
 # pick is permission.json (src/permissionPrefs.ts L1-18); a remembered /model pick is model.json, which wins
 # over the profile's route (src/modelPrefs.ts L1-11); a remembered /effort pick is effort.json, beneath
 # settings.json's values.effortDefault, where Auto is no choice (src/effortPrefs.ts L1-9, L33-52;
-# src/tuiSettingsFile.ts L1-25; src/settings/definitions.ts L83-93, L599); a remembered /preset pick is
+# src/tuiSettingsFile.ts L1-25; src/settings/definitions.ts L83-93, L607); a remembered /preset pick is
 # agent-preset.json, key preset, which outranks the profile's preset (src/presetPrefs.ts L1-9, L19, L41-63); a
 # remembered /kernel pick is kernel.json, key backend, trimmed and lowercased, which picks the agent backend
 # (dsh, claude, codex or a plugin's) when no --backend or DSH_TUI_BACKEND is given, as under Orca; dsh is the
 # default, so a remembered dsh is no choice (src/kernelPrefs.ts L1-7, L26, L42, L51-55, L63-76, L148-181;
-# src/agent/backend-manifest.ts L134; cordis.patch.yml L478-479). A row of the profile's patch
+# src/agent/backend-manifest.ts L134; cordis.patch.yml L480-481). A row of the profile's patch
 # replaces the bundle's row of its id whole (the header above): sandbox-policy sets the sandbox ADR 0136's
 # presets are matched against, dsh-tui the route and effort, llm-deepseek the efforts the route offers
-# (cordis.patch.yml L43-48, L172-180, L407-451). A home-level $DSH_HOME/cordis.patch.yml outranks every
-# profile's patch (deepseek-harness dsh-v0.2.1-rc.3 apps/cli/src/profile-boot.ts L212-217). Each file is read
+# (cordis.patch.yml L43-48, L172-180, L408-453). A home-level $DSH_HOME/cordis.patch.yml outranks every
+# profile's patch (deepseek-harness dsh-v0.2.2-rc.2 apps/cli/src/profile-boot.ts L212-217). Each file is read
 # as dsh-TUI reads it: one that is missing, unreadable or corrupt, or holds no value, is no choice
 # (permissionPrefs.ts L16-17, modelPrefs.ts L4-6, effortPrefs.ts L6-8, tuiSettingsFile.ts L27-28), so only a
 # value it would apply is named; a /permission pick is trimmed and kept only as a command token
 # (permissionPrefs.ts L33-45, src/commands.ts L47-49). With no settings.json, the next boot brings in the dsh-tui
 # section of the first of $DSH_HOME/settings.yaml and settings.yaml.imported that has one, every setting's root
 # effortDefault among them (tuiSettingsFile.ts L1-6, L141-163; src/dsh-adapter/tui-settings.ts L116-123;
-# src/dsh-adapter/plugin.ts L499-503; definitions.ts L593-595): that file is read by line, in the block style dsh
+# src/dsh-adapter/plugin.ts L1124-1128; definitions.ts L601-603): that file is read by line, in the block style dsh
 # writes it, not parsed. DSH_PERMISSION_MODE, DSH_TUI_PRESET and DSH_TUI_BACKEND each outrank the remembered pick
-# in a dsh-tui started with them (cordis.patch.yml L179, L186, L475, L479; guide/dsh-tui-guide/configuration.en.md
-# L176, L405, L414, L419; src/hostEntryRoute.ts L47-49): this reads its own environment's, not Orca's, which
+# in a dsh-tui started with them (cordis.patch.yml L179, L186, L477, L481; guide/dsh-tui-guide/configuration.en.md
+# L176, L405, L417, L425; src/hostEntryRoute.ts L47-49): this reads its own environment's, not Orca's, which
 # Orca's workers take. Only the one key or value is printed, its characters past [A-Za-z0-9._:/-] shown as ?.
 # The id is matched as a key, as DSH_ID_RE matches it, so a grid or uid key holding one of these names is no row.
 DSH_WORKER_ID_RE=$(dsh_id_re 'sandbox-policy|dsh-tui|llm-deepseek')
@@ -776,6 +776,95 @@ dsh_worker_row() {
   elif [ ! -d "$dir" ]; then row "dsh-tui worker defaults" absent "no dsh-tui profile at $dir"
   else row "dsh-tui worker defaults" ok "no remembered /permission, /model, /effort or /preset pick, no /kernel pick but dsh, and no effortDefault in $tui; no $home/cordis.patch.yml; no sandbox-policy, dsh-tui or llm-deepseek row in $dst; none of DSH_PERMISSION_MODE, DSH_TUI_PRESET or DSH_TUI_BACKEND in this environment"
   fi
+}
+# The DeepSeek Harness profiles and desktop profile against the records home/dsh/profiles.json and
+# home/dsh/desktop.json: one row each, summing up the read-only check in this checkout that compares them. The
+# contract is each check's documented output, in its header:
+#   scripts/dsh-profiles: one row per profile in name order, `  dsh profile <name> <status> <detail>` in row()'s
+#     format, the status ok, DIFFERS, UNRECORDED, UNKNOWN or absent, then at most one `dsh profiles UNKNOWN` row
+#     counting the folders whose name holds a control character; exit 0 when every row is ok or absent, 1
+#     otherwise, 2 for a usage error or a record it cannot read (a message on stderr and no row).
+#   scripts/dsh-desktop-check: one line per item, ok, DIFFERS or AHEAD and the item, a name or spec in it shown
+#     as DSH_SHOW shows a value, @ kept; exit 0 when every line is ok or AHEAD, 1 on any DIFFERS, 2 when an input
+#     is missing or unparseable, with one `MISSING <path>` line each and no item line (a message on stderr when it
+#     cannot run at all).
+# A row is absent when there is nothing to compare: no profiles folder, or neither the desktop app nor the desktop
+# profile, found before the check runs, since dsh-desktop-check exits 2 when nothing is installed; and the profiles
+# row when dsh-profiles exits 0 and every row it printed, one at least, is absent. Otherwise a row is ok on exit 0;
+# DIFFERS on exit 1, with the count, the first three and the command that prints them all; and UNKNOWN on exit 2,
+# naming the MISSING paths or else quoting the message the check printed; on exit 0 with no row or item line, or
+# with one that exit 0 rules out (a profile neither ok nor absent, a DIFFERS or MISSING line), which it names; on
+# any other exit or output its check does not document; or with no executable check in this checkout. A check runs
+# by path with no input, and reads, writes, reaches and runs only what its header says: no write, no network, no
+# dsh. dsh-desktop-check runs without DSH_DESKTOP_RECORD and DSH_DESKTOP_RECORD_PATH, so it reads the record named
+# here. A profile's name is shown through DSH_SHOW and a control character anywhere in a row as ?; a name holding a
+# status word between spaces is read up to that word. Neither row fails --check: like the dsh rows above, both are
+# optional.
+DSH_LIST='def list: if length > 3 then .[0:3] + ["and \(length - 3) more"] else . end | join(", ");'
+dsh_profiles_row() {
+  local dir="${DSH_HOME:-$HOME/.dsh}/profiles" check="$ROOT/scripts/dsh-profiles" out rc=0 r s t
+  if [ ! -d "$dir" ]; then row "dsh profiles" absent "no $dir: no DeepSeek Harness profile to compare with home/dsh/profiles.json"; return 0; fi
+  if [ ! -x "$check" ]; then row "dsh profiles" UNKNOWN "no executable scripts/dsh-profiles in this checkout to compare $dir with home/dsh/profiles.json"; return 0; fi
+  out=$("$check" 2>&1 </dev/null) || rc=$?
+  # shellcheck disable=SC2016  # jq program, not shell
+  r=$(jq -Rrs --arg rc "$rc" --arg dir "$dir" "$DSH_LIST"' def show: '"$DSH_SHOW"';
+      split("\n") as $lines
+      | ([$lines[] | select(length > 0)] | if . == [] then " with no message" else ": " + (.[0] | ltrimstr("dsh-profiles: ")) end) as $said
+      | [$lines[] | capture("^  dsh profile (?<name>.*?) +(?<status>ok|DIFFERS|UNRECORDED|UNKNOWN|absent)(?: |$)") | .name |= show] as $rows
+      | [$lines[] | capture("^  dsh profiles +UNKNOWN .*: (?<n>[0-9]+)$") | .n | tonumber] as $odd
+      | [$rows[] | select(.status == "ok") | .name] as $ok
+      | [$rows[] | select(.status == "absent") | .name] as $absent
+      | [$rows[] | select(.status != "ok" and .status != "absent") | "\(.name) \(.status)"] as $off
+      | ($off + [$odd[] | "\(.) named with a control character UNKNOWN"]) as $bad
+      | if $rc == "0" and $bad != [] then ["UNKNOWN", "scripts/dsh-profiles exited 0 but printed \($bad | list); run: scripts/dsh-profiles"]
+        elif $rc == "0" and $rows == [] then ["UNKNOWN", "scripts/dsh-profiles exited 0 but printed no row; run: scripts/dsh-profiles"]
+        elif $rc == "0" and $ok == [] then ["absent", "none of the \($absent | length) profiles home/dsh/profiles.json records is in \($dir)"]
+        elif $rc == "0" then ["ok", "\($ok | length) profiles as home/dsh/profiles.json records them: \($ok | list)" + (if $absent == [] then "" else "; not installed: \($absent | list)" end)]
+        elif $rc == "1" and $bad != [] then ["DIFFERS", "\(($off | length) + ($odd | add // 0)) profiles in \($dir) are not as home/dsh/profiles.json records them: \($bad | list); every difference: scripts/dsh-profiles"]
+        elif $rc == "1" then ["UNKNOWN", "scripts/dsh-profiles exited 1 but printed no row this reads as not ok; run: scripts/dsh-profiles"]
+        elif $rc == "2" then ["UNKNOWN", "scripts/dsh-profiles exited 2\($said); run: scripts/dsh-profiles"]
+        else ["UNKNOWN", "scripts/dsh-profiles exited \($rc), which it does not document; run: scripts/dsh-profiles"] end
+      | "\(.[0])\t\(.[1] | gsub("[\u0000-\u001f\u007f]"; "?"))"' <<<"$out") \
+    || r=$'UNKNOWN\tjq could not read what scripts/dsh-profiles printed; run: scripts/dsh-profiles'
+  IFS=$'\t' read -r s t <<<"$r"
+  case "$s" in
+    ok)      row "dsh profiles" ok "$t" ;;
+    absent)  row "dsh profiles" absent "$t" ;;
+    DIFFERS) row "dsh profiles" DIFFERS "$t" ;;
+    *)       row "dsh profiles" UNKNOWN "$t" ;;
+  esac
+}
+dsh_desktop_row() {
+  local app="${DSH_DESKTOP_APP:-/Applications/DeepSeek Harness.app}" dir="${DSH_HOME:-$HOME/.dsh}/profiles/desktop"
+  local check="$ROOT/scripts/dsh-desktop-check" out rc=0 r s t
+  if [ ! -e "$app" ] && [ ! -e "$dir" ]; then row "dsh desktop profile" absent "no desktop app at $app and no desktop profile at $dir"; return 0; fi
+  if [ ! -x "$check" ]; then row "dsh desktop profile" UNKNOWN "no executable scripts/dsh-desktop-check in this checkout to compare the desktop profile with home/dsh/desktop.json"; return 0; fi
+  out=$(env -u DSH_DESKTOP_RECORD -u DSH_DESKTOP_RECORD_PATH "$check" 2>&1 </dev/null) || rc=$?
+  # shellcheck disable=SC2016  # jq program, not shell
+  r=$(jq -Rrs --arg rc "$rc" "$DSH_LIST"'
+      split("\n") as $lines
+      | [$lines[] | select(test("^(ok|AHEAD|DIFFERS) "))] as $items
+      | [$items[] | select(startswith("ok "))] as $ok
+      | [$items[] | select(startswith("AHEAD ")) | ltrimstr("AHEAD ")] as $ahead
+      | [$items[] | select(startswith("DIFFERS ")) | ltrimstr("DIFFERS ")] as $differs
+      | [$lines[] | select(startswith("MISSING ")) | ltrimstr("MISSING ")] as $missing
+      | ([$lines[] | select(length > 0)] | if . == [] then " with no message" else ": " + (.[0] | ltrimstr("dsh-desktop-check: ")) end) as $said
+      | if $rc == "0" and ($differs != [] or $missing != []) then ["UNKNOWN", "scripts/dsh-desktop-check exited 0 but printed \(([$differs[] | "DIFFERS \(.)"] + [$missing[] | "MISSING \(.)"]) | list); run: scripts/dsh-desktop-check"]
+        elif $rc == "0" and $items != [] then ["ok", "\($ok | length) items as home/dsh/desktop.json records them" + (if $ahead == [] then "" else "; ahead of it: \($ahead | list)" end)]
+        elif $rc == "0" then ["UNKNOWN", "scripts/dsh-desktop-check exited 0 but printed no item line; run: scripts/dsh-desktop-check"]
+        elif $rc == "1" and $differs != [] then ["DIFFERS", "\($differs | length) of \($items | length) items are not as home/dsh/desktop.json records them: \($differs | list); every difference: scripts/dsh-desktop-check"]
+        elif $rc == "1" then ["UNKNOWN", "scripts/dsh-desktop-check exited 1 but printed no DIFFERS line; run: scripts/dsh-desktop-check"]
+        elif $rc == "2" and $missing != [] then ["UNKNOWN", "scripts/dsh-desktop-check cannot read \($missing | length) of its inputs: \($missing | list); run: scripts/dsh-desktop-check"]
+        elif $rc == "2" then ["UNKNOWN", "scripts/dsh-desktop-check exited 2\($said); run: scripts/dsh-desktop-check"]
+        else ["UNKNOWN", "scripts/dsh-desktop-check exited \($rc), which it does not document; run: scripts/dsh-desktop-check"] end
+      | "\(.[0])\t\(.[1] | gsub("[\u0000-\u001f\u007f]"; "?"))"' <<<"$out") \
+    || r=$'UNKNOWN\tjq could not read what scripts/dsh-desktop-check printed; run: scripts/dsh-desktop-check'
+  IFS=$'\t' read -r s t <<<"$r"
+  case "$s" in
+    ok)      row "dsh desktop profile" ok "$t" ;;
+    DIFFERS) row "dsh desktop profile" DIFFERS "$t" ;;
+    *)       row "dsh desktop profile" UNKNOWN "$t" ;;
+  esac
 }
 # Antigravity's self-updater. Its troubleshooting page gives `export AGY_CLI_DISABLE_AUTO_UPDATE=true` in the
 # shell profile to stop it; an earlier --install wrote that line with a comment of its own (ADR 0045), and ADR
@@ -1053,7 +1142,7 @@ runtimes_rows() {
     'not reported (label is not evidence of the selected request effort)' 'agy --version' \
     'settings.json model; antigravity.google/docs/settings' 'antigravity.google/docs/settings'
   # Even --dump-config rewrites cordis.yml through prepareProfile; --check must remain read-only.
-  fields='deepseek-harness 1f81c047fc48fa190a683e469daa699857e9afe8 apps/cli/src/profile-boot.ts:194-198'
+  fields='deepseek-harness ddac96760b6edf8fa0fe17cbdcf0b512f4c12b2c apps/cli/src/profile-boot.ts:194-198'
   model='not reported (--dump-config rewrites cordis.yml; read-only check does not run it)'
   runtime_row 'DeepSeek Harness' "$(runtime_version dsh)" "$model" "$model" 'dsh --version' "$fields" "$fields"
   runtime_row Orca 'not reported (no version command in pinned CLI reference)' 'not reported (host; per-agent launch override)' \
@@ -1116,6 +1205,8 @@ check() {
   agy_model_row
   dsh_row
   dsh_worker_row
+  dsh_profiles_row
+  dsh_desktop_row
   agy_row
   note "OmniRoute gateway (ADR 0056), optional:"
   omniroute_version_row || missing=1
@@ -1220,7 +1311,7 @@ install_reviewer_settings() {
           note "  kept       the previous cordis.patch.yml as $bak"
         fi
         cat "$tmp" > "$dst"; rm -f "$tmp"
-        note "  added      session log upload off, dsh-memento off and approval requests refused to $dst; restart dsh-tui to apply"
+        note "  added      session log upload off, dsh-memento off, approval requests refused and read-before-write on to $dst; restart dsh-tui to apply"
       fi
     fi
   fi

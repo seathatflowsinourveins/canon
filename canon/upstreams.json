@@ -126,6 +126,18 @@
       "adr": "0145"
     },
     {
+      "id": "google-sre-workbook-postmortem",
+      "field": "decision-records",
+      "url": "https://sre.google/workbook/postmortem-culture/",
+      "role": "reference",
+      "license": "CC BY-NC-ND 4.0",
+      "why": "Postmortem action items with an owner and a verifiable end state: the pattern behind the journal entry's owner and closes fields. Read only; nothing copied beyond short quotations.",
+      "evidence": [
+        "https://sre.google/workbook/postmortem-culture/"
+      ],
+      "adr": "0145"
+    },
+    {
       "id": "spec-kit",
       "field": "agent-extensions",
       "repo": "github/spec-kit",
@@ -614,10 +626,10 @@
       "id": "antigravity-cli",
       "field": "agent-harness",
       "repo": "google-antigravity/antigravity-cli",
-      "track": "tag:1.5.5",
+      "track": "tag:1.5.8",
       "role": "tool",
       "license": "UNVERIFIED (no licence file in the repository; GitHub reports none)",
-      "why": "Google's Antigravity CLI (agy), a review-only Orca worker from another model family (ADR 0045, under ADR 0043's terms). Installed machine-level by the owner (aqua:google-antigravity/antigravity-cli), not in mise.toml; check with agy --version. Its background self-updater moved it from 1.5.3 to 1.5.5, and the pin followed after the release notes of 1.5.4 and 1.5.5 were read (Auto mode for agy acp, a swarm preview, fixes; nothing that changes a review-only reader). Its troubleshooting page documents AGY_CLI_DISABLE_AUTO_UPDATE=true, set in the shell profile, to stop the updater; ADR 0065 keeps the updater on (reversing ADR 0045), so the pin is the version last read, and scripts/bootstrap --install removes the line an earlier run wrote to ~/.zshrc. Orca sets the variable in each Antigravity launch that submits a prompt, so its workers do not update; agy update does it at once.",
+      "why": "Google's Antigravity CLI (agy), a review-only Orca worker from another model family (ADR 0045, under ADR 0043's terms). Installed machine-level by the owner (aqua:google-antigravity/antigravity-cli), not in mise.toml; check with agy --version. Its self-updater moved it from 1.5.3 to 1.5.5; by agy's own logs it then ran 1.5.6 from 2026-11-12 and 1.5.8 from 2026-11-13, and 1.5.7 never ran here. Whether the updater or the daily agy update (ADR 0065) made those two moves is UNVERIFIED. The pin followed after the release notes were read. 1.5.4 and 1.5.5: Auto mode for agy acp, a swarm preview, fixes; nothing that changes a review-only reader. 1.5.6 to 1.5.8, read 2026-11-13. 1.5.6 loosens Auto mode's review of commands that leave the terminal sandbox: GitHub API reads and single-file downloads skip the checks a clone gets, and reading ~/.ssh/config, known_hosts, authorized_keys or *.pub no longer counts as reading secrets. 1.5.7 makes Auto the default Agent Mode for a session with no saved mode, headless -p runs included, wherever Auto is available, and Default elsewhere; a strict Tool Permission takes precedence over Auto. 1.5.7 also fixes a PreToolUse hook's auto_approve, or a wildcard command(*) allow rule, bypassing an admin-enforced review. 1.5.8 adds Gemini 4 Hydrogen and Carbon for an API-key sign-in, and Hydrogen alone for Application Default Credentials. 1.5.8 fixes a path bypass in the terminal sandbox's network proxy, and permission rules being ignored for MCP tools loaded up front and for the /browser subagent's tools. Orca's launch carries its bypass flag (ADR 0045 rule 2), and whether 1.5.7's Auto default reaches such a launch is UNVERIFIED. Its troubleshooting page documents AGY_CLI_DISABLE_AUTO_UPDATE=true, set in the shell profile, to stop the updater; ADR 0065 keeps the updater on (reversing ADR 0045), so the pin is the version last read, and scripts/bootstrap --install removes the line an earlier run wrote to ~/.zshrc. Orca sets the variable in each Antigravity launch that submits a prompt, so its workers do not update; agy update does it at once.",
       "evidence": [
         "https://github.com/google-antigravity/antigravity-cli/releases",
         "https://raw.githubusercontent.com/google-antigravity/antigravity-cli/main/README.md",
@@ -630,26 +642,34 @@
       "id": "deepseek-harness",
       "field": "agent-harness",
       "repo": "deepseek-ai/deepseek-harness",
-      "track": "tag:dsh-v0.2.1-rc.3",
+      "track": "tag:dsh-v0.2.2-rc.2",
       "role": "tool",
       "license": "MIT",
-      "why": "DeepSeek Harness (npm @deepseek-ai/dsh), the engine under dsh-tui, a review-only Orca worker from another model family (ADR 0045, under ADR 0043's terms). Every tag is a pre-release. Installed machine-level by the owner (npm:@deepseek-ai/dsh 0.2.1-rc.3, with pnpm for its profile), not in mise.toml; check with dsh --version. Seven community plugins and two of its own hook packages installed machine-level into the dsh-tui profile, chosen for workflow from a community list that is not a review: aegis 2.14.2 (GanyuanRan/Aegis at commit 0461c211e4d8, MIT), dsh-doublecheck 0.9.29 (PerryLink, Apache-2.0), dsh-advisor 0.6.4 (omdsh-dev, MIT), dsh-github-skills 0.2.1 (Starfie1d1272, Apache-2.0), dsh-llm-fallbacks 0.6.12 (omdsh-dev, MIT by its LICENSE file; npm gives none), dsh-memento 0.5.28 (PerryLink, Apache-2.0), dsh-tui-find 0.5.2 (xiaoxiaohaigui, MIT), and the hook packages @deepseek-ai/dsh-hooks-claude-code and @deepseek-ai/dsh-hook-protocol 0.2.1-rc.3 (deepseek-ai/deepseek-harness, MIT). Versions and licences from the profile's installed package files; none was read beyond them. Held 2026-11-10: dsh-v0.2.2-rc.1 (2026-11-04; needs Node >=24.9) moves only with the hand-installed engine: after the owner upgrades it and dsh-tui and scripts/bootstrap --check still shows the review patch ok, both pins move in one pull request (ADR 0045 Evidence). Look again 2026-11-13. Since the proposed ADR 0086 the machine carries two named configurations beside stock: the review configuration adds @deepseek-ai/dsh-experimental-terminal-bundle 0.2.1-rc.3 to the dsh-tui profile, an addition whose own source was not read here, so what it keeps and what it opens is UNVERIFIED; the build configuration is `dsh --profile headless -`, a one-shot runner carrying aegis, dsh-doublecheck 0.9.30, dsh-memento 0.5.30 at writePolicy auto, dsh-subagent-codex and dsh-subagent-claude-code 0.2.1-rc.3. Neither configuration has an eval run, so both are UNVERIFIED. The desktop app is its own entry, dsh-desktop, at the version it runs (ADR 0143), and reviews nothing.",
+      "why": "DeepSeek Harness (npm @deepseek-ai/dsh), the engine under dsh-tui, a review-only Orca worker from another model family (ADR 0045, under ADR 0043's terms). Every tag is a pre-release. Machine-level, not in mise.toml (npm:@deepseek-ai/dsh, which at 0.2.2-rc.2 needs Node >=24.9 by its apps/cli/package.json, with pnpm for its profile); check with dsh --version. Landing this pin moves that install: step (d) of the maintenance agent (ADR 0065) sets the global dsh to main's pin at its next round, and the landing lane runs the same step at once inside the install window below. Its release note says to upgrade every process that shares session storage together, and the desktop app runs this version on the same ~/.dsh (the dsh-desktop entry's pin). A move of this pin follows one order (ADR 0045, the 2026-11-13 line under its held bullet): a rehearsal in throwaway homes first; then one install window, opened only while DeepSeek dispatch is held and no dsh-tui session runs, in which the landing, the global move, each worker profile's refresh to home/dsh/profiles.json by exact dsh plugin adds and removes, and scripts/bootstrap --install follow in that order; it closes when scripts/bootstrap --check shows the review patch ok and scripts/dsh-profiles shows each worker profile ok. Until a profile is refreshed, this engine denies at startup the 0.2.1-rc.3 hook packages it carries, so the hook row, and home/dsh/hooks/guard.mjs with it, does not load there, and in dsh-tui it skips dsh-TUI 0.17.0's bundle (rehearsed for dsh-tui on 2026-11-13; app-boot README L56). dsh-v0.2.2-rc.3 (published 2026-11-13T07:56Z) is newer and outside dsh-TUI 0.20.0's peer lists (its package.json), so rc.2 is the newest the TUI admits. The dsh-tui profile records four community plugins and two of the engine's own hook packages (home/dsh/profiles.json), chosen for workflow from a community list that is not a review: aegis 2.15.0 (GanyuanRan/Aegis at commit e5f43c548a06, MIT), dsh-doublecheck 0.9.31 (PerryLink, Apache-2.0), dsh-memento 0.5.30 (PerryLink, Apache-2.0), dsh-tui-find 0.5.2 (xiaoxiaohaigui, MIT), and the hook packages @deepseek-ai/dsh-hooks-claude-code and @deepseek-ai/dsh-hook-protocol 0.2.2-rc.2 (deepseek-ai/deepseek-harness, MIT). Aegis v2.15.1 (2026-11-13) is newer than the recorded 2.15.0 and is not taken here: it is its own move. dsh-doublecheck 0.9.31's grill, which dsh-tui runs (grill: true), now reaches the workflow engine a preset mounts, so its report's verification, on by default, can run its forked checks where 0.9.30 skipped them, and a skipped run states why; the change adds no network client, storage path or credential read (GitHub's compare of the two releases, lib/grill/index.js). Four plugins leave the profile with this pin: dsh-advisor, which is inert there (ADR 0086 rule 5); dsh-llm-fallbacks, which hands a failing turn to a second model (npm: \"Automatic provider/model fallback chains ... when LLM requests keep failing\"), an addition ADR 0072 rule 6 keeps to the build arm; dsh-github-skills, which ADR 0094 rule 5 declines; and dsh-fail-guard, which the profile carried with no record. A scripted rehearsal on 2026-11-13 installed each worker profile exactly as home/dsh/profiles.json records it, with the canon block in dsh-tui, in throwaway DSH_HOMEs with the pinned pnpm, and composed each with --dump-config: every step exit 0, no admission refusal, no duplicate id and no terminal_* tool, and in dsh-tui session-log and memento off, approval never and fs-observation-policy on; nothing was started. Versions are as that install resolved them, licences from npm's metadata and, for aegis, its LICENSE file at that commit. Since the proposed ADR 0086 the machine carries two named configurations beside stock. The review configuration added @deepseek-ai/dsh-experimental-terminal-bundle to the dsh-tui profile at 0.2.1-rc.3; at this pin it carries no terminal bundle, since the bundle's panel backend needs the Web bundle's terminal controller (ADR 0086 rule 2's 2026-11-13 pointer; that bundle's own entry), so the dsh-tui profile carries the set above with no addition. That removes only the bundle's own terminal tools: a worker's bash is dsh-tool-bash, which the bundle does not provide (the bundle's entry). The build configuration is `dsh --profile headless -`, a one-shot runner carrying aegis, dsh-doublecheck 0.9.30, dsh-memento 0.5.30 at writePolicy auto, dsh-subagent-codex and dsh-subagent-claude-code 0.2.2-rc.2, and the two hook packages at 0.2.2-rc.2 that the worker-parity row in its own patch loads (home/dsh/profiles.json). Neither configuration has an eval run, so both are UNVERIFIED. At this pin the web service's default search is DeepSeek's Search API (searchProvider deepseek-search-api, where 0.2.1-rc.3 composed deepseek-official), which receives each query, a result count and, unless sendOriginalQuestion is off, the latest human prompt cut to 128 characters (dsh-web-deepseek-api's README L27, L44, L75). All four worker profiles compose web search: dsh-tui through the standard preset's own tool-web (packages/bundle/web-app/presets/standard.patch.yml L123-127), the other three through dsh-base's row (the rehearsal's compositions). No row turns sendOriginalQuestion off. That is a recorded limit, not an addition: the recipient is DeepSeek, which already receives every worker turn in full through the chat route (agent-default-model's provider deepseek-official in each composition), so the prefix reaches no new party, and billing follows the conversation's route (README L64); it is stock engine behaviour, so ADR 0072 rule 6 is not engaged (ADR 0086's 2026-11-13 line). The desktop app is its own entry, dsh-desktop, at the version it runs (ADR 0143), and reviews nothing.",
       "evidence": [
         "https://github.com/deepseek-ai/deepseek-harness",
-        "https://raw.githubusercontent.com/deepseek-ai/deepseek-harness/dsh-v0.2.1-rc.3/packages/session/session-log-deepseek/README.md",
+        "https://github.com/deepseek-ai/deepseek-harness/releases/tag/dsh-v0.2.2-rc.2",
+        "https://github.com/deepseek-ai/deepseek-harness/releases/tag/dsh-v0.2.2-rc.3",
+        "https://raw.githubusercontent.com/deepseek-ai/deepseek-harness/dsh-v0.2.2-rc.2/apps/cli/package.json",
+        "https://raw.githubusercontent.com/deepseek-ai/deepseek-harness/dsh-v0.2.2-rc.2/packages/session/session-log-deepseek/README.md",
+        "https://raw.githubusercontent.com/deepseek-ai/deepseek-harness/dsh-v0.2.2-rc.2/packages/fs/fs-observation-policy/README.md",
         "https://registry.npmjs.org/@deepseek-ai/dsh",
-        "https://registry.npmjs.org/dsh-doublecheck/0.9.29",
-        "https://registry.npmjs.org/dsh-advisor/0.6.4",
-        "https://registry.npmjs.org/dsh-github-skills/0.2.1",
-        "https://registry.npmjs.org/dsh-llm-fallbacks/0.6.12",
-        "https://registry.npmjs.org/dsh-memento/0.5.28",
+        "https://registry.npmjs.org/dsh-doublecheck/0.9.31",
+        "https://registry.npmjs.org/dsh-memento/0.5.30",
         "https://registry.npmjs.org/dsh-tui-find/0.5.2",
+        "https://registry.npmjs.org/dsh-llm-fallbacks/0.6.12",
         "https://github.com/GanyuanRan/Aegis",
-        "https://registry.npmjs.org/@deepseek-ai/dsh-hooks-claude-code/0.2.1-rc.3",
-        "https://registry.npmjs.org/@deepseek-ai/dsh-hook-protocol/0.2.1-rc.3",
-        "https://registry.npmjs.org/@deepseek-ai/dsh-experimental-terminal-bundle/0.2.1-rc.3",
-        "https://registry.npmjs.org/@deepseek-ai/dsh-subagent-codex/0.2.1-rc.3",
-        "https://registry.npmjs.org/@deepseek-ai/dsh-subagent-claude-code/0.2.1-rc.3"
+        "https://github.com/GanyuanRan/Aegis/tree/e5f43c548a06c3f302c521a4c23f258296ccc947",
+        "https://github.com/GanyuanRan/Aegis/releases/tag/v2.15.1",
+        "https://registry.npmjs.org/@deepseek-ai/dsh-hooks-claude-code/0.2.2-rc.2",
+        "https://registry.npmjs.org/@deepseek-ai/dsh-hook-protocol/0.2.2-rc.2",
+        "https://raw.githubusercontent.com/deepseek-ai/deepseek-harness/dsh-v0.2.2-rc.2/packages/web/web-deepseek-api/README.md",
+        "https://registry.npmjs.org/@deepseek-ai/dsh-subagent-codex/0.2.2-rc.2",
+        "https://registry.npmjs.org/@deepseek-ai/dsh-subagent-claude-code/0.2.2-rc.2",
+        "https://github.com/PerryLink/dsh-doublecheck/compare/0f80ced5367ba284c55131f138e1d4c7188779a3...deffa7d27a1825c0b8c3274167bb7648c6813112",
+        "https://raw.githubusercontent.com/deepseek-ai/deepseek-harness/dsh-v0.2.2-rc.2/packages/bundle/web-app/presets/standard.patch.yml",
+        "https://raw.githubusercontent.com/deepseek-ai/deepseek-harness/dsh-v0.2.2-rc.2/packages/boot/app-boot/README.md",
+        "https://raw.githubusercontent.com/ccch1mneyyy/dsh-TUI/v0.20.0/package.json"
       ],
       "adr": "0045"
     },
@@ -657,15 +677,16 @@
       "id": "dsh-tui",
       "field": "agent-harness",
       "repo": "ccch1mneyyy/dsh-TUI",
-      "track": "tag:v0.17.0",
+      "track": "tag:v0.20.0",
       "role": "tool",
       "license": "MIT",
-      "why": "Community terminal interface for DeepSeek Harness, the program Orca launches for it (dsh-tui .) under agent id dsh (its CLI bundle); which versions Orca's fixtures used is UNVERIFIED; 0.17.0 follows dsh 0.2.1-rc.3 (ADR 0045). Installed machine-level by the owner (npm:@deepseek-harness-tui/dsh-tui 0.17.0), not in mise.toml; its profile lives in the user's home and its update command updates the profile and aligns the launcher, outside the pin. Its profiles send session logs to the configured base URL by default (session-log-deepseek.enabled, true); its configuration page at v0.17.0 documents a user profile patch row that sets it false, which scripts/bootstrap --install adds to the dsh-tui profile with the dsh-memento row memento.enabled false (ADR 0045), and with an approval row (policy never) and a permission row whose read-only and workspace-write presets refuse, so a request for wider access is refused instead of asked (ADR 0136). Held 2026-11-10: v0.19.0 (2026-11-06) keeps the user patch format and is validated against dsh 0.2.2-rc.1; it moves only with the hand-installed version: after the owner upgrades it and deepseek-harness and scripts/bootstrap --check still shows the review patch ok, both pins move in one pull request (ADR 0045 Evidence). Look again 2026-11-13.",
+      "why": "Community terminal interface for DeepSeek Harness, the program Orca launches for it (dsh-tui .) under agent id dsh (its CLI bundle); which versions Orca's fixtures used is UNVERIFIED; 0.20.0 names DSH 0.2.2-rc.2 its primary compatibility target, and its peer ranges end at that version (README, package.json; ADR 0045). Machine-level, not in mise.toml (npm:@deepseek-harness-tui/dsh-tui); landing this pin moves that install, by step (d) of the maintenance agent (ADR 0065) at its next round and by the landing lane at once inside the install window (deepseek-harness's entry); its profile lives in the user's home, and its update command aligns the TUI, the dsh engine and the global launcher as one set, outside the pins (DSH_TUI_UPDATE_ENGINE=0 leaves the engine alone). Its README says to upgrade together every process that opens the same session store, since catalogs written by 0.2.2-rc.2 subagents cannot be opened by older DSH. Its profiles send session logs to the configured base URL by default (session-log-deepseek.enabled, true); its configuration page at v0.20.0 documents a user profile patch row that sets it false, which scripts/bootstrap --install adds to the dsh-tui profile with the dsh-memento row memento.enabled false (ADR 0045), with an approval row (policy never) and a permission row whose read-only and workspace-write presets refuse, so a request for wider access is refused instead of asked (ADR 0136), and with an fs-observation-policy row disabled false, which keeps read-before-write on in the dsh-tui profile, where dsh-v0.2.2-rc.2's dsh-base ships it off, once --install has written the block (by the source it also decides the standard preset's file tools; not run, ADR 0045's 2026-11-13 Evidence); headless, review-acp and build-acp run without it (ADR 0136's 2026-11-13 line).",
       "evidence": [
         "https://github.com/ccch1mneyyy/dsh-TUI/releases",
-        "https://raw.githubusercontent.com/ccch1mneyyy/dsh-TUI/v0.17.0/README.md",
+        "https://raw.githubusercontent.com/ccch1mneyyy/dsh-TUI/v0.20.0/README.md",
         "https://raw.githubusercontent.com/ccch1mneyyy/dsh-TUI/main/README.md",
-        "https://raw.githubusercontent.com/ccch1mneyyy/dsh-TUI/v0.17.0/docs/configuration.en.md",
+        "https://raw.githubusercontent.com/ccch1mneyyy/dsh-TUI/v0.20.0/docs/configuration.en.md",
+        "https://raw.githubusercontent.com/ccch1mneyyy/dsh-TUI/v0.20.0/package.json",
         "https://github.com/stablyai/orca/issues/38131",
         "https://github.com/stablyai/orca/issues/26594"
       ],
@@ -678,12 +699,13 @@
       "track": "tag:v0.1.1",
       "role": "tool",
       "license": "MIT",
-      "why": "DeepSeek Harness plugin that adds the CI run's allowlisted metadata (provider, repository, refs, commit, workflow, job, run id and URL) as one user message on a turn's first step, read from fixed environment fields; outside CI it does nothing. Its source at the pin makes no network call, writes no file and keeps nothing across sessions, so it may run in the reviewer arm (ADR 0072 rule 6). Installed only into a throwaway DSH_HOME profile, never ~/.dsh or a profile in use (ADR 0072 rule 5). Override of the host's compatibility guard: its peer range for dsh-agent and dsh-llm is ^0.1.0-rc.6, which excludes the pinned dsh 0.2.1-rc.3, so dsh refused the install (judged after the git fetch, then the profile restored) (\"Running it may cause crashes or data loss\") until the exact-version exemption dsh offers was granted in that profile alone (ADR 0094). A named configuration, UNVERIFIED until the review and build evals score it; a crash or data loss there retires it.",
+      "why": "DeepSeek Harness plugin that adds the CI run's allowlisted metadata (provider, repository, refs, commit, workflow, job, run id and URL) as one user message on a turn's first step, read from fixed environment fields; outside CI it does nothing. Its source at the pin makes no network call, writes no file and keeps nothing across sessions, so it may run in the reviewer arm (ADR 0072 rule 6). Installed only into a throwaway DSH_HOME profile, never ~/.dsh or a profile in use (ADR 0072 rule 5). Override of the host's compatibility guard: its peer range for dsh-agent and dsh-llm is ^0.1.0-rc.6, which excludes the pinned dsh 0.2.2-rc.2 as it excluded 0.2.1-rc.3, under which dsh refused the install (judged after the git fetch, then the profile restored) (\"Running it may cause crashes or data loss\") until the exact-version exemption dsh offers was granted in that profile alone (ADR 0094). An exemption names exact runtime versions (plugin-manager README), so the one granted for 0.2.1-rc.3 does not cover 0.2.2-rc.2. A named configuration, UNVERIFIED until the review and build evals score it; a crash or data loss there retires it.",
       "evidence": [
         "https://github.com/lucas-ward/dsh-ci-context",
         "https://raw.githubusercontent.com/lucas-ward/dsh-ci-context/v0.1.1/README.md",
         "https://raw.githubusercontent.com/lucas-ward/dsh-ci-context/v0.1.1/package.json",
-        "https://raw.githubusercontent.com/deepseek-ai/deepseek-harness/dsh-v0.2.1-rc.3/packages/boot/plugin-manager/README.md"
+        "https://raw.githubusercontent.com/deepseek-ai/deepseek-harness/dsh-v0.2.2-rc.2/packages/boot/plugin-manager/README.md",
+        "https://raw.githubusercontent.com/deepseek-ai/deepseek-harness/dsh-v0.2.2-rc.2/packages/boot/app-boot/src/plugin-compatibility.ts"
       ],
       "adr": "0094"
     },
@@ -695,7 +717,7 @@
       "line": "schema-v1.",
       "role": "standard",
       "license": "Apache-2.0",
-      "why": "The Agent Client Protocol, v1: JSON-RPC 2.0 over stdio between a client and an agent (initialize, session setup, session/prompt with session/update notifications, session/cancel). DeepSeek Harness serves it with `dsh --profile acp` through @deepseek-ai/dsh-acp 0.2.1-rc.3, which says it exposes only the standard ACP v1 surface, leaves out session/load, and builds on @agentclientprotocol/sdk 1.4.0, generated from schema-v1.21.0; the review-acp and build-acp profiles a worker is driven through stand on it (ADR 0095). Tracked by the schema release tags and held to the schema-v1. line, so a schema-v2 release does not move it. The wire version is the integer 1, raised only for a breaking change. Whether dsh conforms is UNVERIFIED: no conformance run exists.",
+      "why": "The Agent Client Protocol, v1: JSON-RPC 2.0 over stdio between a client and an agent (initialize, session setup, session/prompt with session/update notifications, session/cancel). DeepSeek Harness serves it with `dsh --profile acp` through @deepseek-ai/dsh-acp 0.2.2-rc.2, which says it exposes only the standard ACP v1 surface, leaves out session/load, and builds on @agentclientprotocol/sdk 1.4.0, generated from schema-v1.21.0; the review-acp and build-acp profiles a worker is driven through stand on it (ADR 0095). Tracked by the schema release tags and held to the schema-v1. line, so a schema-v2 release does not move it. The wire version is the integer 1, raised only for a breaking change. Whether dsh conforms is UNVERIFIED: no conformance run exists.",
       "evidence": [
         "https://agentclientprotocol.com/llms.txt",
         "https://agentclientprotocol.com/protocol/v1/overview.md",
@@ -726,13 +748,13 @@
       "id": "dsh-acp-app",
       "field": "agent-harness",
       "repo": "deepseek-ai/deepseek-harness",
-      "track": "tag:dsh-v0.2.1-rc.3",
+      "track": "tag:dsh-v0.2.2-rc.2",
       "role": "tool",
       "license": "MIT",
-      "why": "@deepseek-ai/dsh-acp-app 0.2.1-rc.3, DeepSeek Harness's own profile bundle (packages/bundle/acp-app) that serves the Agent Client Protocol over stdio through @deepseek-ai/dsh-acp, over dsh-base. Its patch sets the coding-agent persona and a default provider deepseek-official and model deepseek-v4-flash, disables the session-title model call, and starts dsh-acp only after its command provider accepts the invocation. Both the review-acp and build-acp profiles carry it (ADR 0095). Its own source has no network, file or subprocess call; what dsh-acp does is the protocol (acp-spec). Shares the deepseek-harness pin and moves with it. Running either profile is UNVERIFIED.",
+      "why": "@deepseek-ai/dsh-acp-app 0.2.2-rc.2, DeepSeek Harness's own profile bundle (packages/bundle/acp-app) that serves the Agent Client Protocol over stdio through @deepseek-ai/dsh-acp, over dsh-base. Its patch sets the coding-agent persona and a default provider deepseek-official and model deepseek-v4-flash, disables the session-title model call, and starts dsh-acp only after its command provider accepts the invocation. Both the review-acp and build-acp profiles carry it (ADR 0095). Its own source has no network, file or subprocess call; what dsh-acp does is the protocol (acp-spec). Shares the deepseek-harness pin and moves with it. Running either profile is UNVERIFIED.",
       "evidence": [
-        "https://github.com/deepseek-ai/deepseek-harness/tree/dsh-v0.2.1-rc.3/packages/bundle/acp-app",
-        "https://registry.npmjs.org/@deepseek-ai/dsh-acp-app/0.2.1-rc.3"
+        "https://github.com/deepseek-ai/deepseek-harness/tree/dsh-v0.2.2-rc.2/packages/bundle/acp-app",
+        "https://registry.npmjs.org/@deepseek-ai/dsh-acp-app/0.2.2-rc.2"
       ],
       "adr": "0095"
     },
@@ -740,13 +762,27 @@
       "id": "dsh-experimental-terminal-bundle",
       "field": "agent-harness",
       "repo": "deepseek-ai/deepseek-harness",
-      "track": "tag:dsh-v0.2.1-rc.3",
+      "track": "tag:dsh-v0.2.2-rc.2",
       "role": "tool",
       "license": "MIT",
-      "why": "@deepseek-ai/dsh-experimental-terminal-bundle 0.2.1-rc.3 (packages/experimental/terminal-bundle): six experimental global terminal tools that keep shell processes alive across tool calls, in an isolated terminal registry; shipped switched off in Web and Desktop. Both review-acp and build-acp carry it, and ADR 0086 chose it as the one addition of its review configuration on the dsh-tui profile (review-acp is not that configuration). The bundle's own code is empty; its dependency dsh-terminal-bash spawns the shells, confined by the host sandbox unless its mode is danger-full-access, and the profiles' sandbox mode is UNVERIFIED. No code in it or its dependencies calls a model, and its terminal sessions do not survive a restart; a channel to another model or to earlier sessions exists only through what a shell can reach. Shares the deepseek-harness pin and moves with it.",
+      "why": "@deepseek-ai/dsh-experimental-terminal-bundle 0.2.2-rc.2 (packages/experimental/terminal-bundle), the version last read: six experimental global terminal tools that keep shell processes alive across tool calls, and two read-only tools that list and read the terminals the person opened, in an isolated terminal registry; shipped switched off in Web and Desktop. At 0.2.1-rc.3 review-acp and build-acp carried it, and ADR 0086 chose it as the one addition of its review configuration on the dsh-tui profile. At dsh-v0.2.2-rc.2 it is in no worker profile (ADR 0086 rule 2's 2026-11-13 pointer for dsh-tui, ADR 0095 item 4's for review-acp and build-acp; home/dsh/profiles.json). Its backend is now dsh-terminal-panel, not dsh-terminal-bash, and the panel requires the terminalController service (the inject list in its src/index.ts, L22). Only @deepseek-ai/dsh-api-terminal-controller provides that service, for the Web sidebar's terminals, and its README says the Web bundle mounts it (L28); the web-app bundle is the only one whose cordis.patch.yml composes it. Without it, read in source, the panel stays pending (Cordis's lifecycle tutorial) and the terminal tools fail with NO_BACKEND (packages/terminal/terminal/src/index.ts), so a worker profile would carry tools that fail instead of falling back; no tool was called, so that is UNVERIFIED. Its only tools are the six terminal_* tools of dsh-tool-terminal (its src/index.ts, L166-396) and, new at this pin, the panel's user_terminal_list and user_terminal_read (its src/tools.ts, L87, L116), so leaving it out removes no other tool. No worker's bash comes from it: bash is @deepseek-ai/dsh-tool-bash, whose inject list names none of the bundle's services (packages/shell/tool-bash/src/index.ts, L37), and the one service the bundle provides is its terminals registry, which its group isolates (its cordis.patch.yml). dsh-tui takes bash from the standard preset (packages/bundle/web-app/presets/standard.patch.yml, L21-23), which dsh-TUI registers at run time and names as its default (its src/dsh-adapter/bundled-presets.ts and cordis.patch.yml), and review-acp and build-acp take it from dsh-base's own tool-bash row (packages/bundle/base/cordis.patch.yml, L281-283; the rehearsal's compositions). The bundle's own code is empty. The entry stays at dsh-v0.2.2-rc.2, and the bundle returns to a profile only through a new adoption.",
       "evidence": [
-        "https://github.com/deepseek-ai/deepseek-harness/tree/dsh-v0.2.1-rc.3/packages/experimental/terminal-bundle",
-        "https://registry.npmjs.org/@deepseek-ai/dsh-experimental-terminal-bundle/0.2.1-rc.3"
+        "https://github.com/deepseek-ai/deepseek-harness/tree/dsh-v0.2.2-rc.2/packages/experimental/terminal-bundle",
+        "https://github.com/deepseek-ai/deepseek-harness/tree/dsh-v0.2.2-rc.2/packages/experimental/terminal-panel",
+        "https://raw.githubusercontent.com/deepseek-ai/deepseek-harness/dsh-v0.2.2-rc.2/packages/api/terminal-controller/README.md",
+        "https://raw.githubusercontent.com/deepseek-ai/deepseek-harness/dsh-v0.2.2-rc.2/packages/experimental/terminal-panel/src/index.ts",
+        "https://raw.githubusercontent.com/deepseek-ai/deepseek-harness/dsh-v0.2.2-rc.2/packages/bundle/web-app/cordis.patch.yml",
+        "https://raw.githubusercontent.com/deepseek-ai/deepseek-harness/dsh-v0.2.2-rc.2/packages/terminal/terminal/src/index.ts",
+        "https://raw.githubusercontent.com/deepseek-ai/deepseek-harness/dsh-v0.2.2-rc.2/docs/cordis-tutorial/02-lifecycle-and-effects.md",
+        "https://raw.githubusercontent.com/deepseek-ai/deepseek-harness/dsh-v0.2.2-rc.2/packages/experimental/terminal-bundle/cordis.patch.yml",
+        "https://raw.githubusercontent.com/deepseek-ai/deepseek-harness/dsh-v0.2.2-rc.2/packages/experimental/tool-terminal/src/index.ts",
+        "https://raw.githubusercontent.com/deepseek-ai/deepseek-harness/dsh-v0.2.2-rc.2/packages/experimental/terminal-panel/src/tools.ts",
+        "https://raw.githubusercontent.com/deepseek-ai/deepseek-harness/dsh-v0.2.2-rc.2/packages/shell/tool-bash/src/index.ts",
+        "https://raw.githubusercontent.com/deepseek-ai/deepseek-harness/dsh-v0.2.2-rc.2/packages/bundle/web-app/presets/standard.patch.yml",
+        "https://raw.githubusercontent.com/deepseek-ai/deepseek-harness/dsh-v0.2.2-rc.2/packages/bundle/base/cordis.patch.yml",
+        "https://raw.githubusercontent.com/ccch1mneyyy/dsh-TUI/v0.20.0/src/dsh-adapter/bundled-presets.ts",
+        "https://raw.githubusercontent.com/ccch1mneyyy/dsh-TUI/v0.20.0/cordis.patch.yml",
+        "https://registry.npmjs.org/@deepseek-ai/dsh-experimental-terminal-bundle/0.2.2-rc.2"
       ],
       "adr": "0095"
     },
@@ -754,13 +790,13 @@
       "id": "dsh-subagent-codex",
       "field": "agent-harness",
       "repo": "deepseek-ai/deepseek-harness",
-      "track": "tag:dsh-v0.2.1-rc.3",
+      "track": "tag:dsh-v0.2.2-rc.2",
       "role": "tool",
       "license": "MIT",
-      "why": "@deepseek-ai/dsh-subagent-codex 0.2.1-rc.3 (packages/subagent/subagent-codex): a subagent_codex tool that runs one self-contained task in a fresh unattended Codex thread in the parent workspace and returns the answer. It bundles its own @openai/codex 0.153.4, outside the codex-cli pin. Native Codex configuration and authentication stay authoritative: key-like variables are scrubbed from the child's environment, so it runs under whatever login CODEX_HOME and HOME point to where dsh started (in an Orca-started session, an Orca-managed home). permissionMode defaults to never, which declines approvals and leaves the sandbox to Codex's settings; the login, mode and sandbox build-acp gets are UNVERIFIED. Another model family answers and it edits the parent workspace, so it is build arm only, by extension of ADR 0072 rule 6 (it sends a task, not the transcript): build-acp carries it and review-acp does not. A result that used it belongs to that family (ADR 0086). Shares the deepseek-harness pin and moves with it.",
+      "why": "@deepseek-ai/dsh-subagent-codex 0.2.2-rc.2 (packages/subagent/subagent-codex): a subagent_codex tool that runs one self-contained task in a fresh unattended Codex thread in the parent workspace and returns the answer. It bundles its own @openai/codex 0.153.4, outside the codex-cli pin. Native Codex configuration and authentication stay authoritative: key-like variables are scrubbed from the child's environment, so it runs under whatever login CODEX_HOME and HOME point to where dsh started (in an Orca-started session, an Orca-managed home). permissionMode defaults to never, which declines approvals and leaves the sandbox to Codex's settings; the login, mode and sandbox build-acp gets are UNVERIFIED. Another model family answers and it edits the parent workspace, so it is build arm only, by extension of ADR 0072 rule 6 (it sends a task, not the transcript): build-acp carries it and review-acp does not. A result that used it belongs to that family (ADR 0086). Shares the deepseek-harness pin and moves with it.",
       "evidence": [
-        "https://github.com/deepseek-ai/deepseek-harness/tree/dsh-v0.2.1-rc.3/packages/subagent/subagent-codex",
-        "https://registry.npmjs.org/@deepseek-ai/dsh-subagent-codex/0.2.1-rc.3"
+        "https://github.com/deepseek-ai/deepseek-harness/tree/dsh-v0.2.2-rc.2/packages/subagent/subagent-codex",
+        "https://registry.npmjs.org/@deepseek-ai/dsh-subagent-codex/0.2.2-rc.2"
       ],
       "adr": "0095"
     },
@@ -768,13 +804,13 @@
       "id": "dsh-subagent-claude-code",
       "field": "agent-harness",
       "repo": "deepseek-ai/deepseek-harness",
-      "track": "tag:dsh-v0.2.1-rc.3",
+      "track": "tag:dsh-v0.2.2-rc.2",
       "role": "tool",
       "license": "MIT",
-      "why": "@deepseek-ai/dsh-subagent-claude-code 0.2.1-rc.3 (packages/subagent/subagent-claude-code): a subagent_claude_code tool that runs one self-contained task as a fresh unattended Claude Code session in the parent workspace through @anthropic-ai/claude-agent-sdk 0.3.263 (SEE LICENSE IN README.md, not MIT), which bundles Claude Code 2.1.263, behind the claude-code pin, and never falls back to the host claude. Native Claude settings and authentication stay authoritative: it reads the host's user, project and local settings, and the child gets the profile's env option over the parent environment with key-like and DSH_ variables scrubbed, so it runs under the Claude configuration directory (CLAUDE_CONFIG_DIR, else ~/.claude) and its Keychain login unless a surviving provider variable or apiKeyHelper outranks it. permissionMode defaults to dontAsk: the host's allow rules and read-only defaults run, the rest is denied. It may read and write the host's auto memory (UNVERIFIED). The login and mode build-acp gets are UNVERIFIED. Another model family answers and it edits the parent workspace, so it is build arm only, by extension of ADR 0072 rule 6 (it sends a task, not the transcript): build-acp carries it and review-acp does not. Shares the deepseek-harness pin and moves with it.",
+      "why": "@deepseek-ai/dsh-subagent-claude-code 0.2.2-rc.2 (packages/subagent/subagent-claude-code): a subagent_claude_code tool that runs one self-contained task as a fresh unattended Claude Code session in the parent workspace through @anthropic-ai/claude-agent-sdk 0.3.263 (SEE LICENSE IN README.md, not MIT), which bundles Claude Code 2.1.263, behind the claude-code pin, and never falls back to the host claude. Native Claude settings and authentication stay authoritative: it reads the host's user, project and local settings, and the child gets the profile's env option over the parent environment with key-like and DSH_ variables scrubbed, so it runs under the Claude configuration directory (CLAUDE_CONFIG_DIR, else ~/.claude) and its Keychain login unless a surviving provider variable or apiKeyHelper outranks it. permissionMode defaults to dontAsk: the host's allow rules and read-only defaults run, the rest is denied. It may read and write the host's auto memory (UNVERIFIED). The login and mode build-acp gets are UNVERIFIED. Another model family answers and it edits the parent workspace, so it is build arm only, by extension of ADR 0072 rule 6 (it sends a task, not the transcript): build-acp carries it and review-acp does not. Shares the deepseek-harness pin and moves with it.",
       "evidence": [
-        "https://github.com/deepseek-ai/deepseek-harness/tree/dsh-v0.2.1-rc.3/packages/subagent/subagent-claude-code",
-        "https://registry.npmjs.org/@deepseek-ai/dsh-subagent-claude-code/0.2.1-rc.3"
+        "https://github.com/deepseek-ai/deepseek-harness/tree/dsh-v0.2.2-rc.2/packages/subagent/subagent-claude-code",
+        "https://registry.npmjs.org/@deepseek-ai/dsh-subagent-claude-code/0.2.2-rc.2"
       ],
       "adr": "0095"
     },
@@ -800,14 +836,15 @@
       "track": "tag:v10.34.9",
       "role": "tool",
       "license": "MIT",
-      "why": "Package manager dsh-tui needs to build and update its profile (ADR 0045). Installed machine-level by the owner (mise pnpm 10.34.9), not in mise.toml; check with pnpm --version. It runs on the machine-level mise node, 24.22.2 by mise ls -g; the node entry is this repo's own request, which the same release meets. Held 2026-11-10: v12.19.0 (published 2026-11-10) is two major versions past v10. The v11.0.0 notes (2026-04-28) require Node 22 or later, turn on strictDepBuilds, blockExoticSubdeps and a one-day minimumReleaseAge by default, replace the build-dependency settings with allowBuilds, and read .npmrc for auth and registry only. Among the v12.0.0 notes (2026-08-26): git dependencies on known hosts resolve through HTTPS, an unrecognised pnpm-workspace.yaml setting fails where the project's pnpm pin is satisfied, --frozen-lockfile false is gone, engineStrict is stricter, and cyclic peer dependencies re-key a lockfile once. dsh-TUI at v0.17.0 and v0.19.0 asks for pnpm 10 or newer (docs/getting-started.en.md: 'CI uses 11'), so the pinned 10.34.9 is inside its range; its package.json pins packageManager pnpm@11.21.0, and its README documents pnpm 11's blocked install scripts, which its update command configures. Its CI runs only pnpm 11 (newest v11 tag v11.28.11), so v12 with dsh-tui is UNVERIFIED. Pin and hand install move together. mise's minimum_release_age (ADR 0008) does not filter an exact version such as pnpm@12.19.0 (mise settings page), so it would not hold a hand install. No record sets a waiting period for a pin moved by hand (ADR 0016's seven days is the bot's; ADR 0001 only quotes Dependabot's default). Re-read 2026-11-11 and still held: dsh-tui is its one consumer here (the OmniRoute gateway installs through mise's npm backend, not pnpm), dsh-tui stays at v0.17.0, and dsh-TUI's package.json at v0.19.0 still pins packageManager pnpm@11.21.0. Move it with the dsh pins, to the v11 line dsh-TUI's CI runs, not to v12. Look again by 2026-12-10, ADR 0045's review-by.",
+      "why": "Package manager dsh-tui needs to build and update its profile (ADR 0045). Installed machine-level by the owner (mise pnpm 10.34.9), not in mise.toml; check with pnpm --version. It runs on node 24.22.2, which this repository's mise.toml requests (node = \"24\", the node entry); mise ls -g lists no node. Held 2026-11-10: v12.19.0 (published 2026-11-10) is two major versions past v10. The v11.0.0 notes (2026-04-28) require Node 22 or later, turn on strictDepBuilds, blockExoticSubdeps and a one-day minimumReleaseAge by default, replace the build-dependency settings with allowBuilds, and read .npmrc for auth and registry only. Among the v12.0.0 notes (2026-08-26): git dependencies on known hosts resolve through HTTPS, an unrecognised pnpm-workspace.yaml setting fails where the project's pnpm pin is satisfied, --frozen-lockfile false is gone, engineStrict is stricter, and cyclic peer dependencies re-key a lockfile once. dsh-TUI at v0.20.0, as at v0.17.0 and v0.19.0, asks for pnpm 10 or newer (docs/getting-started.en.md: 'CI uses 11'), so the pinned 10.34.9 is inside its range; its package.json pins packageManager pnpm@11.21.0, and its README documents pnpm 11's blocked install scripts, which its update command configures. Its CI runs only pnpm 11 (newest v11 tag v11.28.12, published 2026-11-13), so v12 with dsh-tui is UNVERIFIED. Pin and hand install move together. mise's minimum_release_age (ADR 0008) does not filter an exact version such as pnpm@12.19.0 (mise settings page), so it would not hold a hand install. No record sets a waiting period for a pin moved by hand (ADR 0016's seven days is the bot's; ADR 0001 only quotes Dependabot's default). Re-read 2026-11-11: dsh-tui is its one consumer here (the OmniRoute gateway installs through mise's npm backend, not pnpm). On 2026-11-13, with the dsh pins moving to dsh-v0.2.2-rc.2 and dsh-TUI v0.20.0 (whose package.json still pins packageManager pnpm@11.21.0), a scripted rehearsal installed the four worker profiles (dsh-tui, headless, review-acp and build-acp) as home/dsh/profiles.json records them, each in a throwaway DSH_HOME, through the rc.2 engine's dsh plugin install with the pinned 10.34.9 on node 24.22.2, each exit 0. That shows the install alone: dsh-tui's update command and a build under pnpm 10 were not run, so both are UNVERIFIED. Look again by 2026-12-10, ADR 0045's review-by.",
       "evidence": [
         "https://github.com/pnpm/pnpm/releases/tag/v10.34.9",
         "https://github.com/pnpm/pnpm/releases/tag/v11.0.0",
+        "https://github.com/pnpm/pnpm/releases/tag/v11.28.12",
         "https://github.com/pnpm/pnpm/releases/tag/v12.0.0",
-        "https://raw.githubusercontent.com/ccch1mneyyy/dsh-TUI/v0.17.0/docs/getting-started.en.md",
-        "https://raw.githubusercontent.com/ccch1mneyyy/dsh-TUI/v0.17.0/README.md",
-        "https://raw.githubusercontent.com/ccch1mneyyy/dsh-TUI/v0.17.0/package.json",
+        "https://raw.githubusercontent.com/ccch1mneyyy/dsh-TUI/v0.20.0/docs/getting-started.en.md",
+        "https://raw.githubusercontent.com/ccch1mneyyy/dsh-TUI/v0.20.0/README.md",
+        "https://raw.githubusercontent.com/ccch1mneyyy/dsh-TUI/v0.20.0/package.json",
         "https://mise.jdx.dev/configuration/settings.html"
       ],
       "adr": "0045"

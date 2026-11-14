@@ -7,6 +7,8 @@ review-by: 2026-12-10
 
 # Muse Code, Antigravity and DeepSeek Harness as review-only workers, and one review lifecycle for every change
 
+*Muse Code deferred 2026-11-13 by the owner: no Muse reviewer is started until the owner lifts it. Its row, pin and launch notes are kept as they are, so it can be resumed as written; Codex and Antigravity read in its place, and DeepSeek Harness stays on Flash.*
+
 ## Context and Problem Statement
 
 ADR 0043 adopted Codex as an Orca worker that reads a change and reports. On the owner's instruction of
@@ -47,7 +49,12 @@ owner's delegation of 2026-11-10.
      preview, hook-input fields, models, fixes; none changes a reader's terms; a brief starts no swarm).
      Its docs set `AGY_CLI_DISABLE_AUTO_UPDATE=true` in the shell profile, so `scripts/bootstrap
      --install` writes it to `~/.zshrc`. (Reversed 2026-11-10 by ADR 0065 rule 3: the updater is on
-     again, and `--install` removes that line.)
+     again, and `--install` removes that line.) (2026-11-13: it ran 1.5.6 from 2026-11-12 and 1.5.8 from
+     2026-11-13, by agy's own logs, and the pin followed once the notes of 1.5.6 to 1.5.8 were read.
+     1.5.6 loosens Auto mode's review of commands that leave the terminal sandbox. 1.5.7 makes Auto the
+     default Agent Mode where no mode is saved and Auto is available, headless `-p` included, unless a
+     `strict` Tool Permission is set. Whether that reaches a launch carrying the bypass flag above is
+     UNVERIFIED.)
    * *DeepSeek Harness* (MIT, pre-release only; agent id `dsh`, no entry in the map): API key in its own
      file (not read). Orca launches `dsh-tui .`, whose `/update` moves past the pin. Open Orca issues: a
      first prompt lost past 30 s (#38131), `git` failing in its terminals (#26594). Session logs go to
@@ -81,7 +88,7 @@ owner's delegation of 2026-11-10.
    at `tag:dsh-v0.2.1-rc.3`, `dsh-tui` at `tag:v0.17.0`, and `pnpm` at `tag:v10.34.9` for `dsh-tui`'s
    profile, the installed versions; each already has newer releases, which `outdated` reports.
    `antigravity-cli` was adopted at `tag:1.5.3` and moved to `tag:1.5.5`, the version its updater had
-   installed. All are
+   installed, then on 2026-11-13 to `tag:1.5.8`, the version installed by then. All are
    machine-level, not in `mise.toml`, as ADR 0043 did for Codex. `canon/models.json`
    and ADR 0005 are unchanged: these are readers, not lanes.
 6. **DeepSeek Harness after its trial** (decided by the coordinator under the owner's delegation of
@@ -207,7 +214,10 @@ Read 2026-11-10. `fetched`: downloaded and searched. "Lane": a model summarised 
   (resolved, the 1.5.3 pin). https://antigravity.google/docs/cli/troubleshooting/ — a "self-updater that
   runs in the background"; `AGY_CLI_DISABLE_AUTO_UPDATE` to `true` "inside your shell profile (`~/.bashrc`
   or `~/.zshrc`)" (lane); the name is in the binary (`strings`). Releases 1.5.4 and 1.5.5, notes read (`gh
-  release view`); `tag:1.5.5` → `3e9fbcc9773e` (resolved).
+  release view`); `tag:1.5.5` → `3e9fbcc9773e` (resolved). Releases 1.5.6 (2026-11-11), 1.5.7
+  (2026-11-12) and 1.5.8 (2026-11-13), notes read 2026-11-13 (`gh api`); `tag:1.5.8` → `1554cf9fc71d`
+  (resolved). The versions this machine ran, from the version strings in agy's own CLI logs, read
+  2026-11-13: 1.5.6 from 2026-11-12 and 1.5.8 from 2026-11-13, with no log naming 1.5.7.
 * https://github.com/deepseek-ai/deepseek-harness — MIT; every release a pre-release (`gh`).
   `tag:dsh-v0.2.1-rc.3` → `1f81c047fc48` (resolved).
 * https://raw.githubusercontent.com/ccch1mneyyy/dsh-TUI/v0.17.0/README.md — MIT; `dsh-tui update` "update
@@ -234,6 +244,18 @@ Read 2026-11-10. `fetched`: downloaded and searched. "Lane": a model summarised 
   Whether the nine profile packages load on 0.2.2 is UNVERIFIED. Both pins move together, after the
   owner upgrades both and `scripts/bootstrap --check` still shows the review patch ok; look again
   2026-11-13.
+  2026-11-13: that order cannot hold, since step (d) of the maintenance agent (ADR 0065) sets this machine's global
+  `dsh` and `dsh-tui` to main's pins at every round. An engine move follows this order instead. A rehearsal in
+  throwaway homes comes first (this move's, below). Then one install window, opened only while DeepSeek dispatch
+  is held and no `dsh-tui` session runs, holds in order: the landing; the global move; each worker profile
+  refreshed to `home/dsh/profiles.json` by exact `dsh plugin` adds and removes; `scripts/bootstrap --install`.
+  It closes when `scripts/bootstrap --check` shows the review patch ok and `scripts/dsh-profiles` shows each
+  worker profile ok. Until a profile is refreshed, the new engine denies at startup the 0.2.1-rc.3 hook packages
+  it carries, so `hooks-claude-code`, and `home/dsh/hooks/guard.mjs` with it, does not load there; in `dsh-tui`
+  it also skips dsh-TUI 0.17.0's bundle with its rows, and until `--install` the old canon block has no
+  `fs-observation-policy` row, so read-before-write is off, while its session-log, memento, approval and
+  permission rows still compose (rehearsed on a copy of the `dsh-tui` profile's package set: the new engine's
+  install check and `--dump-config`, both exit 0; app-boot README L56 at `dsh-v0.2.2-rc.2`; nothing started).
 * The DSH retry's report and its brief (read; not in this repository); `evals/review/cases/order-modify.toml`
   (read); the session folder and memento's audit row for the retry (read by the second reader).
 * https://github.com/stablyai/orca/issues/38131, /26594 — open; "30 s submit retry budget", `git` fails in
@@ -287,3 +309,27 @@ Read 2026-11-10. `fetched`: downloaded and searched. "Lane": a model summarised 
 * ADR 0034, 2026-11-11: Muse moves from `--yolo` to `--disable-approval --sandbox-network restricted`
   once the owner sets it, a sandbox that still leaves `/tmp` and the repository's git storage writable;
   Antigravity and DeepSeek Harness keep rule 2's posture.
+* 2026-11-13, the two pins move together: `deepseek-harness` to `tag:dsh-v0.2.2-rc.2` → `ddac96760b6e`, and
+  `dsh-tui` to `tag:v0.20.0` → `8958f08e3ba0` (resolved). dsh-TUI 0.20.0's README names DSH `0.2.2-rc.2` its
+  primary compatibility target and says to upgrade together every process that opens the same session store; the
+  engine's release note says to upgrade all processes sharing session storage together (fetched). The rehearsal
+  the held bullet's 2026-11-13 line puts first (run 2026-11-13): both versions under `mise exec`, the dsh-tui
+  profile in a throwaway `DSH_HOME` with the plugin set the registry now records and the terminal bundle that
+  ADR 0086 rule 2 has since left out, installed by the pinned pnpm 10.34.9 (exit 0).
+  `dsh --profile dsh-tui --dump-config` (exit 0, 129 entries, no duplicate id) composed `session-log-deepseek`
+  and `memento` with `enabled: false`, `approval` `never` and both presets `never`. The new pin's `dsh-base`
+  ships `fs-observation-policy` off, so the canon block gains a row that keeps read-before-write on in the
+  `dsh-tui` profile; `headless`, `review-acp` and `build-acp` run without it (ADR 0136's 2026-11-13 line). A
+  scripted rehearsal (run 2026-11-13, each step's exit code logged) then installed each worker profile exactly
+  as `home/dsh/profiles.json` records it, with no terminal bundle and the canon block in `dsh-tui`, through the
+  installed rc.2 engine with node 24.22.2 and pnpm 10.34.9, and composed each with `--dump-config`: every step
+  exit 0, no admission refusal, no duplicate id and no `terminal_*` tool. In `dsh-tui` (125 entries)
+  `session-log-deepseek` and `memento` are `enabled: false`, `approval` and both presets `never`, and
+  `fs-observation-policy` `disabled: false`. There the file tools come from the standard preset, and by the
+  source the host row still decides them: the policy registers plain `ctx.on` listeners for the `fs/*`
+  intents (its `src/index.ts` L128-138), `tool-fs` dispatches them through `ctx.waterfall` (`write.ts` L121,
+  `edit.ts` L133), and `dsh-scope`'s README says an untagged listener stays global (L42, L75); no session wrote
+  a file, so the behaviour is `UNVERIFIED`. Landing moves this machine's global `dsh` and `dsh-tui` to these
+  pins: step (d) of `home/.claude/canon/maintenance.sh` (ADR 0065) at its next round, and the landing lane at
+  once, inside that window. dsh-TUI 0.20.0 was not started, and `scripts/bootstrap --check` on the real
+  profile follows the window: `UNVERIFIED` here.

@@ -64,7 +64,7 @@ header's `feeds` is `["sip"]`, so `read_baselines` reports `overnight` false and
 its day ratio from 04:00. The actor reads the result for exactly the coming date with
 `read_baselines`. The default output is `catalog/movers-baseline/sip.json`; `--baseline-dir` sets its
 directory, and the actor's `baseline_path` should name that file. `--feed boats` is refused by name:
-the overnight part's baseline waits on a BOATS history loader, and ADR 0093's loader supports SIP only.
+the overnight part's baseline waits on this writer reading the boats root `history_load` now loads (below).
 
 This is an explicit job invocation; it installs no schedule. The coordinator performs the first
 credential-backed load and paper verification.
@@ -112,8 +112,11 @@ the pinned v2.0.0rc8 catalog bindings, `movers_rank` and `history_load` (read 20
 
 `mise run paper:history <tests|windows> --data quotes --symbols AAPL --start <ISO time with zone>
 --end <ISO time with zone> --catalog <existing IEX root>` loads historical IEX quotes as
-`QuoteTick` under `data/quotes/<instrument>/`. The root must hold definitions; SIP roots are refused.
-ADR 0066's bounds apply: IEX only, start at or after 2025-11-04 00:00 New York, at most 90 elapsed days (a conservative
+`QuoteTick` under `data/quotes/<instrument>/`. The root must hold definitions; an IEX load refuses a SIP root.
+With `--feed sip` it loads SIP quotes instead (ADR 0151): at most 8 symbols named with `--symbols`, never
+`--symbols-file`, over at most 60 minutes, into a root of their own that holds no bars or trades (default
+`catalog/sip-quotes`); a bars or trades load is refused in a root that holds quotes. Both bounds are
+UNCALIBRATED. ADR 0066's bounds apply to both feeds: IEX by default, start at or after 2025-11-04 00:00 New York, at most 90 elapsed days (a conservative
 quarter ceiling); small probes are allowed. Both bounds are inclusive, `start < end`, and the end
 must be 15 minutes before now, as for prints. Request/coverage bounds expand to complete microsecond buckets (start rounded
 down, end rounded up to the bucket's last nanosecond), matching the SDK's timestamp precision without
@@ -148,3 +151,14 @@ answer was cut before, and 42,672 in 5: 642,672 quotes in 71 requests, in time o
 microseconds, none crossed, in seven contiguous coverage intervals. PLCE's 148 quotes came in one
 piece that held the endpoint's microsecond. The rerun sent no request and wrote nothing. An hour
 with no quote (a night, a weekend) writes no coverage, so a rerun across one asks for it again.
+
+`mise run paper:history <tests|windows> --feed boats --data quotes|trades|bars --symbols <at most 8>
+--start <ISO time with zone> --end <ISO time with zone>` loads Blue Ocean ATS's overnight feed
+(`boats`), the only feed Alpaca serves overnight history on: its 24/5 page says to give `feed=boats`
+and that `feed=overnight` "will give error", so `--feed overnight` is refused by name. A boats load
+names its symbols with `--symbols`, never a file, spans at most 8 hours (the length of one 20:00-04:00
+New York session; that the window lies inside one is not held) and ends at least 15 minutes before
+now, each held before any pair is read. Boats bars are 1-MINUTE only, the default for this feed. Bars and trades
+go in `catalog/boats`, quotes in `catalog/boats-quotes` by default, and the root must hold the
+definitions. Every other rule of the loads above holds. The baseline writer still refuses
+`--feed boats` until its own change reads a boats root.

@@ -49,7 +49,7 @@ def record() -> dict[str, Any]:
         "mover": {
             "result": {"flat": True, "by_instrument": {"SYN.ALPA": {"open_shares": "0"}}},
             "run": {
-                "rows": {"trail": "0.02", "spread_floor_m": "2"},
+                "rows": {"trail": "0.02", "spread_floor_m": "2", "extended_hours": False},
                 "entries": [
                     {
                         "client_order_id": "buy-1",
@@ -380,17 +380,53 @@ WRITER_REFUSAL = {"when_ns": 10, "instrument_id": "AAA.ALPACA", "decisions": 1, 
 
 
 def test_the_writers_refusal_rows_are_read_by_their_reason(record):
-    """The prospective record contract (2026-11-13): a refusal row names its cause in `reason`, not
-    `cause`; `distance` and `cap` are on the two trail-cap reasons only, and a `reentry_max` row
-    carries `reentry_max` and `reentries` instead."""
+    """mover.py at 3d604ae7:5038-5049 records the cap reasons with distance and cap;
+    :4898-4906 records the re-entry refusal with only a reason, time and instrument."""
     record["mover"]["run"]["refusals"] = [
         {**WRITER_REFUSAL, "reason": "floor_over_cap", "distance": "0.03", "cap": "0.02"},
         {**WRITER_REFUSAL, "reason": "distance_over_cap", "distance": "0.025", "cap": "0.02"},
-        {**WRITER_REFUSAL, "reason": "reentry_max", "reentry_max": 2, "reentries": 2},
+        {
+            "when_ns": 5,
+            "instrument_id": "SYN.ALPACA",
+            "reason": "qualifying close interval end unavailable",
+        },
     ]
     result = checker().check(record)
     assert term(result, "A1").status == "met"
     assert term(result, "A1").counts["named_refusals"] == 3
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "qualifying close interval end unavailable",
+        "post-sale close history exceeded 64 pending intervals",
+    ],
+    ids=["close-interval-unavailable", "post-sale-history-exceeded"],
+)
+def test_written_reentry_refusal_is_counted_without_distance_or_cap(record, reason):
+    record["mover"]["run"]["refusals"] = [
+        {"when_ns": 5, "instrument_id": "SYN.ALPACA", "reason": reason}
+    ]
+    result = checker().check(record)
+    a1 = term(result, "A1")
+    assert a1.status == "met"
+    assert a1.counts["named_refusals"] == 1
+    assert a1.first_failure is None
+    assert (result.summary, result.exit_code) == ("counts", 0)
+
+
+@pytest.mark.parametrize("counters", [{}, {"reentry_max": 2, "reentries": 2}])
+def test_unwritten_reentry_max_reason_is_not_shown_even_with_counters(record, counters):
+    record["mover"]["run"]["refusals"] = [
+        {"when_ns": 5, "instrument_id": "SYN.ALPACA", "reason": "reentry_max", **counters}
+    ]
+    result = checker().check(record)
+    a1 = term(result, "A1")
+    assert a1.status == "not shown"
+    assert a1.counts["named_refusals"] == 0
+    assert a1.first_failure is None
+    assert (result.summary, result.exit_code) == ("incomplete", 2)
 
 
 @pytest.mark.parametrize(
@@ -773,7 +809,131 @@ def test_missing_sale_then_bad_sale_still_fails(record):
 
 def test_empty_sales_with_a_holding_is_not_proof(record):
     change(record, [*EXIT, "sales"], [])
-    assert term(checker().check(record), "A3").status == "not shown"
+    # A previously held stop does not excuse a missing trailing sale's evidence.
+    change(record, [*EXIT, "held_stop_kept"], "9.80")
+    result = checker().check(record)
+    assert term(result, "A3").status == "not shown"
+    assert (result.summary, result.exit_code) == ("incomplete", 2)
+
+
+def test_empty_sales_on_a_wind_down_has_no_remake_to_check(record):
+    # Pinned strategy/mod.rs:1160-1173,1815-1824: market exit uses the ordinary order
+    # factory's client order ID; its MARKET_EXIT tag is not included in the fill tuple.
+    cid = "O-19700101-000130-001-001-2"
+    record["orders"][cid] = record["orders"].pop("sell-1")
+    record["mover"]["run"]["fills"][1][0] = cid
+    record["mover"]["run"]["exits"][0].update(
+        sales=[], trigger_reason="wind-down", trigger_price=None
+    )
+    result = checker().check(record)
+    a3 = term(result, "A3")
+    assert a3.status == "met"
+    assert a3.counts["holdings_without_remake"] == 1
+    assert a3.counts["trailing_sales_checked"] == 0
+    assert '"holdings_without_remake": 1' in result.lines()[2]
+    assert (result.summary, result.exit_code) == ("counts", 0)
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "held stop (followed price)",
+        "held stop (last trade)",
+        "held stop (minute close)",
+        "held stop (holding average)",
+        "held stop (retained)",
+    ],
+)
+def test_empty_sales_on_a_named_held_stop_still_lacks_evidence(record, reason):
+    # mover.py at 3d604ae7:4199,4260,4437 follow each held-stop decision with `_limit_sell`
+    # (anchored on the met price), which records its sale through `_sale_sent` (:4757); an
+    # empty sales list on these reasons is a lost sale row, not a holding with no sale.
+    record["mover"]["run"]["exits"][0].update(
+        sales=[], trigger_reason=reason, held_stop_kept="9.80", held_stop_from_average="0.20"
+    )
+    result = checker().check(record)
+    a3 = term(result, "A3")
+    assert a3.status == "not shown"
+    assert any("no per-sale evidence" in note for note in a3.notes)
+    assert (result.summary, result.exit_code) == ("incomplete", 2)
+
+
+def test_empty_sales_on_an_extended_wind_down_still_lacks_evidence(record):
+    # mover.py at 3d604ae7:4796 `_end` returns at once under `extended_hours`; `_sell_out`
+    # (:4760-4781) marks "wind-down" and then sends a limit sale that `_sale_sent` records.
+    record["mover"]["run"]["rows"]["extended_hours"] = True
+    record["mover"]["run"]["exits"][0].update(sales=[], trigger_reason="wind-down")
+    result = checker().check(record)
+    assert term(result, "A3").status == "not shown"
+    assert (result.summary, result.exit_code) == ("incomplete", 2)
+
+
+@pytest.mark.parametrize("rows", [{}, {"extended_hours": None}])
+def test_a_wind_down_without_the_session_setting_still_lacks_evidence(record, rows):
+    run = record["mover"]["run"]
+    run["rows"].pop("extended_hours")
+    run["rows"].update(rows)
+    run["exits"][0].update(sales=[], trigger_reason="wind-down")
+    result = checker().check(record)
+    assert term(result, "A3").status == "not shown"
+    assert (result.summary, result.exit_code) == ("incomplete", 2)
+
+
+@pytest.mark.parametrize("reason", [None, 7])
+def test_empty_sales_with_no_text_reason_names_the_missing_sale(record, reason):
+    row = record["mover"]["run"]["exits"][0]
+    row.update(sales=[], trigger_reason=reason)
+    result = checker().check(record)
+    a3 = term(result, "A3")
+    assert a3.status == "not shown"
+    assert any(
+        note.endswith('["sales"]: no per-sale evidence for this holding') for note in a3.notes
+    )
+    assert not any("trigger_reason" in path for path in a3.missing)
+
+
+def test_a_reentry_refusal_names_whatever_pending_bound_the_writer_formats(record):
+    # mover.py at 3d604ae7:4916 formats PENDING_REENTRY_BARS into the text.
+    record["mover"]["run"]["refusals"] = [
+        {
+            "when_ns": 5,
+            "instrument_id": "SYN.ALPACA",
+            "reason": "post-sale close history exceeded 128 pending intervals",
+        }
+    ]
+    result = checker().check(record)
+    assert term(result, "A1").status != "not shown"
+    assert (result.summary, result.exit_code) == ("counts", 0)
+
+
+@pytest.mark.parametrize("reason", ["wind-down", "held stop (followed price)"])
+def test_named_exit_without_the_sales_key_still_lacks_evidence(record, reason):
+    row = record["mover"]["run"]["exits"][0]
+    row["trigger_reason"] = reason
+    del row["sales"]
+    result = checker().check(record)
+    assert term(result, "A3").status == "not shown"
+    assert (result.summary, result.exit_code) == ("incomplete", 2)
+
+
+@pytest.mark.parametrize(
+    "reason", ["held stop (unknown)", "wind-down pending", "unpriced_exit", "retained trigger"]
+)
+def test_empty_sales_without_a_written_no_remake_reason_stays_not_shown(record, reason):
+    record["mover"]["run"]["exits"][0].update(sales=[], trigger_reason=reason)
+    result = checker().check(record)
+    assert term(result, "A3").status == "not shown"
+    assert (result.summary, result.exit_code) == ("incomplete", 2)
+
+
+@pytest.mark.parametrize("reason", ["wind-down", "held stop (followed price)"])
+def test_named_exit_does_not_hide_a_recorded_bad_remake(record, reason):
+    row = record["mover"]["run"]["exits"][0]
+    row["trigger_reason"] = reason
+    row["sales"][0]["trailing_offset"] = "0.10"
+    result = checker().check(record)
+    assert term(result, "A3").status == "failed"
+    assert (result.summary, result.exit_code) == ("breaks", 1)
 
 
 def test_no_sales_key_even_with_no_exits_is_not_shown(record):
@@ -1550,11 +1710,11 @@ def test_a_wrong_trailing_offset_fails_a3_without_a_limit_offset(record):
     [
         {"reason": "floor_over_cap", "distance": None, "cap": "0.02", "when_ns": 10},
         {"reason": "distance_over_cap", "distance": "0.01", "cap": "0.02", "when_ns": 10},
-        {"reason": "reentry_max", "reentry_max": None, "reentries": 0, "when_ns": 10},
-        {"reason": "reentry_max", "reentry_max": 3, "reentries": 1, "when_ns": 10},
+        {"reason": "qualifying close interval end unavailable", "when_ns": None},
+        {"reason": "post-sale close history exceeded 64 pending intervals", "when_ns": -1},
     ],
 )
-def test_a_refusal_row_with_null_or_contradictory_numbers_is_not_shown(record, row):
+def test_a_refusal_row_with_invalid_numbers_or_clock_is_not_shown(record, row):
     record["mover"]["run"]["refusals"] = [row]
     assert term(checker().check(record), "A1").status == "not shown"
 
@@ -1912,3 +2072,9 @@ def test_an_unnamed_exit_row_placed_by_its_entry_does_not_hide_a_shortfall(recor
     a5 = term(checker().check(record), "A5")
     assert a5.status == "failed"
     assert a5.first_failure["reason"] == "exit records hold 6 of 10 shares bought"
+
+
+def test_a3_counts_the_trailing_sales_it_compared(record):
+    a3 = term(checker().check(record), "A3")
+    assert a3.status == "met"
+    assert a3.counts["trailing_sales_checked"] >= 1

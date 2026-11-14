@@ -1,0 +1,1 @@
+* A simulation shows a protector's decisions up to the release of its sale, not the fill of a holding another strategy opened, which NautilusTrader's simulated venue refuses before any fill; that fill is shown on paper (ADR 0074; [the simulation page](../../simulation.md)).

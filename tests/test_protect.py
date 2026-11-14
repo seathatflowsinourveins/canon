@@ -42,6 +42,7 @@ from canon_trading import custody
 from canon_trading import mover
 from canon_trading import protect
 from canon_trading import sizing
+from tests.test_owner_protector import alpaca_stream_lock  # noqa: F401 -- offline autouse fixture
 
 ROOT = Path(__file__).resolve().parents[1]
 D = Decimal
@@ -448,6 +449,45 @@ def test_a_short_is_named_and_left_untouched_and_the_long_beside_it_is_protected
     assert "a short of 5" in line and "nothing sent" in line
 
 
+def test_the_sizing_read_leaves_a_below_zero_quantity_labelled_long_alone_as_a_short(
+    capsys,
+) -> None:
+    """The sizing read goes through session_window.positions(), which reads by custody's one rule
+    (the lead's ruling, 2026-11-13 21:19): a quantity below zero is a short whatever its label, so it
+    gets no stop; the long beside it is protected."""
+    paper = Paper(
+        positions=[_position("AAA", "10"), _position("BBB", "-5", "long", available="-5")],
+        no_shorting=False,
+    )
+    data = Data({"AAA": AAA_BOOK, "BBB": BBB_BOOK})
+    code, lines = _run(paper, data, capsys)
+    assert code == 0, lines
+    _no_sale_open_or_cancel(paper)
+    assert [r.symbol for r in paper.submitted] == ["AAA"], lines
+    (line,) = [x for x in lines if x.startswith("left alone BBB:")]
+    assert "a short of 5" in line and "nothing sent" in line
+
+
+@pytest.mark.parametrize(
+    ("qty", "available"),
+    [("NaN", None), ("Infinity", None), ("-Infinity", None), ("many", None), ("7", "-1")],
+)
+def test_one_unreadable_position_is_skipped_by_name_and_every_other_long_is_protected(
+    qty, available, capsys
+) -> None:
+    """The one rule reads each position by itself (the lead, 2026-11-13 21:27): a position whose quantity
+    is no finite number, or whose listed qty_available custody does not accept, is skipped with an ALERT
+    naming it, and the long beside it still gets its stop. The run is not a success: it exits 2, a long
+    left unprotected."""
+    paper = Paper(positions=[_position("AAA", "10"), _position("BBB", qty, available=available)])
+    code, lines = _run(paper, Data({"AAA": AAA_BOOK, "BBB": BBB_BOOK}), capsys)
+    assert code == 2, lines
+    _no_sale_open_or_cancel(paper)
+    assert [r.symbol for r in paper.submitted] == ["AAA"], lines
+    (line,) = [x for x in lines if x.startswith("ALERT BBB:")]
+    assert "position in BBB" in line and "nothing sent" in line, line
+
+
 BIG_BOOK = ("499.99", "500.00", "500.00", "0.10")
 """A $500 name a cent wide with a 10-cent ATR: the Mover's distance is far under 0.1% of the price."""
 
@@ -602,7 +642,7 @@ def test_plan_only_keeps_f2_and_names_the_found_longs_own_atr_distance(capsys) -
         "trailing stop sell 10 AAA, GTC, sell_to_close, distance 0.2500 "
         "(row OWN1, 2.5000% of 10.0000, stop opens about 9.7400 "
         "(the bid 9.99 less the distance; Alpaca sets it from its own mark), from atr, "
-        "trail 0.025000 of entry 10.0000, spread 0.01, floor 0.02 (2 spreads), ATR 0.250000"
+        "trail 0.025000 of entry 10.0000, spread 0.01, floor 0.02 (2 spreads), ATR over 15 bars 0.250000"
     ) in own1
     (own3,) = [x for x in out if x.startswith("would send AAA under OWN3:")]
     assert "distance 0.7500 (row OWN3, 7.5000% of 10.0000" in own3
@@ -1127,18 +1167,12 @@ def test_a_full_page_of_open_orders_is_refused_since_a_covering_sell_may_be_miss
     ("book", "data_kw", "why"),
     [
         (("9.99", "10.00", "10.00", "0.04"), {"quoted": "2026-11-12T14:58:59Z"}, "61 s old"),
-        (("10.01", "10.00", "10.00", "0.04"), {}, "no usable sip spread"),
-        (("10.00", "10.00", "10.00", "0.04"), {}, "no usable sip spread"),
-        (("0", "10.00", "10.00", "0.04"), {}, "no usable sip spread"),
         (("9.99", "0", "10.00", "0.04"), {}, "has no ask"),
         (("9.40", "10.00", "10.00", "0.04"), {}, "distance_over_ceiling"),
         (None, {}, "no latest sip quote"),
     ],
     ids=[
         "stale-quote",
-        "crossed",
-        "locked",
-        "no-bid",
         "no-ask",
         "floor-over-the-ceiling",
         "no-quote",
@@ -1147,8 +1181,9 @@ def test_a_full_page_of_open_orders_is_refused_since_a_covering_sell_may_be_miss
 def test_a_long_with_no_sound_distance_gets_no_stop_and_is_named(
     capsys, book, data_kw, why
 ) -> None:
-    """A stop is never sent at a distance the planning could not stand behind: an old quote, a
-    crossed, locked or one-sided one, none at all, or a spread whose floor is over the ceiling."""
+    """A stop is never sent at a distance the planning could not stand behind: an old quote, one with
+    no ask, none at all, or a spread whose floor is over the ceiling. A quote with no usable spread is
+    planned on the ATR alone (`test_a_long_with_no_usable_spread_is_covered_by_its_atr_alone`)."""
     paper = Paper(positions=[_position("AAA", "10")])
     data = Data({} if book is None else {"AAA": book}, **data_kw)
     code, lines = _run(paper, data, capsys)
@@ -1157,15 +1192,49 @@ def test_a_long_with_no_sound_distance_gets_no_stop_and_is_named(
     assert "no distance" in line and why in line
 
 
-def test_a_cold_atr_takes_the_movers_named_fallback_never_under_the_floor(capsys) -> None:
-    """Fewer complete minutes than the ATR needs: the Mover's planning names its fixed fallback, and
-    the stop goes out at it."""
+def test_fewer_complete_minutes_than_the_atr_needs_take_the_atr_of_those_that_exist(capsys) -> None:
+    """Five complete minutes: the ATR is taken over those five, named, never the fixed fallback (U-h)."""
     paper = Paper(positions=[_position("AAA", "10")])
     code, lines = _run(paper, Data({"AAA": AAA_BOOK}, minutes=5), capsys)
     assert code == 0 and len(paper.submitted) == 1
     (line,) = [x for x in lines if x.startswith("sent AAA:")]
-    assert "ATR cold" in line
+    assert "ATR over 5 bars" in line and "fallback" not in line
+    assert D(str(paper.submitted[0].trail_price)) == D("0.04")
+
+
+def test_no_bar_in_the_session_day_takes_the_named_fallback_never_under_the_floor(capsys) -> None:
+    """No complete minute at all: the fixed fallback, named in the line and counted, and the stop goes
+    out at it."""
+    paper = Paper(positions=[_position("AAA", "10")])
+    report = protect.protect_longs(cast(Any, paper), Data({"AAA": AAA_BOOK}, minutes=0), row="OWN1")
+    assert report.exit_code == 0 and len(paper.submitted) == 1
+    (line,) = [x for x in report.lines() if x.startswith("sent AAA:")]
+    assert "ATR cold, no bar in the session day" in line
+    assert "no history in the session day: fixed fallback" in line
+    assert report.fallbacks == 1
+    assert report.lines()[-1] == "fixed fallback: 1 sent with no history in the session day"
     assert D(str(paper.submitted[0].trail_price)) >= 2 * D("0.01")
+
+
+@pytest.mark.parametrize(
+    "book",
+    [
+        ("10.01", "10.00", "10.00", "0.04"),
+        ("10.00", "10.00", "10.00", "0.04"),
+        ("0", "10.00", "10.00", "0.04"),
+    ],
+    ids=["crossed", "locked", "no-bid"],
+)
+@pytest.mark.no_position_without_its_exit(clause=2)
+def test_a_long_with_no_usable_spread_is_covered_by_its_atr_alone(capsys, book) -> None:
+    """A crossed, locked or bidless quote has no spread floor: the ATR distance stands alone, named,
+    and the stop goes out (U-h; the shape of the evening's two longs that fell to the fixed 2%)."""
+    paper = Paper(positions=[_position("AAA", "10")])
+    code, lines = _run(paper, Data({"AAA": book}), capsys)
+    assert code == 0 and len(paper.submitted) == 1, lines
+    (line,) = [x for x in lines if x.startswith("sent AAA:")]
+    assert "the ATR stands alone, with no spread floor" in line and "fallback" not in line
+    assert D(str(paper.submitted[0].trail_price)) == D("0.04")
 
 
 def test_nothing_is_ever_sold_opened_or_canceled_across_every_case(capsys) -> None:
@@ -1198,7 +1267,9 @@ def _task() -> dict[str, str]:
     return tomllib.loads((ROOT / "mise.toml").read_text())["tasks"]["paper:protect"]
 
 
-def _run_task(tmp_path: Path, account: str) -> tuple[subprocess.CompletedProcess, str]:
+def _run_task(
+    tmp_path: Path, account: str, **flags: str
+) -> tuple[subprocess.CompletedProcess, str]:
     """The task's body with `/usr/bin/security` swapped for a stand-in that logs its arguments; it is
     run only for names refused before the keychain and the lock."""
     log = tmp_path / "security.log"
@@ -1208,7 +1279,7 @@ def _run_task(tmp_path: Path, account: str) -> tuple[subprocess.CompletedProcess
     body = _task()["run"].replace("/usr/bin/security", str(stub))
     done = subprocess.run(
         ["bash", "-c", body],
-        env={"PATH": f"{tmp_path}:/usr/bin:/bin", "usage_account": account},
+        env={"PATH": f"{tmp_path}:/usr/bin:/bin", "usage_account": account, **flags},
         capture_output=True,
         text=True,
         timeout=60,
@@ -1250,7 +1321,7 @@ def test_the_task_reads_account_as_pair_under_its_lock_without_waiting() -> None
 @pytest.mark.parametrize(
     ("account", "said"),
     [
-        ("windows", "account windows (B) is refused by name for now"),
+        ("windows", "account windows (B) takes only --cancel"),
         ("live", "no paper account named 'live'"),
     ],
 )
@@ -1260,6 +1331,56 @@ def test_the_task_refuses_windows_and_any_other_name_before_the_keychain(
     done, asked = _run_task(tmp_path, account)
     assert done.returncode == 3 and asked == ""
     assert said in done.stderr and "nothing was read" in done.stderr
+
+
+# The lead's ruling (d)3 (2026-11-13): a protect-lineage sell left working on B is closed before proof 3
+# by a cancel of that lineage on B. B takes `--cancel` alone; a send on B stays refused.
+def _run_cancel_on_b(tmp_path: Path, cancel: str) -> tuple[subprocess.CompletedProcess, str, Path]:
+    """The task's body on B with the keychain, the temporary folder and the final `exec` stood in
+    for: nothing reaches Alpaca, and the lock is taken in `tmp_path`."""
+    log, ran = tmp_path / "security.log", tmp_path / "ran.log"
+    security, runner = tmp_path / "security", tmp_path / "runner"
+    security.write_text(f'#!/bin/bash\necho "$*" >> {log}\necho "made-up-value-$5"\n')
+    runner.write_text(f'#!/bin/bash\necho "$*" > {ran}\n')
+    for stub in (security, runner):
+        stub.chmod(0o755)
+    body = (
+        _task()["run"]
+        .replace("/usr/bin/security", str(security))
+        .replace("/usr/bin/getconf DARWIN_USER_TEMP_DIR", f"echo {tmp_path}/")
+        .replace("exec /usr/bin/timeout", f"exec {runner}")
+    )
+    done = subprocess.run(
+        ["bash", "-c", body],
+        env={
+            "PATH": f"{tmp_path}:/usr/bin:/bin",
+            "usage_account": "windows",
+            "usage_cancel": cancel,
+        },
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    return done, log.read_text() if log.exists() else "", ran
+
+
+def test_a_cancel_on_b_reads_bs_pair_under_bs_lock_and_runs_only_the_cancel(tmp_path) -> None:
+    if not Path("/usr/bin/lockf").is_file():
+        pytest.skip("the paper task uses macOS /usr/bin/lockf")
+    done, asked, ran = _run_cancel_on_b(tmp_path, "true")
+    assert done.returncode == 0, done.stderr
+    assert "-s canon-alpaca-paper-windows " in asked and "canon-alpaca-paper-protect" not in asked
+    assert (tmp_path / "canon-paper-windows.lock").exists()
+    args = ran.read_text()
+    assert "task_from_flags" in args and args.rstrip().endswith("false  true")
+
+
+@pytest.mark.parametrize("cancel", ["false", ""])
+def test_a_send_on_b_stays_refused_before_the_keychain(tmp_path, cancel) -> None:
+    done, asked, ran = _run_cancel_on_b(tmp_path, cancel)
+    assert done.returncode == 3 and asked == "" and not ran.exists()
+    assert "account windows (B) takes only --cancel" in done.stderr
 
 
 # -- The cancel of protect stops, by name (`paper:protect <account> --cancel`) ------------------------
@@ -1720,9 +1841,9 @@ def test_the_task_hands_the_cancel_and_the_symbol_over() -> None:
     task = _task()
     assert 'flag "--cancel"' in task["usage"] and 'flag "--symbol <symbol>"' in task["usage"]
     assert re.search(
-        r"task_from_flags\(\*sys\.argv\[1:5\]\)\)' "
+        r"task_from_flags\(\*sys\.argv\[1:6\]\)\)' "
         r'"\$\{usage_plan_only:-false\}" "\$\{usage_row:-\}" "\$\{usage_cancel:-false\}" '
-        r'"\$\{usage_symbol:-\}"$',
+        r'"\$\{usage_symbol:-\}" "\$\{usage_only:-\}"$',
         task["run"],
         re.MULTILINE,
     )
@@ -1970,11 +2091,14 @@ def test_the_paper_tests_checks_of_what_is_working_leave_out_a_listed_order_that
 # The lead's rule of 2026-11-13 (order D): in any session, on any account, a position has its exit. Each
 # case below is one of the day's shapes of a long that `paper:protect` finds, and asserts that the long
 # ends the run with a working sell that covers it. The marker gathers the set across files
-# (`pytest -m no_position_without_its_exit`); a case of a gap not yet closed is xfail strict, so the
+# (`pytest -m no_position_without_its_exit`), each naming the clause of ADR 0150 it holds, and
+# `python -m canon_trading.exit_rule` prints every clause's status from them; a case of a gap not yet
+# closed is xfail strict, so the
 # set turns red when its fix lands and the mark is not lifted. A review that finds a new way a position
 # had no exit adds its case here in the same pull request. Inputs are quotes, bars and steps only.
 
-EXIT = pytest.mark.no_position_without_its_exit
+EXIT = pytest.mark.no_position_without_its_exit(clause=2)
+"""ADR 0150's clause 2: a holding the owner opens gets the same exit, by itself."""
 
 
 def _covered(paper: Paper, symbol: str, qty: int, code: int, lines: list[str]) -> None:
@@ -2054,6 +2178,338 @@ def test_exit_for_the_shares_the_owner_added_to_a_protected_long(capsys) -> None
     )
     code, lines = _run(paper, Data({"AAA": AAA_BOOK}), capsys)
     _covered(paper, "AAA", 5, code, lines)
+
+
+# The include list only removes sends; the planner and the send's quantity checks stay the same.
+
+
+def _only_run(paper: Paper, data: Data, capsys, only: str, **flags: Any) -> tuple[int, list[str]]:
+    code = protect.task_from_flags(
+        flags.get("plan_only", "false"),
+        flags.get("row", "OWN1"),
+        flags.get("cancel", "false"),
+        flags.get("symbol", ""),
+        only,
+        trading=cast(Any, paper),
+        data=data,
+        pause=lambda _seconds: None,
+    )
+    out = capsys.readouterr()
+    return code, (out.out + out.err).splitlines()
+
+
+def _data_calls(data: Data) -> list[tuple[str, dict[str, Any]]]:
+    """Compare request fields, including TimeFrame.value (alpaca/data/timeframe.py:76)."""
+    return [
+        (
+            method,
+            {
+                key: getattr(value, "value", value)
+                for key, value in request.to_request_fields().items()
+            },
+        )
+        for method, request in data.asked
+    ]
+
+
+@pytest.mark.parametrize("only", ["AAA", "AAA,BBB", "BBB,AAA", "CCC", "AAA,CCC"])
+def test_only_sends_for_named_longs_and_names_absent_symbols(capsys, only) -> None:
+    paper = Paper(positions=[_position("AAA", "10"), _position("BBB", "5")])
+    data = Data({"AAA": AAA_BOOK, "BBB": BBB_BOOK})
+    code, lines = _only_run(paper, data, capsys, only)
+    named = set(only.split(","))
+    # a named symbol with no long is not a success: a name typed wrong would otherwise read as done
+    assert code == (2 if "CCC" in named else 0), lines
+    assert [request.symbol for request in paper.submitted] == sorted(named & {"AAA", "BBB"})
+    _no_sale_open_or_cancel(paper)
+    for symbol in {"AAA", "BBB"} - named:
+        assert lines.count(f"{symbol}: not named: no stop sent") == 1
+        assert not any(getattr(request, "symbol", None) == symbol for _, request in paper.calls)
+        assert ("get_open_position", symbol) not in paper.calls
+        assert not any(request.symbol_or_symbols == symbol for _, request in data.asked)
+    if "CCC" in named:
+        (line,) = [line for line in lines if "CCC" in line]
+        assert line == "CCC: named in --only, no long held: no stop sent"
+
+
+def test_only_names_a_covered_long_without_sending_for_the_other_long(capsys) -> None:
+    paper = Paper(
+        positions=[_position("AAA", "10"), _position("BBB", "5")],
+        orders=[_order("AAA", "10", FOREIGN_SELL)],
+    )
+    data = Data({"AAA": AAA_BOOK, "BBB": BBB_BOOK})
+    code, lines = _only_run(paper, data, capsys, "AAA")
+    assert code == 0 and not paper.submitted and not data.asked, lines
+    (covered,) = [line for line in lines if "AAA" in line]
+    assert "fully covered by working sells" in covered
+    assert "BBB: not named: no stop sent" in lines
+
+
+@pytest.mark.parametrize("only", ["", "AAA,BBB", "BBB,AAA"])
+def test_only_preserves_the_unfiltered_requests_and_output(capsys, monkeypatch, only) -> None:
+    """Freeze only the clock and nonce so the request log and output can be compared byte for byte."""
+    monkeypatch.setattr(protect, "monotonic", lambda: 0.0)
+    monkeypatch.setattr(protect, "uuid4", lambda: SimpleNamespace(hex="0123456789abcdef"))
+    positions = [_position("AAA", "10"), _position("BBB", "5")]
+    baseline = Paper(positions=positions)
+    selected = Paper(positions=positions)
+    before = Data({"AAA": AAA_BOOK, "BBB": BBB_BOOK})
+    after = Data({"AAA": AAA_BOOK, "BBB": BBB_BOOK})
+    expected = _run(baseline, before, capsys)
+    assert _only_run(selected, after, capsys, only) == expected
+    assert selected.calls == baseline.calls
+    assert _data_calls(after) == _data_calls(before)
+
+
+@pytest.mark.parametrize("only", ["AAA", "AAA,CCC"])
+def test_only_plan_reads_and_plans_every_long_under_every_row(capsys, monkeypatch, only) -> None:
+    monkeypatch.setattr(protect, "monotonic", lambda: 0.0)
+    monkeypatch.setattr(protect, "uuid4", lambda: SimpleNamespace(hex="0123456789abcdef"))
+    positions = [_position("AAA", "10"), _position("BBB", "5")]
+    baseline, selected = Paper(positions=positions), Paper(positions=positions)
+    before = Data({"AAA": AAA_BOOK, "BBB": BBB_BOOK})
+    after = Data({"AAA": AAA_BOOK, "BBB": BBB_BOOK})
+    assert protect.protect_task(cast(Any, baseline), before, plan_only=True) == 0
+    expected = capsys.readouterr().out.splitlines()
+    code, lines = _only_run(selected, after, capsys, only, plan_only="true", row="")
+    # the account's first run already says a named symbol holds no long, and is not a success
+    absent = ["CCC: named in --only, no long held: no stop sent"] if "CCC" in only else []
+    assert code == (2 if absent else 0) and not selected.submitted, lines
+    (extra,) = [line for line in lines if "not named" in line]
+    assert extra == "BBB: not named: a send with --only would send no stop for it"
+    assert [line for line in lines if "no long held" in line] == absent
+    assert [line for line in lines if line != extra and line not in absent] == expected
+    assert selected.calls == baseline.calls and _data_calls(after) == _data_calls(before)
+    for symbol in ("AAA", "BBB"):
+        for row in protect.ROWS:
+            assert any(line.startswith(f"would send {symbol} under {row}:") for line in lines)
+
+
+@pytest.mark.parametrize(
+    ("only", "flags", "reason"),
+    [
+        (",AAA", {}, "empty"),
+        ("AAA,", {}, "empty"),
+        ("AAA,,BBB", {}, "empty"),
+        ("aaa", {}, "plain capital letters"),
+        ("AAA, BBB", {}, "plain capital letters"),
+        ("AAA1", {}, "plain capital letters"),
+        ("AAA.B", {}, "plain capital letters"),
+        ("ÄAA", {}, "plain capital letters"),
+        ("AAA\n", {}, "plain capital letters"),
+        ("AAA,AAA", {}, "twice"),
+        (None, {}, "not text"),
+        ("AAA", {"cancel": "true", "row": ""}, "--cancel"),
+        ("AAA", {"symbol": "BBB"}, "--symbol"),
+        ("AAA", {"cancel": "true", "row": "", "symbol": "BBB"}, "--cancel"),
+        ("AAA", {"plan_only": "perhaps"}, "plan-only"),
+        ("AAA", {"cancel": "perhaps"}, "cancel"),
+        ("AAA", {"row": "UNKNOWN"}, "row"),
+        ("AAA", {"row": ""}, "row"),
+    ],
+)
+def test_only_refuses_bad_flags_without_any_request(capsys, only, flags, reason) -> None:
+    paper = Paper(positions=[_position("AAA", "1")])
+    data = Data({"AAA": AAA_BOOK})
+    code, lines = _only_run(paper, data, capsys, only, **flags)
+    assert code == protect.REFUSED, lines
+    assert paper.calls == [] and data.asked == []
+    assert len(lines) == 1 and lines[0].startswith("refused:")
+    assert reason in lines[0] and "nothing was read or sent" in lines[0]
+
+
+def test_only_keeps_attempting_later_symbols_after_a_failed_send(capsys) -> None:
+    class RefuseFirst(Paper):
+        def submit_order(self, order_data):
+            self.submit_fails = (
+                APIError('{"code": 42210000, "message": "refused"}', _status(422))
+                if order_data.symbol == "AAA"
+                else None
+            )
+            return super().submit_order(order_data)
+
+    for only in ("", "BBB,AAA"):
+        paper = RefuseFirst(positions=[_position("BBB", "1"), _position("AAA", "1")])
+        code, lines = _only_run(paper, Data({"AAA": AAA_BOOK, "BBB": BBB_BOOK}), capsys, only)
+        assert code == 1, lines
+        assert [request.symbol for request in paper.submitted] == ["AAA", "BBB"]
+        assert any(line.startswith("failed AAA:") for line in lines)
+        assert any(line.startswith("sent BBB:") for line in lines)
+        assert not any(name == "get_order_by_client_id" for name, _ in paper.calls)
+
+
+@pytest.mark.parametrize("row", list(protect.ROWS))
+@pytest.mark.parametrize("available", ["2", "1", None])
+def test_only_keeps_the_whole_share_free_quantity_and_row_rules(capsys, row, available) -> None:
+    positions = [_position("AAA", "2.5", available=available), _position("BBB", "1")]
+    baseline, selected = Paper(positions=positions), Paper(positions=positions)
+    before = _run(baseline, Data({"AAA": AAA_BOOK, "BBB": BBB_BOOK}), capsys, row=row)
+    code, lines = _only_run(selected, Data({"AAA": AAA_BOOK}), capsys, "AAA", row=row)
+    assert code == before[0], lines
+    expected = [
+        r.model_dump(exclude={"client_order_id"}) for r in baseline.submitted if r.symbol == "AAA"
+    ]
+    assert [r.model_dump(exclude={"client_order_id"}) for r in selected.submitted] == expected
+    _no_sale_open_or_cancel(selected)
+    assert all(
+        request.qty == 2 and request.qty <= float(available) for request in selected.submitted
+    )
+
+
+def test_only_does_not_count_an_omitted_fraction_as_a_failure(capsys) -> None:
+    paper = Paper(positions=[_position("AAA", "1"), _position("BBB", "0.5")])
+    code, lines = _only_run(paper, Data({"AAA": AAA_BOOK}), capsys, "AAA")
+    assert code == 0 and [request.symbol for request in paper.submitted] == ["AAA"], lines
+    assert "BBB: not named: no stop sent" in lines
+
+
+@pytest.mark.parametrize(
+    ("only", "sent", "plan_only"),
+    [
+        ("BBB", [], "false"),
+        ("AAA,BBB", ["AAA"], "false"),
+        ("AAA", ["AAA"], "false"),
+        ("BBB", [], "true"),
+    ],
+)
+def test_only_and_an_unreadable_position_say_one_true_thing(capsys, only, sent, plan_only) -> None:
+    """A position that cannot be read is an ALERT and a 2 whether it was named or not: what it is, is
+    not known, so the list does not make it "left as found". A named one is never also said to hold no
+    long, which would be false; the long beside it gets its stop only when it is named."""
+    paper = Paper(positions=[_position("AAA", "10"), _position("BBB", "NaN")])
+    data = Data({"AAA": AAA_BOOK, "BBB": BBB_BOOK})
+    code, lines = _only_run(
+        paper, data, capsys, only, plan_only=plan_only, row="" if plan_only == "true" else "OWN1"
+    )
+    assert code == 2, lines
+    assert [r.symbol for r in paper.submitted] == ([] if plan_only == "true" else sent), lines
+    assert len([x for x in lines if x.startswith("ALERT BBB:")]) == 1, lines
+    assert not any("BBB" in x and "no long held" in x for x in lines), lines
+    assert not any(x.startswith("BBB: not named") for x in lines), lines
+    assert not any(getattr(request, "symbol", None) == "BBB" for _, request in paper.calls)
+
+
+@pytest.mark.parametrize("plan_only", [False, True])
+def test_an_empty_include_list_is_refused_and_never_read_as_no_list(plan_only) -> None:
+    """No list is None. A caller that built its list from no names must not get a send for every long."""
+    paper = Paper(positions=[_position("AAA", "10"), _position("BBB", "5")])
+    data = Data({"AAA": AAA_BOOK, "BBB": BBB_BOOK})
+    report = protect.protect_longs(
+        cast(Any, paper), data, plan_only=plan_only, row=None if plan_only else "OWN1", only=()
+    )
+    assert report.exit_code == protect.REFUSED and "names no symbol" in report.refused
+    assert paper.calls == [] and data.asked == [] and not paper.submitted
+
+
+@pytest.mark.parametrize("account", ["tests", "protect"])
+def test_the_task_refuses_an_only_passed_empty_before_any_pair_is_read(tmp_path, account) -> None:
+    """`--only "$NAMES"` with nothing in NAMES reaches the task as an empty value. The module cannot
+    tell that from an absent flag, so the task refuses it before the keychain and the lock."""
+    done, log = _run_task(tmp_path, account, usage_row="F2", usage_only="")
+    assert done.returncode == 3 and log == "", done.stderr
+    assert "--only was given with no symbol; nothing was read or sent" in done.stderr
+    assert done.stdout == ""
+    run = _task()["run"]
+    assert run.index("usage_only+passed") < run.index("/usr/bin/security")
+
+
+def test_the_task_hands_only_over_as_one_optional_text_argument() -> None:
+    task = _task()
+    assert 'flag "--only <symbols>"' in task["usage"]
+    assert "--exclude" not in task["usage"]
+    assert re.search(
+        r"task_from_flags\(\*sys\.argv\[1:6\]\)\)' "
+        r'"\$\{usage_plan_only:-false\}" "\$\{usage_row:-\}" "\$\{usage_cancel:-false\}" '
+        r'"\$\{usage_symbol:-\}" "\$\{usage_only:-\}"$',
+        task["run"],
+        re.MULTILINE,
+    )
+
+
+class OnlyRoundTripPaper(Cancelable):
+    """The paper test's two buys, stop, cancel and closes on the existing offline venue."""
+
+    def __init__(self, failure: str = "") -> None:
+        super().__init__()
+        self.positions: list[Position] = []
+        self.orders: list[Order] = []
+        self.failure = failure
+
+    def submit_order(self, order_data):
+        if isinstance(order_data, TrailingStopOrderRequest):
+            submitted = super().submit_order(order_data)
+            order = submitted.model_copy(
+                update={
+                    "position_intent": order_data.position_intent
+                    if self.failure != "after-stop"
+                    else None
+                }
+            )
+        else:
+            self.calls.append(("submit_order", order_data))
+            self.submitted.append(order_data)
+            if order_data.side.value == "buy":
+                if order_data.symbol == "BBB" and self.failure == "second-buy":
+                    raise APIError('{"code": 42210000, "message": "refused"}', _status(422))
+                self.positions.append(_position(order_data.symbol, "1"))
+            else:
+                assert (
+                    order_data.qty == 1
+                    and order_data.position_intent == PositionIntent.SELL_TO_CLOSE
+                )
+                assert any(p.symbol == order_data.symbol and p.qty == "1" for p in self.positions)
+                self.positions = [p for p in self.positions if p.symbol != order_data.symbol]
+            order = _order(
+                order_data.symbol,
+                "1",
+                order_data.client_order_id,
+                type="market",
+                order_type="market",
+                side=order_data.side,
+                limit_price=None,
+                status="filled",
+                filled_qty="1",
+                position_intent=order_data.position_intent,
+            )
+        self.orders.append(order)
+        self.found[order.client_order_id] = order
+        return order
+
+    def get_orders(self, filter: Any = None):
+        return [
+            order
+            for order in super().get_orders(filter)
+            if order.status.value not in protect.session_window.TERMINAL
+            and str(order.id) not in self.canceled
+        ]
+
+
+@pytest.mark.parametrize("failure", ["", "second-buy", "after-stop"])
+def test_only_paper_round_trip_and_cleanup_on_the_standin(monkeypatch, failure) -> None:
+    """The exact new paper body, including its cleanup, never its credential/session wrapper."""
+    paper_test = _paper_test()
+    monkeypatch.setattr(paper_test.time, "sleep", lambda _seconds: None)
+    paper = OnlyRoundTripPaper(failure)
+    data = Data({"AAA": AAA_BOOK, "BBB": BBB_BOOK})
+    if failure:
+        reason = "buy: refused" if failure == "second-buy" else "required terms"
+        with pytest.raises(AssertionError, match=reason):
+            paper_test._only_round_trip(paper, data, ("AAA", "BBB"))
+    else:
+        paper_test._only_round_trip(paper, data, ("AAA", "BBB"))
+    assert paper.positions == [] and paper.get_orders() == []
+    stops = [
+        request for request in paper.submitted if isinstance(request, TrailingStopOrderRequest)
+    ]
+    assert [request.symbol for request in stops] == ([] if failure == "second-buy" else ["AAA"])
+    assert len(paper.canceled) == len(stops)
+    closed = [
+        request.symbol
+        for request in paper.submitted
+        if request.type.value == "market" and request.side.value == "sell"
+    ]
+    assert closed == (["AAA"] if failure == "second-buy" else ["AAA", "BBB"])
+    assert paper.no_shorting is True
 
 
 def test_the_close_margin_is_one_sends_bound_not_the_tasks_timeout() -> None:

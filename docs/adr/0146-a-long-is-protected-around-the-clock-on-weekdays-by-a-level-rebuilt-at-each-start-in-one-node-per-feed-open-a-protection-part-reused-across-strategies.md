@@ -56,7 +56,9 @@ pre-market, regular and after-hours use `sip` and overnight `boats` (`MOVER_PART
 spans, 04:00-20:00 on `sip` and 20:00-04:00 on `boats`, and one node runs each span whole: two nodes and
 two hand-overs a day, both outside the regular session, each a planned restart. For a node that carries a
 long this amends ADR 0044's bound of 60 minutes a window (the lead's ruling of 2026-11-13); every other
-window keeps it. A node running sixteen hours has not been run, so its soak (memory, the stream across
+window keeps it. ADR 0044's amendment of 2026-11-13 narrows this: until it is relaxed, only a by-hand
+paper run under a flag of its own runs past 60 minutes, and no scheduled window does, so the two nodes
+a day are by hand for now. A node running sixteen hours has not been run, so its soak (memory, the stream across
 hours, reconnects) is `UNVERIFIED` until it is. The adapter resets its feed on a reconnect, so one node
 switching feeds without a restart may be possible; that is not tried.
 
@@ -66,6 +68,17 @@ accepted and fills in the regular session is `UNVERIFIED` on paper. A dead node 
 outside this record. A broker backstop in the regular session (B2) waits for the cancel-latency
 measurement; a plain stop moved to the engine's level (B3) is rejected, since Alpaca's wash-trade
 protection refuses a new order while an opposite-side stop is open (ADR 0110).
+
+**The owner's word for one symbol.** A hold on the whole node is any entry in the instance's `holds/`
+or `inbox/`, read at each start; it stops the runner. A hold on one symbol is one file named for it in a
+folder beside them, `symbol-holds/`, written and removed only by `mise run paper:hold-symbol` (on C the
+owner's word alone, no lane's) and only where a runner's instance was installed, and read by the node at
+its start, where a folder never made holds none and an unreadable one refuses the start (a refused start,
+never a hold of the runner), and by the protector at every step (`src/canon_trading/symbol_hold.py`). A held symbol is not armed; a new
+hold cancels our own sell of it within one step and sells nothing; its level is kept, written to the book
+as `held`, and never lowered; its release re-arms it at that level at the next step, and a breach during
+the hold is sold then under the count rule. Every other holding keeps its stop throughout. On the engine
+this is shown on recorded quotes; on paper it is `UNVERIFIED` until a run on A shows it.
 
 **The gap (rule 3).** Upstream does show a strategy arming its own trailing stop when its entry fills:
 NautilusTrader v1's example `ema_cross_trailing_stop.py` and an acceptance strategy at the pin. The lead's
@@ -147,4 +160,5 @@ repository path is read in the tree at `05905849`.
   closes stop a stray print; the cache database's backings; a day as two nodes; the restart as already
   exercised; the Alpaca quotes, now fetched; two line numbers and two qualifiers. It added the reconnect
   caveat and the first-step check from the plan. Applied. The lead's ruling of the same day then set one
-  node per feed span, amending ADR 0044's 60-minute bound for a carrying node, with the soak `UNVERIFIED`.
+  node per feed span, amending ADR 0044's 60-minute bound for a carrying node, with the soak `UNVERIFIED`;
+  ADR 0044's later amendment of that day limits this to a by-hand paper run under its own flag.

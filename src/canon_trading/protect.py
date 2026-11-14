@@ -2,7 +2,10 @@
 covers, on one paper account, then exit (`mise run paper:protect tests`, or `protect` for account C,
 ADR 0142). A run that sends names the registered row its distance is planned on (`--row`, `ROWS`); there
 is no default. `--plan-only` makes every read, names what each stop would be under every row, and sends
-nothing. `--cancel` cancels the open stops of the protect lineage, every one or one symbol's, and nothing
+nothing. `--only` limits sends to distinct, comma-separated symbols in plain capital letters; omitted
+longs are named without counting as failures. Plan-only still reads and plans every long under every
+row, with an extra line for each omitted long. With no list the run is unchanged. `--cancel` cancels the
+open stops of the protect lineage, every one or one symbol's, and nothing
 else (`cancel_stops`): the way a stop that holds a long's shares is taken off before that long is sold.
 
 Contracts, read 2026-11-12:
@@ -44,7 +47,13 @@ Contracts, read 2026-11-12:
   `price_step.entry_price` of the ask at the Mover's `entry_ticks`, as `_buy` prices
   one. The ATR is NautilusTrader's `AverageTrueRange` at the pin `d53849b216e2`, fed by `update_raw(high,
   low, close)`, which is what its `handle_bar` calls (`crates/indicators/src/volatility/atr.rs:84-86`),
-  on alpaca-py's complete minute bars of the last `ATR_LOOKBACK`.
+  on the last `atr_n` complete minute bars that exist in the session day (`session_bars`), its period
+  their count when fewer exist (`warm_atr`). With no usable spread an ATR row's ATR distance stands
+  alone inside its cap arm (`_atr_alone`); the fixed trail is a fallback only for a symbol with no bar
+  in its session day, or with no spread and a flat session day (the lead's two kinds, 2026-11-13
+  18:17), each named in its line and counted (`ProtectReport.fallbacks`, `.flat_fallbacks`). `distance_for` is the
+  same distance from bars and a touch the caller holds, with no I/O, so a node's protector sends this
+  one distance and not a second (U-h, the lead's order of 2026-11-13).
 
 The run. It reads Alpaca's clock first and nothing else unless the regular session is open (`is_open`, as
 `custody._part` reads it) with at least `CLOSE_MARGIN` left to its close: a stop Alpaca holds works only
@@ -78,6 +87,9 @@ the run has taken since. Each line is
 printed as it happens, so a run that is stopped has already named what it sent; the task's stop signal
 ends it as a failure by name (`custody._stop`). Exit 0 when each long is covered, 1 when a read or a send
 failed or the run was stopped, 2 when a long is left uncovered by name, 3 when the run was refused by name.
+With `--only` the 0 and the 2 speak of the NAMED symbols alone: a long that was not named is left as it
+was found, covered or not, and is no failure, and a named symbol that holds no long is a 2. A position
+that cannot be read is an ALERT and a 2 whether it was named or not: what it is, is not known.
 
 A stop that rests holds its shares: Alpaca refuses another sell of them until the stop is canceled, the
 holder's own included. `--cancel` (`cancel_stops`) cancels the open stops of the protect lineage, every one
@@ -98,6 +110,7 @@ from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
 from dataclasses import field
+from dataclasses import replace
 from datetime import UTC
 from datetime import datetime
 from datetime import timedelta
@@ -111,6 +124,7 @@ from typing import TYPE_CHECKING
 from typing import Any
 from uuid import uuid4
 
+from alpaca.common.enums import Sort
 from alpaca.common.exceptions import APIError
 from alpaca.data.enums import DataFeed
 from alpaca.data.models import BarSet
@@ -155,10 +169,13 @@ from .custody import _value
 from .custody import describe
 from .custody import lineage
 from .custody import open_orders
+from .movers_rank import DAY_START
 from .price_step import entry_price
 from .price_step import tick
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from alpaca.trading.client import TradingClient
 
 __all__ = [
@@ -173,9 +190,13 @@ __all__ = [
 FEED = DataFeed.SIP
 """The quote and bars the distance is planned on: sip, the consolidated NBBO the spread floor is measured
 on (the lead, 2026-11-12: the third paper account runs on sip or not at all)."""
-ATR_LOOKBACK = timedelta(minutes=60)
-"""How far back the minute bars that warm the ATR are read; fewer than `atr_n` complete minutes in it
-leave the ATR cold, and the Mover's planning then names its fixed fallback. UNCALIBRATED."""
+SESSION_DAY_OPENS = DAY_START
+"""Where a session day's minute bars begin, New York wall clock: `movers_rank.DAY_START`, where sip's
+extended hours begin, the convention `session_window` reads the current day's history by too. A
+symbol's ATR is warmed on the last bars that exist since then, not on the last minutes by the clock, so
+a thin name after hours is planned on its own bars (U-h, the lead's order of 2026-11-13). The Mover's
+own warm-up counts only the session part open now (`Mover._warm_atr`); the lead's order names the
+session day, so a range here may span a part's seam."""
 ROWS = session_window.TRAIL_ARMS
 """The rows a stop's distance may be planned on: the Mover's registered trail arms, read from the registry
 a window uses and never a figure of this task's own (the lead's ruling, 2026-11-13). F2 is the fixed
@@ -194,6 +215,9 @@ def planner_config(row: str) -> mover.MoverConfig:
 
 PLANNER = planner_config(session_window.DEFAULT_ARM)
 """The rows the planning shares whatever the trail row: `atr_n`, `entry_ticks`, `spread_floor_m`."""
+ATR_BARS = PLANNER.atr_n + 1
+"""The most bars an ATR is warmed on: `atr_n` + 1, as `Mover._warm_atr` feeds, so each of the `atr_n`
+ranges has a previous close."""
 SEND_MARGIN = timedelta(seconds=math.ceil(CONNECT_TIMEOUT_SECS + READ_TIMEOUT_SECS))
 """The least time left to the close for one stop to be sent: the most one submit may take, the paper
 client's own (connect, read) timeout (`session_window.paper_trading` mounts `providers.with_http_timeout`,
@@ -237,6 +261,31 @@ page does not describe, is undecided until a paper answer shows it, so it fails 
 REFUSED = 3
 
 
+def _plain(symbol: str) -> bool:
+    """A symbol this task takes by name: plain capital letters (no class share with a dot)."""
+    return symbol.isascii() and symbol.isalpha() and symbol.isupper()
+
+
+def _only_symbols(only: str) -> tuple[str, ...] | None:
+    """The send's include list from the task's text, or None for an absent flag (the empty text the
+    task hands over when `--only` was not passed). An invalid list is never repaired."""
+    if not isinstance(only, str):
+        raise TypeError("--only is not text")
+    if only == "":
+        return None
+    symbols = only.split(",")
+    seen: set[str] = set()
+    for symbol in symbols:
+        if not symbol:
+            raise ValueError("--only has an empty symbol")
+        if not _plain(symbol):
+            raise ValueError(f"--only symbol {symbol!r} is not plain capital letters")
+        if symbol in seen:
+            raise ValueError(f"--only names {symbol!r} twice")
+        seen.add(symbol)
+    return tuple(symbols)
+
+
 @dataclass
 class ProtectReport:
     """What the run found and did, by name. Each line is handed to `say` as it happens, when the run is
@@ -250,6 +299,11 @@ class ProtectReport:
     failed: list[str] = field(default_factory=list)
     said: list[str] = field(default_factory=list)
     say: Callable[[str], None] | None = None
+    fallbacks: int = 0
+    """Stops sent on the fixed fallback for a symbol with no bar in its session day."""
+    flat_fallbacks: int = 0
+    """Stops sent on the fixed fallback for a symbol with no usable spread whose session day's bars
+    show no range (the lead's second kind, 2026-11-13 18:17). Each of both is named in its line."""
 
     @property
     def exit_code(self) -> int:
@@ -272,7 +326,21 @@ class ProtectReport:
         if self.refused:
             return [f"refused: {self.refused}"]
         found = self.sent or self.planned or self.left_alone or self.unprotected or self.failed
-        return [*self.said, *([] if found else ["no long held"])]
+        counted = [
+            line
+            for n, line in (
+                (
+                    self.fallbacks,
+                    f"fixed fallback: {self.fallbacks} sent with no history in the session day",
+                ),
+                (
+                    self.flat_fallbacks,
+                    f"fixed fallback: {self.flat_fallbacks} sent with no spread on a flat session day",
+                ),
+            )
+            if n
+        ]
+        return [*self.said, *([] if found else ["no long held"]), *counted]
 
 
 def _remaining(order: Order) -> Decimal | None:
@@ -291,7 +359,8 @@ class Distance:
 
     price: Decimal
     plan: mover.TrailPlan
-    floor: Decimal
+    floor: Decimal | None
+    """The spread floor in dollars; None with no usable spread."""
     quote_age: timedelta
     distance: Decimal
     """What is sent: the Mover's distance, or Alpaca's smallest trail where that is the larger."""
@@ -299,6 +368,13 @@ class Distance:
     """The Mover's own distance, before Alpaca's smallest trail."""
     row: str = ""
     bid: Decimal = Decimal(0)
+    bars: int = 0
+    """The complete one-minute bars of the session day the ATR was warmed on, up to `atr_n`."""
+    fallback: bool = False
+    """The fixed fallback, taken only for a symbol with no bar in its session day, or with no spread
+    and a flat session day (`flat`); counted in the report."""
+    flat: bool = False
+    """The fallback's second kind: no usable spread and bars that show no range."""
 
     def source(self) -> str:
         plan = self.plan
@@ -316,6 +392,11 @@ class Distance:
             )
         )
         opens = f"the bid {self.bid} less the distance; Alpaca sets it from its own mark"
+        at = (
+            f"stop opens about {self.bid - self.distance} ({opens})"
+            if self.bid > 0
+            else "no bid, so the stop opens where Alpaca's own mark less the distance puts it"
+        )
         share = self.distance / self.price
         stepped = (
             f"{share:.4%} of {self.price}, over the {mover.TRAIL_CAP} cap by the price step"
@@ -325,12 +406,16 @@ class Distance:
         parts = [
             f"row {self.row}",
             stepped,
-            f"stop opens about {self.bid - self.distance} ({opens})",
+            at,
             bound,
             f"trail {plan.trail:.6f} of entry {self.price}",
             f"spread {plan.spread}",
-            f"floor {self.floor} ({PLANNER.spread_floor_m} spreads)",
-            f"ATR {'cold' if plan.atr is None else f'{plan.atr:.6f}'}",
+            "no spread floor"
+            if self.floor is None
+            else f"floor {self.floor} ({PLANNER.spread_floor_m} spreads)",
+            "ATR cold, no bar in the session day"
+            if plan.atr is None
+            else f"ATR over {self.bars} bars {plan.atr:.6f}",
             f"quote {max(self.quote_age.total_seconds(), 0.0):.0f} s old",
         ]
         if plan.source:
@@ -353,7 +438,8 @@ class Book:
 
     bid: Decimal
     ask: Decimal
-    atr: AverageTrueRange
+    atr: AverageTrueRange | None
+    """Warmed on `bars` bars; None when the session day has none."""
     age: timedelta
     read_at: float
     """`monotonic()` when the quote was read: its age is counted again just before the send."""
@@ -362,10 +448,72 @@ class Book:
         """The quote's age now: its age when read plus the time since."""
         return self.age + timedelta(seconds=monotonic() - self.read_at)
 
+    bars: int = 0
+
+
+def session_start(now: datetime) -> datetime:
+    """The start of `now`'s session day: the latest `SESSION_DAY_OPENS` in New York at or before it."""
+    here = now.astimezone(session_window.NEW_YORK)
+    opens = datetime.combine(here.date(), SESSION_DAY_OPENS, session_window.NEW_YORK)
+    if here < opens:
+        opens = datetime.combine(
+            here.date() - timedelta(days=1), SESSION_DAY_OPENS, session_window.NEW_YORK
+        )
+    return opens.astimezone(UTC)
+
+
+def session_bars(data: Any, symbol: str, now: datetime) -> list[Any]:
+    """`symbol`'s last `ATR_BARS` complete one-minute `FEED` bars that exist in `now`'s session day,
+    oldest first: the bars a distance is planned on whatever the clock says of the last hour. One
+    request by alpaca-py 0.45.0's `get_stock_bars`, newest first and limited (`BaseBarsRequest`'s
+    `sort` and `limit`, `data/requests.py:65-99`), one over `ATR_BARS` for a minute still open, so a
+    long day is not paged through while the quote ages. `TypeError` for raw data."""
+    found = data.get_stock_bars(
+        StockBarsRequest(
+            symbol_or_symbols=symbol,
+            timeframe=TimeFrame.Minute,
+            start=session_start(now),
+            end=now,
+            feed=FEED,
+            sort=Sort.DESC,
+            limit=ATR_BARS + 1,
+        )
+    )
+    if not isinstance(found, BarSet):
+        raise TypeError("alpaca-py returned raw bar data; the client must use raw_data=False")
+    complete = [
+        bar
+        for bar in sorted(found.data.get(symbol, []), key=lambda b: b.timestamp)
+        if bar.timestamp + timedelta(minutes=1) <= now
+    ]
+    return complete[-ATR_BARS:]
+
+
+def _sound(bar: Any) -> bool:
+    """A bar `update_raw` takes: finite, high over low, close between them; it skips any other
+    (`crates/indicators/src/volatility/atr.rs:143-151`), which would leave an ATR sized to it cold."""
+    high, low, close = float(bar.high), float(bar.low), float(bar.close)
+    return all(map(math.isfinite, (high, low, close))) and low <= close <= high
+
+
+def warm_atr(bars: Sequence[Any]) -> AverageTrueRange | None:
+    """NautilusTrader's `AverageTrueRange` over the last `ATR_BARS` sound `bars` (anything with `high`,
+    `low`, `close`, oldest first; `Price` or float), fed by `update_raw`, as its `handle_bar` does
+    (module header). Its period is `atr_n`, or the bars' count when fewer exist, so fewer bars still
+    give the symbol's own ATR, named by its count in the line (the lead's reading of U-h,
+    2026-11-13); it is initialized after exactly that many. None for no sound bar."""
+    used = [bar for bar in bars if _sound(bar)][-ATR_BARS:]
+    if not used:
+        return None
+    atr = AverageTrueRange(min(PLANNER.atr_n, len(used)))
+    for bar in used:
+        atr.update_raw(float(bar.high), float(bar.low), float(bar.close))
+    return atr
+
 
 def read_book(data: Any, symbol: str, now: datetime) -> Book:
-    """`symbol`'s latest quote and its ATR warmed on the complete minute bars of the last `ATR_LOOKBACK`:
-    `ValueError` or `TypeError` naming why there is none."""
+    """`symbol`'s latest quote and its ATR warmed on its session day's last bars (`session_bars`,
+    `warm_atr`): `ValueError` or `TypeError` naming why there is none."""
     asked = monotonic()
     found = data.get_stock_latest_quote(
         StockLatestQuoteRequest(symbol_or_symbols=symbol, feed=FEED)
@@ -387,22 +535,12 @@ def read_book(data: Any, symbol: str, now: datetime) -> Book:
     ask = Decimal(str(getattr(quote, "ask_price", None) or 0))
     if ask <= 0:
         raise ValueError(f"the latest {FEED.value} quote has no ask ({ask})")
-    bars = data.get_stock_bars(
-        StockBarsRequest(
-            symbol_or_symbols=symbol,
-            timeframe=TimeFrame.Minute,
-            start=now - ATR_LOOKBACK,
-            end=now,
-            feed=FEED,
-        )
-    )
-    if not isinstance(bars, BarSet):
-        raise TypeError("alpaca-py returned raw bar data; the client must use raw_data=False")
-    atr = AverageTrueRange(PLANNER.atr_n)
-    for bar in sorted(bars.data.get(symbol, []), key=lambda b: b.timestamp):
-        if bar.timestamp + timedelta(minutes=1) <= now:  # complete minutes only
-            atr.update_raw(bar.high, bar.low, bar.close)
-    return Book(bid, ask, atr, age, read_at)
+    return _book(bid, ask, session_bars(data, symbol, now), age, read_at)
+
+
+def _book(bid: Decimal, ask: Decimal, bars: Sequence[Any], age: timedelta, read_at: float) -> Book:
+    atr = warm_atr(bars)
+    return Book(bid, ask, atr, age, read_at, 0 if atr is None else atr.count)
 
 
 def row_distance(
@@ -411,7 +549,11 @@ def row_distance(
     """`symbol`'s trailing distance in dollars under `row`, by the Mover's planning (module header),
     never under the spread floor or Alpaca's smallest trail (`venue_smallest`): `ValueError` naming why
     there is none. An own-cap holding keeps its distance up to `sizing.DISTANCE_CEILING`; the entry
-    cap still applies to the other cap arms."""
+    cap still applies to the other cap arms. With no usable spread an ATR row's ATR distance stands
+    alone, with no floor, inside its cap arm (`_atr_alone`); the fixed trail is a fallback only for a
+    symbol with no sound bar in its session day, or whose bars show no range where no spread is
+    quoted, and `Distance.fallback` names it (U-h). The fixed row with no usable spread is sent with
+    no spread floor, named."""
     bid, ask = book.bid, book.ask
     instrument_id = InstrumentId.from_str(f"{symbol}.ALPACA")
     slot = mover.Slot(
@@ -424,12 +566,33 @@ def row_distance(
     price = entry_price(ask, PLANNER.entry_ticks)
     touch = SimpleNamespace(bid_price=Price.from_str(str(bid)), ask_price=Price.from_str(str(ask)))
     plan = planner._entry_trail(slot, price, touch, found_holding=True)
+    fixed_row = planner.settings.trail_mode == "fixed"
+    atr = None if book.atr is None else Decimal(str(book.atr.value))
+    no_range = atr is not None and atr <= 0
+    fallback = not fixed_row and (atr is None or (no_range and plan.spread is None))
     if plan.spread is None:
-        raise ValueError(
-            f"no usable {FEED.value} spread (bid {bid}, ask {ask}), so the spread floor is not known"
+        floor = Decimal(0)
+        unusable = f"no usable {FEED.value} spread (bid {bid}, ask {ask})"
+        if fixed_row or fallback:
+            plan = replace(plan, note=f"{unusable}: no spread floor")
+        else:
+            assert atr is not None
+            plan = _atr_alone(planner, atr, price, unusable)
+    else:
+        # with a usable spread its floor is held for every row here, the fixed row included
+        floor = PLANNER.spread_floor_m * plan.spread / price if plan.floor is None else plan.floor
+    if fallback:
+        plan = replace(
+            plan,
+            note=(
+                "no history in the session day"
+                if atr is None
+                else "the session day's bars show no range"
+            )
+            + ": fixed fallback"
+            + (", raised to the spread floor" if plan.bound == "spread floor" else "")
+            + ("" if plan.spread is not None else f"; {plan.note}"),
         )
-    # the fixed row carries no floor of its own; the spread floor is held for every row here
-    floor = PLANNER.spread_floor_m * plan.spread / price if plan.floor is None else plan.floor
     own = planner.settings.trail_cap == "own"
     if own and plan.trail > sizing.DISTANCE_CEILING:
         raise ValueError(
@@ -450,8 +613,66 @@ def row_distance(
             f"Alpaca's smallest trail) is over the {sizing.DISTANCE_CEILING} ceiling at {price}"
         )
     return sent, Distance(
-        price, plan, PLANNER.spread_floor_m * plan.spread, book.age, sent, distance, row, bid
+        price,
+        plan,
+        None if plan.spread is None else PLANNER.spread_floor_m * plan.spread,
+        book.age,
+        sent,
+        distance,
+        row,
+        bid,
+        book.bars,
+        fallback,
+        fallback and atr is not None,
     )
+
+
+def _atr_alone(
+    planner: mover.Mover, atr: Decimal, price: Decimal, unusable: str
+) -> mover.TrailPlan:
+    """An ATR row's plan with no usable spread: `atr_k` ATRs of `price`, with no spread floor, never
+    under Alpaca's smallest trail (`VENUE_SMALLEST`, which the send raises a distance to anyway), inside
+    the row's cap arm as the Mover's planning holds it (`clamp` to its cap, `refuse` over it; `own`
+    keeps it, and `row_distance` enforces the found holding's ceiling). The chase and exit fractions
+    follow the Mover's own (`_entry_trail`: a quarter of the trail through, a chase no shallower than
+    the row's)."""
+    settings = planner.settings
+    measure = settings.atr_k * atr / price
+    trail, bound = measure, "atr"
+    if trail < VENUE_SMALLEST:
+        trail, bound = VENUE_SMALLEST, "Alpaca's smallest trail"
+    if trail > mover.TRAIL_CAP and settings.trail_cap == "clamp":
+        trail, bound = mover.TRAIL_CAP, "0.02 cap"
+    if trail > mover.TRAIL_CAP and settings.trail_cap == "refuse":
+        raise ValueError(
+            f"the trail {trail} (atr) is over the 0.02 cap; refused (trail_cap refuse)"
+        )
+    return mover.TrailPlan(
+        trail=trail,
+        exit_through=trail / 4,
+        chase_cap=max(trail, settings.chase_cap),
+        atr=atr,
+        spread=None,
+        bound=bound,
+        note=f"{unusable}: the ATR stands alone, with no spread floor",
+        measure=measure,
+    )
+
+
+def distance_for(
+    symbol: str,
+    row: str,
+    bid: Decimal,
+    ask: Decimal,
+    bars: Sequence[Any],
+    planner: mover.Mover | None = None,
+) -> tuple[Decimal, Distance]:
+    """One symbol's distance under one row from what the caller already holds: the touch (`bid`, `ask`)
+    and the session day's bars (`session_bars`, or a node's own, oldest first, each with `high`, `low`
+    and `close`). No I/O: the one distance this task and a node's protector both send (U-h).
+    `ValueError` naming why there is none; `Distance.fallback` when the fixed fallback was taken."""
+    book = _book(bid, ask, bars, timedelta(0), monotonic())
+    return row_distance(book, symbol, row, planner or mover.Mover(planner_config(row)))
 
 
 def plan_distance(
@@ -472,11 +693,13 @@ class _Protect:
         say: Callable[[str], None] | None = None,
         plan_only: bool = False,
         row: str | None = None,
+        only: tuple[str, ...] | None = None,
     ) -> None:
         self.trading = trading
         self.data = data
         self.plan_only = plan_only
         self.row = row
+        self.only = only
         self.planners: dict[str, mover.Mover] = {}
         self.began = 0.0
         """`monotonic()` just before the clock is asked: a later symbol is planned at the clock's time
@@ -490,6 +713,11 @@ class _Protect:
 
     def run(self) -> ProtectReport:
         report = self.report
+        selected = self.only
+        if selected is not None and not selected:
+            # No list is None. An empty list is a caller's mistake, never "every long".
+            report.refused = "the include list names no symbol; nothing was read or sent"
+            return report
         names = ", ".join(ROWS)
         if self.row is not None and self.row not in ROWS:
             report.refused = f"no registered row named {self.row!r}: the rows are {names}; nothing was read or sent"
@@ -538,7 +766,16 @@ class _Protect:
                 "account: no_shorting false, so a sell here could open a short: each stop is marked "
                 "sell_to_close and sent only for shares Alpaca shows held and free in the send step",
             )
-        held = _read("the positions", lambda: session_window.positions(self.trading), dict)
+        held, unread = _read(
+            "the positions", lambda: session_window.position_reads(self.trading), tuple
+        )
+        # One position that cannot be read is skipped by name and every other long is still covered
+        # (the lead, 2026-11-13 21:27); it is unprotected, so the run does not exit 0.
+        for symbol, why in sorted(unread.items()):
+            report.note(
+                report.unprotected,
+                f"ALERT {symbol}: {why}, so it gets no stop; skipped, nothing sent for it",
+            )
         orders = open_orders(self.trading)
         if len(orders) >= ORDERS_PAGE_LIMIT:
             report.refused = (
@@ -556,6 +793,14 @@ class _Protect:
                 )
             if qty <= 0:
                 continue
+            if selected is not None and symbol not in selected:
+                if self.plan_only:
+                    report.note(
+                        None, f"{symbol}: not named: a send with --only would send no stop for it"
+                    )
+                else:
+                    report.note(report.left_alone, f"{symbol}: not named: no stop sent")
+                    continue
             rest = self._uncovered(symbol, qty, orders)
             if rest is None:
                 continue
@@ -563,6 +808,15 @@ class _Protect:
             n += 1
             at = now + timedelta(seconds=monotonic() - self.began)
             self._protect(symbol, whole, qty, ours, at, n)
+        for symbol in selected or ():
+            # A named symbol that could not be read has its ALERT above: what it holds is not known,
+            # so it is not also said to hold no long.
+            if symbol not in unread and held.get(symbol, 0) <= 0:
+                # A name typed wrong would otherwise read as done (as `cancel_stops` holds for its
+                # symbol): it is said in a plan-only run too, and the run is not a success.
+                report.note(
+                    report.unprotected, f"{symbol}: named in --only, no long held: no stop sent"
+                )
         return report
 
     def _uncovered(
@@ -848,6 +1102,8 @@ class _Protect:
                 "is not sent again (mise run paper:account)",
             )
             return
+        report.fallbacks += plan.fallback and not plan.flat
+        report.flat_fallbacks += plan.flat
         report.note(report.sent, f"sent {symbol}: {said}: answered {answered}")
 
 
@@ -857,12 +1113,15 @@ def protect_longs(
     say: Callable[[str], None] | None = None,
     plan_only: bool = False,
     row: str | None = None,
+    only: tuple[str, ...] | None = None,
 ) -> ProtectReport:
     """The run (module header). `data` is an alpaca-py `StockHistoricalDataClient`, or a callable that
     builds one; it is asked only once a long needs a stop. `say` is given each line as it happens.
     `plan_only` makes every read of a sending run and names what each stop would be under every
-    registered row, and sends none. A run that sends names its `row` (`ROWS`); there is no default."""
-    run = _Protect(trading, data, say, plan_only, row)
+    registered row, and sends none. A run that sends names its `row` (`ROWS`); there is no default.
+    `only`, when given, is the include list: it removes sends, never plan-only reads, and an empty one
+    is refused."""
+    run = _Protect(trading, data, say, plan_only, row, only)
     try:
         return run.run()
     except Exception as e:  # noqa: BLE001 - named, with what was sent before it, and exits 1
@@ -1119,6 +1378,7 @@ def task_from_flags(
     row: str,
     cancel: str = "false",
     symbol: str = "",
+    only: str = "",
     trading: TradingClient | None = None,
     data: Any = None,
     pause: Callable[[float], None] = sleep,
@@ -1127,11 +1387,21 @@ def task_from_flags(
     exactly `true` or `false` (mise gives a passed switch `true`, and the task gives `false` for one not
     passed), and anything else is refused by name with nothing read, so a value not known here never
     becomes a send or a cancel. The row is a registered name, or empty for none. A cancel takes no row,
-    and only a cancel takes a symbol, which is plain capital letters."""
+    and only a cancel takes `symbol`, which is plain capital letters. A send's optional `only` is a
+    comma-separated list of distinct symbols in plain capital letters; it cannot accompany a cancel
+    or its symbol flag."""
     for name, value in (("plan-only", plan_only), ("cancel", cancel)):
         if value not in ("true", "false"):
             return _refuse(f"{name} reads {value!r}, which is neither true nor false")
-    if symbol and not (symbol.isascii() and symbol.isalpha() and symbol.isupper()):
+    try:
+        selected = _only_symbols(only)
+    except (TypeError, ValueError) as e:
+        return _refuse(str(e))
+    if only and cancel == "true":
+        return _refuse("--only cannot be used with --cancel")
+    if only and symbol:
+        return _refuse("--only cannot be used with --symbol; that flag belongs to --cancel")
+    if symbol and not _plain(symbol):
         return _refuse(f"the symbol {symbol!r} is not plain capital letters")
     if cancel == "true":
         if row:
@@ -1139,7 +1409,7 @@ def task_from_flags(
         return cancel_task(trading, symbol or None, plan_only == "true", pause)
     if symbol:
         return _refuse("a symbol is named only with --cancel; a send covers every long it finds")
-    return protect_task(trading, data, plan_only == "true", row or None)
+    return protect_task(trading, data, plan_only == "true", row or None, selected)
 
 
 def protect_task(
@@ -1147,6 +1417,7 @@ def protect_task(
     data: Any = None,
     plan_only: bool = False,
     row: str | None = None,
+    only: tuple[str, ...] | None = None,
 ) -> int:
     """`mise run paper:protect tests`: run `protect_longs`, printing each line as it happens; the exit
     code is the report's (module header): a read that fails, or anything else part way, is named and
@@ -1162,7 +1433,9 @@ def protect_task(
                 f"paper:protect: no paper client: {_failure(e)}; nothing was sent", file=sys.stderr
             )
             return 1
-        report = protect_longs(trading, data or session_window.window_data, _say, plan_only, row)
+        report = protect_longs(
+            trading, data or session_window.window_data, _say, plan_only, row, only
+        )
     finally:
         signal.signal(signal.SIGTERM, before)
     if report.refused:

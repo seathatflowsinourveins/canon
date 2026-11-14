@@ -110,12 +110,12 @@
     },
     "antigravity-cli": {
       "default_branch": "main",
-      "default_sha": "3e9fbcc9773e46659f2d21b7ede1ba5906e71eb8",
-      "ref": "refs/tags/1.5.5",
+      "default_sha": "1554cf9fc71ddbcd9e0d176c8f65000612bba3c2",
+      "ref": "refs/tags/1.5.8",
       "repo": "google-antigravity/antigravity-cli",
-      "resolved_at": "2026-11-10T23:35:43Z",
-      "sha": "3e9fbcc9773e46659f2d21b7ede1ba5906e71eb8",
-      "track": "tag:1.5.5"
+      "resolved_at": "2026-11-14T00:27:08Z",
+      "sha": "1554cf9fc71ddbcd9e0d176c8f65000612bba3c2",
+      "track": "tag:1.5.8"
     },
     "arch": {
       "default_branch": "main",
@@ -218,12 +218,12 @@
     },
     "deepseek-harness": {
       "default_branch": "master",
-      "default_sha": "fcc0ad462172522aaf5c93a7b2e01f6b9f0b0159",
-      "ref": "refs/tags/dsh-v0.2.1-rc.3",
+      "default_sha": "39163dd30f703a79079e2d2446545cff3c453738",
+      "ref": "refs/tags/dsh-v0.2.2-rc.2",
       "repo": "deepseek-ai/deepseek-harness",
-      "resolved_at": "2026-11-10T21:34:03Z",
-      "sha": "1f81c047fc48fa190a683e469daa699857e9afe8",
-      "track": "tag:dsh-v0.2.1-rc.3"
+      "resolved_at": "2026-11-14T03:27:08Z",
+      "sha": "ddac96760b6edf8fa0fe17cbdcf0b512f4c12b2c",
+      "track": "tag:dsh-v0.2.2-rc.2"
     },
     "dependabot": {
       "default_branch": "main",
@@ -236,12 +236,12 @@
     },
     "dsh-acp-app": {
       "default_branch": "master",
-      "default_sha": "e8f7b93a344964de3dca1ace9e72b6e4d6de87cb",
-      "ref": "refs/tags/dsh-v0.2.1-rc.3",
+      "default_sha": "39163dd30f703a79079e2d2446545cff3c453738",
+      "ref": "refs/tags/dsh-v0.2.2-rc.2",
       "repo": "deepseek-ai/deepseek-harness",
-      "resolved_at": "2026-11-12T01:13:00Z",
-      "sha": "1f81c047fc48fa190a683e469daa699857e9afe8",
-      "track": "tag:dsh-v0.2.1-rc.3"
+      "resolved_at": "2026-11-14T03:27:08Z",
+      "sha": "ddac96760b6edf8fa0fe17cbdcf0b512f4c12b2c",
+      "track": "tag:dsh-v0.2.2-rc.2"
     },
     "dsh-ci-context": {
       "default_branch": "main",
@@ -263,39 +263,39 @@
     },
     "dsh-experimental-terminal-bundle": {
       "default_branch": "master",
-      "default_sha": "e8f7b93a344964de3dca1ace9e72b6e4d6de87cb",
-      "ref": "refs/tags/dsh-v0.2.1-rc.3",
+      "default_sha": "39163dd30f703a79079e2d2446545cff3c453738",
+      "ref": "refs/tags/dsh-v0.2.2-rc.2",
       "repo": "deepseek-ai/deepseek-harness",
-      "resolved_at": "2026-11-12T01:23:32Z",
-      "sha": "1f81c047fc48fa190a683e469daa699857e9afe8",
-      "track": "tag:dsh-v0.2.1-rc.3"
+      "resolved_at": "2026-11-14T03:27:08Z",
+      "sha": "ddac96760b6edf8fa0fe17cbdcf0b512f4c12b2c",
+      "track": "tag:dsh-v0.2.2-rc.2"
     },
     "dsh-subagent-claude-code": {
       "default_branch": "master",
-      "default_sha": "e8f7b93a344964de3dca1ace9e72b6e4d6de87cb",
-      "ref": "refs/tags/dsh-v0.2.1-rc.3",
+      "default_sha": "39163dd30f703a79079e2d2446545cff3c453738",
+      "ref": "refs/tags/dsh-v0.2.2-rc.2",
       "repo": "deepseek-ai/deepseek-harness",
-      "resolved_at": "2026-11-12T02:33:11Z",
-      "sha": "1f81c047fc48fa190a683e469daa699857e9afe8",
-      "track": "tag:dsh-v0.2.1-rc.3"
+      "resolved_at": "2026-11-14T03:27:09Z",
+      "sha": "ddac96760b6edf8fa0fe17cbdcf0b512f4c12b2c",
+      "track": "tag:dsh-v0.2.2-rc.2"
     },
     "dsh-subagent-codex": {
       "default_branch": "master",
-      "default_sha": "e8f7b93a344964de3dca1ace9e72b6e4d6de87cb",
-      "ref": "refs/tags/dsh-v0.2.1-rc.3",
+      "default_sha": "39163dd30f703a79079e2d2446545cff3c453738",
+      "ref": "refs/tags/dsh-v0.2.2-rc.2",
       "repo": "deepseek-ai/deepseek-harness",
-      "resolved_at": "2026-11-12T01:38:39Z",
-      "sha": "1f81c047fc48fa190a683e469daa699857e9afe8",
-      "track": "tag:dsh-v0.2.1-rc.3"
+      "resolved_at": "2026-11-14T03:27:08Z",
+      "sha": "ddac96760b6edf8fa0fe17cbdcf0b512f4c12b2c",
+      "track": "tag:dsh-v0.2.2-rc.2"
     },
     "dsh-tui": {
       "default_branch": "main",
-      "default_sha": "de73c6f3e5fa8c5b98b7fc87907395f5832c8aa3",
-      "ref": "refs/tags/v0.17.0",
+      "default_sha": "8958f08e3ba09a3db37d35c490d9589c114e7136",
+      "ref": "refs/tags/v0.20.0",
       "repo": "ccch1mneyyy/dsh-TUI",
-      "resolved_at": "2026-11-10T21:34:03Z",
-      "sha": "103834cb1000a84569a71646fec7162f18a058c8",
-      "track": "tag:v0.17.0"
+      "resolved_at": "2026-11-14T03:27:08Z",
+      "sha": "8958f08e3ba09a3db37d35c490d9589c114e7136",
+      "track": "tag:v0.20.0"
     },
     "edgartools": {
       "default_branch": "main",

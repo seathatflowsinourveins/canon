@@ -1,0 +1,1 @@
+| `OVERNIGHT_HISTORY_DELAY` | 15 minutes: the Mover's overnight warm-up asks the `boats` feed for history ending at least this long before now | UNCALIBRATED | Alpaca's 24/5 trading page, as `mover.py` cites it | 2026-11-13 |

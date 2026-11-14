@@ -14,6 +14,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 import tomllib
 from dataclasses import asdict
@@ -977,6 +978,9 @@ def test_the_records_folder_is_refused_on_macos_when_getconf_does_not_give_it(
     """On macOS the records go to the per-user folder `getconf DARWIN_USER_TEMP_DIR` names, whatever
     `$TMPDIR` says; one `getconf` does not give is refused by name, not swapped for `$TMPDIR`'s, where the
     gap marker and `scripts/automation status` would not look. Sweep reading by DeepSeek Harness."""
+    monkeypatch.delenv(
+        session_window.PAPER_DIR_ENV
+    )  # the suite's own folder; read the lookup itself
     monkeypatch.setattr(session_window.sys, "platform", "darwin")
     monkeypatch.setenv("TMPDIR", str(tmp_path))
     session_window.tempfile.tempdir = None  # `gettempdir` caches; read `$TMPDIR` again
@@ -988,9 +992,44 @@ def test_the_records_folder_is_refused_on_macos_when_getconf_does_not_give_it(
         session_window.tempfile.tempdir = None
 
 
+def _real_paper_records() -> Path:
+    """The real per-user records folder, read the way the runner and `scripts/automation` find it,
+    without `session_window`."""
+    if sys.platform != "darwin":
+        return Path(tempfile.gettempdir()) / "canon-paper-session"
+    found = subprocess.run(
+        ["/usr/bin/getconf", "DARWIN_USER_TEMP_DIR"], capture_output=True, text=True, check=True
+    ).stdout.strip()
+    return Path(found) / "canon-paper-session"
+
+
+def test_no_test_resolves_the_real_paper_records_folder() -> None:
+    """With nothing set by the test, the records folder a window would default to is the suite's own,
+    not the real one: a test that forgets `--log-dir` cannot write the real heartbeat or record."""
+    assert os.environ.get(session_window.PAPER_DIR_ENV), (
+        "the suite's guard sets no folder of its own"
+    )
+    real = _real_paper_records().resolve()
+    used = session_window.default_log_dir().resolve()
+    assert used != real and real not in used.parents, used
+    args = session_window._args(["--session", "extended", "--mover"])
+    assert args.log_dir.resolve() != real and real not in args.log_dir.resolve().parents
+
+
+def test_the_records_folder_is_the_one_the_status_reader_is_given(monkeypatch, tmp_path) -> None:
+    """`CANON_PAPER_SESSION_DIR`, which `scripts/automation status` reads for the records folder, names
+    the folder a window writes in too; a relative one is refused by name."""
+    monkeypatch.setenv(session_window.PAPER_DIR_ENV, str(tmp_path / "records"))
+    assert session_window.default_log_dir() == tmp_path / "records"
+    monkeypatch.setenv(session_window.PAPER_DIR_ENV, "relative/records")
+    with pytest.raises(RuntimeError, match=session_window.PAPER_DIR_ENV):
+        session_window.default_log_dir()
+
+
 def test_elsewhere_than_macos_the_records_folder_is_the_systems_temporary_one(
     monkeypatch, tmp_path
 ) -> None:
+    monkeypatch.delenv(session_window.PAPER_DIR_ENV)
     monkeypatch.setattr(session_window.sys, "platform", "linux")
     monkeypatch.setenv("TMPDIR", str(tmp_path))
     session_window.tempfile.tempdir = None
@@ -1021,6 +1060,7 @@ def test_a_run_whose_records_folder_cannot_be_found_says_so_and_exits_1(
     monkeypatch, tmp_path, capsys
 ) -> None:
     """Refused before anything reads Alpaca or writes a record."""
+    monkeypatch.delenv(session_window.PAPER_DIR_ENV)
     monkeypatch.setattr(session_window.sys, "platform", "darwin")
     monkeypatch.setenv("TMPDIR", str(tmp_path))
     monkeypatch.setenv(session_window.COMMIT_ENV, "test")
@@ -6665,6 +6705,141 @@ def held_position(symbol: str, qty: int) -> Position:
     )
 
 
+def listed_position(symbol: str, qty: str, side: str, qty_available: str | None = None) -> Position:
+    """A position as Alpaca might list it, with its quantity and side set apart (alpaca-py's `Position`
+    takes `qty` as text and `side` as its own field, so the two can disagree)."""
+    return Position(
+        asset_id=uuid4(),
+        symbol=symbol,
+        exchange="NASDAQ",
+        asset_class="us_equity",
+        avg_entry_price="100",
+        qty=qty,
+        side=side,
+        cost_basis="100",
+        qty_available=qty_available,
+    )
+
+
+class Listing(Account):
+    """An account whose positions are the ones given, as listed."""
+
+    def __init__(self, *listed: Position) -> None:
+        super().__init__()
+        self.listed = list(listed)
+
+    def get_all_positions(self) -> list:
+        return self.listed
+
+
+@pytest.mark.parametrize(
+    ("qty", "side", "held"),
+    [
+        pytest.param("5", "long", Decimal(5), id="long"),
+        pytest.param("-5", "short", Decimal(-5), id="short"),
+        pytest.param("-5", "long", Decimal(-5), id="below-zero-labelled-long"),
+        pytest.param("5", "short", Decimal(-5), id="above-zero-labelled-short"),
+    ],
+)
+def test_positions_reads_each_quantity_by_custodys_one_rule(qty, side, held) -> None:
+    """`positions` took the quantity's sign off before reading the side, so a quantity below zero labelled
+    long read as a long. Custody's rule (`custody._listed`): a short, by its label or by its sign, is
+    never read as a long."""
+    found = session_window.positions(
+        cast(TradingClient, Listing(listed_position("AAA", qty, side)))
+    )
+    assert found == {"AAA": held}
+
+
+@pytest.mark.parametrize("qty", ["NaN", "Infinity", "-Infinity", "sNaN", "many", ""])
+def test_a_position_quantity_that_is_no_finite_number_stops_the_start_by_name(
+    monkeypatch, tmp_path, qty
+) -> None:
+    """A quantity that is no finite number passed as one (NaN, Infinity), or raised a bare decimal error
+    (no number at all), where custody's rule says what is held there is not known."""
+    trading = cast(TradingClient, Listing(listed_position("AAA", qty, "long")))
+    with pytest.raises(session_window.WindowRefused, match="position in AAA.*not starting"):
+        session_window.positions(trading)
+    monkeypatch.setattr(session_window, "window_node", lambda *a, **k: pytest.fail("built"))
+    with pytest.raises(session_window.WindowRefused, match="position in AAA.*not starting"):
+        session_window.run_window(WindowConfig(log_dir=tmp_path), trading=trading)
+
+
+@pytest.mark.parametrize(
+    ("side", "qty", "available", "readable"),
+    [
+        pytest.param("long", "5", None, True, id="long-absent"),
+        pytest.param("long", "5", "3", True, id="long-count"),
+        pytest.param("long", "5", "-1", False, id="long-below-zero"),
+        pytest.param("long", "5", "many", False, id="long-no-number"),
+        pytest.param("long", "5", "NaN", False, id="long-nan"),
+        pytest.param("short", "-5", "-5", True, id="short-finite"),
+        pytest.param("short", "-5", "Infinity", False, id="short-infinite"),
+    ],
+)
+def test_a_listed_quantity_no_order_holds_is_checked_as_custody_checks_it(
+    side, qty, available, readable
+) -> None:
+    """`qty_available`, as custody reads it: left out it passes; listed it must be a count for a long and
+    a finite number for a short."""
+    trading = cast(TradingClient, Listing(listed_position("AAA", qty, side, available)))
+    if readable:
+        assert session_window.positions(trading) == {"AAA": Decimal(-5 if side == "short" else 5)}
+    else:
+        with pytest.raises(session_window.WindowRefused, match="position in AAA"):
+            session_window.positions(trading)
+
+
+def test_an_unreadable_position_after_the_stop_is_named_and_never_reported_flat(
+    fake_time, tmp_path
+) -> None:
+    """After the stop a window has run, so a quantity that cannot be read is no refusal, which would
+    record that nothing was placed: the check reads each position by itself, names this one in what is
+    left and in its errors, and sends no close on a count it cannot read."""
+    trading = Listing(listed_position("AAA", "NaN", "long"))  # no submit_order: a close would fail
+    report = session_window.WindowReport("regular", "AAA", started="t")
+    left = session_window._flatten_after_stop(
+        cast(TradingClient, trading), WindowConfig(symbol="AAA", log_dir=tmp_path), report
+    )
+    assert any(item.startswith("position in AAA not read:") for item in left), left
+    assert any("position in AAA" in error for error in report.errors)
+
+
+class ListsNoCount(Venue):
+    """The venue, its one position listed with a qty_available custody does not accept for a long."""
+
+    def get_all_positions(self) -> list[Position]:
+        return [p.model_copy(update={"qty_available": "-1"}) for p in super().get_all_positions()]
+
+
+def test_a_fill_then_an_unreadable_listing_is_never_reported_flat_while_held(fake_time) -> None:
+    """The landing review's P1 (2026-11-13): the check updated its orders and requests, then raised on
+    the position, so `held` kept the reading before the fill and the final path reported the account
+    flat while 10 were held. A failed position read never turns a held long into flat, on any path (the
+    lead, 2026-11-13 21:27)."""
+    venue = ListsNoCount(fake_time)
+    venue.order("entry-1", "buy", qty=10, fills=3.0, cancel_after=60.0)
+    left, report = check(venue, {"entry-1": "buy"})
+    assert venue.qty == 10
+    assert any("position in SPY" in error for error in report.errors)
+    assert any(item.startswith("position in SPY not read:") for item in left), left
+    assert not venue.did("close"), "no close is sent on a count that cannot be read"
+
+
+def test_what_was_last_known_held_stays_held_when_a_later_read_fails(fake_time, tmp_path) -> None:
+    """What the check last read held in a symbol stays held there until a reading says otherwise: a
+    later reading that cannot read it keeps that count and names the position."""
+    trading = Listing(listed_position("AAA", "7", "long"))
+    report = session_window.WindowReport("regular", "AAA", started="t")
+    account = session_window._AccountCheck(cast(TradingClient, trading), "AAA", report, {})
+    assert account.read() == ["position of 7 AAA"]
+    trading.listed = [listed_position("AAA", "7", "long", "-1")]
+    left = account.read()
+    assert account.held == {"AAA": Decimal(7)}
+    assert left[0] == "position of 7 AAA"
+    assert left[1].startswith("position in AAA not read:"), left
+
+
 class MultiWindowAccount(Account):
     """An account with independently held symbols and immediate, quantity-checked market fills."""
 
@@ -7635,15 +7810,17 @@ def test_a_refused_mover_window_record_names_its_arm(
 def test_a_profile_flag_is_a_named_trail_and_not_the_default_arm(flags, named, tmp_path) -> None:
     """/code-review high on F-1 rebased onto the ported profile, finding 2, and the Codex range-diff
     reader's P1: a Mover window that named only a profile flag ran OWN1 labelled the default, the
-    named row dropped unsaid, where before it ran the fixed rows. A profile flag given, at its row or
-    away from it, is a named trail: the default arm is not taken, and without Mover the flag is
-    refused like any other trail flag."""
+    named row dropped unsaid. A profile flag given, at its row or away from it, opts out of the
+    default arm; without profile mode it is refused by name, as P9 requires."""
     args = session_window._args(
         ["--session", "extended", "--mover", *flags, "--log-dir", str(tmp_path)]
     )
     assert named in session_window._trail_flags_given(args)
     trail = session_window._mover_trail(args)
     assert (trail["arm"], trail["arm_default"], trail["trail_mode"]) == (None, False, "fixed")
+    args.strategy = "Mover"  # the extended --mover part selected by _main
+    with pytest.raises(ValueError, match=named.split()[0]):
+        session_window.window_config(args, "extended")
     with pytest.raises(SystemExit):
         session_window._args(["--session", "regular", *flags, "--log-dir", str(tmp_path)])
 
@@ -8775,6 +8952,7 @@ def test_the_window_supplies_every_roster_context_and_checks_every_symbol_after_
         strategy.live_bars = 1
         strategy.ranking_records.append({"published": True})
         strategy.opened_slots.add(InstrumentId.from_str("EEE.ALPACA"))
+        seen["strategy"] = strategy
         return (
             SimpleNamespace(cache=SimpleNamespace(orders=lambda **_: []), dispose=lambda: None),
             strategy,
@@ -8816,6 +8994,9 @@ def test_the_window_supplies_every_roster_context_and_checks_every_symbol_after_
     assert report.cap_checks == 5
     assert set(report.mover["position_caps"]) == {"AAA.ALPACA", "BBB.ALPACA"}
     assert report.mover["entry_arm"] == "registered" and report.result == "ok"
+    assert callable(seen["strategy"].context_reader)
+    assert callable(seen["strategy"].context_stop)
+    assert report.mover["run"]["context_request_budget"]["limit_per_minute"] == 150
 
 
 def test_the_outside_scope_bridge_is_named_in_the_window_record(monkeypatch, tmp_path) -> None:
@@ -11234,7 +11415,8 @@ def test_main_records_window_signalled_in_latest_and_heartbeat_before_and_during
     latest = json.loads((rec_dir / "latest.json").read_text())
     heartbeat = json.loads((rec_dir / "last-firing.json").read_text())
     assert latest["result"] == "failed: WindowSignalled: stopped by SIGTERM"
-    assert heartbeat["outcome"] == "failed: WindowSignalled: stopped by SIGTERM"
+    # the arm follows the stop (ADR 0106's follow-up)
+    assert heartbeat["outcome"].startswith("failed: WindowSignalled: stopped by SIGTERM")
 
     sub = tmp_path / "during-node"
     sub.mkdir()
@@ -11261,7 +11443,7 @@ def test_main_records_window_signalled_in_latest_and_heartbeat_before_and_during
     code2 = session_window.main(["--session", "regular", "--log-dir", str(sub)])
     assert code2 == 128 + signal_module.SIGTERM
     heartbeat2 = json.loads((sub_rec / "last-firing.json").read_text())
-    assert heartbeat2["outcome"] == "failed: WindowSignalled: stopped by SIGTERM"
+    assert heartbeat2["outcome"].startswith("failed: WindowSignalled: stopped by SIGTERM")
     # the record is the final one, not the handler's stopping mark (review of the #323 fixes, finding 10)
     latest2 = json.loads((sub_rec / "latest.json").read_text())
     assert latest2["result"].startswith("failed: WindowSignalled")
