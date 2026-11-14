@@ -12,7 +12,7 @@ review-by: 2027-02-12
 Questions about the Parquet we hold (what a catalog root covers, what one day of the market's minute bars
 says, what the run reports add up to) get a script each. Two scout reports of 2026-11-14 converge on an
 embedded engine reading Parquet in place. The lead asked for one engine, DuckDB or Polars, chosen by a
-measurement on our own snapshot: read-only, nanoseconds exact, no pyarrow in the root environment (ADR 0108).
+measurement on our own data: read-only, nanoseconds exact, no pyarrow in the root environment (ADR 0108).
 
 ## Decision Drivers
 
@@ -51,9 +51,13 @@ statement. Polars documents no refusal of any write, in its 22 I/O and lazy user
 DuckDB reads row counts from footers (`parquet_file_metadata`). Polars' footer readers give the schema and,
 experimentally, custom metadata, but no count, so its grid of the whole root would read forbidden rows.
 
-Measured 2026-11-14 on a snapshot of one week of minute bars, about 12,900 instruments (24,767 files,
-349 MB). Each engine and read ran in a fresh process, four rounds in alternating order, not niced, at a
-one-minute load average of 16 to 32. Medians, with each engine's first run in brackets:
+This record measured DuckDB against Polars itself: unlocked the two ran about equal (0.72 s against
+1.00 s for one day's file grid, 0.93 s against 0.95 s for one day's bars) and the read-only lock cost
+DuckDB 1.5 to 2.2 s, with the runs not niced and reading the sim lane's working catalog in place rather than
+a snapshot, so DuckDB was chosen for its lockdown and its footer row counts, not for speed.
+The folder holds one week of minute bars, about 12,900 instruments (24,767 files, 349 MB). Each engine
+and read ran in a fresh process, four rounds in alternating order, at a one-minute load average of 16
+to 32. Medians, with each engine's first run in brackets:
 
 | Read | DuckDB, locked | DuckDB, unlocked | Polars |
 |---|---|---|---|
@@ -62,9 +66,8 @@ one-minute load average of 16 to 32. Medians, with each engine's first run in br
 | One day of the market's minute bars | 2.46 s (2.60), 214 MB | 0.93 s, 221 MB | 0.95 s (1.04), 186 MB |
 | Six run summaries joined to order counts | 0.17 s, 99 MB | 0.16 s, 99 MB | 0.21 s, 93 MB |
 
-All three gave the same digest for each read. Unlocked, DuckDB and Polars run alike; the lock costs 1.5 s
-(bars) to 2.2 s (grid) on 11,938 files, the price of the term. Three runs in the shipped form, with the
-private `temp_directory`, gave 2.92 s and 2.88 s at a load of 32 to 35. The gate's parse is not timed.
+All three gave the same digest for each read. Three runs in the shipped form, with the private
+`temp_directory`, gave 2.92 s and 2.88 s at a load of 32 to 35; the gate's parse is not timed.
 
 The evidence also corrects the brief's premise that a naive read truncates. DuckDB 2.0 reads the columns
 as `TIMESTAMPTZ_NS` at full precision. A cast to `TIMESTAMPTZ` rounds (…123456789 to …123457000), a plain
@@ -101,8 +104,8 @@ Read 2026-11-14.
 * https://github.com/duckdb/duckdb-python/releases/tag/v2.0.0 and https://github.com/duckdb/duckdb/releases/tag/v2.0.0
   — Python ≥ 3.11, results stream, Arrow export moved; engine 2.0.0, Parquet async I/O for local files —
   fetched (gh api); the engine's 844-line list was searched, not read whole.
-* https://pypi.org/pypi/duckdb/2.0.0/json — MIT classifier; no required dependency; pyarrow in `all` — fetched.
-* https://pypi.org/pypi/polars/2.1.0/json — requires `polars-runtime-32==2.1.0` only, pyarrow in extras — fetched.
+* https://pypi.org/pypi/duckdb/2.0.0/json and https://pypi.org/pypi/polars/2.1.0/json — MIT; DuckDB requires
+  nothing (pyarrow in `all`), Polars only `polars-runtime-32==2.1.0` (pyarrow in extras) — fetched.
 * https://github.com/duckdb/duckdb-web/blob/b421c300096722cf2be64d37a35cc5520a3ceb75/docs/2.0/operations_manual/securing_duckdb/overview.md
   — COPY and ATTACH refused (146-147), "can be written to as well as read from" (169), the order and the
   lock (175), defense in depth, not comprehensive (37, 97-102) — fetched.
@@ -125,5 +128,5 @@ Read 2026-11-14.
   load range, the lock's cost and the footer-reader sentence, and added the defense-in-depth caveat.
 * The two scout reports of 2026-11-14 in the lead's archive (outside the repository) — read; their
   ClickHouse, QuestDB, Delta, Iceberg, Lance, cuDF and Sirius lines are `UNVERIFIED` here.
-* The measurement, its scripts and per-run results are outside the repository with the lane's report.
-  The snapshot's schema was probed in a scratch environment before the registry entries existed.
+* The measurement, its scripts and per-run results are outside the repository with the lane's report;
+  the folder's schema was probed in a scratch environment before the registry entries existed.
