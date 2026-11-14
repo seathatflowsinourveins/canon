@@ -205,3 +205,16 @@ def test_unverified_code_identity_cannot_prove_a_fill_model_difference(code):
     replay["mover"]["run"]["fills"][0][3] = "10.12"
     row = next(row for row in compare(record, replay)["rows"] if row["section"] == "entry")
     assert row["cause"] == "unexplained"
+
+
+def test_a_submit_later_in_the_same_minute_is_latency_with_the_fill_model():
+    """Paper submits about a second after the minute it decides on; the replay, with no latency,
+    at the minute. That alone never makes a matched fill unexplained."""
+    from canon_trading.window_parity import compare
+
+    record, replay = pair()
+    record["mover"]["run"]["entries"][0]["submitted_ns"] += 900_000_000
+    replay["mover"]["run"]["fills"][0][3] = "10.12"
+    entry = next(row for row in compare(record, replay)["rows"] if row["section"] == "entry")
+    assert entry["difference"] == ["submit_time", "fill_price"]
+    assert entry["cause"] == "latency and fill model"

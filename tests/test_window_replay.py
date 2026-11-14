@@ -650,3 +650,85 @@ def test_distinct_quotes_on_one_nanosecond_are_kept_and_overlapping_copies_dropp
     assert [int(tick.ask_size) for tick in kept] == [100, 200]
     with pytest.raises(ValueError, match="conflicting catalog quotes"):
         _quotes([roots[0], roots[2]], [str(instrument.id)], at - 1, at + 1)
+
+
+def test_a_reference_root_gives_the_previous_calendar_days_close(alpaca_bars, tmp_path):
+    """A daily bar's ts_init is its next midnight (parse_bar); Tuesday's reference is Monday's."""
+    from datetime import date
+
+    from canon_trading.window_replay import _references
+
+    instrument = alpaca_bars.equity("LLL")
+    root = tmp_path / "daily"
+    root.mkdir()
+    catalog = ParquetDataCatalog(str(root))
+    catalog.write_bars(
+        alpaca_bars.daily(instrument, [7.0, 9.0], first=datetime(2025, 11, 7, tzinfo=NY))
+    )
+    found, unreferenced = _references(
+        {"reference_root": str(root)}, [instrument], date(2025, 11, 11), {instrument.id}
+    )
+    assert found["LLL"].close == 9.0
+    assert found["LLL"].session == date(2025, 11, 10)
+    assert unreferenced == []
+
+
+def test_a_reference_older_than_the_actors_lookback_is_unknown(alpaca_bars):
+    """Paper's actor gives no reference from a bar older than REFERENCE_LOOKBACK_DAYS."""
+    from datetime import date
+
+    from canon_trading.window_replay import _references
+
+    old, other = alpaca_bars.equity("LLL"), alpaca_bars.equity("Z0")
+    spec = {
+        "reference_closes": {
+            "LLL": {"close": 8.0, "session": "2025-10-20"},
+            "Z0": {"close": 8.0, "session": "2025-10-20"},
+        }
+    }
+    found, unreferenced = _references(spec, [old, other], date(2025, 11, 10), set())
+    assert found == {} and unreferenced == ["LLL", "Z0"]
+    with pytest.raises(ValueError, match="no usable prior-session reference for LLL.ALPACA"):
+        _references(spec, [old, other], date(2025, 11, 10), {old.id})
+
+
+def test_a_root_holding_part_of_anothers_quotes_on_one_stamp_agrees(alpaca_bars, tmp_path):
+    from canon_trading.window_replay import _quotes
+
+    instrument = alpaca_bars.equity("LLL")
+    at = ns(START)
+    first, second = quote(instrument, at, 10.0, 10.02, 100), quote(instrument, at, 10.0, 10.02, 200)
+    roots = []
+    for name, ticks in (("a", [first, second]), ("b", [second])):
+        root = tmp_path / name
+        root.mkdir()
+        ParquetDataCatalog(str(root)).write_quote_ticks(ticks, start=at, end=at)
+        roots.append(ParquetDataCatalog(str(root)))
+    kept = _quotes(roots, [str(instrument.id)], at - 1, at + 1)
+    assert [int(tick.ask_size) for tick in kept] == [100, 200]
+    kept = _quotes(roots[::-1], [str(instrument.id)], at - 1, at + 1)
+    assert sorted(int(tick.ask_size) for tick in kept) == [100, 200]
+
+
+def test_a_replay_that_never_ends_is_stopped_by_name(neutral_catalogs, monkeypatch):
+    from canon_trading import window_replay
+
+    spec, *_ = neutral_catalogs
+    monkeypatch.setattr(window_replay, "_WORKER", "import time; time.sleep(30)")
+    monkeypatch.setattr(window_replay, "REPLAY_TIMEOUT_FLOOR_SECS", 1)
+    monkeypatch.setattr(window_replay, "REPLAY_SECS_PER_WINDOW_SEC", 0)
+    with pytest.raises(RuntimeError, match="did not finish within"):
+        window_replay.run_replay(spec)
+
+
+def test_a_replay_error_before_the_log_check_is_the_one_reported(neutral_catalogs):
+    from canon_trading.window_replay import run_replay
+
+    spec, *_ = neutral_catalogs
+    later = {
+        key: (datetime.fromisoformat(spec[key]) + timedelta(days=1)).isoformat()
+        for key in ("window_start", "window_end", "wind_down_at")
+    }
+    with pytest.raises(RuntimeError) as failed:
+        run_replay({**spec, **later, "trade_date": (START + timedelta(days=1)).date().isoformat()})
+    assert str(failed.value).rstrip().splitlines()[-1].startswith("ValueError")

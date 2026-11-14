@@ -18,8 +18,8 @@ The bars root defines the universe through its equity definitions. It also suppl
 registered entry arm's prior sessions and current-day prefix: summary counts are checked,
 never converted into invented bars. Missing history stays named in Day.missing. Catalog
 coverage and absent minute observations are reported separately: a no-trade minute is not
-proof of missing data. Quotes from overlapping roots are deduplicated by their place among
-one timestamp's quotes; a root whose quote in that place differs is refused. Universe bars
+proof of missing data. Quotes from overlapping roots are deduplicated as one stamp's
+multiset; roots that each hold a quote the other lacks at one stamp are refused. Universe bars
 and roster ticks are queried in <=60-minute batches on ts_init, including every item at a
 batch boundary exactly once.
 
@@ -32,6 +32,15 @@ acknowledged logging_sync_to_disk barrier (common/__init__.pyi:1877) make swallo
 handler failures fatal, including stop/dispose failures, with their logged tracebacks.
 The child is ordinary offline Python, through subprocess.run's documented input/capture
 contract; it does not run an agent. Its temporary log is removed after the check.
+
+Named limits (review of 2026-11-13, kept as divergences the parity table reports, not
+explained away): the Mover is composed here, not through session_window.window_node, so
+load_instruments stays off (only roster names can enter), no baseline dollar volume per
+minute is given to its slots, and trigger and trail settings are the arm's rows, not the
+record's; the engine streams from 04:00 New York, so the ranking actor tallies the whole
+pre-market where paper's tallies begin at the node's start (whether paper's subscribe
+backfills is UNVERIFIED); and each roster name's minute history is queried with no start
+bound.
 """
 
 from __future__ import annotations
@@ -85,6 +94,7 @@ from .mover_window import mover_context_feeds
 from .mover_window import mover_universe_parts
 from .mover_window import part_slots
 from .mover_window import window_rank
+from .movers_rank_actor import REFERENCE_LOOKBACK_DAYS
 from .movers_rank_actor import MoversRankActorConfig
 from .movers_rank_actor import ReferenceRead
 
@@ -147,11 +157,12 @@ def _checked_engine(
 
         try:
             yield engine, check
-        finally:
-            try:
-                engine.dispose()
-            finally:
-                check()
+        except BaseException:
+            # The body's own error is the one reported; the log check runs only after success.
+            engine.dispose()
+            raise
+        engine.dispose()
+        check()
 
 
 def venue_preset(fill_arm: str) -> dict[str, Any]:
@@ -271,7 +282,9 @@ def _references(
 ) -> tuple[dict[str, movers_rank.Reference], list[str]]:
     """Each name's usable prior-session close. A roster name without one is refused; any other
     name is left out and named, unknown to the ranking as paper's actor leaves a name with no
-    reference (movers_rank_actor.REFERENCE_LOOKBACK_DAYS)."""
+    reference (movers_rank_actor.alpaca_references: a close of a session before the trade date and
+    no more than REFERENCE_LOOKBACK_DAYS before it, and above zero)."""
+    oldest = day - timedelta(days=REFERENCE_LOOKBACK_DAYS)
     if "reference_closes" in spec:
         references = {
             symbol: movers_rank.Reference(
@@ -282,22 +295,24 @@ def _references(
     elif "reference_root" in spec:
         catalog = ParquetDataCatalog(str(_local(spec["reference_root"], directory=True)))
         references = {}
-        for instrument in instruments:
-            bars = catalog.query_bars(
-                identifiers=[f"{instrument.id}-1-DAY-LAST-EXTERNAL"],
-                end=_ns(datetime.combine(day, time(0), NY)) - 1,
+        # The catalog filters on ts_init, a daily bar's next midnight (canon_alpaca.data's parse_bar),
+        # so the query runs to the trade date's end and keeps the bars dated before it in New York.
+        latest: dict[str, Bar] = {}
+        for bar in catalog.query_bars(
+            identifiers=[f"{instrument.id}-1-DAY-LAST-EXTERNAL" for instrument in instruments],
+            start=_ns(datetime.combine(oldest, time(0), NY)),
+            end=_ns(datetime.combine(day + timedelta(days=1), time(0), NY)),
+        ):
+            if datetime.fromtimestamp(bar.ts_event / SECOND, NY).date() >= day:
+                continue
+            symbol = bar.bar_type.instrument_id.symbol.value
+            if symbol not in latest or bar.ts_event > latest[symbol].ts_event:
+                latest[symbol] = bar
+        for symbol, bar in latest.items():
+            references[symbol] = movers_rank.Reference(
+                close=float(bar.close.as_decimal()),
+                session=datetime.fromtimestamp(bar.ts_event / SECOND, NY).date(),
             )
-            usable = [
-                bar
-                for bar in bars
-                if datetime.fromtimestamp(bar.ts_event / SECOND, NY).date() < day
-            ]
-            if usable:
-                latest = max(usable, key=lambda bar: bar.ts_event)
-                references[instrument.id.symbol.value] = movers_rank.Reference(
-                    close=float(latest.close.as_decimal()),
-                    session=datetime.fromtimestamp(latest.ts_event / SECOND, NY).date(),
-                )
     else:
         raise ValueError("reference_closes or reference_root is required; no online reader is used")
     usable, unreferenced = {}, []
@@ -307,6 +322,7 @@ def _references(
         if (
             reference is None
             or reference.session >= day
+            or reference.session < oldest
             or not Decimal(str(reference.close)).is_finite()
             or reference.close <= 0
         ):
@@ -377,21 +393,31 @@ def _contexts(
 def _quotes(
     catalogs: Sequence[ParquetDataCatalog], ids: Sequence[str], start: int, end: int
 ) -> list[Any]:
-    # Recorded SIP quotes can share a timestamp and differ (two updates in one nanosecond), so a
-    # quote is keyed by its place among its root's quotes of that timestamp: an overlapping root's
-    # copy of the same update is dropped, and a different quote in that place is refused.
-    found: dict[tuple[str, int, int, int], Any] = {}
+    # Recorded SIP quotes can share a timestamp and differ (two updates in one nanosecond), so the
+    # quotes at one stamp are a multiset: a root whose quotes there are all among another's is an
+    # overlapping copy, the longer list is kept, and roots that each hold a quote the other lacks
+    # at one stamp are refused. Every root must be of one feed: quotes of two feeds at different
+    # stamps never meet here (a named limit).
+    found: dict[tuple[str, int, int], list[Any]] = {}
     for catalog in catalogs:
-        seen: dict[tuple[str, int, int], int] = {}
+        here: dict[tuple[str, int, int], list[Any]] = {}
         for tick in catalog.query_quote_ticks(identifiers=ids, start=start, end=end):
-            stamp = (str(tick.instrument_id), tick.ts_init, tick.ts_event)
-            seen[stamp] = seen.get(stamp, -1) + 1
-            key = (*stamp, seen[stamp])
-            other = found.get(key)
-            if other is not None and other != tick:
-                raise ValueError(f"conflicting catalog quotes for {key}")
-            found[key] = tick
-    return sorted(found.values(), key=lambda tick: tick.ts_init)
+            here.setdefault((str(tick.instrument_id), tick.ts_init, tick.ts_event), []).append(tick)
+        for stamp, ticks in here.items():
+            kept = found.get(stamp)
+            if kept is None:
+                found[stamp] = ticks
+                continue
+            small, large = (ticks, kept) if len(ticks) <= len(kept) else (kept, ticks)
+            left = list(large)
+            for tick in small:
+                if tick not in left:
+                    raise ValueError(f"conflicting catalog quotes for {stamp}")
+                left.remove(tick)
+            found[stamp] = large
+    return sorted(
+        (tick for ticks in found.values() for tick in ticks), key=lambda tick: tick.ts_init
+    )
 
 
 def _records(frame: Any) -> list[dict[str, Any]]:
@@ -423,15 +449,28 @@ def _uncovered(
     return missing
 
 
+REPLAY_TIMEOUT_FLOOR_SECS = 600
+"""The least time a replay process is given (UNCALIBRATED; a 46-minute recorded window ran in 7)."""
+REPLAY_SECS_PER_WINDOW_SEC = 1
+"""A replay process's further allowance per second of window (UNCALIBRATED)."""
+
+
 def run_replay(spec: Mapping[str, Any]) -> dict[str, Any]:
-    """Run with an independent native logger even if the caller already ran another engine."""
-    result = subprocess.run(
-        [sys.executable, "-c", _WORKER],
-        input=json.dumps(dict(spec), allow_nan=False),
-        text=True,
-        capture_output=True,
-        check=False,
-    )
+    """Run with an independent native logger even if the caller already ran another engine; a
+    process that outlives its bound is stopped and fails by name."""
+    window = (_at(spec["window_end"]) - _at(spec["window_start"])).total_seconds()
+    bound = REPLAY_TIMEOUT_FLOOR_SECS + REPLAY_SECS_PER_WINDOW_SEC * max(window, 0)
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", _WORKER],
+            input=json.dumps(dict(spec), allow_nan=False),
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=bound,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"replay process did not finish within {bound:.0f} s") from exc
     if result.returncode:
         raise RuntimeError(f"replay process failed ({result.returncode}):\n{result.stderr}")
     return json.loads(result.stdout)

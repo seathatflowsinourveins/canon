@@ -9,8 +9,9 @@ Rank generations are compared by UTC minute, retaining every generation in that 
 Only a unique equal generation in an adjacent, otherwise absent minute proves a minute
 shift. Catalog absence needs a named uncovered interval for a changed symbol's input
 minute; sparse observations alone do not prove it. Matched order instructions with only
-a fill-price/filled-quantity difference can be labelled fill model when the replay names
-its simulated preset and the code agrees. A different commit explains the code row only.
+a fill-price, filled-quantity or fill-time difference can be labelled fill model when the
+replay names its simulated preset and the code agrees, and with a submit later in the same
+UTC minute, latency and fill model. A different commit explains the code row only.
 Other differences remain unexplained. This attribution names observable mechanisms, not
 an estimate of what the live venue would have filled with identical input data.
 
@@ -251,12 +252,19 @@ def _trade_rows(
         if left is None or right is None:
             difference = ["entry absent" if section == "entry" else "exit absent"]
         cause = "unexplained"
-        if (
-            left
-            and right
-            and difference
-            and set(difference) <= {"fill_price", "quantity", "fill_time"}
-        ):
+        # A submit later in the same UTC minute is latency: the replay's venue has none, and paper
+        # submits about a second after the minute it decides on.
+        same_minute = (
+            left is not None
+            and right is not None
+            and left.get("submit_time") is not None
+            and right.get("submit_time") is not None
+            and left["submit_time"] // MINUTE == right["submit_time"] // MINUTE
+        )
+        explained = {"fill_price", "quantity", "fill_time"} | (
+            {"submit_time"} if same_minute else set()
+        )
+        if left and right and difference and set(difference) <= explained:
             submitted = left.get("submit_time")
             code = record.get("commit")
             same_code = (
@@ -283,7 +291,7 @@ def _trade_rows(
                 and not missing
                 and replay.get("venue", {}).get("preset") in ("touch", "tape")
             ):
-                cause = "fill model"
+                cause = "latency and fill model" if "submit_time" in difference else "fill model"
         rows.append(_row(section, key, left, right, difference, cause))
     return rows
 
