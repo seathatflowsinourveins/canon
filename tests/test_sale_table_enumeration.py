@@ -86,6 +86,12 @@ class Account:
     older_owed: int = 0
     total_sold: int = 0
     told: bool = False
+    # The table's `faulted`: a fault of ours was recorded for this holding.
+    faulted: bool = False
+    # The slot's holding has ended. `long` above zero then is ANOTHER position under the
+    # instrument (the netting position closed and reopened), which the glue reads as the
+    # holding's end at every step until the slot ends.
+    ended: bool = False
     young: bool = False
     unread: bool = False
     bid: int = LEVEL - 1
@@ -127,6 +133,7 @@ class Seen:
     overdue: bool = False
     bid: int | None = None
     wait_over: bool = False
+    reopened: bool = False
 
 
 def facts(account, seen, row):
@@ -137,6 +144,7 @@ def facts(account, seen, row):
         reprice_due = reprice_due and through(account.bid, account.floor) < account.previous
     return {
         "whole_cover": account.foreign >= account.long,
+        "faulted": account.faulted,
         "filled_part": bool(leg and leg.filled > 0),
         "long_remains": account.long > 0,
         "leg_positive": (account.uncovered if row == "G" else account.next_quantity) > 0,
@@ -183,7 +191,8 @@ def account_event(account, seen):
     if event == "HS":
         return replace(account, long=account.long - 1)
     if event == "HE":
-        return replace(account, long=0)
+        # Flat, or reopened at least as large as any leg of ours: then no mismatch ever shows.
+        return replace(account, long=MAX_QUANTITY if seen.reopened else 0, ended=True)
     if event == "CP":
         return replace(account, foreign=account.foreign + 1)
     if event == "CL":
@@ -292,6 +301,23 @@ def advance(world, seen, n, table):
     count = world.counted
     origin = world.state.row
     unformed = "not formable" in result.when.split(" and ") or " and not formable" in result.when
+    if event == "RL":
+        # The owner's hold removed: nothing is sent or canceled by it; an open sale makes it wait;
+        # with nothing open the count begins at zero, unless a fault of ours was recorded.
+        assert not {sale.Action.SEND, sale.Action.CANCEL} & set(result.actions), (
+            "a_release_sends_and_cancels_nothing"
+        )
+        if origin in {"TW", "PCT"}:
+            assert result.state == world.state, "a_release_waits_for_an_open_sale"
+        if origin == "T0":
+            assert (result.state.row == "FZ") == account.faulted, "a_release_never_lifts_a_fault"
+            if not account.faulted:
+                covered = account.foreign >= account.long
+                assert result.state == sale.State(
+                    "GC" if covered else "G", None if covered else 0
+                ), "a_release_starts_the_count_again"
+    if result.state.row in FAULT or event in {"oDEN", "oVOID", "oOTH"}:
+        account = replace(account, faulted=True)
     if origin in FAULT:
         assert result.state.row in FAULT | ENDS, "a_fault_of_ours_holds_to_the_next_start"
     if event == "FRZ" and origin in LIVE:
@@ -346,14 +372,10 @@ def advance(world, seen, n, table):
             account = replace(account, legs=(replace(account.legs[0], **{told: True}),))
     if event == "HE" and world.state.row in {"WK", "PF"}:
         assert sale.Action.CANCEL in result.actions, "the_holdings_end_cancels_a_working_sale"
-    if (
-        event == "HE"
-        and origin in {"FZW", "FCW", "OX"}
-        and before.legs
-        and before.legs[0].cancelable
-    ):
-        # An ended holding's sale that can take a cancel is asked canceled from a frozen row and
-        # from the ended row too: a holding reopened at least as large never shows a mismatch.
+    if event == "HE" and before.legs and before.legs[0].cancelable:
+        # ONE property over ALL rows: at the holding's end, a sale of ours that can take a cancel
+        # is asked canceled in that step, whatever the row. A holding reopened at least as large
+        # never shows a mismatch, so nothing else would ask.
         assert sale.Action.CANCEL in result.actions, "an_ended_holdings_sale_is_asked_canceled"
     if event == "HE" and origin == "T0":
         assert result.state.row == "X", "a_stopped_holding_that_ends_has_ended"
@@ -462,11 +484,12 @@ def advance(world, seen, n, table):
                         facts(moved, Seen(between), after.state.row),
                         table=table,
                     )
-                    late = sale.transition(
-                        mid.state, n, echo, facts(moved, Seen(echo), mid.state.row), table=table
-                    )
                 except sale.SaleTableError:
-                    continue
+                    continue  # the account event itself does not apply to this row and account
+                # The echo's own transition is never skipped: a table that throws on it fails here.
+                late = sale.transition(
+                    mid.state, n, echo, facts(moved, Seen(echo), mid.state.row), table=table
+                )
                 assert late.state == mid.state and not late.actions, "echo_is_inert_one_step_late"
                 assert late.named is None, "echo_is_inert_one_step_late"
     # A late fill's post-fill holding and cover determine the row immediately.
@@ -486,6 +509,14 @@ def step(world, observations, n=2, table=sale.TABLE, *, sends=None):
         return replace(
             world, account=replace(world.account, bid=observations[0].bid, fresh=True, newer=True)
         )
+    owed = bool(world.account.ended and world.account.legs and world.account.legs[0].cancelable)
+    if (
+        world.account.ended
+        and world.account.long > 0
+        and not any(seen.code == "HE" for seen in observations)
+    ):
+        # Another position sits under the instrument: the glue raises the end at every step.
+        observations = (Seen("HE", reopened=True), *observations)
     indexed = {str(i): seen for i, seen in enumerate(observations)}
     tagged = [sale.Event(seen.code, {str(i): True}) for i, seen in enumerate(observations)]
     ordered = sale.order_step(tagged, table=table)
@@ -507,6 +538,15 @@ def step(world, observations, n=2, table=sale.TABLE, *, sends=None):
         actions.extend(asked)
     if any(seen.code in INVALIDATES for seen in observations):
         assert sale.Action.SEND not in actions, "invalidation_first"
+    if owed:
+        # After a holding ends, from any row and by any history, no sell of ours is left working
+        # without a cancel being asked for it: a step that begins with one asks, or the sale ends.
+        # A backstop over whole steps: the two per-event properties (the end asks; a mismatch
+        # asks) fail first under every one-cell mutation tried, so this one has no mutation of
+        # its own.
+        assert sale.Action.CANCEL in actions or not world.account.legs, (
+            "no_sale_of_an_ended_holding_works_unasked"
+        )
     return world
 
 
@@ -516,6 +556,9 @@ def alternatives(world):
     if account.young:
         yield (Seen("~"),)
     codes = ["QU", "QA", "NQ", "ST", "FRZ"]
+    if world.state.row in {"T0", "TW", "PCT"}:
+        # A stop that was the owner's hold may be removed at any step.
+        codes.append("RL")
     if world.state.row in COVER:
         # The read may succeed at any step, and the event is emitted in every such step.
         codes.append("UFZ")
@@ -547,6 +590,9 @@ def alternatives(world):
         codes.append("oVOID")
     if account.owed > 0 or account.older_owed > 0:
         codes.append("oLF")
+    if account.long > 0:
+        # The position closes and reopens between two reads: the holding's end with no flat moment.
+        yield (Seen("HE", reopened=True),)
     for code in codes:
         for formable, reprice_due, ends_filled in itertools.product(
             (False, True) if code in {"QU", "oCXL"} else (True,),
@@ -1246,6 +1292,22 @@ FROZEN_WORKING = WORKING + (Seen("oOTH"),)
             "echo_is_inert_one_step_late",
         ),
         (
+            "OX",
+            "oINI",
+            "always",
+            {"next": "X"},
+            (Seen("QU"), Seen("QU")),
+            "echo_is_inert_one_step_late",
+        ),
+        (
+            "TW",
+            "HE",
+            "cancelable",
+            {"next": "TW", "cancel": False},
+            (Seen("QU"), Seen("QU"), Seen("ST"), Seen("oACC"), Seen("oCRJ"), Seen("HE")),
+            "an_ended_holdings_sale_is_asked_canceled",
+        ),
+        (
             "FZW",
             "HE",
             "cancelable",
@@ -1274,6 +1336,86 @@ FROZEN_WORKING = WORKING + (Seen("oOTH"),)
 def test_ninth_form_mutations_have_teeth(row, event, when, changes, history, property_name):
     with pytest.raises(AssertionError, match=property_name):
         walk(history, table=mutated_branch(row, event, when, **changes))
+
+
+HELD_WITH_A_FAULT = FROZEN_WORKING + (Seen("ST"), Seen("oCXL"))
+
+
+@pytest.mark.parametrize(
+    "row,event,when,changes,history,property_name",
+    [
+        (
+            "T0",
+            "RL",
+            "faulted",
+            {"next": "G", "alert": False, "count": "0"},
+            HELD_WITH_A_FAULT + (Seen("RL"),),
+            "a_release_never_lifts_a_fault",
+        ),
+        (
+            "T0",
+            "RL",
+            "not faulted and not whole_cover",
+            {"next": "GC", "count": "0"},
+            (Seen("ST"), Seen("RL")),
+            "a_release_starts_the_count_again",
+        ),
+        (
+            "TW",
+            "RL",
+            "always",
+            {"next": "T0"},
+            (Seen("QU"), Seen("QU"), Seen("ST"), Seen("RL")),
+            "a_release_waits_for_an_open_sale",
+        ),
+        (
+            "PCT",
+            "RL",
+            "always",
+            {"next": "T0"},
+            WORKING + (Seen("ST"), Seen("RL")),
+            "a_release_waits_for_an_open_sale",
+        ),
+        # The holding's end over ALL rows that can hold a sale able to take a cancel: WK, FZW, FCW
+        # and TW have their cases above; here PF, and OX through a holding that reopened at least
+        # as large (no mismatch ever shows) and through the mismatch of a flat one.
+        (
+            "PF",
+            "HE",
+            "always",
+            {"next": "OX", "cancel": False},
+            WORKING + (Seen("oPF"), Seen("HE")),
+            "the_holdings_end_cancels",
+        ),
+        (
+            "OX",
+            "HE",
+            "cancelable",
+            {"next": "OX", "cancel": False},
+            WORKING + (Seen("HE", reopened=True), Seen("oCRJ"), Seen("NQ")),
+            "an_ended_holdings_sale_is_asked_canceled",
+        ),
+        (
+            "OX",
+            "MO",
+            "always",
+            {"next": "OX", "cancel": False},
+            WORKING + (Seen("HE"), Seen("oCRJ"), Seen("NQ")),
+            "mismatch_cancels_in_same_step",
+        ),
+    ],
+)
+def test_tenth_form_mutations_have_teeth(row, event, when, changes, history, property_name):
+    with pytest.raises(AssertionError, match=property_name):
+        walk(history, table=mutated_branch(row, event, when, **changes))
+
+
+def test_a_hold_and_its_release_through_the_table():
+    assert walk((Seen("QU"), Seen("ST"), Seen("RL"))).state == sale.State("G", 0)
+    assert walk(WORKING + (Seen("ST"), Seen("RL"))).state.row == "PCT"
+    assert walk(WORKING + (Seen("ST"), Seen("oCXL"), Seen("RL"))).state == sale.State("G", 0)
+    assert walk(HELD_WITH_A_FAULT + (Seen("RL"),)).state.row == "FZ"
+    assert walk((Seen("QU"), Seen("QU"), Seen("ST"), Seen("oDEN"), Seen("RL"))).state.row == "FZ"
 
 
 def test_a_frozen_or_ended_holdings_sale_is_canceled_at_the_holdings_end():

@@ -156,6 +156,10 @@
       "kind": "account",
       "meaning": "the COVER READS AGAIN: emitted in every step in which the row is FC, FCW or FCP and the read succeeds"
     },
+    "RL": {
+      "kind": "account",
+      "meaning": "the owner's hold of the instrument is REMOVED: emitted in every step in which a holding the hold stopped is no longer held (a hold begins as ST; a stop of the node is never released)"
+    },
     "oUPD": {
       "kind": "order",
       "meaning": "OrderUpdated"
@@ -229,11 +233,13 @@
     "resend_due": "the refusal's wait has passed. After the nth venue's refusal in a row of this holding's sale (since a leg of it last filled, in part or whole, or ended without a refusal: canceled by us, expired or replaced; an acceptance alone starts nothing again) the wait is the chase interval doubled n-1 times and held at REFUSAL_RETRY_MOST_SECS (60 s, a named constant): 5, 10, 20, 40, then 60 s. After a cancel of a leg of it by another hand the wait is OUTSIDE_CANCEL_WAIT_SECS (60 s, a constant of its own: that minute is the owner's hand, not a refusal). True when neither happened in this run; judged in this counted quote's handler and never on a timer",
     "flight_alert_due": "our last command for this leg (its submit, or our cancel of it) has had no answer of any kind for FLIGHT_SECS (60 s, a named constant), and no ALERT has been written for that command's silence; judged in every step of a row that waits for an answer: a counted quote's, or the timer's (ruling 24: a stream of quotes that are not counted must not keep it silent)",
     "long_remains": "a long of this holding is still held after the fill",
+    "faulted": "a fault of ours was recorded for this holding in this run: it was in a row frozen by a fault (FZ, FZW, FZP), or a Denied, a voided fill or an event with no column was judged for it (held by the glue for the holding; a new holding starts with none)",
     "ends_filled": "after this Updated the engine reads our sale FILLED: a reconciliation update whose quantity equals a filled quantity above zero (M:1322-1324)"
   },
   "step_order": [
     "ST",
     "HE",
+    "RL",
     "HS",
     "HG",
     "CP",
@@ -476,6 +482,14 @@
       ],
       "into": "FCW",
       "cause": "outside: it ends when the cover reads again (UFZ)"
+    },
+    {
+      "event": "RL",
+      "from": [
+        "T0"
+      ],
+      "into": "FZ",
+      "cause": "ours: a fault recorded before or during the owner's hold, kept through its release"
     },
     {
       "event": "oDEN",
@@ -804,6 +818,19 @@
           }
         ],
         "note": "emitted only in a row frozen by the cover's read"
+      },
+      "RL": {
+        "occurs": "n/a",
+        "branches": [
+          {
+            "when": "always",
+            "next": "G",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "note": "emitted only in a row stopped by the owner's hold"
       },
       "oUPD": {
         "occurs": "unexpected",
@@ -1215,6 +1242,19 @@
           }
         ],
         "note": "emitted only in a row frozen by the cover's read"
+      },
+      "RL": {
+        "occurs": "n/a",
+        "branches": [
+          {
+            "when": "always",
+            "next": "GC",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "note": "emitted only in a row stopped by the owner's hold"
       },
       "oUPD": {
         "occurs": "unexpected",
@@ -1673,6 +1713,19 @@
         ],
         "note": "emitted only in a row frozen by the cover's read"
       },
+      "RL": {
+        "occurs": "n/a",
+        "branches": [
+          {
+            "when": "always",
+            "next": "RW",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "note": "emitted only in a row stopped by the owner's hold"
+      },
       "oUPD": {
         "occurs": "unexpected",
         "branches": [
@@ -2076,6 +2129,19 @@
           }
         ],
         "note": "emitted only in a row frozen by the cover's read"
+      },
+      "RL": {
+        "occurs": "n/a",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FL",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "note": "emitted only in a row stopped by the owner's hold"
       },
       "oUPD": {
         "occurs": "unexpected",
@@ -2491,6 +2557,19 @@
         ],
         "note": "emitted only in a row frozen by the cover's read"
       },
+      "RL": {
+        "occurs": "n/a",
+        "branches": [
+          {
+            "when": "always",
+            "next": "WK",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "note": "emitted only in a row stopped by the owner's hold"
+      },
       "oUPD": {
         "occurs": "unexpected",
         "branches": [
@@ -2903,6 +2982,19 @@
           }
         ],
         "note": "emitted only in a row frozen by the cover's read"
+      },
+      "RL": {
+        "occurs": "n/a",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PF",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "note": "emitted only in a row stopped by the owner's hold"
       },
       "oUPD": {
         "occurs": "unexpected",
@@ -3352,6 +3444,19 @@
           }
         ],
         "note": "emitted only in a row frozen by the cover's read"
+      },
+      "RL": {
+        "occurs": "n/a",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PCR",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "note": "emitted only in a row stopped by the owner's hold"
       },
       "oUPD": {
         "occurs": "unexpected",
@@ -3841,6 +3946,19 @@
         ],
         "note": "emitted only in a row frozen by the cover's read"
       },
+      "RL": {
+        "occurs": "n/a",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PCO",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "note": "emitted only in a row stopped by the owner's hold"
+      },
       "oUPD": {
         "occurs": "unexpected",
         "branches": [
@@ -4299,6 +4417,19 @@
         ],
         "note": "emitted only in a row frozen by the cover's read"
       },
+      "RL": {
+        "occurs": "n/a",
+        "branches": [
+          {
+            "when": "always",
+            "next": "OX",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "note": "emitted only in a row stopped by the owner's hold"
+      },
       "oUPD": {
         "occurs": "unexpected",
         "branches": [
@@ -4678,6 +4809,19 @@
         ],
         "note": "emitted only in a row frozen by the cover's read"
       },
+      "RL": {
+        "occurs": "n/a",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PCX",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "note": "emitted only in a row stopped by the owner's hold"
+      },
       "oUPD": {
         "occurs": "unexpected",
         "branches": [
@@ -5038,6 +5182,19 @@
           }
         ],
         "note": "emitted only in a row frozen by the cover's read"
+      },
+      "RL": {
+        "occurs": "n/a",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZ",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "note": "emitted only in a row stopped by the owner's hold"
       },
       "oUPD": {
         "occurs": "unexpected",
@@ -5418,6 +5575,19 @@
           }
         ],
         "note": "emitted only in a row frozen by the cover's read"
+      },
+      "RL": {
+        "occurs": "n/a",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZW",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "note": "emitted only in a row stopped by the owner's hold"
       },
       "oUPD": {
         "occurs": "unexpected",
@@ -5814,6 +5984,19 @@
         ],
         "note": "emitted only in a row frozen by the cover's read"
       },
+      "RL": {
+        "occurs": "n/a",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZP",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "note": "emitted only in a row stopped by the owner's hold"
+      },
       "oUPD": {
         "occurs": "unexpected",
         "branches": [
@@ -6203,6 +6386,19 @@
           }
         ],
         "note": "THE COVER READS AGAIN: the freeze ends; the cover is read, and a sale needs the full new count"
+      },
+      "RL": {
+        "occurs": "n/a",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FC",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "note": "emitted only in a row stopped by the owner's hold"
       },
       "oUPD": {
         "occurs": "unexpected",
@@ -6597,6 +6793,19 @@
           }
         ],
         "note": "THE COVER READS AGAIN: the freeze ends and our leg, kept working through it, is in the row its state gives; MO follows in the same step when it is then too large"
+      },
+      "RL": {
+        "occurs": "n/a",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FCW",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "note": "emitted only in a row stopped by the owner's hold"
       },
       "oUPD": {
         "occurs": "unexpected",
@@ -6995,6 +7204,19 @@
           }
         ],
         "note": "the cancel we asked is still pending: nothing; after its acknowledgement the row is FC, and this event, emitted again at the next step, ends the freeze there"
+      },
+      "RL": {
+        "occurs": "n/a",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FCP",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "note": "emitted only in a row stopped by the owner's hold"
       },
       "oUPD": {
         "occurs": "unexpected",
@@ -7403,6 +7625,19 @@
         ],
         "note": "emitted only in a row frozen by the cover's read"
       },
+      "RL": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PCT",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "note": "the hold is removed while a sale of ours is still open: the release waits, and is judged again at every step until the sale has ended (T0)"
+      },
       "oUPD": {
         "occurs": "unexpected",
         "branches": [
@@ -7719,13 +7954,21 @@
         "occurs": "yes",
         "branches": [
           {
-            "when": "always",
+            "when": "cancelable",
+            "next": "PCT",
+            "send": false,
+            "cancel": true,
+            "alert": false
+          },
+          {
+            "when": "not cancelable",
             "next": "TW",
             "send": false,
             "cancel": false,
             "alert": false
           }
-        ]
+        ],
+        "note": "the stopped holding ended (flat, short, or another position under the instrument) with our sale still open: its cancel is asked again as soon as the sale can take one, whatever its size against what is then held; an ended holding's sale never rests beside a later holding in silence"
       },
       "ST": {
         "occurs": "yes",
@@ -7763,6 +8006,19 @@
           }
         ],
         "note": "emitted only in a row frozen by the cover's read"
+      },
+      "RL": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "TW",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "note": "the hold is removed while a sale of ours is still open: the release waits, and is judged again at every step until the sale has ended (T0)"
       },
       "oUPD": {
         "occurs": "unexpected",
@@ -8117,6 +8373,34 @@
           }
         ],
         "note": "emitted only in a row frozen by the cover's read"
+      },
+      "RL": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "faulted",
+            "next": "FZ",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          },
+          {
+            "when": "not faulted and whole_cover",
+            "next": "GC",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          },
+          {
+            "when": "not faulted and not whole_cover",
+            "next": "G",
+            "send": false,
+            "cancel": false,
+            "alert": false,
+            "count": "0"
+          }
+        ],
+        "note": "THE HOLD IS REMOVED and nothing of ours is open: the count begins again at zero at the kept level, as at a start; a fault of ours recorded for the holding is NOT lifted by a hold and its release (FROZEN to the next start, with the alert); a refusal's wait recorded before or during the hold still guards the first leg (resend_due)"
       },
       "oUPD": {
         "occurs": "unexpected",
@@ -8475,6 +8759,19 @@
           }
         ],
         "note": "emitted only in a row frozen by the cover's read"
+      },
+      "RL": {
+        "occurs": "n/a",
+        "branches": [
+          {
+            "when": "always",
+            "next": "X",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "note": "emitted only in a row stopped by the owner's hold"
       },
       "oUPD": {
         "occurs": "unexpected",

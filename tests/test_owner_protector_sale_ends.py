@@ -114,3 +114,30 @@ def test_a_held_holding_that_ends_does_not_lend_its_slot_to_the_next_one(tmp_pat
     assert strategy.slots[h.AAA] is not old, "the holding bought later is not judged by the old one"
     assert c.row(strategy).row == "T0", "and it is held as the old one was"
     assert strategy.sent == []
+
+
+def test_a_stopped_sale_whose_cancel_was_refused_is_asked_again_when_its_holding_ends(
+    tmp_path: Path,
+) -> None:
+    """A hold with our leg in flight (TW), the cancel asked at the acknowledgement and refused
+    (back to TW); the owner then sells and buys again at least our leg's size. The old sell must
+    not rest on the new holding with nothing asking it canceled."""
+    strategy = c.counted(symbol_holds_dir=tmp_path)
+    strategy.observe("9.89", h.T0 + h.SECOND)
+    strategy.observe("9.88", h.T0 + 2 * h.SECOND)
+    (leg,) = strategy.sent
+    symbol_hold.write_hold(tmp_path, "AAA")
+    step(strategy, 3)
+    assert c.row(strategy).row == "TW", c.row(strategy)
+    ours = strategy.cache.order(leg.client_order_id)
+    strategy.deliver("Submitted", leg=ours)
+    strategy.deliver("Accepted", leg=ours)
+    step(strategy, 4)
+    assert strategy.canceled == [leg.client_order_id] and c.row(strategy).row == "PCT"
+    strategy.deliver("CancelRejected", leg=ours)
+    step(strategy, 5)
+    assert c.row(strategy).row == "TW", c.row(strategy)
+    reopen(strategy, 6, 15)
+    step(strategy, 6)
+    assert strategy.canceled == [leg.client_order_id] * 2, "asked again at the holding's end"
+    assert c.row(strategy).row == "PCT", c.row(strategy)

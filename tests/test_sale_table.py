@@ -22,7 +22,7 @@ from canon_trading import sale_table as sale
 DATA_PATH = Path(__file__).resolve().parents[1] / "src/canon_trading/sale_table.json"
 DATA = json.loads(DATA_PATH.read_text())
 HISTORIES = json.loads(Path(__file__).with_name("sale_table_histories.json").read_text())
-CELLS_HASH = "6e47bf488294f99167ac05c852bd5344e1bb66d0a51668eca433b61776a291a0"
+CELLS_HASH = "3b994bc6214fef921560cb1674590a238b6bb7360984f7b3e7fba2ac04110496"
 CELLS = [(r, e, c) for r, row in DATA["cells"].items() for e, c in row.items()]
 BRANCHES = [(r, e, b) for r, e, c in CELLS for b in c["branches"]]
 
@@ -115,8 +115,8 @@ def test_tracked_table_has_exact_contract_and_cells():
     encoded = json.dumps(DATA["cells"], sort_keys=True, separators=(",", ":")).encode()
     assert hashlib.sha256(encoded).hexdigest() == CELLS_HASH
     assert len(DATA["rows"]) == 20
-    assert len(DATA["events"]) == 27
-    assert len(CELLS) == 540
+    assert len(DATA["events"]) == 28
+    assert len(CELLS) == 560
     assert set(sale.TABLE.rows) == set(DATA["rows"])
     assert set(sale.TABLE.events) == set(DATA["events"])
 
@@ -220,7 +220,8 @@ def test_every_freeze_cause_is_listed_and_classified():
         elif cause["event"] == "oVOID":
             assert "HELD" in cause["cause"]
         else:
-            assert cause["event"] in {"oDEN", "oOTH", "oINI", "oPCN"}
+            # RL: a hold's release never lifts a fault recorded for the holding (T0 x RL).
+            assert cause["event"] in {"oDEN", "oOTH", "oINI", "oPCN", "RL"}
             assert cause["cause"].startswith("ours:")
         listed.update((r, cause["event"], cause["into"]) for r in cause["from"])
     assert actual == listed
@@ -667,9 +668,10 @@ def test_event_mapping_comes_only_from_inventory(ended, remainder):
     assert sale.order_event_column("OrderAccepted", table=sale.table_from_data(changed)) == "oSUB"
 
 
+# Every account event a step judges before our order's events can stand between a send and its echo.
 SEND_ECHO_ROWS = {"FL"} | {
     branch["next"]
-    for event in ("FRZ", "ST", "HE")
+    for event in ("ST", "HE", "RL", "HS", "HG", "CP", "CL", "FRZ", "UFZ")
     for branch in DATA["cells"]["FL"][event]["branches"]
 }
 

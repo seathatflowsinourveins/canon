@@ -3,7 +3,7 @@
 Pin: nautilus-trader v2.0.0rc8 at d53849b216e2, whose order transitions are
 crates/model/src/orders/mod.rs:207-302, with reconciliation at 1314-1325 and
 late fills at 1367-1389. Canonical cells SHA256:
-6e47bf488294f99167ac05c852bd5344e1bb66d0a51668eca433b61776a291a0.
+3b994bc6214fef921560cb1674590a238b6bb7360984f7b3e7fba2ac04110496.
 Order-event inventory: crates/model/src/events/order/any.rs:39-57 and
 crates/trading/src/strategy/mod.rs:1445-1462. Order events, including local echoes,
 are judged in the following step, in the table's step order.
@@ -16,9 +16,11 @@ outside this contract. ``named`` is a diagnostic for the caller, never an I/O
 operation. ``Event.facts`` describes the facts at that event in the ordered step.
 
 Named caller limits: added shares wait for the next leg; the acknowledgement's
-next leg waits up to one STEP_NS for a step; an event on an ended holding's leg
-can affect the following holding; remaining quantity after a voided fill that
-did not reopen its order is unread, with the holding frozen.
+next leg waits up to one STEP_NS for a step; a cancel the venue never answers
+holds its row, and so its holding's slot, until it is answered; remaining
+quantity after a voided fill that did not reopen its order is unread, with the
+holding frozen. A holding that ends ends its slot from every row; the owner's
+hold is the stop (ST) and its release is RL, which never lifts a recorded fault.
 """
 
 from collections.abc import Iterable

@@ -229,10 +229,93 @@ def test_a_holding_frozen_with_its_sale_open_stays_stopped_after_the_release(
         under(strategy, n, "9.70")
         step(strategy, n)
     assert strategy.sent == [leg], "a fault's freeze is not lifted by a hold and its release"
-    assert c.row(strategy) == State("T0"), c.row(strategy)
+    assert c.row(strategy) == State("FZ"), "the release reads the recorded fault: frozen again"
     assert strategy._holding_state(h.AAA, strategy.slots[h.AAA])[0] == "frozen"
-    told = [line for line in strategy.said if "frozen by a fault of ours before the hold" in line]
-    assert len(told) == 1 and told[0].startswith("ALERT:"), told
+    told = [line for line in strategy.said if line.startswith("ALERT:") and "T0 x RL" in line]
+    assert len(told) == 1, told
+
+
+def test_a_definitive_refusal_during_the_hold_is_not_cured_by_the_release(tmp_path: Path) -> None:
+    strategy = two_quote(tmp_path)
+    under(strategy, 1, "9.89")
+    under(strategy, 2, "9.88")
+    (leg,) = strategy.sent
+    symbol_hold.write_hold(tmp_path, "AAA")
+    step(strategy, 3)
+    assert c.row(strategy) == State("TW"), c.row(strategy)
+    strategy.deliver_then_step("Denied")
+    symbol_hold.remove_hold(tmp_path, "AAA")
+    step(strategy, 4)
+    for n in range(5, 9):
+        under(strategy, n, "9.70")
+        step(strategy, n)
+    assert strategy.sent == [leg], "a definitive refusal is not cured by a hold and its release"
+    assert c.row(strategy) == State("FZ"), c.row(strategy)
+    assert strategy._holding_state(h.AAA, strategy.slots[h.AAA])[0] == "frozen"
+    assert [line for line in strategy.said if line.startswith("ALERT:") and "T0 x RL" in line]
+
+
+def test_a_refusal_during_the_hold_still_binds_the_first_leg_after_the_release(
+    tmp_path: Path,
+) -> None:
+    strategy = two_quote(tmp_path)
+    under(strategy, 1, "9.89")
+    under(strategy, 2, "9.88")
+    (leg,) = strategy.sent
+    symbol_hold.write_hold(tmp_path, "AAA")
+    step(strategy, 3)
+    strategy.deliver_then_step("Rejected", reason="synthetic venue refusal")
+    assert c.row(strategy) == State("T0"), c.row(strategy)
+    symbol_hold.remove_hold(tmp_path, "AAA")
+    step(strategy, 4)
+    assert c.row(strategy) == State("G", 0), c.row(strategy)
+    under(strategy, 5, "9.70")
+    under(strategy, 6, "9.69")
+    assert strategy.sent == [leg], "the count is complete, but the refusal's wait still runs"
+    under(strategy, 9, "9.68")
+    assert len(strategy.sent) == 2, "sent once the refusal's wait has passed"
+
+
+def test_stored_order_events_are_judged_on_a_quote_under_the_hold(tmp_path: Path) -> None:
+    strategy = two_quote(tmp_path)
+    under(strategy, 1, "9.89")
+    under(strategy, 2, "9.88")
+    (leg,) = strategy.sent
+    symbol_hold.write_hold(tmp_path, "AAA")
+    step(strategy, 3)
+    strategy.deliver("Submitted")
+    strategy.deliver("Accepted")
+    assert strategy.canceled == [], "stored, not yet judged"
+    under(strategy, 3, "9.87")
+    assert strategy.canceled == [leg.client_order_id], (
+        "the owed cancel is asked at the next quote, not only at the next timer step"
+    )
+
+
+def test_a_hold_arriving_with_a_reprice_cancel_answered_sends_no_next_leg(tmp_path: Path) -> None:
+    strategy = two_quote(tmp_path)
+    c.first_leg(strategy)
+    (leg,) = strategy.sent
+    strategy.test_clock.set_time(h.T0 + 60 * h.SECOND)
+    strategy.observe("9.80", h.T0 + 61 * h.SECOND)
+    assert c.row(strategy) == State("PCR"), c.row(strategy)
+    strategy.deliver("Canceled")
+    symbol_hold.write_hold(tmp_path, "AAA")
+    step(strategy, 62)
+    assert strategy.sent == [leg], "the stop is judged before the cancel's answer: no next leg"
+    assert c.row(strategy) == State("T0"), c.row(strategy)
+    assert not [line for line in strategy.said if "not by us" in line], (
+        "the hold's cancel is not told as another hand's"
+    )
+
+
+def test_a_symbol_held_at_the_start_is_not_sold_before_any_step(tmp_path: Path) -> None:
+    symbol_hold.write_hold(tmp_path, "AAA")
+    strategy = two_quote(tmp_path)
+    strategy.on_start()
+    for n in range(1, 5):
+        under(strategy, n)
+    assert strategy.sent == [], "the start's own read holds the symbol before the first step"
 
 
 def test_every_other_holding_goes_on_counting(tmp_path: Path) -> None:

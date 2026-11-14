@@ -350,6 +350,8 @@ SALE_FAULT_ROWS = frozenset({"FZ", "FZW", "FZP"})
 # Rows in which the owner's hold asks nothing more of the table: stopped already, ended, or
 # frozen by a fault of ours with nothing open (which sends nothing and must stay frozen).
 HOLD_SETTLED_ROWS = frozenset({"FZ", "X", "T0", "TW", "PCT"})
+SALE_STOPPED_ROWS = frozenset({"T0", "TW", "PCT"})
+SALE_NOTHING_OPEN_ROWS = frozenset({"G", "GC", "RW", "FZ", "FC", "T0", "X"})
 SALE_COVER_ROWS = frozenset({"FC", "FCW", "FCP"})
 SALE_CANCEL_ROWS = frozenset({"PCR", "PCO", "PCX", "FZP", "FCP", "PCT"})
 # What answers a cancel of ours: its acknowledgement, its refusal, or the leg's own end.
@@ -732,11 +734,12 @@ class Holding:
     # Set when the owner's word held this holding after its sell was placed: its release re-places
     # the sell at the next step while the bid is above the level, with no new observation.
     rearm_at_step: bool = False
-    # The owner's hold at a count above one (`_hold_counted`): applied to this holding; applied
-    # while a fault of ours had frozen it with a sale still open; and its release already said.
+    # The owner's hold at a count above one (`_hold_counted`): applied to this holding, and its
+    # waiting release already said.
     hold_applied: bool = False
-    hold_frozen: bool = False
     hold_release_said: bool = False
+    # The table's `faulted`: a fault of ours was recorded for this holding in this run.
+    sale_faulted: bool = False
 
 
 STREAM_LOGGER = "alpaca.data.live.websocket"
@@ -2285,52 +2288,47 @@ class OwnerProtector(Strategy):
     ) -> bool:
         """The owner's word for this symbol at a count above one; True where it governs this call.
 
-        A hold is the table's stop of the instrument (its ST column): a count is dropped, a working
-        sell of ours is asked to cancel, a leg in flight is told, and nothing is counted or sent
-        while the hold stands; quotes are not judged, so the level stays where it was. The release
-        is a start for the holding: once nothing of ours is open (row T0) the count begins again at
-        zero at the kept level. A holding frozen by a fault of ours is not un-frozen by either:
-        with nothing open its row is left as it is, and one whose open sale the hold canceled stays
-        stopped to the next start.
+        Both halves act through the table. A hold is its stop of the instrument (ST): a count is
+        dropped, a working sell of ours is asked to cancel, a leg in flight is told, and nothing
+        is counted or sent while the hold stands; quotes are not judged, so the level stays where
+        it was. Stored order events are judged on quote calls too, so an owed cancel is not left
+        to the next timer step. The release is the table's RL, emitted in every call while a
+        holding the hold stopped is no longer held: with nothing of ours open the count begins
+        again at zero at the kept level, a recorded fault of ours stays a freeze, and a refusal's
+        wait still guards the first leg. A row frozen with nothing open is left as it is.
         """
         assert slot.sale_state is not None
         row = slot.sale_state.row
         if instrument_id in self.held:
-            if not slot.hold_applied:
-                slot.hold_applied, slot.hold_release_said = True, False
-                slot.hold_frozen = row in SALE_FAULT_ROWS and row != "FZ"
+            slot.hold_applied, slot.hold_release_said = True, False
             if row not in HOLD_SETTLED_ROWS:
                 self._sale_step(instrument_id, ["ST"])
-            elif quote is None:
-                self._sale_step(instrument_id, ["NQ"])
+            else:
+                self._sale_step(instrument_id, ["NQ"] if quote is None else [])
             return True
         if not slot.hold_applied:
             return False
-        if row in SALE_FAULT_ROWS or row == "X":
-            slot.hold_applied = slot.hold_frozen = False
+        if row not in SALE_STOPPED_ROWS:
+            slot.hold_applied = False  # ended, or frozen with nothing open: the hold asked nothing
             return False
-        if row == "T0" and not slot.hold_frozen:
-            slot.hold_applied = False
-            slot.sale_state = sale_table.State("G", 0)
+        self._sale_step(instrument_id, ["RL"] if quote is not None else ["RL", "NQ"])
+        row = slot.sale_state.row
+        if row in SALE_STOPPED_ROWS:
+            if not slot.hold_release_said:
+                slot.hold_release_said = True
+                self._say(
+                    f"{instrument_id}: hold removed: our sell of it is still open (sale row {row}); "
+                    "the count starts again once it has ended"
+                )
+            return True
+        slot.hold_applied = False
+        if row in {"G", "GC"}:
             slot.counted_quote = slot.usable_quote = None
-            slot.observed_quantities = None
             self._say(
                 f"{instrument_id}: hold removed: the count starts again at zero at its level "
                 f"{slot.level}, never lowered; a sale needs {self.settings.breach_count} counted "
                 f"quotes under it; confirm_gap_ms={self.settings.confirm_gap_ms}"
             )
-            return False
-        if not slot.hold_release_said:
-            slot.hold_release_said = True
-            self._say(
-                f"ALERT: {instrument_id}: hold removed, but it was frozen by a fault of ours "
-                "before the hold: it stays stopped until the next start"
-                if slot.hold_frozen
-                else f"{instrument_id}: hold removed: our sell of it is still open (sale row {row}); "
-                "the count starts again once it has ended"
-            )
-        if quote is None:
-            self._sale_step(instrument_id, ["NQ"])
         return True
 
     def _manage_counted(
@@ -2603,6 +2601,7 @@ class OwnerProtector(Strategy):
                     candidate = (size, limit)
         return {
             "whole_cover": event_uncovered == 0,
+            "faulted": slot.sale_faulted,
             "filled_part": order is not None and order.filled_qty.as_decimal() > 0,
             "long_remains": (held if event_held is None else event_held) > 0 and not slot.ended,
             "leg_positive": quantity > 0,
@@ -2776,8 +2775,12 @@ class OwnerProtector(Strategy):
                 )
                 silence = "flight_alert_due" in terms
                 unformed = "not formable" in result.when
-                external_cancel = event.code == "oCXL" and before.row in {"FL", "WK", "PF"}
-                if refusal:
+                external_cancel = event.code == "oCXL" and before.row in {"FL", "WK", "PF", "FCW"}
+                if result.state.row in SALE_FAULT_ROWS or event.code in {"oDEN", "oVOID", "oOTH"}:
+                    slot.sale_faulted = True
+                if event.code == "oREJ" and before.row not in SALE_NOTHING_OPEN_ROWS:
+                    # EVERY rejection of an open sale of ours is recorded, whatever the row that
+                    # judges it (stopped, held, cover unread), so the pace guards the next leg.
                     # A wait is a pace toward the venue, counted from the event's own time.
                     now = self.clock.timestamp_ns() if current_ns is None else current_ns
                     slot.refusal_last_ns = now
@@ -2788,6 +2791,7 @@ class OwnerProtector(Strategy):
                     slot.refusal_reason = self._sale_reason(instrument_id, current_reason)
                     slot.refusals += 1
                     slot.refusal_streak += 1
+                if refusal:
                     wait = refusal_wait_secs(slot.refusal_streak)
                     action_reason = (
                         f"{cell}: venue refused our sale (REJECTED); sent again on a counted quote "
@@ -2880,6 +2884,7 @@ class OwnerProtector(Strategy):
                 if slot.sale_state.row in {"T0", "X"}:
                     self.stopped_sales.pop(instrument_id, None)
         except sale_table.SaleTableError as exc:
+            slot.sale_faulted = True
             self.frozen[instrument_id] = f"{cell}: {type(exc).__name__}: {exc}"
             order = None if slot.protect_id is None else self.cache.order(slot.protect_id)
             slot.sale_state = sale_table.State(
@@ -3671,13 +3676,6 @@ class OwnerProtector(Strategy):
             if row in SALE_FAULT_ROWS | SALE_COVER_ROWS:
                 reason = self.frozen.get(instrument_id, f"sale row {row}")
                 return "frozen", None, f"{reason}; {symbol_hold.HELD}" if held else reason
-            if slot.hold_frozen:
-                return (
-                    "frozen",
-                    None,
-                    "frozen by a fault of ours before the owner's hold"
-                    + (f"; {symbol_hold.HELD}" if held else "; stopped until the next start"),
-                )
             if held:
                 if row in {None, "G", "GC", "RW", "T0", "X"}:
                     return (
