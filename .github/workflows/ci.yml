@@ -28,7 +28,10 @@ jobs:
   check:
     name: checks
     runs-on: ubuntu-24.04
-    timeout-minutes: 40 # the two latest passing runs on main took 22 min 23 s and 22 min 31 s (2026-11-13); scripts/land waits 45 (ADR 0144)
+    # On 2026-11-14 passing runs took 23-38 min created to updated (main 43617194822 33.9 min, 43614583851 36.5;
+    # PR 43579294655 38.4), up from 22 min on 2026-11-13, and runs 43621264808 and 43621201927 were cancelled
+    # at the earlier 40-minute limit; scripts/land waits 95 (ADR 0144)
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
