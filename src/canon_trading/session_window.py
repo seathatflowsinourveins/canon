@@ -2430,16 +2430,17 @@ def start_account(
     """The protector start's per-symbol rule, the one predicate the start (`protector_node.run_protector`)
     and the running protector's roster read (`owner_protector`, review F1) both call, so that a change to
     what a start accepts reaches both (the lead's term (a), 2026-11-13 23:49). From `position_reads`'
-    two maps: an unreadable position, or one listed with a zero quantity, is skipped by name (the lead,
-    2026-11-13 21:27 and 21:35); every other symbol is loaded, and one the adapter's start-up refuses
-    in an instrument it loads, a fractional position (its own whole-share rule,
-    `canon_alpaca.execution.whole_quantity`, which `position_status_report` applies at reconciliation),
-    is refused. `orders`, the account's open orders, is taken and not read: the order half of the
-    start's refusal (an open order the adapter cannot map) runs inside reconciliation and is not
-    called here (the deputy's ruling, 2026-11-13 23:53; review F2's lane owns it)."""
+    two maps: an unreadable, zero or fractional position is skipped by name, leaving the other symbols
+    loadable (the lead's F3 ruling, 2026-11-14 12:08). The adapter's own whole-share rule is called.
+    Before a roster restart, `orders` previews every open order with the adapter's report mapper:
+    an unmappable order refuses that restart (F2). The native engine requests all-symbol reports
+    before filtering by reconciliation instrument (NautilusTrader d53849b216e2,
+    crates/common/src/clients/execution.rs:526-561; live/src/execution/manager.rs:3454-3491).
+    This is a mapping check only; the adapter still owns reconciliation and replacement-chain reads.
+    Trailing reports are enabled, as `owner_execution_config` enables them for the successor."""
+    from canon_alpaca.execution import order_status_report
     from canon_alpaca.execution import whole_quantity  # the adapter's own rule, called
 
-    del orders
     kept: dict[str, Decimal] = {}
     skipped = dict(unread)
     refused: dict[str, str] = {}
@@ -2448,11 +2449,18 @@ def start_account(
             # A zero quantity (a short read as -0 among them) is no holding a node can protect.
             skipped[symbol] = f"position in {symbol} is listed with quantity {qty}, no holding"
             continue
-        kept[symbol] = qty
         try:
             whole_quantity(abs(qty), f"{symbol} position quantity")
         except ValueError as exc:
-            refused[symbol] = str(exc)
+            skipped[symbol] = f"{qty} held; {exc}"
+        else:
+            kept[symbol] = qty
+    for order in orders:
+        try:
+            order_status_report(order, ts_init=0, trailing=True)
+        except ValueError as exc:
+            symbol = str(order.symbol)
+            refused[symbol] = f"{refused[symbol]}; {exc}" if symbol in refused else str(exc)
     return StartAccount(kept, skipped, refused)
 
 

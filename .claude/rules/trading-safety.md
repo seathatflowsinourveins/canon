@@ -25,13 +25,17 @@ paths:
   Account A's paper pair is in the login keychain and reaches only `mise run paper:test` (ADR 0029),
   `mise run paper:data` in data-only mode (ADR 0070), `mise run paper:long-only tests`,
   `mise run paper:account tests`, `mise run paper:close tests` and `mise run paper:protect tests`
-  (ADR 0129);
+  (ADR 0129), and `mise run paper:exit-monitor tests`, GET only (ADR 0158);
   account B's, stored beside it with `paper:store windows`, reaches only `mise run paper:session`, by hand
   or from the scheduled agent (ADR 0044, ADR 0050, ADR 0069), `mise run paper:long-only windows`,
-  `mise run paper:account windows` and `mise run paper:close windows`;
+  `mise run paper:account windows`, `mise run paper:close windows` and `mise run paper:exit-monitor windows`,
+  GET only (ADR 0158);
   account C's, stored with `paper:store protect`, reaches only `mise run paper:account protect` and
   `mise run paper:protect protect`, which sends on C a trailing stop for a long it finds, or with
-  `--cancel` the cancel of such a stop, never anything else (ADR 0114, ADR 0142), and
+  `--cancel` the cancel of such a stop, never anything else (ADR 0114, ADR 0142),
+  `mise run paper:exit-monitor protect`, GET only and only on the lead's standing word
+  (`--lead-go 'exit-monitor protect'`, which its agent reads from `canon/exit-monitor/C/go`, a file only
+  the lead writes; ADR 0158), and
   `mise run paper:protector protect`, the standing protector's task (the lead's 24/5 plan of 2026-11-13,
   Decision D and unit 10; ADR 0146 for protection around the clock), not yet on `main`, admitted on the
   owner's requirement of 2026-11-13, as the lead restates it, that C's holding has its exit in every

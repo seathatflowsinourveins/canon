@@ -328,6 +328,68 @@ n8() {
     jqt "$BOX/notify-status.json" '.pending == 0 and .sent_now == 0 and .notified == null'
 }
 
+n9() {
+  # Unit two (the lead's ruling, 2026-11-14): C behind the lead's word, read in this step.
+  fresh N9 || return 1
+  mkdir -p "$TEST/bin" "$CFG/canon/exit-monitor/C"
+  local task go
+  task=$(sed -n '/^\[tasks\."paper:exit-monitor"\]/,/^\[tasks\."paper:close"\]/p' "$ROOT/mise.toml")
+  printf '%s\n' "$task" | sed -n "/^run = '''$/,/^'''$/p" | sed '1d;$d' \
+    | sed -e "s|/usr/bin/security|$TEST/bin/security|g" -e "s|/usr/bin/timeout|$TEST/bin/timeout|g" \
+          -e "s|\"\$MISE_PROJECT_ROOT/scripts/exit-monitor-notify\"|$TEST/bin/carrier|g" > "$TEST/task.sh"
+  cat > "$TEST/bin/security" <<'STUB'
+#!/bin/bash
+p=""; for a in "$@"; do [ "$p" = -s ] && printf 'security %s\n' "$a" >> "$CASE_DIR/task.log"; p=$a; done
+printf '%s\n' fixture-only
+STUB
+  cat > "$TEST/bin/timeout" <<'STUB'
+#!/bin/bash
+if [ "$1" = -s ]; then shift 3; else shift; fi
+exec "$@"
+STUB
+  cat > "$TEST/bin/uv" <<'STUB'
+#!/bin/bash
+printf 'pass %s\n' "$*" >> "$CASE_DIR/task.log"
+STUB
+  cat > "$TEST/bin/carrier" <<'STUB'
+#!/bin/bash
+printf 'carrier %s\n' "$*" >> "$CASE_DIR/task.log"
+STUB
+  chmod +x "$TEST/bin/"*
+  for go in '' 'exit-monitor C' 'protect OWN1' 'exit-monitor protect '; do
+    : > "$TEST/task.log"
+    env -i PATH="$TEST/bin:/usr/bin:/bin" HOME="$TMP/home" CASE_DIR="$TEST" usage_account=protect usage_lead_go="$go" \
+      /bin/bash "$TEST/task.sh" > /dev/null 2> "$TEST/task.stderr"
+    RC=$?
+    need "C with the word '$go' is refused with exit 3 (got $RC)" test "$RC" = 3 || return 1
+    need "C with the word '$go' reads no pair and starts nothing" test ! -s "$TEST/task.log" || return 1
+    need 'the refusal names the word' grep -q "exit-monitor protect" "$TEST/task.stderr" || return 1
+  done
+  : > "$TEST/task.log"
+  env -i PATH="$TEST/bin:/usr/bin:/bin" HOME="$TMP/home" CASE_DIR="$TEST" usage_account=protect \
+    usage_lead_go='exit-monitor protect' /bin/bash -e "$TEST/task.sh" > /dev/null 2> "$TEST/task.stderr"
+  RC=$?
+  need "C with the lead's word runs (got $RC)" test "$RC" = 0 || return 1
+  need "C reads only C's pair, then one pass on C with the word, then the carrier for C ($(tr '\n' '|' < "$TEST/task.log"))" \
+    test "$(cat "$TEST/task.log")" = "security canon-alpaca-paper-protect
+security canon-alpaca-paper-protect
+pass run --locked python -m canon_trading.exit_monitor C --lead-go exit-monitor protect
+carrier C" || return 1
+  : > "$TEST/task.log"
+  env -i PATH="$TEST/bin:/usr/bin:/bin" HOME="$TMP/home" CASE_DIR="$TEST" usage_account=tests \
+    usage_lead_go='exit-monitor protect' /bin/bash -e "$TEST/task.sh" > /dev/null 2> "$TEST/task.stderr"
+  need "A passes no word to its pass even when one is given ($(sed -n 3p "$TEST/task.log"))" \
+    test "$(sed -n 3p "$TEST/task.log")" = "pass run --locked python -m canon_trading.exit_monitor A" || return 1
+  BOX="$CFG/canon/exit-monitor/C"
+  notice one 'SYN quantity 100 uncovered' uncovered C > "$BOX/alerts.jsonl"
+  run_notify C
+  need "the carrier delivers C's outbox (rc $RC)" test "$RC" = 0 || return 1
+  need 'one send for C' calls 1 || return 1
+  need "C's receipt holds the key" jqt "$BOX/delivered.json" '. == ["exit-monitor:C:one"]' || return 1
+  run_notify D
+  need 'any other account is still refused' test "$RC" = 1
+}
+
 check 'N1: argv, title, lane, batching and uncovered priority' n1
 check 'N2: receipt, retry, 30s timeout and send/record gap' n2
 check 'N3: read-only last 2000 lines, malformed rows and no ALPACA environment' n3
@@ -336,5 +398,6 @@ check 'N5: pass then carrier, exit preservation and credential-free invocation' 
 check 'N6: frozen notice on first pass and once per repeat key' n6
 check 'N7: one run at a time, pruned receipt, latest line, honest status' n7
 check 'N8: a full window of long lines and a full receipt pass no argv limit' n8
+check "N9: C behind the lead's word, in the task and the carrier" n9
 echo "exit-monitor-notify: $pass passed, $fail failed, 0 skipped"
 [ "$fail" -eq 0 ]

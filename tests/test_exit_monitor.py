@@ -288,7 +288,12 @@ def test_level_book_stop_identity_must_be_of_our_node_lineage(em):
 def test_level_book_missing_state_cannot_imply_armed(em):
     report = level_report(quantity="100")
     del report["state"]
-    assert assess(em, reports=[report])[0]["state"] == "unknown"
+    found = assess(em, reports=[report])[0]
+    # ADR 0158: a state the monitor does not know, a missing one included, costs this holding the
+    # report's cover by name (it was "unknown" before, which raised no notice at all).
+    assert found["state"] == "uncovered"
+    assert found["cover"] == "0"
+    assert "is not known to this monitor" in found["reason"]
 
 
 @pytest.mark.parametrize(
@@ -731,11 +736,14 @@ def test_overlap_is_refused_without_account_or_stream_lock(em, tmp_path):
     assert not list(tmp_path.rglob("*.lock"))
 
 
-def test_task_entry_is_one_account_get_only_and_has_no_c(em):
+def test_task_entry_is_one_account_get_only_and_reads_c_only_behind_the_word(em):
     root = Path(__file__).parents[1]
     task = tomllib.loads((root / "mise.toml").read_text())["tasks"]["paper:exit-monitor"]
-    assert 'choices "tests" "windows"' in task["usage"]
-    assert "canon-alpaca-paper-protect" not in task["run"]
+    assert 'choices "tests" "windows" "protect"' in task["usage"]
+    assert 'flag "--lead-go <lead_go>"' in task["usage"]
+    run_body = task["run"]
+    go_check = run_body.index('[ "${usage_lead_go:-}" = "exit-monitor protect" ]')
+    assert go_check < run_body.index("canon-alpaca-paper-protect") < run_body.index("security")
     assert "CANON_ALPACA_DATA_ONLY=1" in task["run"]
     assert "canon_trading.exit_monitor" in task["run"]
     assert "lockf" not in task["run"]
@@ -806,10 +814,10 @@ def test_finite_quantities_and_report_shapes_fail_closed(em):
     for qty in ("NaN", "Infinity", "-1"):
         found = assess(em, orders=[order(qty=qty)])[0]
         assert found["state"] == "unknown"
-    assert (
-        assess(em, reports=[{"symbol": "SYN", "quantity": "NaN", "armed_at": NOW}])[0]["state"]
-        == "unknown"
-    )
+    # ADR 0158 (evidence-verifier/14): a report's bad quantity costs its holding the cover, named.
+    found = assess(em, reports=[{"symbol": "SYN", "quantity": "NaN", "armed_at": NOW}])[0]
+    assert found["state"] == "uncovered"
+    assert "quantity is not a number" in found["reason"]
 
 
 def test_bad_position_keeps_one_unknown_finding(em, tmp_path):
@@ -1158,6 +1166,11 @@ def test_report_of_a_sell_the_venue_shows_but_does_not_count_adds_nothing(em, ch
     is no cover, and a report that names it, or cannot be told apart from it, does not make it one."""
     report = level_report(quantity="100", **({"client_order_id": NODE} if identified else {}))
     found = assess(em, orders=[order(client_order_id=NODE, **changes)], reports=[report])[0]
+    if identified and changes.get("type") == "limit":
+        # Contract row 1 (ADR 0158, 2026-11-14) replaces R7 for this case alone: an acknowledged
+        # working sale of ours that its report names is cover, counted once.
+        assert (found["state"], found["cover"]) == ("covered", "100")
+        return
     assert (found["state"], found["cover"], found["remainder"]) == ("uncovered", "0", "100")
     assert "report not added" in found["reason"]
 
@@ -1184,18 +1197,18 @@ def test_a_dormant_notice_does_not_delay_the_uncovered_alert(em, tmp_path, blip)
 
 
 @pytest.mark.parametrize("sessions", [[["regular"]], [{"part": "regular"}]], ids=["list", "dict"])
-def test_malformed_report_ends_the_pass_unknown_and_written(em, tmp_path, sessions):
-    """P5a: a report the pass cannot use is a failed read: every position unknown, the pass recorded
-    and counted toward the blind telling, never a traceback that writes nothing."""
+def test_malformed_report_sessions_cost_only_that_holding(em, tmp_path, sessions):
+    """P5a, amended by ADR 0158 (evidence-verifier/14): a report's bad sessions cost its holding the
+    report's cover, named; the pass is still ok and written, and no read failure is counted."""
     paper = Paper(positions=[position()])
     result = run(em, tmp_path, paper, reports=[level_report(quantity="100", sessions=sessions)])
-    assert not result["ok"]
-    assert [f["state"] for f in result["findings"]] == ["unknown"]
+    assert result["ok"]
+    assert [f["state"] for f in result["findings"]] == ["uncovered"]
+    assert "no valid session eligibility" in result["findings"][0]["reason"]
     status = json.loads((tmp_path / "canon/exit-monitor/A/status.json").read_text())
-    assert status["ok"] is False
-    assert status["unknown"] == 1
+    assert status["ok"] is True
     memory = json.loads((tmp_path / "memory.json").read_text())
-    assert memory["failures"] == 1
+    assert memory["failures"] == 0
 
 
 def test_open_orders_429_is_named(em, tmp_path):
@@ -1298,3 +1311,507 @@ def test_a_pass_never_turns_the_process_data_only(em, tmp_path, monkeypatch):
     assert DATA_ONLY_ENV not in os.environ
     assert not result["ok"]
     assert "data-only" in result["summary"]
+
+
+# Unit two (the lead's ruling, 2026-11-14): C is admitted only behind the lead's word, by name, read in
+# the same step; A and B keep their default, and without the word C reads nothing.
+C_GO = "exit-monitor protect"
+
+
+def test_c_is_admitted_only_with_the_lead_go_named_in_that_step(em, tmp_path):
+    calls = []
+
+    def factory(account):
+        calls.append(account)
+        return Paper(positions=[position()], orders=[order()])
+
+    assert em.LEAD_GO == C_GO
+    assert "C" not in em.DEFAULT_ACCOUNTS
+    assert not em.monitor_task("C", trading_for=factory)["ok"]
+    for wrong in ("", "exit-monitor C", "protect OWN1", C_GO + " ", "Exit-monitor protect"):
+        refused = em.monitor_task("C", trading_for=factory, lead_go=wrong)
+        assert not refused["ok"] and "lead's named word" in refused["summary"]
+    assert calls == []
+    assert not (tmp_path / "canon/exit-monitor/C").exists()
+    admitted = em.monitor_task("C", trading_for=factory, lead_go=C_GO)
+    assert calls == ["C"]
+    assert admitted["findings"][0]["state"] == "covered"
+    assert json.loads((tmp_path / "canon/exit-monitor/C/status.json").read_text())["account"] == "C"
+
+
+def test_the_go_never_admits_a_or_b_differently_and_a_pass_on_c_needs_it_too(em, tmp_path):
+    paper = Paper(positions=[position()], orders=[order()])
+    assert not em.run_pass("C", paper)["ok"]
+    assert paper.calls == []
+    assert em.run_pass("C", paper, memory_path=tmp_path / "c.json", lead_go=C_GO)["ok"]
+    assert em.monitor_task(
+        "A", trading_for=lambda a: Paper(positions=[position()], orders=[order()]), lead_go=C_GO
+    )["ok"]
+
+
+def test_the_entry_point_passes_c_and_its_word_to_the_task(em, monkeypatch):
+    seen = []
+    monkeypatch.setattr(
+        em, "monitor_task", lambda account, **kw: seen.append((account, kw)) or {"ok": True}
+    )
+    monkeypatch.setattr("sys.argv", ["exit_monitor", "C", "--lead-go", C_GO])
+    assert em.main() == 0
+    assert seen == [("C", {"lead_go": C_GO})]
+
+
+def test_the_entry_point_refuses_c_without_its_word_and_reads_nothing(
+    em, tmp_path, monkeypatch, capsys
+):
+    monkeypatch.setattr("sys.argv", ["exit_monitor", "C"])
+    assert em.main() == 1
+    assert "lead's named word" in capsys.readouterr().out
+    assert not (tmp_path / "canon/exit-monitor/C").exists()
+
+
+def test_the_symbol_holds_map_names_c_as_the_protect_instance():
+    from canon_trading import symbol_hold
+
+    assert symbol_hold.MONITOR_ACCOUNTS == {"A": "tests", "B": "windows", "C": "protect"}
+
+
+# The lead's terms (2026-11-14, ADR 0158): cold and held are node-report states the monitor knows; a
+# state it does not know costs that holding its report's cover, named, and never the pass.
+def test_a_cold_report_is_cover_and_is_named_cold(em):
+    found = assess(em, reports=[level_report(quantity="100", state="cold")])[0]
+    assert found["state"] == "covered"
+    assert found["cover"] == "100"
+    assert found["cold"] is True
+    assert "cold" in found["reason"]
+
+
+def test_a_cold_holding_is_counted_in_status_and_raises_no_notice(em, tmp_path):
+    paper = Paper(positions=[position()])
+    result = run(em, tmp_path, paper, reports=[level_report(quantity="100", state="cold")])
+    assert result["ok"]
+    assert result["status"]["cold"] == 1
+    assert result["status"]["covered"] == 1
+    assert result["alerts"] == []
+
+
+@pytest.mark.parametrize("source", ["word", "order"])
+def test_a_held_report_names_its_source_and_is_never_uncovered(em, source):
+    found = assess(em, reports=[level_report(quantity="100", state="held", source=source)])[0]
+    assert found["state"] == "held"
+    assert f"owner's {source}" in found["reason"]
+    assert found["age_seconds"] == 0
+
+
+@pytest.mark.parametrize("source", [None, "", "lane", 3])
+def test_a_held_report_without_a_known_source_costs_its_cover_by_name(em, source):
+    found = assess(em, reports=[level_report(quantity="100", state="held", source=source)])[0]
+    assert found["state"] == "uncovered"
+    assert "names no known source" in found["reason"]
+
+
+def test_an_unknown_state_costs_only_its_own_holding_and_never_the_pass(em, tmp_path):
+    other = position(symbol="OTH")
+    paper = Paper(positions=[position(), other])
+    reports = [
+        level_report(quantity="100", state="quiescent"),
+        level_report(symbol="OTH", quantity="100", state="armed"),
+    ]
+    result = run(em, tmp_path, paper, reports=reports)
+    assert result["ok"]
+    states = {f["symbol"]: f for f in result["findings"]}
+    assert states["OTH"]["state"] == "covered"
+    assert states["SYN"]["state"] == "uncovered"
+    assert (
+        "quiescent" not in states["SYN"]["reason"]
+    )  # its text is not carried (review, 2026-11-14)
+    assert "not known to this monitor" in states["SYN"]["reason"]
+
+
+# The lead's line (2026-11-14 04:30, ADR 0158): the status counts uncovered holdings by reason, from a fixed
+# set of kinds, never the free text, so the first nights' counts can decide which reason keeps the repeat.
+def test_the_status_counts_uncovered_holdings_by_a_fixed_reason_kind(em, tmp_path):
+    paper = Paper(
+        positions=[
+            position(),
+            position(symbol="WAI"),
+            position(symbol="ODD"),
+            position(symbol="PAR"),
+        ]
+    )
+    reports = [
+        level_report(symbol="WAI", quantity="100", state="waiting", reason="no quote overnight"),
+        level_report(symbol="ODD", quantity="100", state="quiescent"),
+        level_report(symbol="PAR", quantity="40", state="armed"),
+    ]
+    result = run(em, tmp_path, paper, reports=reports)
+    assert result["ok"]
+    by_reason = result["status"]["uncovered_by_reason"]
+    assert by_reason == {
+        "no protector running": 1,
+        "node waiting": 1,
+        "report state not known": 1,
+        "partial cover": 1,
+    }
+    assert sum(by_reason.values()) == result["status"]["uncovered"]
+    kinds = {f["symbol"]: f.get("reason_kind") for f in result["findings"]}
+    assert kinds["WAI"] == "node waiting"
+    assert "no quote overnight" not in json.dumps(result["status"])
+
+
+def test_a_pass_with_nothing_uncovered_counts_no_reason(em, tmp_path):
+    paper = Paper(positions=[position()])
+    result = run(em, tmp_path, paper, reports=[level_report(quantity="100")])
+    assert result["status"]["uncovered_by_reason"] == {}
+
+
+@pytest.mark.parametrize("state", [["armed"], {"state": "armed"}, 3])
+def test_a_state_that_is_not_a_word_costs_only_its_holding_and_never_the_pass(em, tmp_path, state):
+    paper = Paper(positions=[position(), position(symbol="OTH")])
+    reports = [
+        level_report(quantity="100", state=state),
+        level_report(symbol="OTH", quantity="100", state="armed"),
+    ]
+    result = run(em, tmp_path, paper, reports=reports)
+    assert result["ok"], result["summary"]
+    found = {f["symbol"]: f for f in result["findings"]}
+    assert found["OTH"]["state"] == "covered"
+    assert found["SYN"]["state"] == "uncovered"
+    assert "not known to this monitor" in found["SYN"]["reason"]
+    assert result["status"]["uncovered_by_reason"] == {"report state not known": 1}
+
+
+def test_cold_is_counted_only_for_a_holding_its_cold_stop_covers(em, tmp_path):
+    paper = Paper(positions=[position()])
+    result = run(em, tmp_path, paper, reports=[level_report(quantity="40", state="cold")])
+    assert result["status"]["cold"] == 0
+    assert result["findings"][0]["state"] == "uncovered"
+
+
+# The fix round (land-unit2, 2026-11-14): the verifier's claims 13 and 29, and the three contract
+# rows the node's report needs (deputy 04:51; src/canon_trading/node_report.py's docstring).
+
+
+def write_book(tmp_path, holdings, *, account="A"):
+    root = tmp_path / f"canon/exit-monitor/{account}"
+    root.mkdir(parents=True, exist_ok=True)
+    book = {
+        "version": 1,
+        "account": account,
+        "last_step_at": NOW.isoformat(),
+        "step_seconds": 20,
+        "holdings": holdings,
+    }
+    (root / "reports.json").write_text(json.dumps(book))
+
+
+def test_a_report_file_holding_with_no_state_costs_only_its_holding_and_never_the_pass(
+    em, tmp_path
+):
+    write_book(
+        tmp_path,
+        [
+            {"symbol": "SYN", "quantity": "100", "sessions": ["regular"]},
+            {"symbol": "OTH", "quantity": "100", "state": "armed", "sessions": ["regular"]},
+        ],
+    )
+    result = run(em, tmp_path, Paper(positions=[position(), position(symbol="OTH")]))
+    assert result["ok"], result["summary"]
+    found = {f["symbol"]: f for f in result["findings"]}
+    assert found["OTH"]["state"] == "covered"
+    assert found["SYN"]["state"] == "uncovered"
+    assert "not known to this monitor" in found["SYN"]["reason"]
+
+
+def test_the_entry_point_prints_no_symbol_quantity_or_reason_of_a_holding(
+    em, tmp_path, monkeypatch, capsys
+):
+    # The agent's plist sends stdout and stderr to watch/; what a pass finds stays in its folder.
+    held = [position(qty="137", symbol="ZQXW")]
+    monkeypatch.setattr(em.session_window, "paper_trading", lambda: Paper(positions=held))
+    monkeypatch.setattr(em.session_window, "window_data", lambda: None)
+    monkeypatch.setattr("sys.argv", ["exit_monitor", "A"])
+    outputs = []
+    em.main()
+    outputs.append(capsys.readouterr())
+    held.clear()  # sold: the next pass clears its episode
+    em.main()
+    outputs.append(capsys.readouterr())
+    failing = Paper(positions=[position(qty="137", symbol="ZQXW")])
+    failing.fail["positions"] = RuntimeError("ZQXW 137 refused")
+    monkeypatch.setattr(em.session_window, "paper_trading", lambda: failing)
+    assert em.main() == 1
+    outputs.append(capsys.readouterr())
+    for out in outputs:
+        text = out.out + out.err
+        assert "ZQXW" not in text and "137" not in text, text
+        assert json.loads(out.out)["account"] == "A"
+    assert json.loads(outputs[0].out)["counts"]["uncovered"] == 1
+    root = tmp_path / "canon/exit-monitor/A"
+    assert "ZQXW" in (root / "status.json").read_text() or any(
+        "ZQXW" in p.read_text() for p in (root / "records").iterdir()
+    )
+
+
+@pytest.mark.parametrize("identity", [PROTECT, NODE])
+def test_a_report_naming_our_sale_of_either_lineage_covers(em, identity):
+    report = level_report(quantity="100", client_order_id=identity)
+    [found] = assess(em, reports=[report])
+    assert found["state"] == "covered", found
+    assert not found["invalid"]
+
+
+def test_a_report_naming_a_foreign_sale_still_names_it_invalid(em):
+    report = level_report(quantity="100", client_order_id="foreign-1")
+    [found] = assess(em, reports=[report])
+    assert found["state"] == "unknown" and "lineage" in found["reason"]
+
+
+@pytest.mark.parametrize("identity", [PROTECT, NODE])
+def test_our_working_sale_the_venue_acknowledges_covers_through_its_report(em, identity):
+    sale = order(type="limit", order_type="limit", limit_price="99", client_order_id=identity)
+    report = level_report(quantity="100", client_order_id=identity)
+    [found] = assess(em, orders=[sale], reports=[report])
+    assert found["state"] == "covered", found
+    assert found["cover"] == "100"
+
+
+def test_our_sale_not_yet_acknowledged_adds_no_cover_by_name(em):
+    sale = order(type="limit", order_type="limit", limit_price="99", status="pending_new")
+    report = level_report(quantity="100", client_order_id=PROTECT)
+    [found] = assess(em, orders=[sale], reports=[report])
+    assert found["state"] == "uncovered"
+    assert "not shown as working" in found["reason"]
+
+
+def test_a_working_sale_covers_no_more_than_the_venue_shows_left(em):
+    sale = order(
+        type="limit",
+        order_type="limit",
+        limit_price="99",
+        status="partially_filled",
+        qty="100",
+        filled_qty="40",
+    )
+    report = level_report(quantity="100", client_order_id=PROTECT)
+    [found] = assess(em, orders=[sale], reports=[report])
+    assert found["cover"] == "60" and found["state"] == "uncovered"
+    [found] = assess(em, positions=[position("60")], orders=[sale], reports=[report])
+    assert found["state"] == "covered"
+
+
+def test_a_venue_stop_and_its_report_still_count_once(em):
+    report = level_report(quantity="100", client_order_id=PROTECT)
+    [found] = assess(em, orders=[order()], reports=[report])
+    assert found["cover"] == "100" and "same stop is shown at the venue" in found["reason"]
+
+
+def test_a_reported_uncovered_holding_is_known_no_cover(em, tmp_path):
+    paper = Paper(positions=[position()])
+    result = run(em, tmp_path, paper, reports=[level_report(quantity="100", state="uncovered")])
+    assert result["ok"], result["summary"]
+    found = result["findings"][0]
+    assert found["state"] == "uncovered" and "not known" not in found["reason"]
+    assert result["status"]["uncovered_by_reason"] == {"node uncovered": 1}
+
+
+@pytest.mark.parametrize("result", ["voided", "fault", "other", "cover unread"])
+def test_a_frozen_report_with_any_result_of_the_node_reads_frozen(em, tmp_path, result):
+    report = level_report(quantity="100", state="frozen", result=result)
+    paper = Paper(positions=[position()])
+    first = run(em, tmp_path, paper, reports=[report])
+    assert first["ok"], first["summary"]
+    found = first["findings"][0]
+    assert found["frozen"] == result and found["reason"].startswith("frozen by the protector")
+    second = run(em, tmp_path, paper, reports=[report])  # the episode's memory reads back
+    assert second["ok"] and "memory" not in second["summary"], second["summary"]
+
+
+@pytest.mark.parametrize("result", [None, "", "the venue said ZQXW 137", 3])
+def test_a_frozen_report_with_another_result_reads_frozen_other_with_no_free_text(em, result):
+    report = level_report(quantity="100", state="frozen", result=result)
+    [found] = assess(em, reports=[report])
+    assert found["state"] == "uncovered" and found["frozen"] == "other", found
+    assert "ZQXW" not in found["reason"]
+
+
+def test_an_unknown_state_carries_none_of_its_text_and_takes_its_own_kind(em, tmp_path):
+    # Review (code review at high effort, 2026-11-14): a node's raw text never reaches a reason, an
+    # alert or the log, and cannot pick another kind, "no protector running" say.
+    paper = Paper(positions=[position()])
+    report = level_report(quantity="100", state="no protector running ZQXW")
+    result = run(em, tmp_path, paper, reports=[report])
+    found = result["findings"][0]
+    assert "ZQXW" not in found["reason"] and "not known to this monitor" in found["reason"]
+    assert result["status"]["uncovered_by_reason"] == {"report state not known": 1}
+
+
+def test_a_report_file_holding_that_is_not_an_object_is_a_named_failed_read(em, tmp_path):
+    # Guard for the review round (2026-11-14): the check now raises TypeError, which _reports catches.
+    write_book(tmp_path, [3, {"symbol": "OTH", "quantity": "100", "state": "armed"}])
+    result = run(em, tmp_path, Paper(positions=[position()]))
+    assert not result["ok"]
+    assert "report" in result["summary"]
+
+
+@pytest.mark.parametrize("state", ["armed", "counting", "cold", "waiting", "guarded", "uncovered"])
+def test_each_state_of_the_contract_table_reads_as_the_table_says(em, state):
+    # The contract's one home is REPORT_STATES (the deputy, 2026-11-14): the parser reads it.
+    [found] = assess(em, reports=[level_report(quantity="100", state=state)])
+    covers = em.REPORT_STATES[state] == em.COVER
+    assert (found["state"] == "covered") is covers, found
+
+
+def test_the_contract_table_holds_every_state_the_record_names(em):
+    assert em.REPORT_STATES == {
+        "armed": em.COVER,
+        "counting": em.COVER,
+        "cold": em.COVER,
+        "waiting": em.NO_COVER,
+        "guarded": em.NO_COVER,
+        "uncovered": em.NO_COVER,
+        "held": em.HELD,
+        "frozen": em.FROZEN,
+    }
+
+
+# From 49a02067 (land-carrier-rows), on the deputy's 11:48 order: evidence-verifier/14 and the held row.
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"state": None},
+        {"state": ["armed"]},
+        {"quantity": "many"},
+        {"sessions": "regular"},
+        {"sessions": ["nowhere"]},
+        {"state": "cold", "quantity": "many"},
+    ],
+    ids=[
+        "no-state",
+        "state-not-text",
+        "quantity-not-decimal",
+        "sessions-not-a-list",
+        "unknown-part",
+        "cold-quantity-not-decimal",
+    ],
+)
+def test_a_bad_row_of_the_report_file_costs_only_its_holding(em, tmp_path, bad):
+    root = tmp_path / "canon/exit-monitor/A"
+    root.mkdir(parents=True)
+    broken = level_report(quantity="100")
+    del broken["last_step_at"], broken["step_seconds"]
+    if bad.get("state", "") is None:
+        del broken["state"]
+    else:
+        broken.update(bad)
+    good = level_report(symbol="OTH", quantity="100")
+    del good["last_step_at"], good["step_seconds"]
+    for row in (broken, good):
+        row["armed_at"] = NOW.isoformat()
+    book = {
+        "version": 1,
+        "account": "A",
+        "last_step_at": NOW.isoformat(),
+        "step_seconds": 20,
+        "holdings": [broken, good],
+    }
+    (root / "reports.json").write_text(json.dumps(book))
+    result = run(em, tmp_path, Paper(positions=[position(), position(symbol="OTH")]))
+    assert result["ok"], result["summary"]
+    found = {f["symbol"]: f for f in result["findings"]}
+    assert found["OTH"]["state"] == "covered"
+    assert found["SYN"]["state"] == "uncovered"
+    assert "it adds no cover" in found["SYN"]["reason"]
+
+
+def test_a_frozen_holding_with_a_held_report_reads_frozen(em):
+    reports = [
+        level_report(quantity="100", state="frozen", result="denied"),
+        level_report(quantity="100", state="held", source="order"),
+    ]
+    found = assess(em, reports=reports)[0]
+    assert found["state"] == "uncovered"
+    assert found["frozen"] == "denied"
+
+
+# From 806d3e69, on the deputy's 11:48 order: the staging (ii) case's reader, on what a real pass writes.
+def test_the_staging_case_reads_what_a_real_pass_writes(em, tmp_path):
+    """ADR 0158's staging (ii) reads the pass's stamp and the uncovered event from the folder: its reader
+    is checked here, on the files `run_pass` writes, since the case itself runs only on paper."""
+    from tests.test_paper_exit_monitor_staging import observe
+
+    root = tmp_path / "canon/exit-monitor/A"
+    paper = Paper(positions=[position()])
+    run(em, tmp_path, paper)
+    stamps, event = observe(root, "SYN", NOW)
+    assert stamps == [NOW] and event == {}
+    paper.now = NOW + timedelta(seconds=180)
+    run(em, tmp_path, paper)
+    stamps, event = observe(root, "SYN", NOW)
+    assert stamps == [NOW + timedelta(seconds=180)]
+    assert event["key"].startswith("exit-monitor:A:SYN:") and event["state"] == "uncovered"
+    assert observe(root, "SYN", NOW + timedelta(seconds=181)) == ([], {})
+    assert observe(root, "OTH", NOW)[1] == {}
+
+
+# The Codex pre-landing read of 85a6316c (xr-carrier, 2026-11-14), from its probes.
+def test_a_report_naming_a_sale_the_venue_rejected_adds_no_cover(em, tmp_path):
+    # Codex P1-1: a rejected or ended sale is never cover, whatever a report says of it.
+    rejected = order(
+        type="limit", order_type="limit", limit_price="99", status="rejected", failed_at=NOW
+    )
+    paper = Paper(positions=[position()], orders=[rejected])
+    result = run(
+        em, tmp_path, paper, reports=[level_report(quantity="100", client_order_id=PROTECT)]
+    )
+    found = result["findings"][0]
+    assert found["state"] != "covered", found
+    assert found["cover"] == "0"
+    assert "has ended at the venue" in found["reason"]
+
+
+def test_a_fresh_held_report_replaces_a_freeze_carried_from_an_earlier_pass(em, tmp_path):
+    # Codex P2-3: a carried freeze does not outrank the node's fresh word that the owner holds it.
+    paper = Paper(positions=[position()])
+    first = run(
+        em,
+        tmp_path,
+        paper,
+        reports=[level_report(quantity="100", state="frozen", result="denied")],
+    )
+    assert first["findings"][0]["frozen"] == "denied"
+    paper.now += timedelta(seconds=1)
+    held = level_report(quantity="100", state="held", source="order", last_step_at=paper.now)
+    second = run(em, tmp_path, paper, reports=[held])
+    assert second["findings"][0]["state"] == "held", second["findings"][0]
+    paper.now += timedelta(seconds=900)
+    held = level_report(quantity="100", state="held", source="order", last_step_at=paper.now)
+    third = run(em, tmp_path, paper, reports=[held])
+    assert third["findings"][0]["state"] == "held"
+    assert third["alerts"] == []
+
+
+@pytest.mark.parametrize("kind", ["trailing_stop", "limit"])
+def test_a_later_ended_read_overrides_the_same_sale_seen_open_earlier_in_the_pass(
+    em, tmp_path, kind
+):
+    # Codex re-read of 1b8f60b5 (R1, the rest of P1-1): the open GET shows the sale, the closed GET
+    # after it shows the same identity canceled; the later fact wins and nothing of it is cover.
+    limit = "99" if kind == "limit" else None
+    open_sale = order(type=kind, order_type=kind, limit_price=limit)
+    closed_sale = order(
+        type=kind, order_type=kind, limit_price=limit, status="canceled", canceled_at=NOW
+    )
+
+    class Snapshots(Paper):
+        def get_orders(self, request):
+            status = request.status.value
+            self.calls.append(status)
+            return [closed_sale] if status == "closed" else [open_sale]
+
+    paper = Snapshots(positions=[position()])
+    result = run(
+        em, tmp_path, paper, reports=[level_report(quantity="100", client_order_id=PROTECT)]
+    )
+    found = result["findings"][0]
+    assert "closed" in paper.calls
+    assert found["state"] != "covered", found
+    assert found["cover"] == "0", found
