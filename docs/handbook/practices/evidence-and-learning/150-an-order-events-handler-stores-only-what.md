@@ -1,0 +1,1 @@
+* An order event's handler stores only what the event carries, and the next step reads the engine (ADR 0088); every engine run fails on a "Python <handler> failed" line in its log, a check not yet built in the tree (roadmap step 6).

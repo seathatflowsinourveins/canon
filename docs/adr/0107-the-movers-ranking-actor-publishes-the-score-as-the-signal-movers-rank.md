@@ -55,8 +55,10 @@ adapter contract in proposed ADR 0090, read at `cx-c11-request-trades` commit `2
 2026-11-11). This checkout's adapter has no streaming bars/status hooks yet, so wire delivery remains
 UNVERIFIED until that adapter change is integrated. Alpaca's own bars are used, not node-built ones: at the pin a time bar is built for
 every clock minute, pauses included, unless `time_bars_build_with_no_updates` is off. The I/O boundary
-is the actor: it reads the reference closes (daily bars, `adjustment=split`, `sip`) and the forward and
-reverse splits since them over GET only, in a worker thread, at start and again when the trade date rolls
+is the actor: it reads the reference closes (the `sip` snapshot's raw daily bars, not split-adjusted; a name
+with a split since its reference is excluded, not adjusted: `movers_rank_actor.py:37-44`,
+`movers_rank.py:686-693`, `:1089`, `:1109` at 7294fe94) and the forward and reverse splits since them over
+GET only, in a worker thread, at start and again when the trade date rolls
 at 20:00 New York (a failed or unusable read is retried on the next tick), and reads the baseline file
 its config names once a trade date with `movers_rank.read_baselines`. Each `PUBLISH_INTERVAL_SECS`,
 `PUBLISH_OFFSET_SECS` after the minute mark, it computes one generation with `computed_ns` the tick, so
