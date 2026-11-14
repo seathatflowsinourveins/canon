@@ -1,0 +1,112 @@
+#!/bin/bash
+# Exit monitor carrier, frozen L2 brief (2026-11-13), N1-N6.
+# Contract: osascript(1), AppleScript display notification via argv, adopted by
+# ADR 0011 and home/.claude/canon/lanes-watch.sh:17-22,37-44,103-127.
+# Reads only the last 2000 outbox lines; a successful batch remembers every key.
+# A failed send stays pending. A stop between sending and recording may repeat
+# that batch at the next run. No account access, credential, schedule or order.
+# One run per account at a time: a run that finds the folder's .notify.lock held, and
+# not older than LOCK_STALE_MIN minutes, sends nothing and exits 0; an older lock is a
+# killed run's, and is taken over. delivered.json keeps only keys still in the window.
+# A pending alert older than the last 2000 lines is never sent (a named limit).
+# CLAUDE_CONFIG_DIR replaces ~/.claude. CANON_EXITMON_NO_NOTIFY=1 records status
+# without sending; CANON_EXITMON_OSASCRIPT replaces osascript and
+# CANON_EXITMON_NOTIFY_SECS the 30 s bound (tests only).
+# notify-status.json: pending is the number still due after this attempt;
+# sent_now counts keys sent in the batch; notified is null when nothing was due.
+set -uo pipefail
+# Expand names, never values, before starting any child process.
+for name in "${!ALPACA_@}"; do unset "$name"; done
+export PATH=/usr/bin:/bin:/usr/sbin:/sbin
+case "${1:-}" in
+  A|B) account="$1" ;;
+  *) echo 'exit-monitor-notify: expected account A or B; C is not authorized' >&2; exit 1 ;;
+esac
+cfg="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+w="$cfg/canon/exit-monitor/$account"
+now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+pending=null; sent_now=0; notified=null
+OSA=${CANON_EXITMON_OSASCRIPT:-/usr/bin/osascript}
+NOTIFY_SECS=${CANON_EXITMON_NOTIFY_SECS:-30}
+LOCK_STALE_MIN=3  # over the task's 3-minute bound (mise.toml paper:exit-monitor)
+
+# Replace whole files, using the watchdog's per-run temporary file pattern.
+put() {
+  local t
+  [ ! -d "$w/$1" ] || return 1
+  t=$(mktemp "$w/.$1.XXXXXX") || return 1
+  if printf '%s\n' "$2" > "$t" && mv -f "$t" "$w/$1"; then return 0; fi
+  rm -f "$t"; return 1
+}
+status() {
+  local data
+  data=$(jq -cn --arg at "$now" --argjson pending "$pending" \
+    --argjson sent "$sent_now" --argjson notified "$notified" --arg error "${1:-}" '
+      {checked_at: $at, pending: $pending, sent_now: $sent, notified: $notified}
+      + (if $error == "" then {} else {error: $error} end)') || return 1
+  put notify-status.json "$data"
+}
+fail() {
+  echo "exit-monitor-notify: $1" >&2
+  [ "$notified" = true ] || notified=false
+  [ -n "$pending" ] || pending=null
+  status "$1" || echo "exit-monitor-notify: could not write $w/notify-status.json" >&2
+  exit 1
+}
+mkdir -p "$w" || fail "could not create $w"
+lock="$w/.notify.lock"
+if ! mkdir "$lock" 2>/dev/null; then
+  if [ -n "$(find "$lock" -maxdepth 0 -type d -mmin +"$LOCK_STALE_MIN" 2>/dev/null)" ]; then
+    rmdir "$lock" 2>/dev/null; mkdir "$lock" 2>/dev/null \
+      || { echo "exit-monitor-notify: another run holds $lock; nothing sent" >&2; exit 0; }
+  else
+    echo "exit-monitor-notify: another run holds $lock; nothing sent" >&2; exit 0
+  fi
+fi
+trap 'rmdir "$lock" 2>/dev/null' EXIT
+delivered='[]'
+if [ -e "$w/delivered.json" ] || [ -L "$w/delivered.json" ]; then
+  [ -f "$w/delivered.json" ] && [ -r "$w/delivered.json" ] || fail "could not read $w/delivered.json"
+  delivered=$(jq -ce 'if type == "array" and all(.[]; type == "string")
+    then . else error("expected an array of delivered keys") end' "$w/delivered.json") \
+    || fail "could not read $w/delivered.json"
+  [ -n "$delivered" ] || fail "could not read $w/delivered.json"
+fi
+alerts='[]'
+if [ -e "$w/alerts.jsonl" ] || [ -L "$w/alerts.jsonl" ]; then
+  [ -f "$w/alerts.jsonl" ] && [ -r "$w/alerts.jsonl" ] || fail "could not read $w/alerts.jsonl"
+  alerts=$(tail -n 2000 "$w/alerts.jsonl" | jq -cRn '
+    [inputs | fromjson? | objects | select(.key | type == "string")]
+    | group_by(.key) | map(last) | sort_by(.state != "uncovered")') \
+    || fail "could not read $w/alerts.jsonl"
+fi
+notify=$(jq -cn --argjson alerts "$alerts" --argjson delivered "$delivered" '
+  $alerts | map(select(.key as $key | $delivered | index($key) == null))') \
+  || fail 'could not read pending keys'
+pending=$(jq 'length' <<< "$notify") || { pending=null; fail 'could not count pending keys'; }
+if [ "$pending" -gt 0 ]; then
+  notified=false
+  if [ "${CANON_EXITMON_NO_NOTIFY:-0}" != 1 ]; then
+    msg=$(jq -r 'if length == 1 then (.[0].flag // "" | tostring)
+      else "\(length) new flag(s): " + (.[0:4] | map(.flag // "" | tostring) | join("  ·  ")) end' <<< "$notify") \
+      || fail 'could not read notification text'
+    lane=$(jq -r '.[0].lane // "" | tostring' <<< "$notify") || fail 'could not read notification lane'
+    # Text is argv, never AppleScript source; the watchdog's 30 + 5 s bound.
+    if /usr/bin/timeout -k 5 "$NOTIFY_SECS" "$OSA" -e 'on run argv' \
+      -e 'display notification (item 1 of argv) with title "Canon exit monitor" subtitle (item 2 of argv)' \
+      -e 'end run' "$msg" "$lane" >/dev/null 2>&1; then
+      notified=true
+      sent_now=$pending
+      delivered=$(jq -cn --argjson prev "$delivered" --argjson sent "$notify" \
+        '($prev + ($sent | map(.key))) | unique') || fail 'could not read delivered keys'
+    fi
+  fi
+fi
+pending=$((pending - sent_now))
+# keep only keys the window still holds: an older key can never be read again
+delivered=$(jq -cn --argjson d "$delivered" --argjson a "$alerts" \
+  '($a | map(.key)) as $k | $d | map(select(. as $x | $k | index($x) != null))') \
+  || fail 'could not read delivered keys'
+put delivered.json "$delivered" || fail "could not write $w/delivered.json"
+status || { echo "exit-monitor-notify: could not write $w/notify-status.json" >&2; exit 1; }
+exit 0

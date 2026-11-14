@@ -902,7 +902,7 @@ exec /usr/bin/timeout -s KILL 300 uv run --locked python -c 'from canon_trading.
 [tasks."paper:exit-monitor"]
 description = "Write one paper account's exit status, record and alert outbox (GET only; no orders)"
 shell = "bash -c"
-timeout = "2m"
+timeout = "3m"  # keychain 2 x 10 s, the pass 50 s, the carrier 30 + 5 s, with room; its lock goes stale at 3 min
 usage = '''
 arg "<account>" help="tests: account A; windows: account B; C has no standing authorization" {
   choices "tests" "windows"
@@ -920,7 +920,13 @@ if [ -z "$ALPACA_API_KEY" ] || [ -z "$ALPACA_SECRET_KEY" ]; then
   unset ALPACA_API_KEY ALPACA_SECRET_KEY
 fi
 export ALPACA_API_KEY ALPACA_SECRET_KEY CANON_PAPER_ACCOUNT="$usage_account" CANON_ALPACA_DATA_ONLY=1
-exec /usr/bin/timeout -s KILL 50 uv run --locked python -m canon_trading.exit_monitor "$label"
+pass_rc=0
+/usr/bin/timeout -s KILL 50 uv run --locked python -m canon_trading.exit_monitor "$label" || pass_rc=$?
+unset ALPACA_API_KEY ALPACA_SECRET_KEY
+if ! "$MISE_PROJECT_ROOT/scripts/exit-monitor-notify" "$label"; then
+  echo "paper:exit-monitor: carrier failed for account $label" >&2
+fi
+exit "$pass_rc"
 '''
 
 [tasks."paper:close"]
