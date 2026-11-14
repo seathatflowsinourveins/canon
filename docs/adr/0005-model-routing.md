@@ -253,6 +253,13 @@ reasoning effort, with the fast tier where it is needed. The table's codex row r
   `--user-config` leaves such a value as it is and names it MISMATCH, so moving it is a step taken on
   purpose.
 
+
+### Muse deferred (2026-11-13)
+
+The owner deferred Muse Code on 2026-11-13. Its row in `canon/models.json` stays, marked
+`deferred` with that date, so its model and launch flags are kept for a resume (ADR 0045, ADR 0059).
+No Muse reviewer is started while it is deferred. The DeepSeek Harness row is unchanged, on Flash.
+
 ### Consequences
 
 * Good: caches survive; lanes are cheap where output is checkable; the table has an expiry date.

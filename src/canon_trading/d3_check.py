@@ -1,17 +1,23 @@
 """Read one paper-window JSON against the D3 acceptance terms (S5, A1-R).
 
 Contract read 2026-11-13; the numbers are UNCALIBRATED.
-Writer references below are at 16d02e1f:
+Writer references below are at 16d02e1f unless a newer base is named:
 * mover.py:1964-1977: run lists; :3701-3733: entries; :3631-3649: sizing;
   :1195-1205: exits; :1739-1746: fill tuples; :1916-1930: settings rows.
 * session_window.py:3244: mover.run; :1087-1156: mover.result; :1722-1751,
   :3375-3407: closing evidence; :4581-4601: order events and denial reasons.
-* Since #351 (mover.py at 42f2aa58) the writer records A3's sales and both refusal
-  lists: `_sale_sent` (:2199-2240) gives each sale `distance_in_force`, in price
-  units, compared to `trailing_offset`; `refusal_row` (:1546-1556) each
-  `order_refusals` row; :4179-4188 each `refusals` row, which :4004 keeps out of
-  `dropped`. Null trailing AND limit offsets describe a plain limit, not a trailing
-  remake. A record written before #351 has no sales, so A3 is not shown on it.
+* A1/A3 writer references at 3d604ae7, mover.py: since #351, `_sale_sent`
+  (:2581-2624) gives each sale `distance_in_force`, in price units, compared to
+  `trailing_offset`; `refusal_row` (:1689-1699) gives each order refusal, while
+  :5038-5049 writes cap refusals and :4898-4906,4915-4921 writes re-entry refusals.
+  Null trailing AND limit offsets describe a plain limit, not a trailing remake.
+  `ExitRecord.record` (:1349-1392) writes `sales` and `trigger_reason`; an explicit
+  empty sales list on the in-session wind-down (:4796-4808, `extended_hours` false)
+  leaves A3 no remake to check. Every other exit records its sale: a held stop's
+  plain limit via :4442,4757, the out-of-session wind-down's via `_sell_out`, so an
+  empty list on any of them is missing evidence, as is a trailing-stop fire's. Any
+  sales present are still checked. A record written before #351 has no sales key,
+  so A3 is not shown on it.
 
 Sizing implements the recorded equity specialization of pinned NautilusTrader
 d53849b216e2, crates/risk/src/sizing.rs:74-116 (loss/distance, caps, whole-share
@@ -376,6 +382,20 @@ def _a1_entry(t: Term, entry: KeyPath) -> None:
 TRAIL_CAP_REFUSALS = ("floor_over_cap", "distance_over_cap")
 """A refusal row's `reason` for the trail cap; these rows carry `distance` and `cap`."""
 
+# mover.py at 3d604ae7:4898-4906,4915-4921, the second formatting PENDING_REENTRY_BARS
+# (:1281) into its text. The texts are local to the trading module, so they are copied
+# without importing it, and the bound is matched as any whole number.
+REENTRY_REFUSALS = (
+    re.compile(r"qualifying close interval end unavailable"),
+    re.compile(r"post-sale close history exceeded \d+ pending intervals"),
+)
+
+MARKET_EXIT_REASON = "wind-down"
+"""The exit reason `Mover._end` marks before upstream's market exit (mover.py at 3d604ae7:4796-4808),
+whose orders pass no `_sale_sent` and so write no sale row. `_sell_out` marks the same text outside
+the session (:4760-4781) and records its limit sale, so the text names a sale-less exit only where
+the run's `extended_hours` row is false (`_end` returns at once when it is true)."""
+
 # mover.py at 16d02e1f: _buy returns reasons through _enter:3341 into dropped;
 # _entry_trail's ValueErrors pass through _buy:3457-3460. Match the complete reason
 # after its instrument prefix, not keywords in the notes that share this list.
@@ -429,7 +449,7 @@ NAMED_DROP_PATTERNS = (
 
 
 def _a1_refusals(t: Term) -> None:
-    # The record unit's contract, not on main yet: each row names its cause in `reason`.
+    # mover.py at 3d604ae7:2760 writes the rows; each names its cause in `reason`.
     new = (*RUN, "refusals")
     if t.optional(new) is not ABSENT:
         for index in range(len(t.array(new))):
@@ -440,14 +460,7 @@ def _a1_refusals(t: Term) -> None:
                     cap = t.number((*row, "cap"))
                     if cap <= 0 or t.number((*row, "distance")) <= cap:
                         t.unknown((*row, "distance"), "distance over a positive cap not shown")
-                elif reason == "reentry_max":
-                    most = t.number((*row, "reentry_max"))
-                    made = t.number((*row, "reentries"))
-                    if most < 0 or most != most.to_integral_value() or made < most:
-                        t.unknown(
-                            (*row, "reentries"), "re-entries at the recorded maximum not shown"
-                        )
-                else:
+                elif not any(pattern.fullmatch(reason) for pattern in REENTRY_REFUSALS):
                     t.unknown((*row, "reason"), f"not a refusal reason the writer gives: {reason}")
                 t.stamp((*row, "when_ns"))
                 t.counts["named_refusals"] += 1
@@ -626,29 +639,42 @@ def _a2(t: Term) -> None:
 
 
 def _a3(t: Term) -> None:
-    # mover.py:1975 exposes exits but has NO per-sale writer at this base.
+    # mover.py at 3d604ae7:1392,2770 exposes every holding's sales, including an empty list.
+    t.counts["holdings_without_remake"] = 0
+    # a `met` with no trailing sale compared is a vacuous one; the count lets a reader see it
+    t.counts["trailing_sales_checked"] = 0
     exits = t.array(EXITS)
     if not exits:
         t.unknown(EXITS, "no exits[].sales evidence; A3 is not shown by an empty exit list")
     for index in range(len(exits)):
         with t.scope():
-            sales_path = (*EXITS, index, "sales")  # prospective per-sale record contract
+            sales_path = (*EXITS, index, "sales")
             sales = t.array(sales_path)
             if not sales:
+                # Read the array first: no sales key (pre-#351) is still missing evidence.
+                # Only the in-session wind-down sells with no sale row (`MARKET_EXIT_REASON`).
+                # Every other exit, a held stop's included, sends a sale `_sale_sent` records
+                # (mover.py at 3d604ae7:4442,4757), so an empty list there is a lost row.
+                reason = t.optional((*EXITS, index, "trigger_reason"))
+                extended = t.optional((*RUN, "rows", "extended_hours"))
+                if reason == MARKET_EXIT_REASON and extended is False:
+                    t.counts["holdings_without_remake"] += 1
+                    continue
                 t.unknown(sales_path, "no per-sale evidence for this holding")
             for sale in range(len(sales)):
                 with t.scope():
                     row = (*sales_path, sale)
-                    # Prospective trailing_offset / limit_offset / distance row.
+                    # mover.py at 3d604ae7:2593-2609 reads offsets and distance at send.
                     trailing = t.read((*row, "trailing_offset"))
                     limit = t.read((*row, "limit_offset"))
                     if trailing is None and limit is None:
                         continue  # explicitly a plain limit, with no trailing offset to compare
-                    distance = t.number((*row, "distance_in_force"))  # mover.py:2225
+                    distance = t.number((*row, "distance_in_force"))
                     offset = t.number((*row, "trailing_offset"))
                     if distance <= 0 or offset != distance:
                         t.fail((*row, "trailing_offset"), f"distance in force is {distance}")
                     t.number((*row, "limit_offset"))
+                    t.counts["trailing_sales_checked"] += 1
 
 
 def _buys(t: Term) -> dict[str, tuple[int, KeyPath]]:

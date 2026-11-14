@@ -691,13 +691,14 @@ data "$@"
 # account's pair may serve it (ADR 0093, the decision of 2026-11-11). It runs canon_trading.history_load in
 # data-only mode (ADR 0070): every request but GET is refused before it is sent. It places nothing and opens
 # no stream, so it takes no account's lock and no stream lock. The module paces its GETs by ADR 0093's
-# row, stops by name at a 429, names `sip` for bars/trades or `iex` for quotes and never falls back. The run is
-# held to `deadline` seconds by timeout(1) -s KILL. Trades use the adapter's historical prints fetch and
+# row, stops by name at a 429, names `sip` for bars/trades and `iex`, or `sip` within its bound, for quotes,
+# and never falls back. The run is held to `deadline` seconds by timeout(1) -s KILL. Trades use the
+# adapter's historical prints fetch and
 # the catalog's trade-tick writer, with the same catalog lock, feed marker and pace as bars.
 # `--baseline-inputs` (ADR 0087's evening baseline) runs scripts/movers-baseline-inputs.py instead: it also
 # sends two trading-API GETs, Alpaca's calendar and its active assets, which ADR 0093's row does not count.
 [tasks."paper:history"]
-description = "Load historical sip bars or trades, or IEX quotes, for listed symbols with one paper account's pair, GET only, paced; read Alpaca's trade-condition codes per tape; or write a feed's nightly movers baseline from the catalog"
+description = "Load historical sip bars or trades, or IEX quotes or bounded SIP quotes, for listed symbols with one paper account's pair, GET only, paced; read Alpaca's trade-condition codes per tape; or write a feed's nightly movers baseline from the catalog"
 shell = "bash -c"
 timeout = "6h"
 usage = '''
@@ -709,8 +710,8 @@ arg "[mode]" help="baseline: write from the catalog without reading an account p
 }
 flag "--session <date>" help="baseline mode: coming trade date, ISO date"
 flag "--sessions-file <file>" help="baseline mode: ordered session calendar including the trade date and five prior sessions"
-flag "--feed <feed>" help="baseline mode: one feed, in its own catalog root; default sip" {
-  choices "sip" "boats"
+flag "--feed <feed>" help="baseline mode: sip (the default) or boats, in its own catalog root. Load mode, --data quotes only: iex (the default) or sip, the Securities Information Processor feed (alpaca-py DataFeed.SIP; that it is the national best bid and offer is UNVERIFIED), for at most 8 symbols named with --symbols, never --symbols-file, over at most 60 minutes, into a root of its own that holds no bars or trades (ADR 0151); bars and trades are sip, refuse --feed iex and a root that holds quotes; every other mode refuses iex" {
+  choices "sip" "boats" "iex"
 }
 flag "--max-excluded-share <share>" help="baseline mode: the most of the catalog's equities left out (UNCALIBRATED; default 0.5)"
 flag "--baseline-dir <root>" help="baseline mode: write <feed>.json in this directory; default catalog/movers-baseline"
@@ -720,8 +721,8 @@ flag "--symbols-file <file>" help="a file of symbols, one a line"
 flag "--start <start>" help="ISO 8601 with a time zone; required"
 flag "--end <end>" help="ISO 8601 with a time zone; required, at least 15 minutes (trades, quotes or 1-MINUTE bars) or a day (1-DAY bars) before now"
 flag "--bars <bars>" help="1-MINUTE, 1-DAY or both, comma-separated; default both"
-flag "--catalog <root>" help="the catalog root, never under ledger/; default catalog, or catalog/<feed> in baseline mode"
-flag "--data <kind>" help="bars (the default) or individual trade prints, on sip (ADR 0093's pace and catalog lock), or IEX quotes from 2025-11-04 New York on over at most 90 days (ADR 0066); --bars applies only to bars" {
+flag "--catalog <root>" help="the catalog root, never under ledger/; default catalog, catalog/sip-quotes for --data quotes --feed sip, or catalog/<feed> in baseline mode"
+flag "--data <kind>" help="bars (the default) or individual trade prints, on sip (ADR 0093's pace and catalog lock), or quotes from 2025-11-04 New York on, IEX over at most 90 days (ADR 0066) or SIP within --feed sip's bound; --bars applies only to bars" {
   choices "bars" "trades" "quotes"
 }
 '''
@@ -736,6 +737,10 @@ esac
 # would load sip into a boats root. Flags carry no usage default, so an unset one is empty here.
 named() { for v in "$@"; do eval "[ -z \"\${usage_$v:-}\" ]" || printf ' --%s' "${v//_/-}"; done; }
 module=  # set by a mode that runs its own module; an inherited value is not used
+# iex is a quote feed: only load mode's --data quotes takes it, refused by name everywhere else.
+if [ "${usage_feed:-}" = iex ] && { [ -n "${usage_mode:-}" ] || [ -n "${usage_baseline_inputs:-}" ] || [ "${usage_data:-bars}" != quotes ]; }; then
+  echo "paper:history: --feed iex is for --data quotes only, in load mode; nothing was read" >&2; exit 3
+fi
 case "${usage_mode:-}" in
   baseline)
     wrong=$(named symbols symbols_file start end bars data baseline_inputs)
@@ -763,15 +768,26 @@ case "${usage_mode:-}" in
       module=baseline-inputs
       set -- --directory "$usage_baseline_inputs" --catalog "$usage_catalog" --baseline-dir "$usage_baseline_dir"
     else
-      wrong=$(named session sessions_file feed max_excluded_share baseline_dir)
+      wrong=$(named session sessions_file max_excluded_share baseline_dir)
+      # --feed sip|iex is the quote feed the module takes; boats is the baseline's alone
+      [ "${usage_feed:-}" != boats ] || wrong="$wrong --feed boats"
+    fi
+    if [ "${usage_data:-}" = quotes ] && [ "${usage_feed:-}" = sip ]; then
+      # The module's sip quote bound, held here too so a misuse reads no pair; the module checks the span.
+      [ -n "${usage_symbols:-}" ] && [ -z "${usage_symbols_file:-}" ] || { echo "paper:history: sip quotes take --symbols named on the command line, never --symbols-file; nothing was read" >&2; exit 3; }
+      count=$(printf '%s\n' "$usage_symbols" | tr ',' '\n' | awk '{ gsub(/^[ \t]+|[ \t]+$/, ""); if ($0 != "") print toupper($0) }' | sort -u | wc -l | tr -d ' ')
+      [ "$count" -le 8 ] || { echo "paper:history: sip quotes take at most 8 symbols (SIP_QUOTES_MAX_SYMBOLS), got $count; nothing was read" >&2; exit 3; }
     fi
     [ -z "$wrong" ] || { echo "paper:history: load mode takes no baseline flag:$wrong; give the baseline mode for those; nothing was read" >&2; exit 3; }
     ;;
   *) echo "paper:history: unknown mode '${usage_mode}'; nothing was read" >&2; exit 3 ;;
 esac
-[ -n "${module:-}" ] || set -- --start "${usage_start:-}" --end "${usage_end:-}" --bars "${usage_bars:-1-MINUTE,1-DAY}" --catalog "${usage_catalog:-catalog}" --data "${usage_data:-bars}"
+root=catalog  # sip quotes default to a root of their own (ADR 0151)
+[ "${usage_data:-}" != quotes ] || [ "${usage_feed:-}" != sip ] || root=catalog/sip-quotes
+[ -n "${module:-}" ] || set -- --start "${usage_start:-}" --end "${usage_end:-}" --bars "${usage_bars:-1-MINUTE,1-DAY}" --catalog "${usage_catalog:-$root}" --data "${usage_data:-bars}"
 [ -n "${module:-}" ] || [ -z "${usage_symbols:-}" ] || set -- "$@" --symbols "$usage_symbols"
 [ -n "${module:-}" ] || [ -z "${usage_symbols_file:-}" ] || set -- "$@" --symbols-file "$usage_symbols_file"
+[ -n "${module:-}" ] || [ -z "${usage_feed:-}" ] || set -- "$@" --feed "$usage_feed"
 ALPACA_API_KEY="$(/usr/bin/timeout 30 /usr/bin/security find-generic-password -s "$svc" -a ALPACA_API_KEY -w)" || ALPACA_API_KEY=""
 ALPACA_SECRET_KEY="$(/usr/bin/timeout 30 /usr/bin/security find-generic-password -s "$svc" -a ALPACA_SECRET_KEY -w)" || ALPACA_SECRET_KEY=""
 [ -n "$ALPACA_API_KEY" ] && [ -n "$ALPACA_SECRET_KEY" ] || { echo "paper:history: account ${usage_account}'s pair is not in the login keychain (mise run paper:check ${usage_account}); nothing was read" >&2; exit 1; }
@@ -841,10 +857,9 @@ exec /usr/bin/timeout -s KILL 600 uv run --locked python -c 'import sys; from ca
 
 # A read of one paper account (src/canon_trading/custody.py): equity, cash and buying power, each position,
 # each open order with its time in force and position intent as Alpaca returns them and whether its client
-# order ID is of our nodes' lineage or foreign, and `no_shorting`; then the New York trade date's ended orders,
-# from a closed-order history walk paged at the poll interval over submissions back to 92 days before the
-# date (Alpaca cancels a GTC order at 90 days), which can take minutes on a busy account and is printed after
-# the rest, so a failed or killed walk leaves the account read shown. GET only: the task and the module set
+# order ID is of our nodes' lineage or foreign, and `no_shorting`; then the New York trade date's ended orders
+# submitted inside that date (one submitted earlier is not listed), from a closed-order history walk paged at
+# the poll interval and printed after the rest, so a failed walk leaves the account read shown. GET only: the task and the module set
 # data-only mode (CANON_ALPACA_DATA_ONLY=1, ADR 0070), so the client refuses every other method before
 # sending. `tests` reads account A's pair and `windows` account B's (ADR 0069), as
 # paper:long-only does, into this task's environment only; neither value is printed, and no account number or

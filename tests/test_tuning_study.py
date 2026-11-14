@@ -657,10 +657,24 @@ def test_agy_3_stop_is_submitted_in_the_entry_timestamp(alpaca_bars: AlpacaBars)
 
 
 def test_agy_3_entry_with_no_positive_planned_stop_is_refused(alpaca_bars: AlpacaBars) -> None:
+    """Every entry the replay sends has a positive planned stop. Since the sub-dollar offset ruling
+    (the lead, 2026-11-13, 17:27: one step where the cap is under one), 0.0003 and under plan no
+    positive stop and 0.0004 plans one, so this tape's entry at 0.0004 is sized, not refused."""
+    from canon_trading.mover import MoverConfig
+    from canon_trading.mover import planned_stop
+
+    settings = MoverConfig(max_notional=Decimal(1000), max_move=Decimal(1000))
+
+    def stop(price: Decimal) -> Decimal:
+        return planned_stop(price, settings.trail, settings.exit_through, settings.chase_cap)
+
+    assert stop(Decimal("0.0003")) <= 0 < stop(Decimal("0.0004"))
     day = date(2025, 3, 10)
     bars = [tape_bar("AAPL", day, 570 + i, 0.0001 + i * 0.0001) for i in range(4)]
     result = replay_tape(alpaca_bars, bars, protect=True, reference=0.0001)
-    assert not any(order.side.name == "BUY" for order in result.orders)
+    buys = [order for order in result.orders if order.side.name == "BUY"]
+    assert buys
+    assert all(stop(order.price.as_decimal()) > 0 for order in buys)
 
 
 @pytest.mark.parametrize("missing", ["symbol", "session"])
@@ -1416,7 +1430,9 @@ def test_a_native_stop_limit_seeded_under_its_limit_offset_is_priced_at_least_on
 
     real = tuning_study.offsets
 
-    def wide(entry: Decimal, trail: Decimal, exit_through: Decimal) -> tuple[Decimal, Decimal]:
+    def wide(
+        entry: Decimal, trail: Decimal, exit_through: Decimal, **_kwargs: Decimal | None
+    ) -> tuple[Decimal, Decimal]:
         trailing, _ = real(entry, trail, exit_through)
         return trailing, entry + Decimal("0.01")  # a limit offset over the seed close
 
