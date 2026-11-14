@@ -302,6 +302,7 @@ from alpaca.data.models import TradeCancel
 from alpaca.data.models import TradeCorrection
 from alpaca.data.models import TradingStatus
 from alpaca.data.requests import StockBarsRequest
+from alpaca.data.requests import StockLatestQuoteRequest
 from alpaca.data.requests import StockQuotesRequest
 from alpaca.data.requests import StockTradesRequest
 from alpaca.data.timeframe import TimeFrame
@@ -433,6 +434,10 @@ class HistoricalClient(Protocol):
     def get_stock_bars(self, request_params: StockBarsRequest) -> BarSet | RawData: ...
 
     def get_stock_quotes(self, request_params: StockQuotesRequest) -> QuoteSet | RawData: ...
+
+    def get_stock_latest_quote(
+        self, request_params: StockLatestQuoteRequest
+    ) -> dict[str, Quote] | RawData: ...
 
     def get(self, path: str, data: dict | None = None) -> HTTPResult: ...
 
@@ -2158,6 +2163,9 @@ class AlpacaDataClient(MarketDataClient):
 
     @override
     async def _request_quotes(self, request: live.RequestQuotes) -> None:
+        if (request.params or {}).get("latest") is True:
+            await self._request_latest_quote(request)
+            return
         instrument_ids = request.instrument_ids
         if len(instrument_ids) != 1:
             raise ValueError(
@@ -2206,6 +2214,81 @@ class AlpacaDataClient(MarketDataClient):
                 f"price finer than the instrument's precision; the first: {first_fine}"
             )
         self._handle_response(self._quotes_response(request, instrument.id, ticks))
+
+    async def _request_latest_quote(self, request: live.RequestQuotes) -> None:
+        """One latest snapshot on the established stream feed, without catalog reads or writes.
+
+        Contract: alpaca-py c42add7c0a70, historical/stock.py:163-182 and requests.py:246-289;
+        NautilusTrader d53849b216e2, QuotesResponse and ClientOutput.request_failed
+        (crates/live/src/python/client/mod.rs:504-527). The SDK's own 429/504 retries remain:
+        one SDK call can make four HTTP GETs, with three 3 s waits, in the historical executor.
+        Engine-filled request bounds are ignored and response bounds are None/None: the pin
+        trims by ts_init, and a receipt-stamped snapshot can be later than its filled end
+        (crates/common/src/messages/data/response.rs:47-72; data/src/engine/streaming.rs:419-426).
+        """
+        instrument_ids = request.instrument_ids
+        symbol = instrument_ids[0].symbol.value if instrument_ids else "<no instrument>"
+        try:
+            if len(instrument_ids) != 1:
+                raise ValueError(
+                    f"Alpaca latest quote requests take one instrument, got {len(instrument_ids)}"
+                )
+            instrument = self._equity(instrument_ids[0])
+            historical = self._historical
+            if historical is None:
+                raise RuntimeError("Alpaca data client is not connected")
+            if request.limit not in (None, 1):
+                raise ValueError(f"latest quote limit must be None or 1, got {request.limit}")
+            params = request.params or {}
+            if params.get("skip_catalog_data") is not True:
+                raise ValueError("latest quote requires skip_catalog_data=True")
+            if params.get("update_catalog") is not False:
+                raise ValueError("latest quote requires update_catalog=False")
+            feed, named = named_feed(params, STREAM_FEEDS, "latest quote requests")
+            if not named:
+                raise ValueError("latest quote requires an explicit feed matching the stream feed")
+            if feed is DataFeed.IEX:
+                raise ValueError("IEX is refused for a latest quote seed")
+            if self._stream_feed is None:
+                raise ValueError("no stream feed yet")
+            if feed != self._stream_feed:
+                raise ValueError(
+                    f"latest quote feed {feed.value} differs from stream feed {self._stream_feed.value}"
+                )
+            result = await self._one_historical_call(
+                historical.get_stock_latest_quote,
+                StockLatestQuoteRequest(symbol_or_symbols=symbol, feed=feed),
+            )
+            if not isinstance(result, dict):
+                raise TypeError("alpaca-py returned non-dict latest quote data")
+            ticks: list[QuoteTick] = []
+            if symbol in result:
+                quote = result[symbol]
+                if not isinstance(quote, Quote):
+                    raise TypeError(
+                        "alpaca-py returned raw or non-Quote latest quote data; "
+                        "the client must use raw_data=False"
+                    )
+                try:
+                    ticks.append(parse_quote(quote, instrument, self.clock.timestamp_ns()))
+                except (OneSidedQuoteError, FinePriceError) as e:
+                    self._log.warning(f"{symbol}: latest quote dropped: {type(e).__name__}: {e}")
+            response = QuotesResponse(
+                client_id=self.client_id,
+                instrument_id=instrument.id,
+                data=ticks,
+                correlation_id=request.request_id,
+                ts_init=self.clock.timestamp_ns(),
+                start=None,
+                end=None,
+                params=request.params,
+            )
+        except Exception as e:  # noqa: BLE001 - complete every SDK or conversion failure by name.
+            self._output.request_failed(
+                request.request_id, f"{symbol}: latest quote refused: {type(e).__name__}: {e}"
+            )
+            return
+        self._handle_response(response)
 
     def _quotes_response(
         self, request: live.RequestQuotes, instrument_id: InstrumentId, ticks: list[QuoteTick]
