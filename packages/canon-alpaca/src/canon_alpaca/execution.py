@@ -375,12 +375,16 @@ Known limits:
   stop price as the trigger price and the node's trigger type, else `DEFAULT`; trailing reports also
   carry their offset and type, as above.
 * After start-up, such an open order that the node does not hold (an OCO, bracket or OTO leg placed by
-  someone else, say) is left out of the running open-order check's report, the fill request's open
-  orders and the stream's outside reports. It is named once by an ALERT with a count of those left out,
-  and the count drops when it ends (`_leave_out`). One such order would otherwise fail the whole report,
-  and with it every order's check while it stands. The node does not see that order or the shares it
-  holds, so a cover judged from the node's cache does not count it. An order the node holds that it
-  cannot represent still fails the report.
+  someone else, say) is left out of the running open-order check's report and the stream's outside
+  reports. It is named once by an ALERT with a count of those left out, and the count drops when it ends
+  (`_leave_out`); a full page of open orders ends none. One such order would otherwise fail the whole
+  report, and with it every order's check while it stands. The node does not see that order or the
+  shares it holds, so a cover judged from the node's cache does not count it. An order the node holds
+  that it cannot represent, traced through `replaces`, still fails the report. The leave-out keys on the
+  engine's `open_only`, which the running check sets from `open_check_open_only` (default true); with
+  that off, the check asks as start-up does and such an order fails it. A running fill request names
+  one instrument, so a partly filled such order fails its own symbol's request alone, and nothing is
+  inferred for that symbol (ADR 0075).
 * Timestamps lose sub-microsecond precision: alpaca-py parses them into `datetime`.
 * A trading client given to the constructor is the caller's: every connect uses it, a disconnect does not
   drop it, and nothing is built from the environment in its place (the adapter guide closes in
@@ -2970,20 +2974,12 @@ class AlpacaExecutionClient(ExecutionClient):
         }
 
     def _unrepresentable_outside(self, order: AlpacaOrder) -> str | None:
-        """Why an open order the node does not hold cannot be represented on its own terms, or None.
-
-        The terms are `mapped_order_report`'s, with the trailing setting an order not held is mapped
-        under; nothing is read. An order the node holds, by its own client order ID, a replacement this
-        client indexed or its venue order ID, is never judged here: one of those it cannot represent
-        stays a refusal (ADR 0030)."""
+        """Why an open order cannot be represented as an order the node does not hold, or None: the terms
+        are `mapped_order_report`'s, under the trailing setting such an order is mapped with, and nothing
+        is read. The caller has found that the node does not hold it, by a trace of its `replaces`
+        (`_node_order_id`); an order the node holds that this slice cannot represent stays a refusal
+        (ADR 0030)."""
         if not is_open_order(order):
-            return None
-        candidates = (
-            holdable_id(order.client_order_id),
-            self._index.get(str(order.id)),
-            self._held_by_venue_id(str(order.id)),
-        )
-        if any(cid is not None and self.cache.order(cid) is not None for cid in candidates):
             return None
         try:
             mapped_order_report(order, 0, trailing=self._report_external_trailing_stops)
@@ -3052,7 +3048,10 @@ class AlpacaExecutionClient(ExecutionClient):
                 f"{order_description(update.order)} is not reported: status replaced: "
                 "its replacement is reported instead"
             )
+            # A left-out order's replacement is judged on its own update, under its own ID.
+            self._left_out.discard(order_id)
             return
+        # `_apply` traced it (`_node_order_id`): the node does not hold it.
         reason = self._unrepresentable_outside(update.order)
         if reason is not None:
             # Named once; its stream fills are never shown to the engine, which does not hold it.
@@ -4640,6 +4639,7 @@ class AlpacaExecutionClient(ExecutionClient):
                 )
             )
         found: dict[str, AlpacaOrder] = {}
+        full_page = False
         for request in requests:
             orders = await self._call(self._venue().get_orders, request)
             if not isinstance(orders, list):
@@ -4647,6 +4647,7 @@ class AlpacaExecutionClient(ExecutionClient):
                     "alpaca-py returned raw order data; the client must use raw_data=False"
                 )
             if len(orders) >= ORDERS_PAGE_LIMIT:
+                full_page = True
                 self._log.warning(
                     f"Alpaca returned {len(orders)} orders, its most per request; older ones may be "
                     "missing",
@@ -4681,12 +4682,17 @@ class AlpacaExecutionClient(ExecutionClient):
         for order in found.values():
             if str(order.id) in superseded or str(order.id) in not_yet:
                 continue
-            reason = self._unrepresentable_outside(order) if running else None
-            if reason is not None:
+            try:
+                report = await self._order_report(order, found)
+            except ValueError:
+                # Left out only when the order cannot be represented on its own terms and its trace
+                # finds no order of the node's: a trace that fails raises again here, as it did above.
+                reason = self._unrepresentable_outside(order) if running else None
+                if reason is None or await self._node_order_id(order, found) is not None:
+                    raise
                 self._leave_out(order, reason)
                 left_out.add(str(order.id))
                 continue
-            report = await self._order_report(order, found)
             try:
                 report = await self._settled_report(report) if report is not None else None
             except HeldReportError:
@@ -4695,8 +4701,8 @@ class AlpacaExecutionClient(ExecutionClient):
                 continue
             if report is not None:
                 reports.append(report)
-        if running and command.instrument_id is None:
-            # Every open order was read: one left out before and not now has ended.
+        if running and command.instrument_id is None and not full_page:
+            # Every open order was read: one left out before and not listed open now has ended.
             self._no_longer_left_out(self._left_out - left_out)
         return reports
 
@@ -4937,12 +4943,6 @@ class AlpacaExecutionClient(ExecutionClient):
                 try:
                     if await self._node_order_id(order) is not None:
                         continue  # the node's own: its reports wait for its fills (`_settled_report`)
-                    reason = self._unrepresentable_outside(order)
-                    if reason is not None:
-                        # Its fills are not shown: the node does not hold it, and neither do its
-                        # reports (`_order_status_reports`), so no fill of it is one the engine infers.
-                        self._leave_out(order, reason)
-                        continue
                     report = await self._order_report(order)
                     if report is None or report.filled_qty.as_decimal() <= 0:
                         continue
