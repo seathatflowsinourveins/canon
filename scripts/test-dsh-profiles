@@ -222,8 +222,9 @@ chmod +x "$TMP/failjq/jq"
 
 # P3 and P5 — which folders under profiles/ are profiles: dsh refuses node_modules (and ., .. and a
 # name with a backslash) as a profile name and accepts one starting with a dot (app-boot profile.ts
-# L169-176), so a dot-folder is read and node_modules is not, even with a package.json; a folder whose
-# name holds a control character cannot be printed as a row name, and is counted instead.
+# L165-172 at dsh-v0.2.2-rc.2), so a dot-folder is read and node_modules is not, even with a
+# package.json; a folder whose name holds a control character cannot be printed as a row name, and is
+# counted instead.
 P3D_HOME=$(fixture_home p3-dot)
 P3D_DSH="$TMP/cases/p3-dot/dsh"
 fixture_profile p3-dot .scratch '{"dependencies":{"unvetted":"1.0.0"}}'

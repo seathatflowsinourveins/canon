@@ -28,7 +28,7 @@
 //   Teardown sends SIGTERM and exits immediately, without stdin EOF, waiting for shutdown,
 //   session/cancel, or cancelled outcomes for outstanding permission requests.
 //   The pinned DSH app's EOF/shutdown contract is described in:
-//   https://github.com/deepseek-ai/deepseek-harness/blob/1f81c047fc48fa190a683e469daa699857e9afe8/packages/bundle/acp-app/README.md
+//   https://github.com/deepseek-ai/deepseek-harness/blob/ddac96760b6edf8fa0fe17cbdcf0b512f4c12b2c/packages/bundle/acp-app/README.md#L27
 // - Empty option values fall back; a following flag can be consumed as a value.
 //   --timeout is not validated; NaN, values below 1 or above 2147483647 use Node's 1 ms delay.
 // - ACP v1 is registered by ADR 0095; dsh-acp-app adoption remains deferred in ADR 0086.

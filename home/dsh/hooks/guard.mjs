@@ -33,21 +33,26 @@
  * name, and deny > ask > allow (README.md L62, L97); a provider reason passes
  * through verbatim (L158), and PreToolUse is partial: deny and ask work (L178).
  *
- * Upstream, read at deepseek-harness pin 1f81c047fc48:
+ * Upstream, read at deepseek-harness pin ddac96760b6e (dsh-v0.2.2-rc.2); each
+ * payload field and tool name below reads as it did at 1f81c047fc48:
  *   packages/experimental/hooks-claude-code/README.md L48 (configPath), L93
  *   (payload base), L62 (PreToolUse), L68-75, L97, L158, L178;
- *   packages/experimental/hooks-claude-code/src/index.ts L335, L346 (the
+ *   packages/experimental/hooks-claude-code/src/index.ts L333, L344 (the
  *   PreToolUse payload fields); packages/experimental/hook-protocol/src/
  *   runner.ts L2-3, L87 (a command hook runs through ctx.shell);
- *   packages/shell/tool-bash/src/index.ts L369, L379 (bash, command);
- *   packages/shell/tool-pwsh/src/index.ts L398 (pwsh, command);
+ *   packages/shell/tool-bash/src/index.ts L393, L403 (bash, command);
+ *   packages/shell/tool-pwsh/src/index.ts L409, L420 (pwsh, command);
  *   packages/experimental/tool-terminal/src/index.ts L203, L208 (terminal_send,
  *   text); packages/fs/tool-fs/src/write.ts L74, L77 (write, file_path);
  *   packages/fs/tool-fs/src/edit.ts L86, L89 (edit, file_path);
- *   packages/fs/tool-str-replace-editor/src/index.ts L430
- *   (str_replace_editor).
+ *   packages/fs/tool-str-replace-editor/src/index.ts L435, L444
+ *   (str_replace_editor, path).
  * The matcher's terminal and multi_edit name no tool at this pin; they stay
- * because the owner's hooks.json has them.
+ * because the owner's hooks.json has them. No worker profile loads the
+ * terminal tools at this pin (home/dsh/profiles.json), so terminal_send applies
+ * only where they still load: the desktop profile, which carries the terminal
+ * bundle beside the Web bundle that composes its controller (ADR 0143;
+ * packages/bundle/web-app/cordis.patch.yml L126-127).
  */
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
