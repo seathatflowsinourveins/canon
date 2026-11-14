@@ -1278,7 +1278,9 @@ def _task() -> dict[str, str]:
     return tomllib.loads((ROOT / "mise.toml").read_text())["tasks"]["paper:protect"]
 
 
-def _run_task(tmp_path: Path, account: str) -> tuple[subprocess.CompletedProcess, str]:
+def _run_task(
+    tmp_path: Path, account: str, **flags: str
+) -> tuple[subprocess.CompletedProcess, str]:
     """The task's body with `/usr/bin/security` swapped for a stand-in that logs its arguments; it is
     run only for names refused before the keychain and the lock."""
     log = tmp_path / "security.log"
@@ -1288,7 +1290,7 @@ def _run_task(tmp_path: Path, account: str) -> tuple[subprocess.CompletedProcess
     body = _task()["run"].replace("/usr/bin/security", str(stub))
     done = subprocess.run(
         ["bash", "-c", body],
-        env={"PATH": f"{tmp_path}:/usr/bin:/bin", "usage_account": account},
+        env={"PATH": f"{tmp_path}:/usr/bin:/bin", "usage_account": account, **flags},
         capture_output=True,
         text=True,
         timeout=60,
@@ -1850,9 +1852,9 @@ def test_the_task_hands_the_cancel_and_the_symbol_over() -> None:
     task = _task()
     assert 'flag "--cancel"' in task["usage"] and 'flag "--symbol <symbol>"' in task["usage"]
     assert re.search(
-        r"task_from_flags\(\*sys\.argv\[1:5\]\)\)' "
+        r"task_from_flags\(\*sys\.argv\[1:6\]\)\)' "
         r'"\$\{usage_plan_only:-false\}" "\$\{usage_row:-\}" "\$\{usage_cancel:-false\}" '
-        r'"\$\{usage_symbol:-\}"$',
+        r'"\$\{usage_symbol:-\}" "\$\{usage_only:-\}"$',
         task["run"],
         re.MULTILINE,
     )
@@ -2187,3 +2189,309 @@ def test_exit_for_the_shares_the_owner_added_to_a_protected_long(capsys) -> None
     )
     code, lines = _run(paper, Data({"AAA": AAA_BOOK}), capsys)
     _covered(paper, "AAA", 5, code, lines)
+
+
+# The include list only removes sends; the planner and the send's quantity checks stay the same.
+
+
+def _only_run(paper: Paper, data: Data, capsys, only: str, **flags: Any) -> tuple[int, list[str]]:
+    code = protect.task_from_flags(
+        flags.get("plan_only", "false"),
+        flags.get("row", "OWN1"),
+        flags.get("cancel", "false"),
+        flags.get("symbol", ""),
+        only,
+        trading=cast(Any, paper),
+        data=data,
+        pause=lambda _seconds: None,
+    )
+    out = capsys.readouterr()
+    return code, (out.out + out.err).splitlines()
+
+
+def _data_calls(data: Data) -> list[tuple[str, dict[str, Any]]]:
+    """Compare request fields, including TimeFrame.value (alpaca/data/timeframe.py:76)."""
+    return [
+        (
+            method,
+            {
+                key: getattr(value, "value", value)
+                for key, value in request.to_request_fields().items()
+            },
+        )
+        for method, request in data.asked
+    ]
+
+
+@pytest.mark.parametrize("only", ["AAA", "AAA,BBB", "BBB,AAA", "CCC", "AAA,CCC"])
+def test_only_sends_for_named_longs_and_names_absent_symbols(capsys, only) -> None:
+    paper = Paper(positions=[_position("AAA", "10"), _position("BBB", "5")])
+    data = Data({"AAA": AAA_BOOK, "BBB": BBB_BOOK})
+    code, lines = _only_run(paper, data, capsys, only)
+    named = set(only.split(","))
+    # a named symbol with no long is not a success: a name typed wrong would otherwise read as done
+    assert code == (2 if "CCC" in named else 0), lines
+    assert [request.symbol for request in paper.submitted] == sorted(named & {"AAA", "BBB"})
+    _no_sale_open_or_cancel(paper)
+    for symbol in {"AAA", "BBB"} - named:
+        assert lines.count(f"{symbol}: not named: no stop sent") == 1
+        assert not any(getattr(request, "symbol", None) == symbol for _, request in paper.calls)
+        assert ("get_open_position", symbol) not in paper.calls
+        assert not any(request.symbol_or_symbols == symbol for _, request in data.asked)
+    if "CCC" in named:
+        (line,) = [line for line in lines if "CCC" in line]
+        assert line == "CCC: named in --only, no long held: no stop sent"
+
+
+def test_only_names_a_covered_long_without_sending_for_the_other_long(capsys) -> None:
+    paper = Paper(
+        positions=[_position("AAA", "10"), _position("BBB", "5")],
+        orders=[_order("AAA", "10", FOREIGN_SELL)],
+    )
+    data = Data({"AAA": AAA_BOOK, "BBB": BBB_BOOK})
+    code, lines = _only_run(paper, data, capsys, "AAA")
+    assert code == 0 and not paper.submitted and not data.asked, lines
+    (covered,) = [line for line in lines if "AAA" in line]
+    assert "fully covered by working sells" in covered
+    assert "BBB: not named: no stop sent" in lines
+
+
+@pytest.mark.parametrize("only", ["", "AAA,BBB", "BBB,AAA"])
+def test_only_preserves_the_unfiltered_requests_and_output(capsys, monkeypatch, only) -> None:
+    """Freeze only the clock and nonce so the request log and output can be compared byte for byte."""
+    monkeypatch.setattr(protect, "monotonic", lambda: 0.0)
+    monkeypatch.setattr(protect, "uuid4", lambda: SimpleNamespace(hex="0123456789abcdef"))
+    positions = [_position("AAA", "10"), _position("BBB", "5")]
+    baseline = Paper(positions=positions)
+    selected = Paper(positions=positions)
+    before = Data({"AAA": AAA_BOOK, "BBB": BBB_BOOK})
+    after = Data({"AAA": AAA_BOOK, "BBB": BBB_BOOK})
+    expected = _run(baseline, before, capsys)
+    assert _only_run(selected, after, capsys, only) == expected
+    assert selected.calls == baseline.calls
+    assert _data_calls(after) == _data_calls(before)
+
+
+@pytest.mark.parametrize("only", ["AAA", "AAA,CCC"])
+def test_only_plan_reads_and_plans_every_long_under_every_row(capsys, monkeypatch, only) -> None:
+    monkeypatch.setattr(protect, "monotonic", lambda: 0.0)
+    monkeypatch.setattr(protect, "uuid4", lambda: SimpleNamespace(hex="0123456789abcdef"))
+    positions = [_position("AAA", "10"), _position("BBB", "5")]
+    baseline, selected = Paper(positions=positions), Paper(positions=positions)
+    before = Data({"AAA": AAA_BOOK, "BBB": BBB_BOOK})
+    after = Data({"AAA": AAA_BOOK, "BBB": BBB_BOOK})
+    assert protect.protect_task(cast(Any, baseline), before, plan_only=True) == 0
+    expected = capsys.readouterr().out.splitlines()
+    code, lines = _only_run(selected, after, capsys, only, plan_only="true", row="")
+    # the account's first run already says a named symbol holds no long, and is not a success
+    absent = ["CCC: named in --only, no long held: no stop sent"] if "CCC" in only else []
+    assert code == (2 if absent else 0) and not selected.submitted, lines
+    (extra,) = [line for line in lines if "not named" in line]
+    assert extra == "BBB: not named: a send with --only would send no stop for it"
+    assert [line for line in lines if "no long held" in line] == absent
+    assert [line for line in lines if line != extra and line not in absent] == expected
+    assert selected.calls == baseline.calls and _data_calls(after) == _data_calls(before)
+    for symbol in ("AAA", "BBB"):
+        for row in protect.ROWS:
+            assert any(line.startswith(f"would send {symbol} under {row}:") for line in lines)
+
+
+@pytest.mark.parametrize(
+    ("only", "flags", "reason"),
+    [
+        (",AAA", {}, "empty"),
+        ("AAA,", {}, "empty"),
+        ("AAA,,BBB", {}, "empty"),
+        ("aaa", {}, "plain capital letters"),
+        ("AAA, BBB", {}, "plain capital letters"),
+        ("AAA1", {}, "plain capital letters"),
+        ("AAA.B", {}, "plain capital letters"),
+        ("ÄAA", {}, "plain capital letters"),
+        ("AAA\n", {}, "plain capital letters"),
+        ("AAA,AAA", {}, "twice"),
+        (None, {}, "not text"),
+        ("AAA", {"cancel": "true", "row": ""}, "--cancel"),
+        ("AAA", {"symbol": "BBB"}, "--symbol"),
+        ("AAA", {"cancel": "true", "row": "", "symbol": "BBB"}, "--cancel"),
+        ("AAA", {"plan_only": "perhaps"}, "plan-only"),
+        ("AAA", {"cancel": "perhaps"}, "cancel"),
+        ("AAA", {"row": "UNKNOWN"}, "row"),
+        ("AAA", {"row": ""}, "row"),
+    ],
+)
+def test_only_refuses_bad_flags_without_any_request(capsys, only, flags, reason) -> None:
+    paper = Paper(positions=[_position("AAA", "1")])
+    data = Data({"AAA": AAA_BOOK})
+    code, lines = _only_run(paper, data, capsys, only, **flags)
+    assert code == protect.REFUSED, lines
+    assert paper.calls == [] and data.asked == []
+    assert len(lines) == 1 and lines[0].startswith("refused:")
+    assert reason in lines[0] and "nothing was read or sent" in lines[0]
+
+
+def test_only_keeps_attempting_later_symbols_after_a_failed_send(capsys) -> None:
+    class RefuseFirst(Paper):
+        def submit_order(self, order_data):
+            self.submit_fails = (
+                APIError('{"code": 42210000, "message": "refused"}', _status(422))
+                if order_data.symbol == "AAA"
+                else None
+            )
+            return super().submit_order(order_data)
+
+    for only in ("", "BBB,AAA"):
+        paper = RefuseFirst(positions=[_position("BBB", "1"), _position("AAA", "1")])
+        code, lines = _only_run(paper, Data({"AAA": AAA_BOOK, "BBB": BBB_BOOK}), capsys, only)
+        assert code == 1, lines
+        assert [request.symbol for request in paper.submitted] == ["AAA", "BBB"]
+        assert any(line.startswith("failed AAA:") for line in lines)
+        assert any(line.startswith("sent BBB:") for line in lines)
+        assert not any(name == "get_order_by_client_id" for name, _ in paper.calls)
+
+
+@pytest.mark.parametrize("row", list(protect.ROWS))
+@pytest.mark.parametrize("available", ["2", "1", None])
+def test_only_keeps_the_whole_share_free_quantity_and_row_rules(capsys, row, available) -> None:
+    positions = [_position("AAA", "2.5", available=available), _position("BBB", "1")]
+    baseline, selected = Paper(positions=positions), Paper(positions=positions)
+    before = _run(baseline, Data({"AAA": AAA_BOOK, "BBB": BBB_BOOK}), capsys, row=row)
+    code, lines = _only_run(selected, Data({"AAA": AAA_BOOK}), capsys, "AAA", row=row)
+    assert code == before[0], lines
+    expected = [
+        r.model_dump(exclude={"client_order_id"}) for r in baseline.submitted if r.symbol == "AAA"
+    ]
+    assert [r.model_dump(exclude={"client_order_id"}) for r in selected.submitted] == expected
+    _no_sale_open_or_cancel(selected)
+    assert all(
+        request.qty == 2 and request.qty <= float(available) for request in selected.submitted
+    )
+
+
+def test_only_does_not_count_an_omitted_fraction_as_a_failure(capsys) -> None:
+    paper = Paper(positions=[_position("AAA", "1"), _position("BBB", "0.5")])
+    code, lines = _only_run(paper, Data({"AAA": AAA_BOOK}), capsys, "AAA")
+    assert code == 0 and [request.symbol for request in paper.submitted] == ["AAA"], lines
+    assert "BBB: not named: no stop sent" in lines
+
+
+@pytest.mark.parametrize("plan_only", [False, True])
+def test_an_empty_include_list_is_refused_and_never_read_as_no_list(plan_only) -> None:
+    """No list is None. A caller that built its list from no names must not get a send for every long."""
+    paper = Paper(positions=[_position("AAA", "10"), _position("BBB", "5")])
+    data = Data({"AAA": AAA_BOOK, "BBB": BBB_BOOK})
+    report = protect.protect_longs(
+        cast(Any, paper), data, plan_only=plan_only, row=None if plan_only else "OWN1", only=()
+    )
+    assert report.exit_code == protect.REFUSED and "names no symbol" in report.refused
+    assert paper.calls == [] and data.asked == [] and not paper.submitted
+
+
+@pytest.mark.parametrize("account", ["tests", "protect"])
+def test_the_task_refuses_an_only_passed_empty_before_any_pair_is_read(tmp_path, account) -> None:
+    """`--only "$NAMES"` with nothing in NAMES reaches the task as an empty value. The module cannot
+    tell that from an absent flag, so the task refuses it before the keychain and the lock."""
+    done, log = _run_task(tmp_path, account, usage_row="F2", usage_only="")
+    assert done.returncode == 3 and log == "", done.stderr
+    assert "--only was given with no symbol; nothing was read or sent" in done.stderr
+    assert done.stdout == ""
+    run = _task()["run"]
+    assert run.index("usage_only+passed") < run.index("/usr/bin/security")
+
+
+def test_the_task_hands_only_over_as_one_optional_text_argument() -> None:
+    task = _task()
+    assert 'flag "--only <symbols>"' in task["usage"]
+    assert "--exclude" not in task["usage"]
+    assert re.search(
+        r"task_from_flags\(\*sys\.argv\[1:6\]\)\)' "
+        r'"\$\{usage_plan_only:-false\}" "\$\{usage_row:-\}" "\$\{usage_cancel:-false\}" '
+        r'"\$\{usage_symbol:-\}" "\$\{usage_only:-\}"$',
+        task["run"],
+        re.MULTILINE,
+    )
+
+
+class OnlyRoundTripPaper(Cancelable):
+    """The paper test's two buys, stop, cancel and closes on the existing offline venue."""
+
+    def __init__(self, failure: str = "") -> None:
+        super().__init__()
+        self.positions: list[Position] = []
+        self.orders: list[Order] = []
+        self.failure = failure
+
+    def submit_order(self, order_data):
+        if isinstance(order_data, TrailingStopOrderRequest):
+            submitted = super().submit_order(order_data)
+            order = submitted.model_copy(
+                update={
+                    "position_intent": order_data.position_intent
+                    if self.failure != "after-stop"
+                    else None
+                }
+            )
+        else:
+            self.calls.append(("submit_order", order_data))
+            self.submitted.append(order_data)
+            if order_data.side.value == "buy":
+                if order_data.symbol == "BBB" and self.failure == "second-buy":
+                    raise APIError('{"code": 42210000, "message": "refused"}', _status(422))
+                self.positions.append(_position(order_data.symbol, "1"))
+            else:
+                assert (
+                    order_data.qty == 1
+                    and order_data.position_intent == PositionIntent.SELL_TO_CLOSE
+                )
+                assert any(p.symbol == order_data.symbol and p.qty == "1" for p in self.positions)
+                self.positions = [p for p in self.positions if p.symbol != order_data.symbol]
+            order = _order(
+                order_data.symbol,
+                "1",
+                order_data.client_order_id,
+                type="market",
+                order_type="market",
+                side=order_data.side,
+                limit_price=None,
+                status="filled",
+                filled_qty="1",
+                position_intent=order_data.position_intent,
+            )
+        self.orders.append(order)
+        self.found[order.client_order_id] = order
+        return order
+
+    def get_orders(self, filter: Any = None):
+        return [
+            order
+            for order in super().get_orders(filter)
+            if order.status.value not in protect.session_window.TERMINAL
+            and str(order.id) not in self.canceled
+        ]
+
+
+@pytest.mark.parametrize("failure", ["", "second-buy", "after-stop"])
+def test_only_paper_round_trip_and_cleanup_on_the_standin(monkeypatch, failure) -> None:
+    """The exact new paper body, including its cleanup, never its credential/session wrapper."""
+    paper_test = _paper_test()
+    monkeypatch.setattr(paper_test.time, "sleep", lambda _seconds: None)
+    paper = OnlyRoundTripPaper(failure)
+    data = Data({"AAA": AAA_BOOK, "BBB": BBB_BOOK})
+    if failure:
+        reason = "buy: refused" if failure == "second-buy" else "required terms"
+        with pytest.raises(AssertionError, match=reason):
+            paper_test._only_round_trip(paper, data, ("AAA", "BBB"))
+    else:
+        paper_test._only_round_trip(paper, data, ("AAA", "BBB"))
+    assert paper.positions == [] and paper.get_orders() == []
+    stops = [
+        request for request in paper.submitted if isinstance(request, TrailingStopOrderRequest)
+    ]
+    assert [request.symbol for request in stops] == ([] if failure == "second-buy" else ["AAA"])
+    assert len(paper.canceled) == len(stops)
+    closed = [
+        request.symbol
+        for request in paper.submitted
+        if request.type.value == "market" and request.side.value == "sell"
+    ]
+    assert closed == (["AAA"] if failure == "second-buy" else ["AAA", "BBB"])
+    assert paper.no_shorting is True

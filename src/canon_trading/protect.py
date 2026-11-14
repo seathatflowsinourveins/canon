@@ -2,7 +2,10 @@
 covers, on one paper account, then exit (`mise run paper:protect tests`, or `protect` for account C,
 ADR 0142). A run that sends names the registered row its distance is planned on (`--row`, `ROWS`); there
 is no default. `--plan-only` makes every read, names what each stop would be under every row, and sends
-nothing. `--cancel` cancels the open stops of the protect lineage, every one or one symbol's, and nothing
+nothing. `--only` limits sends to distinct, comma-separated symbols in plain capital letters; omitted
+longs are named without counting as failures. Plan-only still reads and plans every long under every
+row, with an extra line for each omitted long. With no list the run is unchanged. `--cancel` cancels the
+open stops of the protect lineage, every one or one symbol's, and nothing
 else (`cancel_stops`): the way a stop that holds a long's shares is taken off before that long is sold.
 
 Contracts, read 2026-11-12:
@@ -83,6 +86,8 @@ the run has taken since. Each line is
 printed as it happens, so a run that is stopped has already named what it sent; the task's stop signal
 ends it as a failure by name (`custody._stop`). Exit 0 when each long is covered, 1 when a read or a send
 failed or the run was stopped, 2 when a long is left uncovered by name, 3 when the run was refused by name.
+With `--only` the 0 and the 2 speak of the NAMED symbols alone: a long that was not named is left as it
+was found, covered or not, and is no failure, and a named symbol that holds no long is a 2.
 
 A stop that rests holds its shares: Alpaca refuses another sell of them until the stop is canceled, the
 holder's own included. `--cancel` (`cancel_stops`) cancels the open stops of the protect lineage, every one
@@ -233,6 +238,31 @@ not shown to protect the long, a failure by name, never sent again: `suspended`,
 `calculated` are not this stop working; and `held`, which alpaca-py's `OrderStatus` lists and Alpaca's
 page does not describe, is undecided until a paper answer shows it, so it fails rather than counts."""
 REFUSED = 3
+
+
+def _plain(symbol: str) -> bool:
+    """A symbol this task takes by name: plain capital letters (no class share with a dot)."""
+    return symbol.isascii() and symbol.isalpha() and symbol.isupper()
+
+
+def _only_symbols(only: str) -> tuple[str, ...] | None:
+    """The send's include list from the task's text, or None for an absent flag (the empty text the
+    task hands over when `--only` was not passed). An invalid list is never repaired."""
+    if not isinstance(only, str):
+        raise TypeError("--only is not text")
+    if only == "":
+        return None
+    symbols = only.split(",")
+    seen: set[str] = set()
+    for symbol in symbols:
+        if not symbol:
+            raise ValueError("--only has an empty symbol")
+        if not _plain(symbol):
+            raise ValueError(f"--only symbol {symbol!r} is not plain capital letters")
+        if symbol in seen:
+            raise ValueError(f"--only names {symbol!r} twice")
+        seen.add(symbol)
+    return tuple(symbols)
 
 
 @dataclass
@@ -642,11 +672,13 @@ class _Protect:
         say: Callable[[str], None] | None = None,
         plan_only: bool = False,
         row: str | None = None,
+        only: tuple[str, ...] | None = None,
     ) -> None:
         self.trading = trading
         self.data = data
         self.plan_only = plan_only
         self.row = row
+        self.only = only
         self.planners: dict[str, mover.Mover] = {}
         self.began = 0.0
         """`monotonic()` at the clock's read: a later symbol is planned at the clock's time plus what
@@ -657,6 +689,11 @@ class _Protect:
 
     def run(self) -> ProtectReport:
         report = self.report
+        selected = self.only
+        if selected is not None and not selected:
+            # No list is None. An empty list is a caller's mistake, never "every long".
+            report.refused = "the include list names no symbol; nothing was read or sent"
+            return report
         names = ", ".join(ROWS)
         if self.row is not None and self.row not in ROWS:
             report.refused = f"no registered row named {self.row!r}: the rows are {names}; nothing was read or sent"
@@ -732,6 +769,14 @@ class _Protect:
                 )
             if qty <= 0:
                 continue
+            if selected is not None and symbol not in selected:
+                if self.plan_only:
+                    report.note(
+                        None, f"{symbol}: not named: a send with --only would send no stop for it"
+                    )
+                else:
+                    report.note(report.left_alone, f"{symbol}: not named: no stop sent")
+                    continue
             rest = self._uncovered(symbol, qty, orders)
             if rest is None:
                 continue
@@ -739,6 +784,13 @@ class _Protect:
             n += 1
             at = now + timedelta(seconds=monotonic() - self.began)
             self._protect(symbol, whole, qty, ours, at, n)
+        for symbol in selected or ():
+            if held.get(symbol, 0) <= 0:
+                # A name typed wrong would otherwise read as done (as `cancel_stops` holds for its
+                # symbol): it is said in a plan-only run too, and the run is not a success.
+                report.note(
+                    report.unprotected, f"{symbol}: named in --only, no long held: no stop sent"
+                )
         return report
 
     def _uncovered(
@@ -1015,12 +1067,15 @@ def protect_longs(
     say: Callable[[str], None] | None = None,
     plan_only: bool = False,
     row: str | None = None,
+    only: tuple[str, ...] | None = None,
 ) -> ProtectReport:
     """The run (module header). `data` is an alpaca-py `StockHistoricalDataClient`, or a callable that
     builds one; it is asked only once a long needs a stop. `say` is given each line as it happens.
     `plan_only` makes every read of a sending run and names what each stop would be under every
-    registered row, and sends none. A run that sends names its `row` (`ROWS`); there is no default."""
-    run = _Protect(trading, data, say, plan_only, row)
+    registered row, and sends none. A run that sends names its `row` (`ROWS`); there is no default.
+    `only`, when given, is the include list: it removes sends, never plan-only reads, and an empty one
+    is refused."""
+    run = _Protect(trading, data, say, plan_only, row, only)
     try:
         return run.run()
     except Exception as e:  # noqa: BLE001 - named, with what was sent before it, and exits 1
@@ -1277,6 +1332,7 @@ def task_from_flags(
     row: str,
     cancel: str = "false",
     symbol: str = "",
+    only: str = "",
     trading: TradingClient | None = None,
     data: Any = None,
     pause: Callable[[float], None] = sleep,
@@ -1285,11 +1341,21 @@ def task_from_flags(
     exactly `true` or `false` (mise gives a passed switch `true`, and the task gives `false` for one not
     passed), and anything else is refused by name with nothing read, so a value not known here never
     becomes a send or a cancel. The row is a registered name, or empty for none. A cancel takes no row,
-    and only a cancel takes a symbol, which is plain capital letters."""
+    and only a cancel takes `symbol`, which is plain capital letters. A send's optional `only` is a
+    comma-separated list of distinct symbols in plain capital letters; it cannot accompany a cancel
+    or its symbol flag."""
     for name, value in (("plan-only", plan_only), ("cancel", cancel)):
         if value not in ("true", "false"):
             return _refuse(f"{name} reads {value!r}, which is neither true nor false")
-    if symbol and not (symbol.isascii() and symbol.isalpha() and symbol.isupper()):
+    try:
+        selected = _only_symbols(only)
+    except (TypeError, ValueError) as e:
+        return _refuse(str(e))
+    if only and cancel == "true":
+        return _refuse("--only cannot be used with --cancel")
+    if only and symbol:
+        return _refuse("--only cannot be used with --symbol; that flag belongs to --cancel")
+    if symbol and not _plain(symbol):
         return _refuse(f"the symbol {symbol!r} is not plain capital letters")
     if cancel == "true":
         if row:
@@ -1297,7 +1363,7 @@ def task_from_flags(
         return cancel_task(trading, symbol or None, plan_only == "true", pause)
     if symbol:
         return _refuse("a symbol is named only with --cancel; a send covers every long it finds")
-    return protect_task(trading, data, plan_only == "true", row or None)
+    return protect_task(trading, data, plan_only == "true", row or None, selected)
 
 
 def protect_task(
@@ -1305,6 +1371,7 @@ def protect_task(
     data: Any = None,
     plan_only: bool = False,
     row: str | None = None,
+    only: tuple[str, ...] | None = None,
 ) -> int:
     """`mise run paper:protect tests`: run `protect_longs`, printing each line as it happens; the exit
     code is the report's (module header): a read that fails, or anything else part way, is named and
@@ -1320,7 +1387,9 @@ def protect_task(
                 f"paper:protect: no paper client: {_failure(e)}; nothing was sent", file=sys.stderr
             )
             return 1
-        report = protect_longs(trading, data or session_window.window_data, _say, plan_only, row)
+        report = protect_longs(
+            trading, data or session_window.window_data, _say, plan_only, row, only
+        )
     finally:
         signal.signal(signal.SIGTERM, before)
     if report.refused:
