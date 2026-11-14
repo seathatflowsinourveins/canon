@@ -200,6 +200,88 @@ def test_venue_profile_reaches_the_native_engine(shape, monkeypatch, arm) -> Non
     )
 
 
+def test_a_spec_latency_reaches_each_segment_venue_counted_from_send(shape, monkeypatch) -> None:
+    from canon_trading.send_latency import SendLatency
+
+    module = runner()
+    native = module.BacktestEngine
+    models = []
+
+    class ObservedEngine:
+        def __init__(self, config):
+            self.engine = native(config)
+
+        def __getattr__(self, name):
+            return getattr(self.engine, name)
+
+        def add_venue(self, *args, **kwargs):
+            models.append(kwargs["latency_model"])
+            self.engine.add_venue(*args, **kwargs)
+
+    monkeypatch.setattr(module, "BacktestEngine", ObservedEngine)
+    latency = {"insert_ns": 5_000_000, "update_ns": 7_000_000, "delete_ns": 7_000_000}
+    shape["spec"]["latency"] = latency
+    report = module.replay(shape["spec"])
+    assert report["status"] == "completed", report
+    assert models and all(isinstance(model, SendLatency) for model in models)
+    assert len({id(model) for model in models}) == len(models)  # one model per segment's engine
+    assert [(m.insert_ns, m.update_ns, m.delete_ns) for m in models] == [
+        (5_000_000, 7_000_000, 7_000_000)
+    ] * len(models)
+    venue = report["venue"]
+    assert venue["latency"] == {
+        "model": "SendLatency",
+        "kind": "counted from send",
+        **latency,
+    }
+    assert "latency_ns" not in venue
+    assert "latency_model" not in venue
+    assert venue["departures"] == [
+        (
+            "latency: SendLatency, counted from send "
+            "(insert 5000000, update 7000000, delete 7000000 ns); v1 has none"
+        )
+    ]
+    assert not any("Zero latency" in limit for limit in report["limits"])
+    assert any("in flight at a segment's end" in limit for limit in report["limits"])
+    json.dumps(report, allow_nan=False)
+
+
+@pytest.mark.parametrize(
+    "latency",
+    [
+        {"insert_ns": 5},
+        {"insert_ns": 5, "update_ns": 7, "delete_ns": 7, "base_ns": 0},
+        {"insert_ns": -1, "update_ns": 7, "delete_ns": 7},
+        {"insert_ns": 5.0, "update_ns": 7, "delete_ns": 7},
+        {"insert_ns": True, "update_ns": 7, "delete_ns": 7},
+        {"insert_ns": 2**64, "update_ns": 7, "delete_ns": 7},
+        {"insert_ns": 60_000_000_001, "update_ns": 7, "delete_ns": 7},
+        [5, 7, 7],
+    ],
+)
+def test_a_malformed_latency_is_refused_before_any_engine(shape, latency) -> None:
+    shape["spec"]["latency"] = latency
+    report = runner().replay(shape["spec"])
+    assert report["status"] == "refused"
+    assert "latency" in report["refusals"][0]["reason"]
+
+
+def test_send_latency_refuses_a_command_handed_in_before_it_was_made() -> None:
+    from types import SimpleNamespace
+
+    from canon_trading.send_latency import SendLatency
+
+    model = SendLatency(5, 7, 9)
+    command = SimpleNamespace(ts_init=1_000)
+    assert model.get_insert_latency(command, 1_000) == 5
+    assert model.get_insert_latency(command, 1_250) == 255
+    assert model.get_update_latency(command, 1_250) == 257
+    assert model.get_delete_latency(command, 1_250) == 259
+    with pytest.raises(ValueError, match="before the command's ts_init"):
+        model.get_insert_latency(command, 999)
+
+
 @pytest.mark.parametrize("row", ["OWN1", "OWN3"])
 def test_arms_from_each_symbols_history_using_public_row_arithmetic(shape, row) -> None:
     shape["spec"]["row"] = row
