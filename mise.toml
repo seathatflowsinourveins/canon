@@ -701,15 +701,15 @@ data "$@"
 # `--baseline-inputs` (ADR 0087's evening baseline) runs scripts/movers-baseline-inputs.py instead: it also
 # sends two trading-API GETs, Alpaca's calendar and its active assets, which ADR 0093's row does not count.
 [tasks."paper:history"]
-description = "Load historical sip bars or trades, IEX quotes or bounded SIP quotes, or bounded boats (overnight) bars, trades or quotes, for listed symbols with one paper account's pair, GET only, paced; read Alpaca's trade-condition codes per tape; or write a feed's nightly movers baseline from the catalog"
+description = "Load historical sip bars or trades, IEX quotes or bounded SIP quotes, or bounded boats (overnight) bars, trades or quotes, for listed symbols with one paper account's pair, GET only, paced; read Alpaca's trade-condition codes per tape; read Alpaca's split records over days the sim date map allows; or write a feed's nightly movers baseline from the catalog"
 shell = "bash -c"
 timeout = "6h"
 usage = '''
 arg "<account>" help="tests: account A's pair; windows: account B's pair (ADR 0069, ADR 0093)" {
   choices "tests" "windows"
 }
-arg "[mode]" help="baseline: write from the catalog without reading an account pair; conditions: GET Alpaca's trade-condition codes for tapes A, B and C into <catalog>/conditions/trade.json, and with --symbols, --start and --end each symbol's raw prints with their conditions beside it" {
-  choices "baseline" "conditions"
+arg "[mode]" help="baseline: write from the catalog without reading an account pair; conditions: GET Alpaca's trade-condition codes for tapes A, B and C into <catalog>/conditions/trade.json, and with --symbols, --start and --end each symbol's raw prints with their conditions beside it; corporate-actions: GET Alpaca's split records (reverse, forward and unit splits) for the days --start to --end, every symbol or those named, into <catalog>/corporate-actions/, after checking every day against --date-map before any pair is read" {
+  choices "baseline" "conditions" "corporate-actions"
 }
 flag "--session <date>" help="baseline mode: coming trade date, ISO date"
 flag "--sessions-file <file>" help="baseline mode: ordered session calendar including the trade date and five prior sessions"
@@ -721,7 +721,8 @@ flag "--baseline-dir <root>" help="baseline mode: write <feed>.json in this dire
 flag "--baseline-inputs <dir>" help="prepare the evening calendar and whole-market asset definitions in this directory, GET only with the selected pair; requires --catalog and --baseline-dir, takes no mode or load flags"
 flag "--symbols <symbols>" help="symbols, comma-separated (or --symbols-file)"
 flag "--symbols-file <file>" help="a file of symbols, one a line"
-flag "--start <start>" help="ISO 8601 with a time zone; required"
+flag "--start <start>" help="ISO 8601 with a time zone; required (corporate-actions mode: a YYYY-MM-DD day)"
+flag "--date-map <file>" help="corporate-actions mode only, required: the sim lane's date map; every day of the span must be development or closed"
 flag "--end <end>" help="ISO 8601 with a time zone; required, at least 15 minutes (trades, quotes or 1-MINUTE bars) or a day (1-DAY bars) before now"
 flag "--bars <bars>" help="1-MINUTE, 1-DAY or both, comma-separated; default both, or 1-MINUTE (the only one) for --feed boats"
 flag "--catalog <root>" help="the catalog root, never under ledger/; default catalog, catalog/sip-quotes for --data quotes --feed sip, catalog/boats or catalog/boats-quotes for --feed boats, or catalog/<feed> in baseline mode"
@@ -746,7 +747,7 @@ if [ "${usage_feed:-}" = iex ] && { [ -n "${usage_mode:-}" ] || [ -n "${usage_ba
 fi
 case "${usage_mode:-}" in
   baseline)
-    wrong=$(named symbols symbols_file start end bars data baseline_inputs)
+    wrong=$(named symbols symbols_file start end bars data baseline_inputs date_map)
     [ -z "$wrong" ] || { echo "paper:history: baseline mode takes no load flag:$wrong; nothing was read" >&2; exit 3; }
     set --
     [ -z "${usage_session:-}" ] || set -- "$@" --session "$usage_session"
@@ -756,7 +757,7 @@ case "${usage_mode:-}" in
     exec /usr/bin/timeout -s KILL "$deadline" uv run --locked python -m canon_trading.movers_baseline "$@"
     ;;
   conditions)
-    wrong=$(named session sessions_file feed max_excluded_share baseline_dir symbols_file bars data baseline_inputs)
+    wrong=$(named session sessions_file feed max_excluded_share baseline_dir symbols_file bars data baseline_inputs date_map)
     [ -z "$wrong" ] || { echo "paper:history: conditions mode takes no flag but --catalog, --symbols, --start and --end:$wrong; nothing was read" >&2; exit 3; }
     set -- --out "${usage_catalog:-catalog}/conditions/trade.json"
     [ -z "${usage_symbols:-}" ] || set -- "$@" --symbols "$usage_symbols"
@@ -764,14 +765,25 @@ case "${usage_mode:-}" in
     [ -z "${usage_end:-}" ] || set -- "$@" --end "$usage_end"
     module=canon_trading.trade_conditions
     ;;
+  corporate-actions)
+    wrong=$(named session sessions_file feed max_excluded_share baseline_dir bars data baseline_inputs)
+    [ -z "$wrong" ] || { echo "paper:history: corporate-actions mode takes no flag but --start, --end, --date-map, --catalog, --symbols and --symbols-file:$wrong; nothing was read" >&2; exit 3; }
+    [ -n "${usage_start:-}" ] && [ -n "${usage_end:-}" ] && [ -n "${usage_date_map:-}" ] || { echo "paper:history: corporate-actions mode needs --start, --end and --date-map; nothing was read" >&2; exit 3; }
+    set -- --start "$usage_start" --end "$usage_end" --date-map "$usage_date_map" --catalog "${usage_catalog:-catalog}"
+    [ -z "${usage_symbols:-}" ] || set -- "$@" --symbols "$usage_symbols"
+    [ -z "${usage_symbols_file:-}" ] || set -- "$@" --symbols-file "$usage_symbols_file"
+    module=canon_trading.corporate_actions
+    # The span is checked against the date map before any pair is read; a refused span ends here.
+    /usr/bin/timeout -s KILL 120 uv run --locked python -m "$module" "$@" --check-only || exit $?
+    ;;
   "")
     if [ -n "${usage_baseline_inputs:-}" ]; then
-      wrong=$(named session sessions_file feed max_excluded_share symbols symbols_file start end bars data)
+      wrong=$(named session sessions_file feed max_excluded_share symbols symbols_file start end bars data date_map)
       [ -z "$wrong" ] && [ -n "${usage_catalog:-}" ] && [ -n "${usage_baseline_dir:-}" ] || { echo "paper:history: --baseline-inputs needs --catalog and --baseline-dir, with no mode or other flags:$wrong; nothing was read" >&2; exit 3; }
       module=baseline-inputs
       set -- --directory "$usage_baseline_inputs" --catalog "$usage_catalog" --baseline-dir "$usage_baseline_dir"
     else
-      wrong=$(named session sessions_file max_excluded_share baseline_dir)
+      wrong=$(named session sessions_file max_excluded_share baseline_dir date_map)
     fi
     if [ "${usage_feed:-}" = boats ]; then
       # The module's boats bound, held here too so a misuse reads no pair; the module checks the span and end.
