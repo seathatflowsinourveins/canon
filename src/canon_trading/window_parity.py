@@ -252,8 +252,9 @@ def _trade_rows(
         if left is None or right is None:
             difference = ["entry absent" if section == "entry" else "exit absent"]
         cause = "unexplained"
-        # A submit later in the same UTC minute is latency: the replay's venue has none, and paper
-        # submits about a second after the minute it decides on.
+        # A submit later in the same UTC minute is latency: the replay's venue has none or a
+        # modelled one (its report's venue.latency), and paper submits about a second after the
+        # minute it decides on.
         same_minute = (
             left is not None
             and right is not None
