@@ -84,6 +84,7 @@ from canon_trading.owner_protector import owner_execution_config
 from canon_trading.price_step import tick
 from canon_trading.price_step import up_on_step
 from canon_trading.start_level import Entry as start_level_entry
+from canon_trading.start_level import Horizon
 from canon_trading.start_level import LevelBook
 
 AAA = InstrumentId.from_str("AAA.ALPACA")
@@ -160,6 +161,7 @@ def working_sell(
         "status": OrderStatus.PARTIALLY_FILLED,
         "quantity": Quantity.from_str(qty),
         "filled_qty": Quantity.from_str(filled),
+        "venue_order_ids": [],  # DeepSeek P2-2: no venue leg, so never kept by identity.
         "leaves_qty": Quantity.from_str(str(Decimal(qty) - Decimal(filled))),
         "is_quote_quantity": False,
         "contingency_type": ContingencyType.NO_CONTINGENCY,
@@ -225,7 +227,13 @@ class VenueOrders:
         asset: Any = None,
         failure: Exception | None = None,
         answer: Any = None,
+        clock: str = "2025-11-10T16:03:00+00:00",
+        held: str | None = "10",
     ) -> None:
+        # DeepSeek P2-2: GET /clock and GET /positions/{symbol} for a found holding's venue
+        # reading; `held` None answers as Alpaca does for no position (an error).
+        self.clock = clock
+        self.held = held
         self.orders = list(orders or [])
         self.asset = asset
         self.failure = failure
@@ -236,6 +244,12 @@ class VenueOrders:
         self.reads.append((route, params))
         if route.startswith("/assets/"):
             return self.asset
+        if route == "/clock":
+            return {"timestamp": self.clock}
+        if route.startswith("/positions/"):
+            if self.held is None:
+                raise LookupError("position does not exist")
+            return {"symbol": route.removeprefix("/positions/"), "qty": self.held}
         assert route == "/orders" and params is not None, route
         if self.failure is not None:
             raise self.failure
@@ -1438,14 +1452,21 @@ def restart_record(**changes: Any) -> dict[str, Any]:
         "quantity": "10",
         "written_ns": T0 + SECOND,
         "run": "shape-prior",
+        # DeepSeek P2-2: the venue's reading of the holding's fills, on the venue's clock; an
+        # entry without one is never the same holding (old=True leaves it out).
+        "horizon_ns": T0 + SECOND,
+        "applied": [],
         # Review fix round, ruling (a) (2026-11-13 17:56): a carried entry with no distance never
         # takes the cold fallback, so a carry case keeps the distance OWN1's cold trail gives
         # here (0.04); an old entry passes distance=None. See FIXROUND-L1.md §Review fix round.
         "distance": "0.04",
     }
+    old = changes.pop("old", False)
     record.update(changes)
     if record["distance"] is None:
         del record["distance"]
+    if old:
+        del record["horizon_ns"], record["applied"]
     return record
 
 
@@ -1947,7 +1968,7 @@ def test_a_book_level_is_not_carried_when_the_venue_sold_it_out_since(tmp_path: 
     strategy.on_start()
     assert strategy.slots[AAA].level == Price.from_str("1.01"), "carried across a sell-out"
     assert any(
-        "previous level not carried: a new holding: sold out since "
+        "previous level not carried: a new holding: sold out since the venue's "
         f"{iso(T0 + SECOND)} (10 of 10 sold); it was 1.10" in note
         for note in strategy.said
     ), strategy.said
@@ -2234,35 +2255,36 @@ def test_an_entry_without_a_distance_keeps_its_level_and_takes_the_rows_distance
     assert strategy.sent[0].trailing_offset == Decimal("0.0300")
 
 
-def test_an_entry_without_a_distance_never_takes_the_fixed_fallback(
+def test_an_entry_without_a_distance_is_covered_by_the_cold_rule_never_left_bare(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Ruling (a): with only the fixed fallback to plan from, the carried level is kept, nothing
-    is raised or sent, and that is named at each step until a distance can be planned."""
+    """Ruling (a) as the lead narrowed it (2026-11-13, 23:2x), superseding its first form here:
+    a carried long whose record has no distance and only the fixed fallback to plan from is
+    covered by that cold rule at the higher of its carried level and the rule's, named as such,
+    and never left bare; it never sends more than it holds."""
     path = tmp_path / "levels.json"
     strategy, _calls = carried_start(
         path, monkeypatch, level="0.7926", bid="0.7985", highest="0.8350", distance=None
     )
-    assert strategy.slots[AAA].level is None
-
-    def named(notes: list[str]) -> int:
-        return sum(
-            "the row gives only the fixed fallback" in note
-            and "carried level 0.7926 kept, raises nothing until a distance can be planned" in note
-            for note in notes
-        )
-
-    # U-h plans at the start on each answer (cache, seed, bars), each refusal named.
-    assert named(strategy.said) >= 1, strategy.said
+    slot = strategy.slots[AAA]
+    assert slot.level is not None, strategy.said
+    assert slot.level.as_decimal() == max(
+        Decimal("0.7926"), up_on_step(Decimal("0.7985") - FALLBACK)
+    )
+    assert slot.distance is not None and slot.distance.fallback
+    assert any("no carried distance" in note and "cold rule" in note for note in strategy.said), (
+        strategy.said
+    )
     for n in (181, 182, 183):
         strategy.test_clock.set_time(T0 + n * SECOND)
         strategy.cached.latest = quote("0.7985", T0 + n * SECOND)
         before = len(strategy.said)
         strategy._on_step(cast(Any, SimpleNamespace()))
-        assert named(strategy.said[before:]) == 1, strategy.said[before:]  # Each step, once.
-    assert not strategy.sent, "a carried long armed from the fixed fallback"
-    assert book_rows(path)["AAA.ALPACA"]["last_level"] == "0.7926"
-    assert "fallback" not in " ".join(n for n in strategy.said if "armed distance" in n)
+        step = strategy.said[before:]
+        assert not [n for n in step if "distance refused" in n or "fixed fallback (" in n], step
+        assert not [n for n in step if "replanned" in n], f"no replan on the same bars: {step}"
+    held = strategy.cached.held[0].quantity.as_decimal()
+    assert sum(order.quantity.as_decimal() for order in strategy.sent) <= held
 
 
 def test_an_entry_without_a_distance_and_no_quote_keeps_its_level_and_names_it(
@@ -2455,7 +2477,14 @@ def test_a_holding_this_run_saw_end_is_retired_with_no_level(tmp_path: Path) -> 
     following = restart_harness(path, trading=VenueOrders())
     following.on_start()
     assert following.slots[AAA].level == Price.from_str("1.01")
-    assert following.settings.trading.reads == [], "an entry with no level needs no venue read"
+    # An entry with no level needs no same-holding walk; the reads are the found holding's own
+    # venue reading (DeepSeek P2-2): the clock, both sides' orders, then the position.
+    assert [route for route, _ in following.settings.trading.reads] == [
+        "/clock",
+        "/orders",
+        "/orders",
+        "/positions/AAA",
+    ]
 
 
 def test_two_accounts_sharing_a_book_keep_a_step_each_under_the_lock(
@@ -2470,7 +2499,9 @@ def test_two_accounts_sharing_a_book_keep_a_step_each_under_the_lock(
     held: list[bool] = []
     write = start_level.LevelBook.write
 
-    def locked_write(book: Path, entries: Any, *, last_step_ns: Any = None) -> None:
+    def locked_write(
+        book: Path, entries: Any, *, last_step_ns: Any = None, carried: Any = ()
+    ) -> None:
         with (Path(book).parent / f"{Path(book).name}.lock").open("a") as other:
             try:
                 fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -2479,7 +2510,7 @@ def test_two_accounts_sharing_a_book_keep_a_step_each_under_the_lock(
             else:
                 fcntl.flock(other, fcntl.LOCK_UN)
                 held.append(False)
-        write(book, entries, last_step_ns=last_step_ns)
+        write(book, entries, last_step_ns=last_step_ns, carried=carried)
 
     monkeypatch.setattr(start_level.LevelBook, "write", staticmethod(locked_write))
     first, second = restart_harness(path), restart_harness(path)
@@ -3198,6 +3229,7 @@ def test_reconciled_external_long_opens_at_reconciliation_time_not_the_venue_ope
         written_ns=T0 + SECOND,
         run="shape-previous",
         distance=Decimal("0.25"),
+        horizon=Horizon(T0 + SECOND),  # DeepSeek P2-2: the venue's reading, nothing since.
     )
     LevelBook.write(path, {("shape", AAA): previous})
     venue = VenueOrders()
@@ -3408,7 +3440,7 @@ def test_both_rows_of_a_duplicate_holding_are_named_with_an_alert(tmp_path):
     """F4's property: no rejected row is dropped silently, the earlier of a duplicate pair too."""
     path = tmp_path / "levels.json"
     rows = [restart_record(), restart_record(last_level="1.20")]
-    path.write_text(json.dumps({"schema": 2, "entries": rows}))
+    path.write_text(json.dumps({"schema": 3, "entries": rows}))
     notes: list[str] = []
     assert LevelBook.read(path, report=notes.append) == {}
     assert [note.split(":")[0] for note in notes] == [str(AAA), str(AAA)], notes
