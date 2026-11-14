@@ -10,7 +10,8 @@ submit params on release (crates/execution/src/order_emulator/emulator.rs:1522-1
 
 The Mover lends its existing state to this part, preserving every scheduling and
 order decision. Other strategies use the position/quote callbacks with private
-holding state. The fixed default distances are MoverConfig's defaults; no template
+holding state. The default arm is the deployed Mover's OWN1 (session_window.py's
+DEFAULT_ARM), using Mover._entry_trail and _cold_plan unchanged; no template
 selects or derives a separate trail. Advanced Mover arms retain their existing
 context, calculations and records. The retained method entry points on Mover are
 forwarders so the existing override and method-only test seams keep working.
@@ -24,17 +25,22 @@ from dataclasses import replace
 from decimal import Decimal
 from typing import Any
 
+from nautilus_trader.indicators import AverageTrueRange
+from nautilus_trader.model import Bar
+from nautilus_trader.model import BarAggregation
 from nautilus_trader.model import BarType
 from nautilus_trader.model import ClientOrderId
 from nautilus_trader.model import InstrumentId
 from nautilus_trader.model import OrderReleased
 from nautilus_trader.model import OrderSide
 from nautilus_trader.model import Price
+from nautilus_trader.model import PriceType
 from nautilus_trader.model import TimeInForce
 from nautilus_trader.model import TrailingOffsetType
 from nautilus_trader.model import TriggerType
 
 from . import mover
+from . import sizing
 from .mover import EXTENDED_HOURS
 from .mover import FLOOR_WAIT_SECS
 from .mover import HOLD_MOST_SECS
@@ -69,7 +75,11 @@ from .price_step import stop_trigger_price
 
 @dataclass(frozen=True)
 class ProtectionConfig:
-    """The default Mover arm, with reduce-only sells for a composed template."""
+    """The deployed Mover's OWN1 arm, with reduce-only sells for a composed template.
+
+    session_window.TRAIL_ARMS/DEFAULT_ARM names ATR at k=1 with the own cap arm.
+    The 2% value is its named cold-ATR fallback, not selection of the F2 arm.
+    """
 
     trail: Decimal = Decimal("0.02")
     exit_through: Decimal = Decimal("0.005")
@@ -77,10 +87,21 @@ class ProtectionConfig:
     chase_secs: int = 5
     exit_ticks: int = 1
     reduce_only: bool = True
+    atr_k: Decimal = Decimal(1)
+    atr_n: int = 14
+    spread_floor_m: Decimal = Decimal(2)
 
     @property
     def trail_mode(self) -> str:
-        return "fixed"
+        return "atr"
+
+    @property
+    def trail_cap(self) -> str:
+        return "own"
+
+    @property
+    def size_from_budget(self) -> bool:
+        return False  # the shared selector is called with found_holding=True
 
     @property
     def trigger(self) -> TriggerType:
@@ -108,6 +129,7 @@ class _HoldingContext:
         self.fills: list[tuple[str, str, str, str, int]] = []
         self.notes: dict[InstrumentId, list[str]] = {}
         self.dropped: list[str] = []
+        self.baseline_dollar_volume_per_minute: dict[InstrumentId, Decimal] = {}
 
     def __getattr__(self, name: str) -> Any:
         if name.startswith("_"):
@@ -128,44 +150,104 @@ class Protection:
         self.strategy = strategy
         self.config = config
         # Mover's state and method-only stand-ins include the optional advanced arms;
-        # the callback context below only runs the fixed default arm.
+        # the callback context below only runs the deployed default arm, OWN1.
         self._context: Any = _HoldingContext(self, strategy, config) if context is None else context
+        self._arming_quotes: dict[InstrumentId, tuple[int, int] | None] = {}
+        self._closing_slots: dict[InstrumentId, Slot] = {}
 
     def on_position_opened(self, event: Any) -> None:
         """Arm from the owning long position; later partial fills reuse its one slot."""
         if event.strategy_id != self.strategy.strategy_id or event.signed_qty <= 0:
             return
-        state = self._context
-        slot = state.slots.get(event.instrument_id)
-        if slot is None:
-            slot = Slot(
-                event.instrument_id,
-                BarType.from_str(f"{event.instrument_id}-1-MINUTE-LAST-EXTERNAL"),
-                deque(),
-                deque(),
-            )
-            state.slots[event.instrument_id] = slot
+        slot = self._position_slot(event.instrument_id, event.ts_init)
+        if not slot.was_held:
+            self._arming_quotes[event.instrument_id] = None
             slot.entry_id = event.opening_order_id
             slot.entry_received_ns = event.ts_init
             slot.was_held = True
         held = self._held(slot)
         if held > 0:
-            self._protect(slot, held, event.ts_init)
+            self._position_step(slot, held, event.ts_init)
 
     def on_position_changed(self, event: Any) -> None:
         self.on_position_opened(event)
 
+    def _position_slot(self, instrument_id: InstrumentId, now: int) -> Slot:
+        state = self._context
+        slot = state.slots.get(instrument_id)
+        if slot is None:
+            slot = Slot(
+                instrument_id,
+                BarType.from_str(f"{instrument_id}-1-MINUTE-LAST-EXTERNAL"),
+                deque(maxlen=state.settings.atr_n + 1),
+                deque(maxlen=state.settings.atr_n + 1),
+                atr=AverageTrueRange(state.settings.atr_n),
+                subscribed_ns=now,
+            )
+            state.slots[instrument_id] = slot
+            mover.Mover._warm_atr(state, slot, self.strategy.cache.bars(slot.bar_type) or [], now)
+        return slot
+
+    def on_bar(self, bar: Bar) -> None:
+        """Feed complete minute bars once, using the Mover's interval and ATR contracts."""
+        spec = bar.bar_type.spec
+        if (
+            spec.step != 1
+            or spec.aggregation != BarAggregation.MINUTE
+            or spec.price_type != PriceType.LAST
+        ):
+            return
+        slot = self._position_slot(bar.bar_type.instrument_id, bar.ts_init)
+        opened, closed = mover.bar_opened_ns(bar), mover.bar_closed_ns(bar)
+        if bar.bar_type.is_internally_aggregated() and opened < slot.subscribed_ns:
+            self._holding_note(
+                slot, f"{slot.instrument_id}: skipping the first partial INTERNAL minute"
+            )
+            return
+        if closed > bar.ts_init:
+            return
+        if slot.last_bar_closed_ns is not None and closed <= slot.last_bar_closed_ns:
+            return
+        slot.last_bar_closed_ns = closed
+        if opened not in slot.atr_minutes:
+            slot.atr_minutes.add(opened)
+            if slot.atr is not None:
+                slot.atr.handle_bar(bar)
+        slot.closes.append(bar.close.as_decimal())
+        if slot.was_held and (held := self._held(slot)) > 0:
+            self._position_step(slot, held, bar.ts_init)
+
+    def _entry_trail(self, slot: Slot, price: Decimal, quote: Any, **kwargs: Any) -> TrailPlan:
+        """Use the existing Mover selector for a holding, including its OWN1 fallback."""
+        return mover.Mover._entry_trail(
+            self._context, slot, price, quote, found_holding=True, **kwargs
+        )
+
+    def _cold_plan(self, *args: Any, **kwargs: Any) -> TrailPlan:
+        return mover.Mover._cold_plan(self._context, *args, **kwargs)
+
     def on_position_closed(self, event: Any) -> None:
         if event.strategy_id != self.strategy.strategy_id:
             return
-        slot = self._context.slots.get(event.instrument_id)
-        if slot is not None:
-            self.cancel_flat(slot)
-            order = self._order(slot.protect_id)
-            if order is None or order.is_closed:
-                self._context.slots.pop(event.instrument_id)
+        self._arming_quotes.pop(event.instrument_id, None)
+        slot = self._context.slots.pop(event.instrument_id, None)
+        if slot is not None and self.cancel_flat(slot):
+            # Keep only the old cancel to await. A re-entry gets new holding state,
+            # including its plan, exit record and first-observation guard.
+            self._closing_slots[event.instrument_id] = slot
+
+    def _previous_closed(self, instrument_id: InstrumentId) -> bool:
+        previous = self._closing_slots.get(instrument_id)
+        if previous is None:
+            return True
+        if self.cancel_flat(previous):
+            return False
+        del self._closing_slots[instrument_id]
+        return True
 
     def on_quote(self, quote: Any) -> None:
+        if not self._previous_closed(quote.instrument_id):
+            return
         slot = self._context.slots.get(quote.instrument_id)
         if slot is None:
             return
@@ -176,9 +258,70 @@ class Protection:
         self._read_released_triggers()
         held = self._held(slot)
         if held > 0:
-            self._protect(slot, held, quote.ts_init)
+            self._position_step(slot, held, quote.ts_init)
         elif held == 0:
             self.cancel_flat(slot)
+
+    def _position_step(self, slot: Slot, held: Decimal, now: int) -> None:
+        """A level already met when armed needs a further quote before selling.
+
+        Ruling B bounds the guard to arming: once safely emulated, the native
+        Mover path elects on one observation. Repeated callbacks for the quote
+        that filled the entry are still that one observation, including partial
+        fills. No later-step persistence count or time span is introduced here.
+        """
+        if not self._previous_closed(slot.instrument_id):
+            return
+        quote = self.strategy.cache.quote(slot.instrument_id)
+        average = self._position_average(slot)
+        if slot.trail_plan is None and quote is not None and average is not None:
+            plan = self._entry_trail(slot, average, quote, now=now)
+            # No template distance: the shared Mover plan supplies L under the fill,
+            # including its ATR fallback and the spread floor it selected. Without
+            # a quote the existing _hold path protects the known holding meanwhile.
+            distance = offsets(
+                average,
+                plan.trail,
+                plan.exit_through,
+                least=None
+                if plan.spread is None
+                else self._context.settings.spread_floor_m * plan.spread,
+                chase_cap=plan.chase_cap,
+            )[0]
+            # _entry_trail(found_holding=True) leaves this caller's ceiling to it,
+            # as protect.row_distance does, before and after price-step rounding.
+            if plan.trail > sizing.DISTANCE_CEILING or distance > average * sizing.DISTANCE_CEILING:
+                self._holding_note(
+                    slot,
+                    f"{slot.instrument_id}: distance_over_ceiling: the trail {plan.trail} "
+                    f"({plan.bound}), distance {distance} at {average}, exceeds "
+                    f"{sizing.DISTANCE_CEILING}; protection refused",
+                )
+                return
+            slot.trail_plan = slot.initial_trail = plan
+            slot.sized_loss = distance
+        if slot.held_since is not None or slot.exiting:
+            # A hold is already protection. Its first followed breach is a sale,
+            # not a new arming step (Mover._hold/_trail's existing contract).
+            self._arming_quotes.pop(slot.instrument_id, None)
+        if slot.instrument_id in self._arming_quotes:
+            level = None if average is None else fill_trigger(average, slot.sized_loss)
+            if quote is not None and quote.bid_price.as_decimal() > 0 and level is not None:
+                observed = (int(quote.ts_event), int(quote.ts_init))
+                first = self._arming_quotes[slot.instrument_id]
+                if first == observed:
+                    return
+                if first is None and quote.bid_price.as_decimal() <= level:
+                    self._arming_quotes[slot.instrument_id] = observed
+                    return
+                del self._arming_quotes[slot.instrument_id]
+        self._protect(slot, held, now)
+
+    def _holding_note(self, slot: Slot, reason: str) -> None:
+        """Expose a template refusal in its strategy log once as well as its notes."""
+        if reason not in self._context.notes.get(slot.instrument_id, []):
+            self._note(slot, reason)
+            self._say(reason)
 
     def cancel_flat(self, slot: Slot) -> bool:
         """Withdraw the previous holding's sell; report whether it was still working."""
