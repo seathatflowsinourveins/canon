@@ -736,9 +736,11 @@ def load_trades(
     sleep: Callable[[float], None] = time.sleep,
     now: Callable[[], datetime] = utc_now,
     out: Callable[[str], None] = print,
+    skipped: dict[str, int] | None = None,
 ) -> int:
     """Load complete missing intervals of SIP prints through the adapter and the pinned trade-tick
-    writer (contracts in this module's header), an overfull interval in parts.
+    writer (contracts in this module's header), an overfull interval in parts. Prints skipped
+    rather than written are added to `skipped` by kind (`size 0`), for the caller's done line.
     """
     try:
         for name, value in (("start", start), ("end", end)):
@@ -790,10 +792,12 @@ def load_trades(
                 for lo, hi in missing:
                     part: int | None = lo
                     while part is not None:
-                        loaded, part = _load_trade_part(
+                        loaded, part, unsized = _load_trade_part(
                             client, catalog, path, instrument, part, hi, pace, max_rows, out
                         )
                         written += loaded
+                        if unsized and skipped is not None:
+                            skipped["size 0"] = skipped.get("size 0", 0) + unsized
         return written
     except HistoryStopped:
         raise
@@ -814,9 +818,9 @@ def _load_trade_part(
     pace: Pace,
     max_rows: int,
     out: Callable[[str], None],
-) -> tuple[int, int | None]:
-    """Fetch and write one part of a missing interval, from `lo` to `hi`: the trades written, and
-    where the next part starts, or `None` once the interval is done. An answer over `max_rows` valid
+) -> tuple[int, int | None, int]:
+    """Fetch and write one part of a missing interval, from `lo` to `hi`: the trades written,
+    where the next part starts, or `None` once the interval is done, and the size-0 prints skipped. An answer over `max_rows` valid
     prints is cut before its last timestamp, so no timestamp is split across parts, the coverage
     written ends one nanosecond before it, and the next part starts there."""
     symbol = instrument.id.symbol.value
@@ -852,9 +856,19 @@ def _load_trade_part(
     # timestamp keep the answer's order.
     answered = sorted(history.trades, key=lambda row: row[1])
     covered_to, following = hi, None
-    if len(answered) > max_rows:
+    truncated = len(answered) > max_rows
+    # A print of size 0 (an after-hours print seen 2026-11-13) cannot be a TradeTick at the pin:
+    # Quantity refuses a size that is not positive. It is skipped and counted, never fatal; any
+    # other unusable size still reaches parse_trade and stops by name. The cut below is judged on
+    # the whole answer, so skipping never hides a truncated one.
+    kept, unsized = [], []
+    for row in answered:
+        (unsized if row[0].size == 0 else kept).append(row)
+    if truncated:
         last = answered[-1][1]
         answered = [row for row in answered if row[1] < last]
+        kept = [row for row in kept if row[1] < last]
+        unsized = [row for row in unsized if row[1] < last]
         if not answered:
             raise HistoryStopped(
                 f"the {what} request has more than {max_rows} trades at one timestamp, "
@@ -870,17 +884,13 @@ def _load_trade_part(
     ticks = []
     rounded = 0
     first_rounding = ""
-    # A print of size 0 (an after-hours print seen 2026-11-13) cannot be a TradeTick at the pin:
-    # Quantity refuses a size that is not positive. It is skipped and counted, never fatal.
-    unsized = [row for row in answered if not row[0].size > 0]
     if unsized:
-        answered = [row for row in answered if row[0].size > 0]
         out(
             f"paper:history: Skipped {len(unsized)} size-0 {what}; "
             f"the first at {unsized[0][0].timestamp}"
         )
     try:
-        for trade, ts_event in answered:
+        for trade, ts_event in kept:
             tick = parse_trade(trade, instrument, ts_event, ts_event=ts_event)
             ticks.append(tick)
             if was_rounded(tick.price, trade.price):
@@ -889,8 +899,16 @@ def _load_trade_part(
     except Exception as e:
         raise HistoryStopped(f"parsing {what} failed ({type(e).__name__}): {e}") from e
     if not ticks:
-        out(f"paper:history: {what}: 0 trades, {gets} GET(s)")
-        return 0, None
+        if unsized:
+            # Nothing to write, so the pinned catalog records no coverage for this span; a later
+            # run asks for it again. The interval itself goes on from where a cut left it.
+            out(
+                f"paper:history: {what}: 0 trades written, only size-0 prints to "
+                f"{covered_to}, coverage not recorded, {gets} GET(s)"
+            )
+        else:
+            out(f"paper:history: {what}: 0 trades, {gets} GET(s)")
+        return 0, following, len(unsized)
     if rounded:
         out(
             f"paper:history: Rounded {rounded} of {len(ticks)} Alpaca trades "
@@ -906,7 +924,7 @@ def _load_trade_part(
             (path / FEED_FILE).unlink(missing_ok=True)
         raise HistoryStopped(f"writing {what} into {path} failed ({type(e).__name__}): {e}") from e
     out(f"paper:history: {what}: {len(ticks)} trades to {covered_to}, {gets} GET(s)")
-    return len(ticks), following
+    return len(ticks), following, len(unsized)
 
 
 def _quote_bounds(start: datetime, end: datetime, now: datetime) -> tuple[int, int]:
@@ -1285,10 +1303,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             _quote_feed(quote_feed, symbols, args.start, args.end)
         except HistoryStopped as e:
             parser.error(str(e))
+    skipped: dict[str, int] = {}
     try:
         client = history_client()
         if args.data == "trades":
-            written = load_trades(client, symbols, args.start, args.end, args.catalog, now=utc_now)
+            written = load_trades(
+                client, symbols, args.start, args.end, args.catalog, now=utc_now, skipped=skipped
+            )
         elif quote_feed is not None:
             written = load_quotes(
                 client, symbols, args.start, args.end, args.catalog, feed=quote_feed, now=utc_now
@@ -1303,7 +1324,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     except HistoryStopped as e:
         print(f"paper:history: {e}", file=sys.stderr, flush=True)
         return 1
-    print(f"paper:history: done, {written} {args.data} written to {args.catalog}", flush=True)
+    unwritten = "".join(f", {n} {kind} skipped" for kind, n in skipped.items())
+    print(
+        f"paper:history: done, {written} {args.data} written to {args.catalog}{unwritten}",
+        flush=True,
+    )
     return 0
 
 
