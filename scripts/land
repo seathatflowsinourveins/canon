@@ -16,6 +16,7 @@
 # origin there is no hosted run, so the whole of scripts/ci runs here.
 #
 # Usage: scripts/land [--body <file>] [--reviewed <note>] [--dry-run] [--pr <number>]
+#        scripts/land --draft [--body <file>] [--dry-run]
 #   --body <file>   pull request description (Summary / Test Plan / Evidence); default: for --pr, the pull
 #                   request's own body, otherwise the commit messages
 #   --reviewed <note>  which independent review ran on this change and what came of it (ADR 0017). Needed
@@ -25,6 +26,14 @@
 #   --pr <number>   land a pull request someone else opened, such as the dependency bot's (ADR 0016):
 #                   check it out in its own worktree, merge main into it if it is behind, then land it.
 #                   With --dry-run, a pull request that is no longer open is reported, and the run goes on
+#   --draft         publish the branch for review, not for landing: run the same address check and landing
+#                   checks, push, open a draft pull request if none is open for the branch, and stop. It posts
+#                   no review or signoff status and asks for no merge, so nothing can merge from it ("Draft
+#                   pull requests cannot be merged", docs.github.com, about-pull-requests); the hosted
+#                   workflow runs on it as on any pull request. Needs origin; takes neither --pr nor
+#                   --reviewed, since the note is recorded when the branch lands. The landing later is this
+#                   script without --draft, which marks the open draft ready (gh pr ready) once its checks
+#                   have passed and before it posts any status.
 # The title, which is also the squash commit's subject, is the pull request's own title for --pr, else an
 # open pull request's own title when there is one, else the last commit's subject. The squash subject
 # ends in "(#<number>)", which is added unless the title already ends with it.
@@ -40,7 +49,7 @@
 # warning, as does a named test the tree lacks. It never refuses a change for a missing or malformed marker. scripts/fix-index lists them.
 # gh flags used are from gh's own help (gh 2.103.3): auth status, pr create --title/--body-file,
 # pr merge --squash/--auto/--match-head-commit/--subject/--body-file, pr checks --required --json, pr checkout --worktree,
-# pr view --json/--jq (title, body, state), pr list --json/--jq, api (commit statuses; rate_limit --jq).
+# pr view --json/--jq (title, body, state, isDraft), pr list --json/--jq, pr create --draft, pr ready, api (commit statuses; rate_limit --jq).
 set -uo pipefail
 SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 CHECK_ADDRESSES="$(dirname "$SELF")/check-addresses"
@@ -51,9 +60,9 @@ die()  { local b=""; [ "${GH_IN_USE:-0}" = 1 ] && b=$(spent_budget) && b="; $b";
 # answered <what failed> <GitHub's answer>: die with the answer, and a budget the answer or /rate_limit names
 answered() { local b=""; b=$(spent_budget "$2") && b="; $b"; GH_IN_USE=0; die "$1: ${2:-no answer}$b"; }
 note() { echo "land: $*"; }
-USAGE="usage: scripts/land [--body <file>] [--reviewed <note>] [--dry-run] [--pr <number>]"
+USAGE="usage: scripts/land [--body <file>] [--reviewed <note>] [--dry-run] [--pr <number>] | --draft [--body <file>] [--dry-run]"
 
-BODY=""; DRY=0; PR=""; REVIEWED=""
+BODY=""; DRY=0; PR=""; REVIEWED=""; DRAFT=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --body)    BODY="${2:-}"; [ $# -ge 2 ] || die "$USAGE"; shift 2 ;;
@@ -64,9 +73,14 @@ while [ $# -gt 0 ]; do
                 [ -n "${REVIEWED//[[:space:]]/}" ] || die "--reviewed needs a note in plain ASCII: what ran and what came of it"
                 shift 2 ;;
     --dry-run) DRY=1; shift ;;
+    --draft)   DRAFT=1; shift ;;
     *) die "$USAGE" ;;
   esac
 done
+if [ "$DRAFT" -eq 1 ]; then
+  [ -z "$PR" ] || die "--draft publishes the current branch; it cannot be used with --pr"
+  [ -z "$REVIEWED" ] || die "--draft records no review; give --reviewed when the branch lands"
+fi
 if [ -n "$BODY" ]; then
   [ -f "$BODY" ] || die "body file not found: $BODY"
   BODY="$(cd "$(dirname "$BODY")" && pwd)/$(basename "$BODY")"
@@ -138,6 +152,7 @@ if git remote get-url origin >/dev/null 2>&1; then
   GH_IN_USE=1
 fi
 [ -n "$remote" ] || [ -z "$INNER_PR" ] || die "pull request $INNER_PR has no origin remote to land through; nothing was landed"
+[ -n "$remote" ] || [ "$DRAFT" -eq 0 ] || die "--draft opens a pull request on origin, and there is no origin remote; nothing was done"
 # What a branch must contain before it lands: GitHub's main where there is a remote, the local one otherwise.
 base=main
 if [ -n "$remote" ]; then
@@ -271,6 +286,7 @@ rebase_onto_base() {
   local args=()
   [ -z "$BODY" ] || args+=(--body "$BODY")
   [ -z "$REVIEWED" ] || args+=(--reviewed "$REVIEWED")
+  [ "$DRAFT" -eq 0 ] || args+=(--draft)
   note "rebased; running main's copy of scripts/land on it"
   exec "$SELF" ${args[@]+"${args[@]}"}
 }
@@ -347,7 +363,8 @@ set +f
 
 set +f
 missing_note=0
-if [ ${#needs[@]} -gt 0 ] && [ -z "$REVIEWED" ]; then
+# A draft records no review (it posts no status), so it needs no note; its landing does.
+if [ ${#needs[@]} -gt 0 ] && [ -z "$REVIEWED" ] && [ "$DRAFT" -eq 0 ]; then
   cmd="scripts/land"
   [ -z "$INNER_PR" ] || cmd="$cmd --pr $INNER_PR"
   [ -z "$BODY" ] || cmd="$cmd --body $(printf '%q' "$BODY")"
@@ -517,14 +534,19 @@ if [ -z "$remote" ]; then
   exit 0
 fi
 
-[ "$DRY" -eq 0 ] || finish_dry "push $branch, open a pull request if there is none, record the review, sign off and squash-merge it"
+if [ "$DRAFT" -eq 1 ]; then
+  [ "$DRY" -eq 0 ] || finish_dry "push $branch and open a draft pull request if none is open; post no status and merge nothing"
+else
+  [ "$DRY" -eq 0 ] || finish_dry "push $branch, open a pull request if there is none (marking an open draft ready), record the review, sign off and squash-merge it"
+fi
 sha=$(git rev-parse HEAD)
 git push -q -u "$remote" "$branch" || die "push failed"
 found=$(open_pr) || die "could not list the pull requests for $branch"
 if [ -z "$found" ]; then
   [ -z "$existing" ] || die "${existing#* } is no longer open; nothing was merged"
-  gh pr create --base main --head "$branch" --title "$title" --body-file "$pr_body" >/dev/null \
-    || die "could not open the pull request"
+  create=(--base main --head "$branch" --title "$title" --body-file "$pr_body")
+  [ "$DRAFT" -eq 0 ] || create=(--draft "${create[@]}")
+  gh pr create "${create[@]}" >/dev/null || die "could not open the pull request"
   found=$(open_pr) || die "could not list the pull requests for $branch"
 fi
 [ -n "$found" ] || die "no open pull request found for $branch"
@@ -532,6 +554,20 @@ num=${found%% *}; url=${found#* }
 # The title checked above belongs to the pull request found before the push; a different one is not merged.
 [ -z "$existing" ] || [ "$num" = "${existing%% *}" ] || die "the open pull request for $branch is now $url, not ${existing#* }; nothing was merged"
 [ -z "$INNER_PR" ] || [ "$num" = "$INNER_PR" ] || die "the open pull request for $branch is $url, not pull request $INNER_PR"
+
+# A draft stops here: published and checked by the hosted run, with no status and no merge request.
+if [ "$DRAFT" -eq 1 ]; then
+  note "draft: $branch is pushed to $url; nothing was signed off or merged. Land it in its slot with: scripts/land --reviewed \"<what ran and what came of it>\" (and --body if it had one)"
+  exit 0
+fi
+
+# GitHub merges no draft, and auto-merge would wait on one for ever, so an open draft for this branch is
+# marked ready here: after its checks have passed and before any status is posted.
+is_draft=$(gh pr view "$num" --json isDraft --jq .isDraft) || die "could not read whether $url is a draft; nothing was merged"
+if [ "$is_draft" = true ]; then
+  gh pr ready "$num" >/dev/null || die "could not mark the draft $url ready for review; nothing was merged"
+  note "marked the draft $url ready for review"
+fi
 
 # Record the review first: `signoff` is the status the ruleset waits for, so nothing can merge before the
 # note is on the commit. (A status description holds 140 characters; the note was cut to that when read.)

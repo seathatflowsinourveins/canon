@@ -9,6 +9,14 @@ review-by: 2027-02-09
 
 Amended 2026-11-13: [ADR 0144](0144-a-landing-runs-the-quick-checks-here-and-the-full-suite-once-on-github.md) replaces the full local landing run with the quick set; the hosted gate stays.
 
+Amended 2026-11-13: `scripts/land --draft` publishes a branch as a draft pull request after the same
+address check and landing checks, and posts no status and asks for no merge, since GitHub merges no draft
+("Draft pull requests cannot be merged", https://docs.github.com/en/pull-requests/collaborating-with-pull-requests/proposing-changes-to-your-work-with-pull-requests/about-pull-requests,
+fetched 2026-11-13). The landing marks it ready (`gh pr ready`) after its checks pass and before any
+status. The ruleset (read 2026-11-13) targets only the default branch, so a pushed branch that is not
+landing breaks no rule. That the hosted workflow runs on a draft is `UNVERIFIED`: GitHub's default
+`pull_request` types are `opened`, `synchronize` and `reopened`, and its events page names no exception for a draft.
+
 ## Context and Problem Statement
 
 The owner's standing instruction (2026-11-09) is that work lands automatically once it passes its checks.
