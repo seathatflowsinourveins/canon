@@ -18,6 +18,14 @@ under its own ID. Everything after the buy is the protector's own code and the e
 matching. What differs from a live run: the long's position events reach the protector, which they
 do not for an EXTERNAL long.
 
+NOT SHOWN ON THE ENGINE by these cases; the paper proof is where each is shown:
+* discovery's own checks on a live account, which run degenerate under the departure: exactly one
+  EXTERNAL long, and another strategy's sell or position on the instrument;
+* a sale that reaches its end on quote and timer steps alone: under the departure the long's
+  position events give the sale's step extra calls at the buy and at the fill;
+* a leg in flight when a new holding outside the roster ends the run, and a count that completes
+  between the end's request and the stop.
+
 Every case fails on a handler error in the engine's log and on a step the protector swallowed.
 """
 

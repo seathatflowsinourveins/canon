@@ -15,6 +15,8 @@ from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from canon_trading import symbol_hold
 from tests import test_owner_protector as h
 from tests import test_owner_protector_sale_table as c
@@ -176,3 +178,25 @@ def test_a_holding_that_goes_flat_while_its_stopped_sale_is_open_has_ended(tmp_p
     assert h.AAA not in strategy.levels
     slot = strategy.slots.get(h.AAA)
     assert slot is None or slot.ended, "nothing of the ended holding is judged again"
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="count-two follow-up: refused-cancel re-ask with its wait (a refused cancel at a "
+    "holding's end is asked again at every step, with no pace)",
+)
+def test_a_refused_cancel_at_a_holdings_end_is_asked_again_at_a_pace() -> None:
+    """The owner sold and bought again at least our leg's size, so the end is seen at every step
+    and no mismatch ever shows. A venue that refuses our cancel each time must be asked again at a
+    pace (the refused sale's is 5, 10, 20 s), not once a second."""
+    strategy = c.counted()
+    c.first_leg(strategy)
+    (leg,) = strategy.sent
+    reopen(strategy, 5, 15)
+    step(strategy, 5)
+    ours = strategy.cache.order(leg.client_order_id)
+    for seconds in range(6, 16):
+        if c.row(strategy).row == "PCX":
+            strategy.deliver("CancelRejected", leg=ours)
+        step(strategy, seconds)
+    assert len(strategy.canceled) <= 3, len(strategy.canceled)

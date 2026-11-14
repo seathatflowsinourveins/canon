@@ -247,8 +247,16 @@ Order handlers only enqueue event payloads. Steps replay them on independent nat
 in arrival order (python/orders/limit.rs:463-466, 470-572), so a later cached state cannot supply
 an earlier event's facts. Local echoes produced by a step wait for the following step too.
 Every wait after a refusal or an outside cancel is counted from the later of the event's own
-stamp and its receipt here. Named limit: a stamp ahead of the node's clock lengthens the wait
-by the difference.
+stamp and its receipt here, and a send line's refusal_to_send_ms from the same moment. Named
+limit: a stamp ahead of the node's clock lengthens the wait by the difference, with no cap.
+Named limits of the status at a count above one (_holding_state), each held by an
+expected-failure case that names its follow-up: a frozen reason outside the fault and cover rows
+is dropped, so a holding that waits because its distance is refused reads "no level planned
+yet"; under the owner's hold a recorded fault is not named and the line says that removing the
+hold re-arms the holding, though the release freezes it again. A holding that never had a usable
+quote reads `counting` (the cold start's follow-up). Named limit, held the same way: a refused
+cancel at a holding's end is asked again at every step with no pace; a held symbol's refused
+cancel is asked again only at its holding's end.
 
 Review F1 of #443's max review (the lead's ruling, 2026-11-13 22:47 and 22:52): a holding first bought
 after the start, in a symbol the node did not load, is named at once and has its exit within a bound.

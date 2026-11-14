@@ -489,6 +489,24 @@ def test_no_quote_to_plan_from_is_named_at_every_step():
     )
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason="count-two follow-up: node-report (the status drops a frozen reason outside the fault "
+    "and cover rows: a holding that waits because its distance is refused reads as unplanned)",
+)
+def test_the_status_names_why_a_holding_waits_without_a_plan():
+    """The line said at every step names the refused distance; the status a monitor reads must
+    carry the same reason, as it does at a count of one."""
+    strategy = c.Counted(breach_count=2, confirm_gap_ms=0)
+    strategy.cached.latest = None
+    strategy.adopt_holding(h.AAA, h.Price.from_str("9.90"))
+    strategy.test_clock.set_time(h.T0 + h.SECOND)
+    step(strategy)
+    assert any("distance refused" in line for line in strategy.said), strategy.said
+    state, _, reason = strategy._holding_state(h.AAA, strategy.slots[h.AAA])
+    assert reason is not None and "distance refused" in reason, (state, reason)
+
+
 def test_oversized_leg_is_cut_on_the_first_quote_after_a_refused_cancel():
     strategy = c.counted()
     c.first_leg(strategy)

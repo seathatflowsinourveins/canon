@@ -343,3 +343,26 @@ def test_the_hold_never_cancels_an_order_the_owner_placed(tmp_path: Path) -> Non
     sent = {order.client_order_id for order in strategy.sent}
     assert set(strategy.canceled) <= sent, "only IDs this instance sent are ever canceled"
     assert owner.client_order_id not in strategy.canceled
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="count-two follow-up: node-report (under the hold the status hides a recorded fault "
+    "and says that removing the hold re-arms the holding)",
+)
+def test_the_status_under_a_hold_names_a_recorded_fault(tmp_path: Path) -> None:
+    """A fault of ours froze the holding, then the owner held the symbol. The release will freeze
+    it again, so the status must not say that removing the hold re-arms it."""
+    strategy = two_quote(tmp_path)
+    c.first_leg(strategy)
+    strategy.deliver_then_step(
+        "Unrecognized", leg=strategy.cache.order(strategy.slots[h.AAA].protect_id)
+    )
+    symbol_hold.write_hold(tmp_path, "AAA")
+    step(strategy, 3)
+    strategy.deliver_then_step("Canceled")
+    step(strategy, 4)
+    assert c.row(strategy) == State("T0"), c.row(strategy)
+    state, _, reason = strategy._holding_state(h.AAA, strategy.slots[h.AAA])
+    assert "re-arms" not in (reason or ""), reason
+    assert state == "frozen", (state, reason)
