@@ -112,8 +112,11 @@ the pinned v2.0.0rc8 catalog bindings, `movers_rank` and `history_load` (read 20
 
 `mise run paper:history <tests|windows> --data quotes --symbols AAPL --start <ISO time with zone>
 --end <ISO time with zone> --catalog <existing IEX root>` loads historical IEX quotes as
-`QuoteTick` under `data/quotes/<instrument>/`. The root must hold definitions; SIP roots are refused.
-ADR 0066's bounds apply: IEX only, start at or after 2025-11-04 00:00 New York, at most 90 elapsed days (a conservative
+`QuoteTick` under `data/quotes/<instrument>/`. The root must hold definitions; an IEX load refuses a SIP root.
+With `--feed sip` it loads SIP quotes instead (ADR 0151): at most 8 symbols named with `--symbols`, never
+`--symbols-file`, over at most 60 minutes, into a root of their own that holds no bars or trades (default
+`catalog/sip-quotes`); a bars or trades load is refused in a root that holds quotes. Both bounds are
+UNCALIBRATED. ADR 0066's bounds apply to both feeds: IEX by default, start at or after 2025-11-04 00:00 New York, at most 90 elapsed days (a conservative
 quarter ceiling); small probes are allowed. Both bounds are inclusive, `start < end`, and the end
 must be 15 minutes before now, as for prints. Request/coverage bounds expand to complete microsecond buckets (start rounded
 down, end rounded up to the bucket's last nanosecond), matching the SDK's timestamp precision without
