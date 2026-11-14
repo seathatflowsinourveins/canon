@@ -934,7 +934,9 @@ show_recorder_status() {
 # clone of origin's main at the commit fetched for it (the protector refuses a main checkout), removed after
 # the run. Each start reads, in its step, its instance's holds/ and inbox/ (any entry stops the runner: the
 # owner's word outranks the go and the schedule, and nothing retries around it), on C the lead's standing go
-# in `go` ("protect <row>", read at every start). The level book (start_level.book_path()) is read by the
+# in `go` ("protect <row>", read at every start). Its symbol-holds/ (the owner's word for one symbol,
+# canon_trading.symbol_hold) is handed to every run, which reads it at its start and every step; an entry
+# there holds that symbol only and never stops the runner. The level book (start_level.book_path()) is read by the
 # node itself once it holds the account's locks (the lead's ruling, 2026-11-13, 17:10), so the runner reads
 # none: it names the book's path in CANON_PROTECTOR_LEVEL_BOOK (protector_node.LEVEL_BOOK_ENV). The seam
 # (the lead's ruling (d)4, 2026-11-13): the runner learns each run's planned end from the protector's own
@@ -1040,7 +1042,7 @@ pr_prepare() {
 pr_launch() { # <lock wait s>
   local -a args
   P_CUR_LOG="$P_LOGS/$(/bin/date +%s)-$P_SLOT.log"
-  args=(paper:protector "$P_ACCOUNT" --row "$P_ROW" --holds-dir "$P_INST/holds" --inbox "$P_INST/inbox" --minutes 960)
+  args=(paper:protector "$P_ACCOUNT" --row "$P_ROW" --holds-dir "$P_INST/holds" --inbox "$P_INST/inbox" --symbol-holds-dir "$P_INST/symbol-holds" --minutes 960)
   [ "$P_ACCOUNT" != protect ] || args+=(--lead-go "protect $P_ROW")
   [ "$1" = 0 ] || args+=(--lock-wait "$1")
   (if ! { exec 8>>"$P_NEXT_WT.lock" && "$LOCKF" -t 0 8 2>/dev/null; }; then
@@ -1339,7 +1341,7 @@ do_install_protector() {
   case "$url" in https://*|/*) ;; *) note "  FAILED: the protector runner's origin must be https"; return 1 ;; esac
   if [[ "$url" =~ ^https://[^/?#]*@ ]]; then note "  FAILED: the protector runner's origin carries credentials"; return 1; fi
   case "$url" in *[?#]*) note "  FAILED: the protector runner's origin has a query or fragment"; return 1 ;; esac
-  mkdir -p "$inst/holds" "$inst/inbox" "$AGENTS_DIR" "$CANON_HOME/watch" || { note "  FAILED: could not create $inst"; return 1; }
+  mkdir -p "$inst/holds" "$inst/inbox" "$inst/symbol-holds" "$AGENTS_DIR" "$CANON_HOME/watch" || { note "  FAILED: could not create $inst"; return 1; }
   # a running firing holds the instance's runner lock for as long as it protects: never replace its files then
   exec 6>>"$inst/runner.lock" || { note "  FAILED: could not open $inst/runner.lock"; return 1; }
   "$LOCKF" -t 0 6 2>/dev/null || rc=$?
@@ -1368,7 +1370,7 @@ do_install_protector() {
     rm -f "$t"; exec 6>&-; note "  FAILED: could not install the protector runner for $account"; return 1
   fi
   exec 6>&-
-  t="holds $inst/holds, inbox $inst/inbox"
+  t="holds $inst/holds, inbox $inst/inbox, the owner's per-symbol holds $inst/symbol-holds"
   [ "$account" != protect ] || t="$t; the lead's standing go in $inst/go"
   note "  wrote      $plist (account $account, row $row; $t)"
   if [ "${AUTOMATION_SKIP_LAUNCHD:-0}" = 1 ]; then note "  not loaded (AUTOMATION_SKIP_LAUNCHD=1)"; return 0; fi

@@ -1064,6 +1064,7 @@ flag "--minutes <minutes>" help="1-960, default 30; shortened to the current fee
 flag "--feed <feed>" help="sip or boats; otherwise selected from Alpaca's clock/calendar; IEX refused"
 flag "--holds-dir <holds_dir>" required=#true help="absolute holds folder; any entry refuses the start"
 flag "--inbox <inbox>" required=#true help="absolute inbox file or folder; unread or nonempty refuses the start"
+flag "--symbol-holds-dir <symbol_holds_dir>" help="absolute folder of the owner's per-symbol holds (paper:hold-symbol), default this account's protector instance's; read at the start (never made: none held; unreadable: refused) and at every step; a held symbol is not armed and only our own sell of it is canceled"
 flag "--lead-go <lead_go>" help="on C: carry the lead's start instruction exactly as 'protect OWN1' or 'protect OWN3'"
 flag "--lock-wait <lock_wait>" help="0-300, default 0: wait this long for the account's locks, then refuse (the protector runner's successor)"
 '''
@@ -1090,6 +1091,7 @@ ALPACA_SECRET_KEY="$(/usr/bin/timeout 30 /usr/bin/security find-generic-password
 [ -n "$ALPACA_API_KEY" ] && [ -n "$ALPACA_SECRET_KEY" ] || { echo "paper:protector: the named account's pair is not in the login keychain; nothing was sent" >&2; exit 1; }
 export ALPACA_API_KEY ALPACA_SECRET_KEY CANON_PAPER_ACCOUNT="$usage_account"
 args=("$usage_account" --row "$usage_row" --holds-dir "$usage_holds_dir" --inbox "$usage_inbox")
+[ -z "${usage_symbol_holds_dir:-}" ] || args+=(--symbol-holds-dir "$usage_symbol_holds_dir")
 [ -z "${usage_levels:-}" ] || args+=(--levels "$usage_levels")
 [ -z "${usage_minutes:-}" ] || args+=(--minutes "$usage_minutes")
 [ -z "${usage_feed:-}" ] || args+=(--feed "$usage_feed")
@@ -1100,6 +1102,25 @@ args=("$usage_account" --row "$usage_row" --holds-dir "$usage_holds_dir" --inbox
 # clock/stop bounds. Nothing invokes the session window's flattening step.
 exec /usr/bin/timeout -s TERM -k 785 58800 uv run --locked python -m canon_trading.protector_node "${args[@]}"
 '''
+
+# The owner's word for one symbol (src/canon_trading/symbol_hold.py): one file named for the symbol in the
+# protector instance's symbol-holds/ folder, beside holds/ and inbox/, whose any entry stops the whole node.
+# `on` writes it, `off` removes it, and nothing else: no credential, account, order or node is read or
+# touched. A running protector reads it at every step: a new hold cancels only our own sell of that symbol
+# within one step and sells nothing; removing it re-arms the symbol at its level, never lowered. On C
+# (protect) the word is the owner's alone: no lane, coordinator or automation runs this task there.
+[tasks."paper:hold-symbol"]
+description = "Write (on) or remove (off) the owner's hold on one symbol for one protector instance; on protect (C) the word is the owner's alone and no lane runs it there; reads no credential and sends nothing"
+usage = '''
+arg "<account>" help="the protector instance: tests (A), windows (B) or protect (C, the owner's alone)" {
+  choices "tests" "windows" "protect"
+}
+arg "<symbol>" help="the symbol as the account lists it, for example ABC; a '/' is refused"
+arg "<action>" help="on writes the hold; off removes it" {
+  choices "on" "off"
+}
+'''
+run = 'uv run --locked python -m canon_trading.symbol_hold "$usage_account" "$usage_symbol" "$usage_action"'
 
 # The nightly study (docs/adr/0089-the-nightly-study-loop.md): one firing of canon_trading.nightly_study in
 # this checkout, which studies the latest recorded night once and does nothing when there is none: the
