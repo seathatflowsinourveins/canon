@@ -278,10 +278,10 @@ for each cause (the stop, the holding's end, our sale larger than the long) is n
 wait another cause started; a part fill and an acknowledgement at last ask what their row
 already owes. Each refusal is counted in a line with its next wait; its ALERT is written once per
 leg. While a stopped holding's sale is open the owner's hold raises the stop at every step
-(TW x ST), so the ask comes whether or not the holding ends. The stop, the end and the cut are
-judged before a step's stored order events, so an acknowledgement or an update stored before the
-step is never read as the answer to a cancel that step asks: it is replayed on its leg and judged
-in no row. UNPACED where a sale known to be working is larger than a live or frozen
+(TW x ST), so the ask comes whether or not the holding ends. The stop and the end are judged
+before a step's stored order events, the cut after them, so an acknowledgement or an update
+stored before the step is never read as the answer to a cancel that step asks: it is replayed on
+its leg, judged in no row, and the cancel stays requested. UNPACED where a sale known to be working is larger than a live or frozen
 holding (the cut for size): an oversell cannot wait. It has a floor: a cut the venue refused is
 asked again no sooner than CUT_FLOOR_SECS after that refusal, at most one cancel a second for
 the holding, so a refusal that persists never becomes a cancel for each quote; the chase asks
@@ -3161,7 +3161,8 @@ class OwnerProtector(Strategy):
         if derive_mismatch:
             entries.append(("MO", None))
         cell = f"{slot.sale_state.row} x {events[-1] if events else 'step'}"
-        # The legs whose cancel this step has asked: a stored event of theirs is older than it.
+        # The legs whose cancel this step has asked (by the stop or the end, judged before stored
+        # events): a stored event of theirs is older than that cancel.
         asked_in_step: set[Any] = set()
         try:
             for tagged in sale_table.order_step(
@@ -3188,16 +3189,14 @@ class OwnerProtector(Strategy):
                     )
                     if type(item).__name__ == "OrderFilled":
                         event_held -= item.last_qty.as_decimal()
-                    replayed = self._sale_orders.get(item.client_order_id)
-                    if (
-                        code in {"oACC", "oUPD"}
-                        and item.client_order_id in asked_in_step
-                        and (replayed is None or replayed.status != OrderStatus.FILLED)
-                    ):
-                        # Stored before this step, so before the cancel this step asked for its
-                        # leg (the stop, the end and the cut are judged first): it cannot be
-                        # that cancel's answer, and a pending cancel's row would read it as its
-                        # refusal. It is replayed on the leg and judged in no row.
+                    if code in {"oACC", "oUPD"} and item.client_order_id in asked_in_step:
+                        # Stored before this step, so before the cancel this step sent for its
+                        # leg (the stop and the end are judged before stored events): it cannot
+                        # be that cancel's answer, and a pending cancel's row would read it as
+                        # its refusal. It is replayed on the leg and judged in no row. The replay
+                        # ran on our copy before it saw the pending cancel, so the cancel the
+                        # step asked is kept requested.
+                        self.cancel_requested.add(item.client_order_id)
                         self._say(
                             f"{instrument_id}: sale event {code} was stored before this step "
                             "asked its leg's cancel: no answer to it"

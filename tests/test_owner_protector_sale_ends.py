@@ -390,6 +390,30 @@ def test_an_update_stored_at_every_step_does_not_starve_the_standing_stop(
 
 
 @pytest.mark.parametrize("stored", ["Updated", "Accepted"])
+def test_a_skipped_stored_event_keeps_the_cancel_its_step_asked(
+    tmp_path: Path, stored: str
+) -> None:
+    """An event stored before the step and judged in no row is still replayed on our copy of the
+    leg, which has not yet seen the pending cancel. The cancel the step asked stays requested:
+    the duplicate guard, the fault rows and the holding status read it as pending."""
+    strategy = c.counted(symbol_holds_dir=tmp_path)
+    c.first_leg(strategy)
+    (leg,) = strategy.sent
+    ours = strategy.cache.order(leg.client_order_id)
+    if stored == "Accepted":
+        strategy.deliver("Filled", quantity=1, leg=ours)
+        step(strategy, 2)
+    strategy.deliver(stored, leg=ours, ts_event=h.T0 + 3 * h.SECOND)
+    symbol_hold.write_hold(tmp_path, "AAA")
+    step(strategy, 3)
+    assert strategy.canceled == [leg.client_order_id] and c.row(strategy).row == "PCT"
+    assert leg.client_order_id in strategy.cancel_requested, "the step's own cancel is pending"
+    step(strategy, 4)
+    assert leg.client_order_id in strategy.cancel_requested, "still pending a step later"
+    assert strategy.canceled == [leg.client_order_id]
+
+
+@pytest.mark.parametrize("stored", ["Updated", "Accepted"])
 def test_an_event_stored_before_the_first_stop_is_not_its_cancels_refusal(
     tmp_path: Path, stored: str
 ) -> None:
