@@ -27,10 +27,12 @@ import importlib.util
 import re
 import sys
 import uuid
+from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
 from typing import cast
+from zoneinfo import ZoneInfo
 
 import pytest
 from alpaca.trading.models import TradeUpdate
@@ -268,59 +270,138 @@ def _ended(account: Account, seconds: int = 70) -> tuple[list[tuple[int, str | N
         eng.dispose()
 
 
-def test_an_unreadable_long_outside_the_roster_keeps_a_new_whole_share_long_from_ending_the_run() -> (
+def _start_refuses(account: Account) -> dict[str, str]:
+    """What the start's own predicate refuses in this account (`session_window.start_account`)."""
+    held, unread = session_window.position_reads(cast(Any, account))
+    return session_window.start_account(held, unread).refused
+
+
+def _unread(account: Account, symbol: str) -> Account:
+    account.unreadable.add(symbol)
+    return account
+
+
+START_CASES = {
+    "accepted: a new whole-share long alone": (lambda: Account(AAA="10", CCC="5"), False),
+    "accepted: an unreadable long outside the roster, which the start skips": (
+        lambda: _unread(Account(AAA="10", BBB="7", CCC="5"), "BBB"),
+        False,
+    ),
+    "accepted: a roster long turned unreadable, which the start skips": (
+        lambda: _unread(Account(AAA="10", CCC="5"), "AAA"),
+        False,
+    ),
+    "accepted: a zero quantity, which the start skips": (
+        lambda: Account(AAA="10", BBB="0", CCC="5"),
+        False,
+    ),
+    "refused: a fractional long outside the roster": (
+        lambda: Account(AAA="10", BBB="2.5", CCC="5"),
+        True,
+    ),
+    "refused: a roster long turned fractional": (lambda: Account(AAA="10.5", CCC="5"), True),
+    "refused: a fractional short": (lambda: Account(AAA="10", BBB="-1.5", CCC="5"), True),
+}
+
+
+@pytest.mark.parametrize("case", sorted(START_CASES))
+def test_a_new_whole_share_long_ends_the_run_exactly_when_the_start_would_accept_the_account(
+    case,
+) -> None:
+    """The lead's term (a), 2026-11-13 23:49: the run asks the start's own predicate. For every account
+    the start refuses, the run does not end by name; for every account it accepts, a whole-share long
+    first bought outside the roster ends it."""
+    make, refused = START_CASES[case]
+    assert bool(_start_refuses(make())) is refused
+    shutdowns, guard = _ended(make())
+    if refused:
+        assert not shutdowns and guard.ended_for is None, guard.said
+    else:
+        assert [reason for _at, reason in shutdowns] == ["new holding outside the roster: CCC 5"], (
+            guard.said
+        )
+
+
+def test_the_run_calls_the_starts_predicate_and_the_adapters_whole_share_rule(monkeypatch) -> None:
+    """Called, never copied: when the predicate, or the adapter's whole-share rule it calls, accepts a
+    fractional position, the run ends at once (review F2 narrows this guard by changing either)."""
+    from canon_alpaca import execution
+
+    assert not _ended(Account(AAA="10", BBB="2.5", CCC="5"))[0]
+    with monkeypatch.context() as patch:
+        accepted = session_window.StartAccount
+        patch.setattr(
+            session_window,
+            "start_account",
+            lambda held, unread, orders=(): accepted(dict(held), dict(unread), {}),
+        )
+        assert _ended(Account(AAA="10", BBB="2.5", CCC="5"))[0]
+    with monkeypatch.context() as patch:
+        patch.setattr(execution, "whole_quantity", lambda value, field: value)
+        assert _ended(Account(AAA="10", BBB="2.5", CCC="5"))[0]
+
+
+def test_a_new_long_the_restart_cannot_take_is_named_unprotected_once_and_the_monitor_shows_it_uncovered() -> (
     None
 ):
-    """The successor's start reads the same account and refuses an unreadable position
-    (`session_window.positions`), so an end here would leave every holding with no stop of ours: the run
-    goes on, protecting its roster, and names the new holding and what keeps it from ending."""
-    account = Account(AAA="10", BBB="7", CCC="5")
-    account.unreadable.add("BBB")
-    with pytest.raises(session_window.PositionUnread):
-        session_window.positions(cast(Any, account))
-    shutdowns, guard = _ended(account)
-    assert not shutdowns and guard.ended_for is None, "the run ended into a start that refuses"
+    """The lead's term (c): one ALERT names the new holding as unprotected and what blocks the restart,
+    across every read of the run, and the exit monitor shows it uncovered."""
+    from canon_trading import exit_monitor
+
+    account = Account(AAA="10", BBB="2.5", CCC="5")
+    shutdowns, guard = _ended(account, seconds=95)
+    assert not shutdowns and account.reads >= 3
     named = alerts(guard, "CCC")
     assert len(named) == 1, guard.said
-    assert "does not end" in named[0][1] and "BBB unreadable" in named[0][1]
+    line = named[0][1]
+    assert "unprotected" in line and "5 held" in line, line
+    assert "BBB position quantity 2.5 is fractional" in line, line
+    findings = exit_monitor.assess(
+        "A",
+        account.get_all_positions(),
+        [],
+        [],
+        exit_monitor.empty_memory("A"),
+        datetime(2026, 11, 13, 10, tzinfo=ZoneInfo("America/New_York")),
+    )
+    (ccc,) = [finding for finding in findings if finding["symbol"] == "CCC"]
+    assert ccc["state"] == "uncovered", ccc
 
 
-def test_a_roster_holding_turned_unreadable_keeps_a_new_whole_share_long_from_ending_the_run() -> (
-    None
-):
-    account = Account(AAA="10", CCC="5")
-    account.unreadable.add("AAA")
-    with pytest.raises(session_window.PositionUnread):
-        session_window.positions(cast(Any, account))
-    shutdowns, guard = _ended(account)
-    assert not shutdowns, "the run ended into a start that refuses"
-    assert "AAA unreadable" in alerts(guard, "CCC")[0][1]
+def test_the_run_ends_at_the_first_read_the_start_would_accept() -> None:
+    """The lead's term (b): decided at every read, never latched. A fractional holding that reads whole
+    at the next read lets that read end the run."""
 
-
-def test_a_fractional_long_keeps_a_new_whole_share_long_from_ending_the_run() -> None:
-    """The adapter's start-up refuses a fractional position in an instrument it loads
-    (`packages/canon-alpaca/src/canon_alpaca/execution.py:372`; that refusal is UNVERIFIED as run here)."""
-    account = Account(AAA="10", BBB="2.5", CCC="5")
-    shutdowns, guard = _ended(account)
-    assert not shutdowns, "the run ended into a start the adapter refuses"
-    assert "BBB 2.5 fractional" in alerts(guard, "CCC")[0][1]
-
-
-def test_the_run_ends_at_the_first_read_once_nothing_would_refuse_the_next_start() -> None:
-    class Clears(Account):
+    class Rounds(Account):
         def get_all_positions(self) -> list[Any]:
             listed = super().get_all_positions()
-            self.unreadable.clear()  # the account reads in full from the next read on
+            self.held["BBB"] = "3"  # whole from the next read on
             return listed
 
-    account = Clears(AAA="10", BBB="7", CCC="5")
-    account.unreadable.add("BBB")
+    account = Rounds(AAA="10", BBB="2.5", CCC="5")
     shutdowns, guard = _ended(account)
     assert account.reads >= 2
     assert [reason for _at, reason in shutdowns] == [
-        "new holding outside the roster: BBB 7, CCC 5"
+        "new holding outside the roster: BBB 3, CCC 5"
     ], guard.said
     assert shutdowns[0][0] - alerts(guard, "CCC")[0][0] >= owner_protector.ROSTER_POLL_SECS * SECOND
+
+
+def test_the_start_refuses_a_fractional_holding_by_name_before_any_node(
+    controls, tmp_path, monkeypatch
+) -> None:
+    """The start calls the same predicate: a fractional position, which the adapter's start-up refuses in
+    an instrument it loads, is refused by name before the node is built."""
+    from tests.test_protector_node import Listing
+    from tests.test_protector_node import listed
+    from tests.test_protector_node import real_reader
+    from tests.test_protector_node import window
+
+    module, settings, _strategy, _foreign, _reads, built = real_reader(monkeypatch, controls)
+    trading = Listing(listed("AAA", "10"), listed("BBB", "2.5"))
+    with pytest.raises(window.WindowRefused, match="BBB position quantity 2.5 is fractional"):
+        module.run_protector(settings, trading=trading, lock_dir=tmp_path)
+    assert not built
 
 
 def test_a_failed_read_is_an_alert_and_is_read_again_at_the_next_interval() -> None:

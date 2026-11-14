@@ -484,13 +484,12 @@ def run_protector(
         # its label or by its sign, is below zero and never read as a long, and one that cannot be read
         # is named with an ALERT and skipped, its symbol and any level for it left out of the node, so
         # every other long is still covered (the lead, 2026-11-13 21:27 and 21:35).
-        held, unread = window.position_reads(trading)
         # A zero quantity (a short read as -0 among them) is no holding this node can protect: it is
-        # named and skipped like an unreadable one, never a refusal of every other long.
-        for symbol, qty in sorted(held.items()):
-            if qty == 0:
-                unread[symbol] = f"position in {symbol} is listed with quantity {qty}, no holding"
-                del held[symbol]
+        # named and skipped like an unreadable one, never a refusal of every other long. What the start
+        # skips and refuses is one predicate, `window.start_account`, which the running protector's
+        # roster read calls too (review F1; the lead's term (a), 2026-11-13 23:49).
+        start = window.start_account(*window.position_reads(trading))
+        held, unread = dict(start.held), dict(start.skipped)
         for symbol, why in sorted(unread.items()):
             print(
                 f"ALERT {symbol}: {why}, so this node does not protect it; skipped, nothing sent for it",
@@ -503,6 +502,12 @@ def run_protector(
             )
         if not held:
             raise window.WindowRefused("no starting holding; no protector node started")
+        if start.refused:
+            # Named here, before any node: the adapter's start-up would fail on it (execution.py:372).
+            raise window.WindowRefused(
+                "; ".join(start.refused[s] for s in sorted(start.refused))
+                + "; no protector node started"
+            )
         for instrument in config.levels:
             if held.get(instrument.symbol.value, 0) <= 0:
                 raise window.WindowRefused(
