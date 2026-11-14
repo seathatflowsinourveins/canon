@@ -19,7 +19,7 @@ Where do the live account's locks live, and how are they taken?
 * The live locks are named apart from every paper lock, in one place.
 * A live task's shape is proven on a paper account first, under the lock a paper run there waits for.
 * A hung command must neither keep a lock for good nor outlive it (the note above `paper:test`).
-* Two runs that can act on one account never both proceed, whatever the call or the environment holds.
+* Two runs through the script on one account never both proceed, whatever the call or its environment holds.
 
 ## Considered Options
 
@@ -55,7 +55,8 @@ and a test to hold the copies equal; one script is tested once and names the liv
    whole command it was called from, a refusal after `||` included, and as first written `--wait 08` ran
    the command with no lock held. Such an error, another return, a lock file that cannot be opened, a
    clock that gives no time and a shell that ends inside a step each end in a refusal by name, status
-   above 0.
+   above 0. (One end has bash's message alone: in POSIX mode bash 3.2 ends itself, status 1, at such an
+   error. The checks of the numbers keep every call from it.)
 6. **The deadline.** The command runs under timeout(1), which "makes itself the leader of a process group
    that the command inherits", and once timeout has ended, or the script is told to stop, the whole group
    is killed. With no `--grace` the signal is SIGKILL, as `paper:test` and `paper:session` send; with one,
@@ -84,8 +85,9 @@ record.
   (`tests/conftest.py`, `scripts/test-lanes` and this self-test; a search for its assignments).
 * Limit: a stop between timeout's start and the note of its process id signals nothing, and the command
   runs to its deadline under its locks (as `mise.toml`'s `bounded`). A command can return the script's
-  own 1 and 3: the refusal's line on stderr tells them apart. The script is not on `scripts/land`'s
-  trading-path list.
+  own 1 and 3: the refusal's line on stderr tells them apart. The clock is checked once, before any lock:
+  a later empty reading at the stream step leaves that wait without its bound, under the account's lock,
+  and runs nothing unlocked. The script is not on `scripts/land`'s trading-path list.
 
 ### Confirmation
 
@@ -97,11 +99,12 @@ the command once, and a second during the grace leaves the first stop's status; 
 locks do not wait for each other; `protect --stream` holds account C's two locks; a run with
 `CANON_PAPER_SESSION_DIR` set is refused on each account; an unknown temporary folder, a lock file that
 cannot be opened and a clock that gives no time each stop the run; a leading zero is a wrong call, and
-`--wait 09` runs nothing while both live locks are held; with the checks of its numbers taken out of a
-copy, a wait of `08`, of `1.5` and of a word each break the lock step and are refused, as is a broken
-stream step; the grace; a piped line; a pseudo-terminal.
-78 cases on macOS 27.2 under bash 3.2.57, run by hand, 2026-11-14. Failing first: 9 with no script (the
-builder's figure, reproduced by a second reader), and 35 of these cases against the script as first
+`--wait 09` runs nothing while both live locks are held; with the whole-number and leading-zero checks
+taken out of a copy, a wait of `08`, of `1.5` and of a word, each without `--stream` and with it, break
+the account's lock step and are refused there, as is a broken stream step; the grace; a piped line; a
+pseudo-terminal.
+82 cases on macOS 27.2 under bash 3.2.57, run by hand, 2026-11-14. Failing first: 9 with no script (the
+builder's figure, reproduced by a second reader), and 38 of these cases against the script as first
 written. No case touches a real lock, a keychain or the network. No paper run applies: the script
 reaches no account.
 
@@ -138,3 +141,6 @@ Read 2026-11-14 unless a line gives another date.
   wait ran the command with no lock. Both are corrected in one round, with clause 5, the checked open,
   the single SIGTERM, the second stop, the kept standard input and the variable's refusal, each on a case
   that failed first. "Account C's 5 before `protect`", a figure no reader could reproduce, is dropped.
+* A third reader, 2026-11-14 (a high read of that correction): no case failed with the account step's own
+  refusal taken out, since each such case passed `--stream` and the stream step refused instead. Closed
+  by the same cases without `--stream`, asked for that step's own line: 4 fail with the refusal removed.

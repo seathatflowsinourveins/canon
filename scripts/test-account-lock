@@ -259,30 +259,43 @@ PROBE
 
   # ---------- a lock step that fails ----------
   # The command runs only past a marker each lock step sets when it holds its lock, so a step that breaks in any
-  # way refuses. First as a caller can break it: another run holds both live locks and the wait is padded.
+  # way refuses. First the call that broke it as first written: another run holds both live locks and the wait
+  # is padded. It is now refused as a wrong call, before any lock step, so this case shows the call, not a step.
   echo "a lock step that fails:"
   hold "$LIVE_LOCK"; hold "$LIVE_STREAM"
   run live --stream --wait 09 --deadline 30 -- "$W/noted"
   check "live --stream --wait 09 while another run holds both live locks: nothing run, refused by name, a non-zero exit ($rc)" \
         eval '[ "$rc" != 0 ] && [ ! -e "$W/ran" ] && grep -q "nothing was run" "$W/out"'
   release
-  # Then with the argument checks taken out of a copy (in either form: as first written they were one line), so
-  # that a wait the shell's arithmetic cannot read reaches lock_wait itself: a padded one, one that is not a
-  # number, and a word (at which bash 3.2 ends the whole shell, with status 0). Each broke the step in the script
-  # as first written, and the command ran or the run read as done.
+  # Then with two checks taken out of a copy, the whole-number check of the wait and the leading-zero check (in
+  # either form: as first written they were one line), so that a wait the shell's arithmetic cannot read reaches
+  # lock_wait itself: a padded one, one that is not a number, and a word (at which bash 3.2 ends the whole shell,
+  # with status 0). Each broke the step in the script as first written, and the command ran or the run read as done.
+  # Each is run without --stream and with it. Without it nothing after the account's step refuses, so that step's
+  # own refusal is all that stands between the broken step and the command; with it, the account's step must
+  # still be the one that refuses. So the line asked for is that step's own, or, for the word, the exit's.
   if ! swapped '/^whole "\$lockwait" || usage/d; /^if ! whole "\$lockwait"/d; s/case "\$secs" in 0?\*)/case "$secs" in no-such-value)/' "$W/account-lock-unchecked" \
        '^whole "\$lockwait" [|][|] usage|^if ! whole "\$lockwait"|in 0[?][*][)]'; then
     t_fail "a copy with the checks of its numbers taken out"
   else
-    for w in 08 1.5 soon; do
+    for how in "" " --stream"; do
+      for w in 08 1.5 soon; do
+        # shellcheck disable=SC2034  # read by the eval'd check
+        case "$w" in
+          soon) line="the run ended inside a lock step, before its locks were held; nothing was run" ;;
+          *) line="the step that takes account live.s lock failed, so the lock is not held; nothing was run" ;;
+        esac
+        rm -f "${W:?}/ran"
+        # shellcheck disable=SC2086  # $how is --stream or nothing
+        "$W/account-lock-unchecked" live $how --wait "$w" --deadline 5 -- "$W/noted" > "$W/out" 2>&1 < /dev/null; rc=$?
+        check "with the checks of its numbers taken out, --wait $w$how breaks the account's lock step: refused at that step by its own line, or for a word by the exit's, nothing run, exit 1, both locks free" \
+              eval '[ "$rc" = 1 ] && [ ! -e "$W/ran" ] && grep -q "^account-lock: $line\$" "$W/out" && free $LIVE_LOCK && free $LIVE_STREAM'
+      done
       rm -f "${W:?}/ran"
-      "$W/account-lock-unchecked" live --stream --wait "$w" --deadline 5 -- "$W/noted" > "$W/out" 2>&1 < /dev/null; rc=$?
-      check "with the checks of its numbers taken out, --wait $w breaks the lock step: refused by name, nothing run, exit 1, both locks free" \
-            eval '[ "$rc" = 1 ] && [ ! -e "$W/ran" ] && grep -q "account-lock: .*lock.*; nothing was run" "$W/out" && free $LIVE_LOCK && free $LIVE_STREAM'
+      # shellcheck disable=SC2086  # $how is --stream or nothing
+      "$W/account-lock-unchecked" live $how --wait 2 --deadline 5 -- "$W/noted" > "$W/out" 2>&1 < /dev/null; rc=$?
+      check "... and the same copy, called well$how, runs its command (so it is the broken step that was refused)" eval '[ "$rc" = 0 ] && [ -e "$W/ran" ]'
     done
-    rm -f "${W:?}/ran"
-    "$W/account-lock-unchecked" live --stream --wait 2 --deadline 5 -- "$W/noted" > "$W/out" 2>&1 < /dev/null; rc=$?
-    check "... and the same copy, called well, runs its command (so it is the broken step that was refused)" eval '[ "$rc" = 0 ] && [ -e "$W/ran" ]'
   fi
   # and the stream lock's step alone, the account's lock already held: its wait swapped for one the shell cannot read
   if ! swapped 's/lock_wait 7 "\$left"/lock_wait 7 "08"/' "$W/account-lock-stream-step" 'lock_wait 7 "\$left"'; then

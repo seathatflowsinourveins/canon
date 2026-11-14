@@ -19,11 +19,14 @@
 #               is told to stop, then SIGKILL that many seconds later, for a command that cancels what it sent
 #               when it is told to end (as paper:close's uv runs under `timeout -s TERM -k 30`)
 #   Each number of seconds is whole, of at most six digits, with no leading zero.
-# Exit: the command's own status; 1 when a lock stayed held or its file could not be opened, the temporary
-# folder is not known or CANON_PAPER_SESSION_DIR is set; 3 for a wrong call; timeout(1)'s status when the
+# Exit: the command's own status; 1 for each refusal that is not a wrong call: a lock stayed held, a lock step
+# failed or the shell ended inside one, a lock file could not be opened, the temporary folder is not known, the
+# clock gave no time, or CANON_PAPER_SESSION_DIR is set; 3 for a wrong call; timeout(1)'s status when the
 # deadline stopped the command (124, or 137 for a SIGKILL); 143, 129 or 130 when this script was told to stop
 # by SIGTERM, SIGHUP or SIGINT. A command that itself ends 1 or 3 reads the same as a refusal here: each refusal
 # says so on stderr, in a line that ends "nothing was run", and that line, not the status, tells them apart.
+# One end has no such line: with POSIXLY_CORRECT set, bash 3.2 ends itself with status 1, under its own message,
+# at an arithmetic it cannot read. The checks of the numbers keep every call from reaching that.
 # The command reads this script's own standard input.
 #
 # How the lock is held, as in mise.toml's paper tasks (the note above paper:test): the lock file is opened on
@@ -87,7 +90,9 @@ if [ -n "${CANON_PAPER_SESSION_DIR:-}" ]; then
   echo "account-lock: CANON_PAPER_SESSION_DIR is set, which moves the folder paper:protector takes its locks in, so a run here and a run there would not exclude each other; unset it; nothing was run" >&2; exit 1
 fi
 start=$(/bin/date +%s)
-# a clock that gives no time cannot bound a wait: refused here, before any lock
+# a clock that gives no time cannot bound a wait: refused here, before any lock. The reading is checked this
+# once. A later empty one makes lock_wait give up at once; at the stream step's own reading alone it leaves that
+# wait without its bound, under the account's lock. Neither runs the command without its locks.
 case "$start" in ''|*[!0-9]*) echo "account-lock: the clock gave no time (/bin/date +%s printed '$start'), so no wait can be bounded; nothing was run" >&2; exit 1 ;; esac
 # the folder's name, or a stop: none would leave a lock file of this run's own, beside no other run's
 tmp="$(/usr/bin/getconf DARWIN_USER_TEMP_DIR)" || tmp=""
