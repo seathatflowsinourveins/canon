@@ -1,0 +1,6418 @@
+{
+  "pin": "nautilus-trader v2.0.0rc8 at d53849b216e2",
+  "pin_paths": {
+    "M": "crates/model/src/orders/mod.rs",
+    "S": "crates/trading/src/strategy/mod.rs"
+  },
+  "applies": "a count above one (the default, 2); count one is not touched and keeps the emulator path",
+  "rows": {
+    "G": {
+      "phase": "none",
+      "engine_status": "no open sale",
+      "meaning": "COUNTING. No sale of ours is open; the count governs (0 to N-1)."
+    },
+    "GC": {
+      "phase": "none",
+      "engine_status": "no open sale",
+      "meaning": "COVERED. No sale of ours; foreign sells cover the whole long; no count accrues."
+    },
+    "FL": {
+      "phase": "fl",
+      "engine_status": "INITIALIZED or SUBMITTED",
+      "meaning": "IN FLIGHT. A leg was sent; the venue has not acknowledged it."
+    },
+    "WK": {
+      "phase": "wk",
+      "engine_status": "ACCEPTED",
+      "meaning": "WORKING at the venue, nothing of this leg filled."
+    },
+    "PF": {
+      "phase": "pf",
+      "engine_status": "PARTIALLY_FILLED",
+      "meaning": "PARTLY FILLED and working."
+    },
+    "PCR": {
+      "phase": "pc",
+      "engine_status": "PENDING_CANCEL",
+      "meaning": "CANCEL ASKED FOR A RE-PRICE (the chase). The next leg is sent on its acknowledgement."
+    },
+    "PCO": {
+      "phase": "pc",
+      "engine_status": "PENDING_CANCEL",
+      "meaning": "CANCEL ASKED: OUR SALE IS TOO LARGE (the holding shrank, or a foreign sell appeared)."
+    },
+    "OX": {
+      "phase": "mixed",
+      "engine_status": "any open status, no cancel pending",
+      "meaning": "HOLDING ENDED, OUR SALE STILL OPEN, no cancel pending (in flight, or its cancel was refused)."
+    },
+    "PCX": {
+      "phase": "pc",
+      "engine_status": "PENDING_CANCEL",
+      "meaning": "CANCEL ASKED: THE HOLDING ENDED."
+    },
+    "FZ": {
+      "phase": "none",
+      "engine_status": "no open sale",
+      "meaning": "FROZEN. Nothing is sent before the runner's next start (a named limit)."
+    },
+    "FZW": {
+      "phase": "mixed",
+      "engine_status": "any open status, no cancel pending",
+      "meaning": "FROZEN, and a sale of ours is still open."
+    },
+    "FZP": {
+      "phase": "pc",
+      "engine_status": "PENDING_CANCEL",
+      "meaning": "FROZEN, cancel of our sale asked."
+    },
+    "PCT": {
+      "phase": "pc",
+      "engine_status": "PENDING_CANCEL",
+      "meaning": "CANCEL ASKED AT STOP."
+    },
+    "TW": {
+      "phase": "mixed",
+      "engine_status": "any open status",
+      "meaning": "STOPPED WITH OUR SALE STILL OPEN (its cancel refused, or it could not be asked)."
+    },
+    "T0": {
+      "phase": "none",
+      "engine_status": "no open sale",
+      "meaning": "STOPPED. Nothing of ours is open."
+    },
+    "X": {
+      "phase": "none",
+      "engine_status": "no open sale",
+      "meaning": "THE HOLDING ENDED. Nothing of ours is open; a later long is a new holding at G, count 0."
+    }
+  },
+  "events": {
+    "QU": {
+      "kind": "market",
+      "meaning": "a counted quote UNDER: the venue clock accepts it and its bid is at or under the level"
+    },
+    "QA": {
+      "kind": "market",
+      "meaning": "a counted quote ABOVE the level"
+    },
+    "NQ": {
+      "kind": "market",
+      "meaning": "a step with NO quote (the timer step)"
+    },
+    "HG": {
+      "kind": "account",
+      "meaning": "the holding GROWS"
+    },
+    "HS": {
+      "kind": "account",
+      "meaning": "the holding SHRINKS, not by a fill of our sale"
+    },
+    "CP": {
+      "kind": "account",
+      "meaning": "the owner PLACES or enlarges a sell (any working sell this object did not send)"
+    },
+    "CL": {
+      "kind": "account",
+      "meaning": "a sell of the owner's ENDS or shrinks"
+    },
+    "MO": {
+      "kind": "account",
+      "meaning": "MISMATCH, ours too LARGE: our cancelable sale exceeds the long less foreign sells"
+    },
+    "HE": {
+      "kind": "account",
+      "meaning": "the holding ENDS (flat, short, or a different position under the same instrument)"
+    },
+    "ST": {
+      "kind": "account",
+      "meaning": "STOP of the instrument or of the strategy"
+    },
+    "FRZ": {
+      "kind": "account",
+      "meaning": "a FREEZE begins for a cause other than a refusal of our sale"
+    },
+    "oUPD": {
+      "kind": "order",
+      "meaning": "OrderUpdated"
+    },
+    "oSUB": {
+      "kind": "order",
+      "meaning": "OrderSubmitted"
+    },
+    "oACC": {
+      "kind": "order",
+      "meaning": "OrderAccepted"
+    },
+    "oREJ": {
+      "kind": "order",
+      "meaning": "OrderRejected"
+    },
+    "oDEN": {
+      "kind": "order",
+      "meaning": "OrderDenied"
+    },
+    "oCXL": {
+      "kind": "order",
+      "meaning": "OrderCanceled: the acknowledgement in a cancel-asked row, a cancel from elsewhere in any other"
+    },
+    "oCRJ": {
+      "kind": "order",
+      "meaning": "OrderCancelRejected: our cancel REFUSED"
+    },
+    "oEXP": {
+      "kind": "order",
+      "meaning": "OrderExpired"
+    },
+    "oPF": {
+      "kind": "order",
+      "meaning": "OrderFilled leaving a remainder (a partial fill)"
+    },
+    "oFF": {
+      "kind": "order",
+      "meaning": "OrderFilled for the whole remaining quantity of the leg"
+    },
+    "oVOID": {
+      "kind": "order",
+      "meaning": "OrderFillVoided"
+    },
+    "oLF": {
+      "kind": "order",
+      "meaning": "a LATE FILL of an EARLIER leg of ours: OrderFilled for a leg already canceled or expired"
+    },
+    "oINI": {
+      "kind": "order",
+      "meaning": "OrderInitialized of our leg: the echo of our own submit, published inside it before the command leaves"
+    },
+    "oPCN": {
+      "kind": "order",
+      "meaning": "OrderPendingCancel of our leg: the echo of our own cancel, published inside it before the command leaves"
+    },
+    "oOTH": {
+      "kind": "order",
+      "meaning": "any other event of our order: the kinds the inventory marks CANNOT OCCUR (Emulated, Released, Triggered, PendingUpdate, ModifyRejected), and any kind the pin's list does not know"
+    }
+  },
+  "predicates": {
+    "count_complete": "this quote is the Nth counted quote under the level since the count was last zero",
+    "formable": "the leg can be formed: a positive limit at the pricing quote's bid, the instrument in the cache, its quantity exactly representable, the client order ID unused",
+    "whole_cover": "foreign working sells cover the whole long at this step",
+    "filled_part": "the engine reads our sale with a filled quantity above zero",
+    "cancelable": "the engine reads our sale ACCEPTED or PARTIALLY_FILLED",
+    "reprice_due": "the chase function, called in this counted quote's handler, gives a price under our working leg's limit: the chase interval has passed since this leg's price was set, and the price a tick through this quote's bid, held at the episode's floor until the floor's wait has run, is lower than the leg's limit",
+    "leg_positive": "the leg's quantity is above zero. For the first leg it is the uncovered quantity read in this step; for the next leg it is the quantity at the episode's opening less the shares sold, and never more than the uncovered quantity read in this step",
+    "long_remains": "a long of this holding is still held after the fill",
+    "ends_filled": "after this Updated the engine reads our sale FILLED: a reconciliation update whose quantity equals a filled quantity above zero (M:1322-1324)"
+  },
+  "step_order": [
+    "ST",
+    "HE",
+    "HS",
+    "HG",
+    "CP",
+    "CL",
+    "FRZ",
+    "our order's events, as they arrived",
+    "MO",
+    "QU, QA or NQ"
+  ],
+  "order_event_inventory": {
+    "source": "crates/model/src/events/order/any.rs:39-57 (the enum); crates/trading/src/strategy/mod.rs:1445-1462 (its dispatch to a strategy)",
+    "kinds": {
+      "Initialized": {
+        "enum_line": 40,
+        "dispatch_line": 1446,
+        "treatment": "own column",
+        "columns": [
+          "oINI"
+        ],
+        "reason": "published inside our own submit (strategy/mod.rs:2419, 2448-2452)"
+      },
+      "Denied": {
+        "enum_line": 41,
+        "dispatch_line": 1447,
+        "treatment": "own column",
+        "columns": [
+          "oDEN"
+        ]
+      },
+      "Emulated": {
+        "enum_line": 42,
+        "dispatch_line": 1448,
+        "treatment": "cannot occur",
+        "columns": [
+          "oOTH"
+        ],
+        "reason": "the leg is a plain LIMIT sent straight to the venue with no emulation trigger (ruling 1)"
+      },
+      "Released": {
+        "enum_line": 43,
+        "dispatch_line": 1449,
+        "treatment": "cannot occur",
+        "columns": [
+          "oOTH"
+        ],
+        "reason": "the leg is a plain LIMIT sent straight to the venue with no emulation trigger (ruling 1)"
+      },
+      "Submitted": {
+        "enum_line": 44,
+        "dispatch_line": 1450,
+        "treatment": "own column",
+        "columns": [
+          "oSUB"
+        ]
+      },
+      "Accepted": {
+        "enum_line": 45,
+        "dispatch_line": 1452,
+        "treatment": "own column",
+        "columns": [
+          "oACC"
+        ]
+      },
+      "Rejected": {
+        "enum_line": 46,
+        "dispatch_line": 1451,
+        "treatment": "own column",
+        "columns": [
+          "oREJ"
+        ]
+      },
+      "Canceled": {
+        "enum_line": 47,
+        "dispatch_line": 1453,
+        "treatment": "own column",
+        "columns": [
+          "oCXL"
+        ]
+      },
+      "Expired": {
+        "enum_line": 48,
+        "dispatch_line": 1454,
+        "treatment": "own column",
+        "columns": [
+          "oEXP"
+        ]
+      },
+      "Triggered": {
+        "enum_line": 49,
+        "dispatch_line": 1455,
+        "treatment": "cannot occur",
+        "columns": [
+          "oOTH"
+        ],
+        "reason": "a plain LIMIT has no trigger price"
+      },
+      "PendingUpdate": {
+        "enum_line": 50,
+        "dispatch_line": 1456,
+        "treatment": "cannot occur",
+        "columns": [
+          "oOTH"
+        ],
+        "reason": "this table never modifies an order: a re-price is a cancel and a new leg (ruling 3)"
+      },
+      "PendingCancel": {
+        "enum_line": 51,
+        "dispatch_line": 1457,
+        "treatment": "own column",
+        "columns": [
+          "oPCN"
+        ],
+        "reason": "published inside our own cancel (strategy/mod.rs:836-862)"
+      },
+      "ModifyRejected": {
+        "enum_line": 52,
+        "dispatch_line": 1458,
+        "treatment": "cannot occur",
+        "columns": [
+          "oOTH"
+        ],
+        "reason": "this table never modifies an order: a re-price is a cancel and a new leg (ruling 3)"
+      },
+      "CancelRejected": {
+        "enum_line": 53,
+        "dispatch_line": 1459,
+        "treatment": "own column",
+        "columns": [
+          "oCRJ"
+        ]
+      },
+      "Updated": {
+        "enum_line": 54,
+        "dispatch_line": 1460,
+        "treatment": "own column",
+        "columns": [
+          "oUPD"
+        ]
+      },
+      "Filled": {
+        "enum_line": 55,
+        "dispatch_line": 1461,
+        "treatment": "folded into named columns",
+        "columns": [
+          "oLF",
+          "oPF",
+          "oFF"
+        ],
+        "reason": "oLF when the leg it fills has already ended (canceled or expired); else oPF when the fill leaves a remainder, oFF when it does not"
+      },
+      "FillVoided": {
+        "enum_line": 56,
+        "dispatch_line": 1462,
+        "treatment": "own column",
+        "columns": [
+          "oVOID"
+        ]
+      }
+    }
+  },
+  "properties_for_step_d": {
+    "every_fill_counts": "a fill of any leg of ours, working or ended, is applied to the shares sold and to the holding read before the mismatch and the holding's end are judged in that step; none is dropped because its leg is not the working one",
+    "sold_known_before_the_next_leg": "when S2 sizes, every share the venue showed sold on an earlier leg is in the node's count (met at its source, in the adapter; the ran-out path is the named limit until that unit is on main)",
+    "no_leg_of_size_zero": "no leg of size zero or less is ever sent; a first leg whose size reads zero sends nothing, freezes nothing and alerts nothing",
+    "nothing_for_a_whole_cover": "nothing is sent for a holding wholly covered by foreign sells; in a row with no sale of ours open, an event that changes the holding's size or the foreign cover re-reads the cover in that step",
+    "invalidation_first": "what a step sees is applied in step_order; no leg is sent in a step that also saw a stop, the holding's end, a shrink, a foreign sell placed or a freeze",
+    "no_timer_transition": "a timer step changes no row, asks no cancel and sends nothing; the floor's wait is started and judged only in the handler of a counted quote under the level",
+    "row_stored_before_actions": "the row a transition leads to is stored BEFORE its actions are carried out: the engine publishes Initialized inside our submit and PendingCancel inside our cancel, so the echo of a send meets the in-flight row and the echo of a cancel meets its cancel-asked row, and each does nothing",
+    "every_kind_has_a_column": "each kind of order event the pin can deliver to a strategy is named to a column by order_event_inventory and by nothing else; a kind the inventory does not know answers as the catch-all"
+  },
+  "sending_transitions": [
+    {
+      "row": "G",
+      "event": "QU",
+      "when": "count_complete and leg_positive and formable"
+    },
+    {
+      "row": "PCR",
+      "event": "oCXL",
+      "when": "leg_positive and formable"
+    }
+  ],
+  "cells": {
+    "G": {
+      "QU": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "not count_complete",
+            "next": "G",
+            "send": false,
+            "cancel": false,
+            "alert": false,
+            "count": "+1"
+          },
+          {
+            "when": "count_complete and leg_positive and formable",
+            "next": "FL",
+            "send": true,
+            "cancel": false,
+            "alert": false
+          },
+          {
+            "when": "count_complete and leg_positive and not formable",
+            "next": "FZ",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          },
+          {
+            "when": "count_complete and not leg_positive and whole_cover",
+            "next": "GC",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          },
+          {
+            "when": "count_complete and not leg_positive and not whole_cover",
+            "next": "G",
+            "send": false,
+            "cancel": false,
+            "alert": false,
+            "count": "0"
+          }
+        ],
+        "note": "S1, THE FIRST LEG: the episode opens; a plain LIMIT straight to the venue for the uncovered quantity read in this step. THE SEND GUARD: a size of zero or less sends nothing, with no freeze and no alert, and the row is the one the cover gives"
+      },
+      "QA": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "G",
+            "send": false,
+            "cancel": false,
+            "alert": false,
+            "count": "0"
+          }
+        ],
+        "note": "the level may rise"
+      },
+      "NQ": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "G",
+            "send": false,
+            "cancel": false,
+            "alert": false,
+            "count": "="
+          }
+        ],
+        "note": "never a send; the count's own span rule, where set, may clear it"
+      },
+      "HG": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "whole_cover",
+            "next": "GC",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          },
+          {
+            "when": "not whole_cover",
+            "next": "G",
+            "send": false,
+            "cancel": false,
+            "alert": false,
+            "count": "0"
+          }
+        ],
+        "note": "a new arming for the new quantity; the cover is read again"
+      },
+      "HS": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "whole_cover",
+            "next": "GC",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          },
+          {
+            "when": "not whole_cover",
+            "next": "G",
+            "send": false,
+            "cancel": false,
+            "alert": false,
+            "count": "0"
+          }
+        ],
+        "note": "a new arming for the new quantity; the cover is read again"
+      },
+      "CP": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "whole_cover",
+            "next": "GC",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          },
+          {
+            "when": "not whole_cover",
+            "next": "G",
+            "send": false,
+            "cancel": false,
+            "alert": false,
+            "count": "0"
+          }
+        ]
+      },
+      "CL": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "whole_cover",
+            "next": "GC",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          },
+          {
+            "when": "not whole_cover",
+            "next": "G",
+            "send": false,
+            "cancel": false,
+            "alert": false,
+            "count": "0"
+          }
+        ],
+        "note": "a new arming for the new quantity; the cover is read again"
+      },
+      "MO": {
+        "occurs": "n/a",
+        "branches": [
+          {
+            "when": "always",
+            "next": "G",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "note": "emitted only for a cancelable sale of ours with no cancel pending"
+      },
+      "HE": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "X",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "ST": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "T0",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "FRZ": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZ",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          }
+        ]
+      },
+      "oUPD": {
+        "occurs": "unexpected",
+        "branches": [
+          {
+            "when": "always",
+            "next": "G",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:249, 294, 297",
+        "note": "allowed on a closed order; no effect"
+      },
+      "oSUB": {
+        "occurs": "no",
+        "branches": [
+          {
+            "when": "always",
+            "next": "G",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:247-249, 293-299",
+        "note": "a closed order takes only a fill, a void or an update; or no order exists"
+      },
+      "oACC": {
+        "occurs": "no",
+        "branches": [
+          {
+            "when": "always",
+            "next": "G",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:247-249, 293-299",
+        "note": "a closed order takes only a fill, a void or an update; or no order exists"
+      },
+      "oREJ": {
+        "occurs": "no",
+        "branches": [
+          {
+            "when": "always",
+            "next": "G",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:247-249, 293-299",
+        "note": "a closed order takes only a fill, a void or an update; or no order exists"
+      },
+      "oDEN": {
+        "occurs": "no",
+        "branches": [
+          {
+            "when": "always",
+            "next": "G",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:247-249, 293-299",
+        "note": "a closed order takes only a fill, a void or an update; or no order exists"
+      },
+      "oCXL": {
+        "occurs": "no",
+        "branches": [
+          {
+            "when": "always",
+            "next": "G",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:247-249, 293-299",
+        "note": "a closed order takes only a fill, a void or an update; or no order exists"
+      },
+      "oCRJ": {
+        "occurs": "no",
+        "branches": [
+          {
+            "when": "always",
+            "next": "G",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:247-249, 293-299",
+        "note": "a closed order takes only a fill, a void or an update; or no order exists"
+      },
+      "oEXP": {
+        "occurs": "no",
+        "branches": [
+          {
+            "when": "always",
+            "next": "G",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:247-249, 293-299",
+        "note": "a closed order takes only a fill, a void or an update; or no order exists"
+      },
+      "oPF": {
+        "occurs": "no",
+        "branches": [
+          {
+            "when": "always",
+            "next": "G",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:247, 295; a part leaves the status ended, model/src/orders/mod.rs:1375-1376",
+        "note": "no leg of ours is open to fill; a fill of an ended leg is the event oLF"
+      },
+      "oFF": {
+        "occurs": "no",
+        "branches": [
+          {
+            "when": "always",
+            "next": "G",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:247, 295; a part leaves the status ended, model/src/orders/mod.rs:1375-1376",
+        "note": "no leg of ours is open to fill; a fill of an ended leg is the event oLF"
+      },
+      "oVOID": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZ",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:248, 293, 296, 298",
+        "note": "a voided fill of our ended sale: the held quantity is no longer what we read"
+      },
+      "oLF": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "not long_remains",
+            "next": "X",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          },
+          {
+            "when": "long_remains and whole_cover",
+            "next": "GC",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          },
+          {
+            "when": "long_remains and not whole_cover",
+            "next": "G",
+            "send": false,
+            "cancel": false,
+            "alert": false,
+            "count": "0"
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:247, 295, 1375-1376",
+        "note": "quantities re-read from every leg of ours; the fill is ours, not a shrink; the cover is read again"
+      },
+      "oINI": {
+        "occurs": "unexpected",
+        "branches": [
+          {
+            "when": "always",
+            "next": "G",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:227, 229, 237, 239, 242, 283, 285",
+        "note": "an event the table has no column for (none is produced for a plain limit we never modify): named once, nothing else; an echo not expected in this row answers as the catch-all does"
+      },
+      "oPCN": {
+        "occurs": "unexpected",
+        "branches": [
+          {
+            "when": "always",
+            "next": "G",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:227, 229, 237, 239, 242, 283, 285",
+        "note": "an event the table has no column for (none is produced for a plain limit we never modify): named once, nothing else; an echo not expected in this row answers as the catch-all does"
+      },
+      "oOTH": {
+        "occurs": "unexpected",
+        "branches": [
+          {
+            "when": "always",
+            "next": "G",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:227, 229, 237, 239, 242, 283, 285",
+        "note": "an event the table has no column for (none is produced for a plain limit we never modify): named once, nothing else"
+      }
+    },
+    "GC": {
+      "QU": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "GC",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "note": "no count accrues while foreign sells cover the whole long"
+      },
+      "QA": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "GC",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "NQ": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "GC",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "HG": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "whole_cover",
+            "next": "GC",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          },
+          {
+            "when": "not whole_cover",
+            "next": "G",
+            "send": false,
+            "cancel": false,
+            "alert": false,
+            "count": "0"
+          }
+        ],
+        "note": "a sale then needs the full new count"
+      },
+      "HS": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "whole_cover",
+            "next": "GC",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          },
+          {
+            "when": "not whole_cover",
+            "next": "G",
+            "send": false,
+            "cancel": false,
+            "alert": false,
+            "count": "0"
+          }
+        ],
+        "note": "a sale then needs the full new count"
+      },
+      "CP": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "whole_cover",
+            "next": "GC",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          },
+          {
+            "when": "not whole_cover",
+            "next": "G",
+            "send": false,
+            "cancel": false,
+            "alert": false,
+            "count": "0"
+          }
+        ],
+        "note": "a sale then needs the full new count"
+      },
+      "CL": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "whole_cover",
+            "next": "GC",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          },
+          {
+            "when": "not whole_cover",
+            "next": "G",
+            "send": false,
+            "cancel": false,
+            "alert": false,
+            "count": "0"
+          }
+        ],
+        "note": "a sale then needs the full new count"
+      },
+      "MO": {
+        "occurs": "n/a",
+        "branches": [
+          {
+            "when": "always",
+            "next": "GC",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "note": "emitted only for a cancelable sale of ours with no cancel pending"
+      },
+      "HE": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "X",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "ST": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "T0",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "FRZ": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZ",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          }
+        ]
+      },
+      "oUPD": {
+        "occurs": "unexpected",
+        "branches": [
+          {
+            "when": "always",
+            "next": "GC",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:249, 294, 297",
+        "note": "allowed on a closed order; no effect"
+      },
+      "oSUB": {
+        "occurs": "no",
+        "branches": [
+          {
+            "when": "always",
+            "next": "GC",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:247-249, 293-299",
+        "note": "a closed order takes only a fill, a void or an update; or no order exists"
+      },
+      "oACC": {
+        "occurs": "no",
+        "branches": [
+          {
+            "when": "always",
+            "next": "GC",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:247-249, 293-299",
+        "note": "a closed order takes only a fill, a void or an update; or no order exists"
+      },
+      "oREJ": {
+        "occurs": "no",
+        "branches": [
+          {
+            "when": "always",
+            "next": "GC",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:247-249, 293-299",
+        "note": "a closed order takes only a fill, a void or an update; or no order exists"
+      },
+      "oDEN": {
+        "occurs": "no",
+        "branches": [
+          {
+            "when": "always",
+            "next": "GC",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:247-249, 293-299",
+        "note": "a closed order takes only a fill, a void or an update; or no order exists"
+      },
+      "oCXL": {
+        "occurs": "no",
+        "branches": [
+          {
+            "when": "always",
+            "next": "GC",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:247-249, 293-299",
+        "note": "a closed order takes only a fill, a void or an update; or no order exists"
+      },
+      "oCRJ": {
+        "occurs": "no",
+        "branches": [
+          {
+            "when": "always",
+            "next": "GC",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:247-249, 293-299",
+        "note": "a closed order takes only a fill, a void or an update; or no order exists"
+      },
+      "oEXP": {
+        "occurs": "no",
+        "branches": [
+          {
+            "when": "always",
+            "next": "GC",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:247-249, 293-299",
+        "note": "a closed order takes only a fill, a void or an update; or no order exists"
+      },
+      "oPF": {
+        "occurs": "no",
+        "branches": [
+          {
+            "when": "always",
+            "next": "GC",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:247, 295; a part leaves the status ended, model/src/orders/mod.rs:1375-1376",
+        "note": "no leg of ours is open to fill; a fill of an ended leg is the event oLF"
+      },
+      "oFF": {
+        "occurs": "no",
+        "branches": [
+          {
+            "when": "always",
+            "next": "GC",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:247, 295; a part leaves the status ended, model/src/orders/mod.rs:1375-1376",
+        "note": "no leg of ours is open to fill; a fill of an ended leg is the event oLF"
+      },
+      "oVOID": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZ",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:248, 293, 296, 298",
+        "note": "a voided fill of our ended sale: the held quantity is no longer what we read"
+      },
+      "oLF": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "not long_remains",
+            "next": "X",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          },
+          {
+            "when": "long_remains and whole_cover",
+            "next": "GC",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          },
+          {
+            "when": "long_remains and not whole_cover",
+            "next": "G",
+            "send": false,
+            "cancel": false,
+            "alert": false,
+            "count": "0"
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:247, 295, 1375-1376",
+        "note": "quantities re-read from every leg of ours; the fill is ours, not a shrink; the cover is read again"
+      },
+      "oINI": {
+        "occurs": "unexpected",
+        "branches": [
+          {
+            "when": "always",
+            "next": "GC",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:227, 229, 237, 239, 242, 283, 285",
+        "note": "an event the table has no column for (none is produced for a plain limit we never modify): named once, nothing else; an echo not expected in this row answers as the catch-all does"
+      },
+      "oPCN": {
+        "occurs": "unexpected",
+        "branches": [
+          {
+            "when": "always",
+            "next": "GC",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:227, 229, 237, 239, 242, 283, 285",
+        "note": "an event the table has no column for (none is produced for a plain limit we never modify): named once, nothing else; an echo not expected in this row answers as the catch-all does"
+      },
+      "oOTH": {
+        "occurs": "unexpected",
+        "branches": [
+          {
+            "when": "always",
+            "next": "GC",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:227, 229, 237, 239, 242, 283, 285",
+        "note": "an event the table has no column for (none is produced for a plain limit we never modify): named once, nothing else"
+      }
+    },
+    "FL": {
+      "QU": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FL",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "note": "NOTHING CAN BE ASKED before the venue's acknowledgement (a named limit; the proof on A measures it); no re-price before it"
+      },
+      "QA": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FL",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "note": "a confirmed sale is committed, as a triggered stop is: nothing changes"
+      },
+      "NQ": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FL",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "HG": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FL",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "note": "NOTHING is canceled: our sale stays for its own quantity; the added shares are outside it"
+      },
+      "HS": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FL",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          }
+        ],
+        "note": "NOTHING CAN BE ASKED before the venue's acknowledgement (a named limit; the proof on A measures it); our sale may exceed the holding until then; MO follows it"
+      },
+      "CP": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FL",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          }
+        ],
+        "note": "NOTHING CAN BE ASKED before the venue's acknowledgement (a named limit; the proof on A measures it); our sale may exceed the holding until then; MO follows it"
+      },
+      "CL": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FL",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "note": "NOTHING is canceled: our sale stays for its own quantity; the added shares are outside it"
+      },
+      "MO": {
+        "occurs": "n/a",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FL",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "note": "emitted only for a cancelable sale of ours with no cancel pending"
+      },
+      "HE": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "OX",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          }
+        ],
+        "note": "NOTHING CAN BE ASKED before the venue's acknowledgement (a named limit; the proof on A measures it)"
+      },
+      "ST": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "TW",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          }
+        ],
+        "note": "NOTHING CAN BE ASKED before the venue's acknowledgement (a named limit; the proof on A measures it)"
+      },
+      "FRZ": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZW",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          }
+        ]
+      },
+      "oUPD": {
+        "occurs": "unexpected",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FL",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:218, 234",
+        "note": "we never modify; no effect"
+      },
+      "oSUB": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FL",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:212"
+      },
+      "oACC": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "WK",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:233"
+      },
+      "oREJ": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZ",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:231",
+        "note": "frozen with the alert: a definitive refusal is not cured by sending again"
+      },
+      "oDEN": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZ",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:209",
+        "note": "frozen with the alert: a definitive refusal is not cured by sending again"
+      },
+      "oCXL": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZ",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:232",
+        "note": "canceled when we asked for no cancel (it may be the owner's own hand): frozen with the alert, at any leg"
+      },
+      "oCRJ": {
+        "occurs": "unexpected",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FL",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:230",
+        "note": "no cancel is ever asked in this row; no effect"
+      },
+      "oEXP": {
+        "occurs": "unexpected",
+        "branches": [
+          {
+            "when": "whole_cover",
+            "next": "GC",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          },
+          {
+            "when": "not whole_cover",
+            "next": "G",
+            "send": false,
+            "cancel": false,
+            "alert": false,
+            "count": "0"
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:216, 227-235",
+        "note": "the pin has it only from INITIALIZED, for external orders; if delivered, the expiry rule holds"
+      },
+      "oPF": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PF",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:235, 1378"
+      },
+      "oFF": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "not long_remains",
+            "next": "X",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          },
+          {
+            "when": "long_remains and whole_cover",
+            "next": "GC",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          },
+          {
+            "when": "long_remains and not whole_cover",
+            "next": "G",
+            "send": false,
+            "cancel": false,
+            "alert": false,
+            "count": "0"
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:235, 1369-1371"
+      },
+      "oVOID": {
+        "occurs": "no",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FL",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:209-218, 227-235"
+      },
+      "oLF": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "not long_remains",
+            "next": "OX",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          },
+          {
+            "when": "long_remains",
+            "next": "FL",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:247, 295, 1375-1376",
+        "note": "quantities re-read from every leg of ours; the fill is ours, not a shrink; nothing can be asked before the acknowledgement; MO follows it"
+      },
+      "oINI": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FL",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "trading/src/strategy/mod.rs:2419, 2448-2452",
+        "note": "the echo of the send that entered this row: nothing"
+      },
+      "oPCN": {
+        "occurs": "unexpected",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZW",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:227, 229, 237, 239, 242, 283, 285",
+        "note": "an event the table has no column for (none is produced for a plain limit we never modify): FROZEN with the alert; the working leg keeps working; an echo not expected in this row answers as the catch-all does"
+      },
+      "oOTH": {
+        "occurs": "unexpected",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZW",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:227, 229, 237, 239, 242, 283, 285",
+        "note": "an event the table has no column for (none is produced for a plain limit we never modify): FROZEN with the alert; the working leg keeps working"
+      }
+    },
+    "WK": {
+      "QU": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "reprice_due",
+            "next": "PCR",
+            "send": false,
+            "cancel": true,
+            "alert": false
+          },
+          {
+            "when": "not reprice_due",
+            "next": "WK",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "note": "THE CHASE ASKS HERE AND NOWHERE ELSE: in the handler of a counted quote, never on a timer step"
+      },
+      "QA": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "WK",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "note": "a confirmed sale is committed, as a triggered stop is: nothing changes; no cancel and no re-price whatever the chase function reads: a leg priced under the level is marketable at a bid at or above it"
+      },
+      "NQ": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "WK",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "note": "never a re-price and never a send on a timer step"
+      },
+      "HG": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "WK",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "note": "NOTHING is canceled: our sale stays for its own quantity; the added shares are outside it"
+      },
+      "HS": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "WK",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "note": "MO follows in the same step when our sale is then too large"
+      },
+      "CP": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "WK",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "note": "MO follows in the same step when our sale is then too large"
+      },
+      "CL": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "WK",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "note": "NOTHING is canceled: our sale stays for its own quantity; the added shares are outside it"
+      },
+      "MO": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PCO",
+            "send": false,
+            "cancel": true,
+            "alert": false
+          }
+        ],
+        "note": "the cut comes first; no new order in this step; never a modify"
+      },
+      "HE": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "OX",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "note": "MO follows in the same step"
+      },
+      "ST": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PCT",
+            "send": false,
+            "cancel": true,
+            "alert": false
+          }
+        ]
+      },
+      "FRZ": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZW",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          }
+        ],
+        "note": "our sale stays; it is cut only by MO"
+      },
+      "oUPD": {
+        "occurs": "unexpected",
+        "branches": [
+          {
+            "when": "always",
+            "next": "WK",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:243, 1322",
+        "note": "nothing is filled, so it cannot end the leg; a quantity changed at the venue shows as MO"
+      },
+      "oSUB": {
+        "occurs": "no",
+        "branches": [
+          {
+            "when": "always",
+            "next": "WK",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:236-246"
+      },
+      "oACC": {
+        "occurs": "no",
+        "branches": [
+          {
+            "when": "always",
+            "next": "WK",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:236-246"
+      },
+      "oREJ": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZ",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:236",
+        "note": "frozen with the alert: a definitive refusal is not cured by sending again"
+      },
+      "oDEN": {
+        "occurs": "no",
+        "branches": [
+          {
+            "when": "always",
+            "next": "WK",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:236-246"
+      },
+      "oCXL": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZ",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:241",
+        "note": "canceled when we asked for no cancel (it may be the owner's own hand): frozen with the alert, at any leg"
+      },
+      "oCRJ": {
+        "occurs": "unexpected",
+        "branches": [
+          {
+            "when": "always",
+            "next": "WK",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:240",
+        "note": "no cancel of ours is pending in this row; no effect"
+      },
+      "oEXP": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "whole_cover",
+            "next": "GC",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          },
+          {
+            "when": "not whole_cover",
+            "next": "G",
+            "send": false,
+            "cancel": false,
+            "alert": false,
+            "count": "0"
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:244",
+        "note": "never carried into the next session without a new count"
+      },
+      "oPF": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PF",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:245, 1378"
+      },
+      "oFF": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "not long_remains",
+            "next": "X",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          },
+          {
+            "when": "long_remains and whole_cover",
+            "next": "GC",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          },
+          {
+            "when": "long_remains and not whole_cover",
+            "next": "G",
+            "send": false,
+            "cancel": false,
+            "alert": false,
+            "count": "0"
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:245, 1369-1371"
+      },
+      "oVOID": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZW",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:246"
+      },
+      "oLF": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "not long_remains",
+            "next": "OX",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          },
+          {
+            "when": "long_remains",
+            "next": "WK",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:247, 295, 1375-1376",
+        "note": "quantities re-read from every leg of ours; the fill is ours, not a shrink; MO follows in the same step when ours is then too large"
+      },
+      "oINI": {
+        "occurs": "unexpected",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZW",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:227, 229, 237, 239, 242, 283, 285",
+        "note": "an event the table has no column for (none is produced for a plain limit we never modify): FROZEN with the alert; the working leg keeps working; an echo not expected in this row answers as the catch-all does"
+      },
+      "oPCN": {
+        "occurs": "unexpected",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZW",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:227, 229, 237, 239, 242, 283, 285",
+        "note": "an event the table has no column for (none is produced for a plain limit we never modify): FROZEN with the alert; the working leg keeps working; an echo not expected in this row answers as the catch-all does"
+      },
+      "oOTH": {
+        "occurs": "unexpected",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZW",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:227, 229, 237, 239, 242, 283, 285",
+        "note": "an event the table has no column for (none is produced for a plain limit we never modify): FROZEN with the alert; the working leg keeps working"
+      }
+    },
+    "PF": {
+      "QU": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "reprice_due",
+            "next": "PCR",
+            "send": false,
+            "cancel": true,
+            "alert": false
+          },
+          {
+            "when": "not reprice_due",
+            "next": "PF",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "note": "THE CHASE ASKS HERE AND NOWHERE ELSE: in the handler of a counted quote, never on a timer step"
+      },
+      "QA": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PF",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "note": "a confirmed sale is committed, as a triggered stop is: nothing changes; no cancel and no re-price whatever the chase function reads: a leg priced under the level is marketable at a bid at or above it"
+      },
+      "NQ": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PF",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "note": "never a re-price and never a send on a timer step"
+      },
+      "HG": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PF",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "note": "NOTHING is canceled: our sale stays for its own quantity; the added shares are outside it"
+      },
+      "HS": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PF",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "note": "MO follows in the same step when our sale is then too large"
+      },
+      "CP": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PF",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "note": "MO follows in the same step when our sale is then too large"
+      },
+      "CL": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PF",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "note": "NOTHING is canceled: our sale stays for its own quantity; the added shares are outside it"
+      },
+      "MO": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PCO",
+            "send": false,
+            "cancel": true,
+            "alert": false
+          }
+        ],
+        "note": "the cut comes first; no new order in this step; never a modify"
+      },
+      "HE": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "OX",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "note": "MO follows in the same step"
+      },
+      "ST": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PCT",
+            "send": false,
+            "cancel": true,
+            "alert": false
+          }
+        ]
+      },
+      "FRZ": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZW",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          }
+        ],
+        "note": "our sale stays; it is cut only by MO"
+      },
+      "oUPD": {
+        "occurs": "unexpected",
+        "branches": [
+          {
+            "when": "ends_filled and not long_remains",
+            "next": "X",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          },
+          {
+            "when": "ends_filled and long_remains and whole_cover",
+            "next": "GC",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          },
+          {
+            "when": "ends_filled and long_remains and not whole_cover",
+            "next": "G",
+            "send": false,
+            "cancel": false,
+            "alert": false,
+            "count": "0"
+          },
+          {
+            "when": "not ends_filled",
+            "next": "PF",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:291, 1322-1324",
+        "note": "a reconciliation update whose quantity equals the filled quantity ENDS the leg as sold; any other changes no row, and a quantity changed at the venue shows as MO"
+      },
+      "oSUB": {
+        "occurs": "no",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PF",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:283-292"
+      },
+      "oACC": {
+        "occurs": "unexpected",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PF",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:290",
+        "note": "the engine then reads ACCEPTED with a part filled; the row is still PF, and oREJ is then possible"
+      },
+      "oREJ": {
+        "occurs": "unexpected",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZ",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:290, then 236",
+        "note": "reachable once an Accepted has put the engine's status back to ACCEPTED; frozen with the alert: a definitive refusal is not cured by sending again"
+      },
+      "oDEN": {
+        "occurs": "no",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PF",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:283-292"
+      },
+      "oCXL": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZ",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:287",
+        "note": "canceled when we asked for no cancel (it may be the owner's own hand): frozen with the alert, at any leg"
+      },
+      "oCRJ": {
+        "occurs": "unexpected",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PF",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:286",
+        "note": "no cancel of ours is pending in this row; no effect"
+      },
+      "oEXP": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "whole_cover",
+            "next": "GC",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          },
+          {
+            "when": "not whole_cover",
+            "next": "G",
+            "send": false,
+            "cancel": false,
+            "alert": false,
+            "count": "0"
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:288",
+        "note": "never carried into the next session without a new count"
+      },
+      "oPF": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PF",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:1378"
+      },
+      "oFF": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "not long_remains",
+            "next": "X",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          },
+          {
+            "when": "long_remains and whole_cover",
+            "next": "GC",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          },
+          {
+            "when": "long_remains and not whole_cover",
+            "next": "G",
+            "send": false,
+            "cancel": false,
+            "alert": false,
+            "count": "0"
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:289, 1369-1371"
+      },
+      "oVOID": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZW",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:292"
+      },
+      "oLF": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "not long_remains",
+            "next": "OX",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          },
+          {
+            "when": "long_remains",
+            "next": "PF",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:247, 295, 1375-1376",
+        "note": "quantities re-read from every leg of ours; the fill is ours, not a shrink; MO follows in the same step when ours is then too large"
+      },
+      "oINI": {
+        "occurs": "unexpected",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZW",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:227, 229, 237, 239, 242, 283, 285",
+        "note": "an event the table has no column for (none is produced for a plain limit we never modify): FROZEN with the alert; the working leg keeps working; an echo not expected in this row answers as the catch-all does"
+      },
+      "oPCN": {
+        "occurs": "unexpected",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZW",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:227, 229, 237, 239, 242, 283, 285",
+        "note": "an event the table has no column for (none is produced for a plain limit we never modify): FROZEN with the alert; the working leg keeps working; an echo not expected in this row answers as the catch-all does"
+      },
+      "oOTH": {
+        "occurs": "unexpected",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZW",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:227, 229, 237, 239, 242, 283, 285",
+        "note": "an event the table has no column for (none is produced for a plain limit we never modify): FROZEN with the alert; the working leg keeps working"
+      }
+    },
+    "PCR": {
+      "QU": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PCR",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "note": "wait for the acknowledgement; this quote becomes the newest counted quote held"
+      },
+      "QA": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PCR",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "note": "a confirmed sale is committed, as a triggered stop is: nothing changes; this quote becomes the newest counted quote held"
+      },
+      "NQ": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PCR",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "HG": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PCR",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "note": "NOTHING is canceled: our sale stays for its own quantity; the added shares are outside it"
+      },
+      "HS": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PCO",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "note": "the episode ends at the acknowledgement: no next leg; G at zero, or covered"
+      },
+      "CP": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PCO",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "note": "the episode ends at the acknowledgement: no next leg; G at zero, or covered"
+      },
+      "CL": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PCR",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "note": "NOTHING is canceled: our sale stays for its own quantity; the added shares are outside it"
+      },
+      "MO": {
+        "occurs": "n/a",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PCR",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "note": "emitted only for a cancelable sale of ours with no cancel pending"
+      },
+      "HE": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PCX",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "ST": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PCT",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "FRZ": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZP",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          }
+        ]
+      },
+      "oUPD": {
+        "occurs": "unexpected",
+        "branches": [
+          {
+            "when": "ends_filled and not long_remains",
+            "next": "X",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          },
+          {
+            "when": "ends_filled and long_remains and whole_cover",
+            "next": "GC",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          },
+          {
+            "when": "ends_filled and long_remains and not whole_cover",
+            "next": "G",
+            "send": false,
+            "cancel": false,
+            "alert": false,
+            "count": "0"
+          },
+          {
+            "when": "not ends_filled and filled_part",
+            "next": "PF",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          },
+          {
+            "when": "not ends_filled and not filled_part",
+            "next": "WK",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:270, 1313-1320, 1322-1324",
+        "note": "a reconciliation update whose quantity equals the filled quantity ENDS the leg as sold; any other restores the status from before the cancel request and is read as a refusal"
+      },
+      "oSUB": {
+        "occurs": "no",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PCR",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:263-272"
+      },
+      "oACC": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "filled_part",
+            "next": "PF",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          },
+          {
+            "when": "not filled_part",
+            "next": "WK",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:269",
+        "note": "the engine's 'failed cancel request': read as a refusal"
+      },
+      "oREJ": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZ",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:263",
+        "note": "frozen with the alert: a definitive refusal is not cured by sending again"
+      },
+      "oDEN": {
+        "occurs": "no",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PCR",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:263-272"
+      },
+      "oCXL": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "leg_positive and formable",
+            "next": "FL",
+            "send": true,
+            "cancel": false,
+            "alert": false
+          },
+          {
+            "when": "leg_positive and not formable",
+            "next": "FZ",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          },
+          {
+            "when": "not leg_positive and whole_cover",
+            "next": "GC",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          },
+          {
+            "when": "not leg_positive and not whole_cover",
+            "next": "G",
+            "send": false,
+            "cancel": false,
+            "alert": false,
+            "count": "0"
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:267; trading/src/strategy/mod.rs:818-865",
+        "note": "S2, THE NEXT LEG: priced from the newest counted quote held at this step (the one that asked or a newer one), for the quantity at the episode's opening less the shares sold and never more than the uncovered quantity read in this step. PROPERTY (the lead's Q3): the replaced leg's final filled quantity is known before this sizes; the means (every fill emitted before Canceled, or one status read first) is open"
+      },
+      "oCRJ": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "filled_part",
+            "next": "PF",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          },
+          {
+            "when": "not filled_part",
+            "next": "WK",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:266, 943-951, 1067-1068",
+        "note": "our cancel REFUSED; the engine restores the status it had; the re-price is asked again by a later counted quote"
+      },
+      "oEXP": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "whole_cover",
+            "next": "GC",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          },
+          {
+            "when": "not whole_cover",
+            "next": "G",
+            "send": false,
+            "cancel": false,
+            "alert": false,
+            "count": "0"
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:268",
+        "note": "ended, but not by our cancel: NEVER the acknowledgement (D3); no next leg"
+      },
+      "oPF": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PCR",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:271, 1378-1386",
+        "note": "stays pending; quantities re-read"
+      },
+      "oFF": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "not long_remains",
+            "next": "X",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          },
+          {
+            "when": "long_remains and whole_cover",
+            "next": "GC",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          },
+          {
+            "when": "long_remains and not whole_cover",
+            "next": "G",
+            "send": false,
+            "cancel": false,
+            "alert": false,
+            "count": "0"
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:271, 1369-1371"
+      },
+      "oVOID": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZP",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:272"
+      },
+      "oLF": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "not long_remains",
+            "next": "PCX",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          },
+          {
+            "when": "long_remains",
+            "next": "PCR",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:247, 295, 1375-1376",
+        "note": "quantities re-read from every leg of ours; the fill is ours, not a shrink; the next leg is sized after it"
+      },
+      "oINI": {
+        "occurs": "unexpected",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZP",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:227, 229, 237, 239, 242, 283, 285",
+        "note": "an event the table has no column for (none is produced for a plain limit we never modify): FROZEN with the alert; an echo not expected in this row answers as the catch-all does"
+      },
+      "oPCN": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PCR",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "trading/src/strategy/mod.rs:836-862",
+        "note": "the echo of the cancel that entered this row: nothing"
+      },
+      "oOTH": {
+        "occurs": "unexpected",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZP",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:227, 229, 237, 239, 242, 283, 285",
+        "note": "an event the table has no column for (none is produced for a plain limit we never modify): FROZEN with the alert"
+      }
+    },
+    "PCO": {
+      "QU": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PCO",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "QA": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PCO",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "NQ": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PCO",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "HG": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PCO",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "HS": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PCO",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "CP": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PCO",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "CL": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PCO",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "MO": {
+        "occurs": "n/a",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PCO",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "note": "emitted only for a cancelable sale of ours with no cancel pending"
+      },
+      "HE": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PCX",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "ST": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PCT",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "FRZ": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZP",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          }
+        ]
+      },
+      "oUPD": {
+        "occurs": "unexpected",
+        "branches": [
+          {
+            "when": "ends_filled and not long_remains",
+            "next": "X",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          },
+          {
+            "when": "ends_filled and long_remains and whole_cover",
+            "next": "GC",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          },
+          {
+            "when": "ends_filled and long_remains and not whole_cover",
+            "next": "G",
+            "send": false,
+            "cancel": false,
+            "alert": false,
+            "count": "0"
+          },
+          {
+            "when": "not ends_filled and filled_part",
+            "next": "PF",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          },
+          {
+            "when": "not ends_filled and not filled_part",
+            "next": "WK",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:270, 1313-1320, 1322-1324",
+        "note": "a reconciliation update whose quantity equals the filled quantity ENDS the leg as sold; any other restores the status from before the cancel request and is read as a refusal"
+      },
+      "oSUB": {
+        "occurs": "no",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PCO",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:263-272"
+      },
+      "oACC": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "filled_part",
+            "next": "PF",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          },
+          {
+            "when": "not filled_part",
+            "next": "WK",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:269",
+        "note": "the engine's 'failed cancel request': read as a refusal"
+      },
+      "oREJ": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZ",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:263",
+        "note": "frozen with the alert: a definitive refusal is not cured by sending again"
+      },
+      "oDEN": {
+        "occurs": "no",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PCO",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:263-272"
+      },
+      "oCXL": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "whole_cover",
+            "next": "GC",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          },
+          {
+            "when": "not whole_cover",
+            "next": "G",
+            "send": false,
+            "cancel": false,
+            "alert": false,
+            "count": "0"
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:267; trading/src/strategy/mod.rs:818-865",
+        "note": "THE acknowledgement"
+      },
+      "oCRJ": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "filled_part",
+            "next": "PF",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          },
+          {
+            "when": "not filled_part",
+            "next": "WK",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:266, 943-951, 1067-1068",
+        "note": "our cancel REFUSED; the engine restores the status it had; MO asks again on a timer step"
+      },
+      "oEXP": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "whole_cover",
+            "next": "GC",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          },
+          {
+            "when": "not whole_cover",
+            "next": "G",
+            "send": false,
+            "cancel": false,
+            "alert": false,
+            "count": "0"
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:268",
+        "note": "ended, but not by our cancel: NEVER the acknowledgement (D3); no next leg"
+      },
+      "oPF": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PCO",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:271, 1378-1386",
+        "note": "stays pending; quantities re-read"
+      },
+      "oFF": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "not long_remains",
+            "next": "X",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          },
+          {
+            "when": "long_remains and whole_cover",
+            "next": "GC",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          },
+          {
+            "when": "long_remains and not whole_cover",
+            "next": "G",
+            "send": false,
+            "cancel": false,
+            "alert": false,
+            "count": "0"
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:271, 1369-1371"
+      },
+      "oVOID": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZP",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:272"
+      },
+      "oLF": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "not long_remains",
+            "next": "PCX",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          },
+          {
+            "when": "long_remains",
+            "next": "PCO",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:247, 295, 1375-1376",
+        "note": "quantities re-read from every leg of ours; the fill is ours, not a shrink"
+      },
+      "oINI": {
+        "occurs": "unexpected",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZP",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:227, 229, 237, 239, 242, 283, 285",
+        "note": "an event the table has no column for (none is produced for a plain limit we never modify): FROZEN with the alert; an echo not expected in this row answers as the catch-all does"
+      },
+      "oPCN": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PCO",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "trading/src/strategy/mod.rs:836-862",
+        "note": "the echo of the cancel that entered this row: nothing"
+      },
+      "oOTH": {
+        "occurs": "unexpected",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZP",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:227, 229, 237, 239, 242, 283, 285",
+        "note": "an event the table has no column for (none is produced for a plain limit we never modify): FROZEN with the alert"
+      }
+    },
+    "OX": {
+      "QU": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "OX",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "QA": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "OX",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "NQ": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "OX",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "HG": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "OX",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "HS": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "OX",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "CP": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "OX",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "CL": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "OX",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "MO": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PCX",
+            "send": false,
+            "cancel": true,
+            "alert": false
+          }
+        ],
+        "note": "asked in the step it becomes cancelable, then on timer steps"
+      },
+      "HE": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "OX",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "ST": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "cancelable",
+            "next": "PCT",
+            "send": false,
+            "cancel": true,
+            "alert": false
+          },
+          {
+            "when": "not cancelable",
+            "next": "TW",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          }
+        ]
+      },
+      "FRZ": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "OX",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "oUPD": {
+        "occurs": "unexpected",
+        "branches": [
+          {
+            "when": "ends_filled",
+            "next": "X",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          },
+          {
+            "when": "not ends_filled",
+            "next": "OX",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:243, 291, 1322-1324",
+        "note": "a reconciliation update can end the leg as sold; any other changes no row"
+      },
+      "oSUB": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "OX",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "oACC": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PCX",
+            "send": false,
+            "cancel": true,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:233",
+        "note": "acknowledged at last: the owed cancel"
+      },
+      "oREJ": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "X",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:209, 231-232, 236, 241, 244, 287-288"
+      },
+      "oDEN": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "X",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:209, 231-232, 236, 241, 244, 287-288"
+      },
+      "oCXL": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "X",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:209, 231-232, 236, 241, 244, 287-288"
+      },
+      "oCRJ": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "OX",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "oEXP": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "X",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:209, 231-232, 236, 241, 244, 287-288"
+      },
+      "oPF": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PCX",
+            "send": false,
+            "cancel": true,
+            "alert": true
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:235, 245",
+        "note": "sold a part after the end"
+      },
+      "oFF": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "X",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:235, 245, 289",
+        "note": "our sale filled after the holding ended; on an account that allows shorting, a short"
+      },
+      "oVOID": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "OX",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "oLF": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "OX",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:247, 295, 1375-1376",
+        "note": "quantities re-read from every leg of ours; the fill is ours, not a shrink"
+      },
+      "oINI": {
+        "occurs": "unexpected",
+        "branches": [
+          {
+            "when": "always",
+            "next": "OX",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:227, 229, 237, 239, 242, 283, 285",
+        "note": "an event the table has no column for (none is produced for a plain limit we never modify): named once, nothing else; an echo not expected in this row answers as the catch-all does"
+      },
+      "oPCN": {
+        "occurs": "unexpected",
+        "branches": [
+          {
+            "when": "always",
+            "next": "OX",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:227, 229, 237, 239, 242, 283, 285",
+        "note": "an event the table has no column for (none is produced for a plain limit we never modify): named once, nothing else; an echo not expected in this row answers as the catch-all does"
+      },
+      "oOTH": {
+        "occurs": "unexpected",
+        "branches": [
+          {
+            "when": "always",
+            "next": "OX",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:227, 229, 237, 239, 242, 283, 285",
+        "note": "an event the table has no column for (none is produced for a plain limit we never modify): named once, nothing else"
+      }
+    },
+    "PCX": {
+      "QU": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PCX",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "QA": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PCX",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "NQ": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PCX",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "HG": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PCX",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "HS": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PCX",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "CP": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PCX",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "CL": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PCX",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "MO": {
+        "occurs": "n/a",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PCX",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "note": "emitted only for a cancelable sale of ours with no cancel pending"
+      },
+      "HE": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PCX",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "ST": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PCT",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "FRZ": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PCX",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "oUPD": {
+        "occurs": "unexpected",
+        "branches": [
+          {
+            "when": "ends_filled",
+            "next": "X",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          },
+          {
+            "when": "not ends_filled",
+            "next": "OX",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:270, 1313-1320, 1322-1324",
+        "note": "a reconciliation update whose quantity equals the filled quantity ENDS the leg as sold; any other restores the status from before the cancel request and is read as a refusal"
+      },
+      "oSUB": {
+        "occurs": "no",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PCX",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:263-272"
+      },
+      "oACC": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "OX",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:269",
+        "note": "the engine's 'failed cancel request': read as a refusal"
+      },
+      "oREJ": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "X",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:263",
+        "note": "frozen with the alert: a definitive refusal is not cured by sending again"
+      },
+      "oDEN": {
+        "occurs": "no",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PCX",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:263-272"
+      },
+      "oCXL": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "X",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:267; trading/src/strategy/mod.rs:818-865",
+        "note": "THE acknowledgement"
+      },
+      "oCRJ": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "OX",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:266, 943-951, 1067-1068",
+        "note": "our cancel REFUSED; the engine restores the status it had"
+      },
+      "oEXP": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "X",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:268",
+        "note": "ended, but not by our cancel: NEVER the acknowledgement (D3); no next leg"
+      },
+      "oPF": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PCX",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:271, 1378-1386",
+        "note": "stays pending; quantities re-read"
+      },
+      "oFF": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "X",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:271, 1369-1371"
+      },
+      "oVOID": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PCX",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:272"
+      },
+      "oLF": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PCX",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:247, 295, 1375-1376",
+        "note": "quantities re-read from every leg of ours; the fill is ours, not a shrink"
+      },
+      "oINI": {
+        "occurs": "unexpected",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PCX",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:227, 229, 237, 239, 242, 283, 285",
+        "note": "an event the table has no column for (none is produced for a plain limit we never modify): named once, nothing else; an echo not expected in this row answers as the catch-all does"
+      },
+      "oPCN": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PCX",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "trading/src/strategy/mod.rs:836-862",
+        "note": "the echo of the cancel that entered this row: nothing"
+      },
+      "oOTH": {
+        "occurs": "unexpected",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PCX",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:227, 229, 237, 239, 242, 283, 285",
+        "note": "an event the table has no column for (none is produced for a plain limit we never modify): named once, nothing else"
+      }
+    },
+    "FZ": {
+      "QU": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZ",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "QA": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZ",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "NQ": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZ",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "HG": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZ",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "HS": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZ",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "CP": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZ",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "CL": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZ",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "MO": {
+        "occurs": "n/a",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZ",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "note": "emitted only for a cancelable sale of ours with no cancel pending"
+      },
+      "HE": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "X",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "ST": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "T0",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "FRZ": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZ",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "oUPD": {
+        "occurs": "unexpected",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZ",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:249, 294, 297",
+        "note": "allowed on a closed order; no effect"
+      },
+      "oSUB": {
+        "occurs": "no",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZ",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:247-249, 293-299",
+        "note": "a closed order takes only a fill, a void or an update; or no order exists"
+      },
+      "oACC": {
+        "occurs": "no",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZ",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:247-249, 293-299",
+        "note": "a closed order takes only a fill, a void or an update; or no order exists"
+      },
+      "oREJ": {
+        "occurs": "no",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZ",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:247-249, 293-299",
+        "note": "a closed order takes only a fill, a void or an update; or no order exists"
+      },
+      "oDEN": {
+        "occurs": "no",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZ",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:247-249, 293-299",
+        "note": "a closed order takes only a fill, a void or an update; or no order exists"
+      },
+      "oCXL": {
+        "occurs": "no",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZ",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:247-249, 293-299",
+        "note": "a closed order takes only a fill, a void or an update; or no order exists"
+      },
+      "oCRJ": {
+        "occurs": "no",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZ",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:247-249, 293-299",
+        "note": "a closed order takes only a fill, a void or an update; or no order exists"
+      },
+      "oEXP": {
+        "occurs": "no",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZ",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:247-249, 293-299",
+        "note": "a closed order takes only a fill, a void or an update; or no order exists"
+      },
+      "oPF": {
+        "occurs": "no",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZ",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:247, 295; a part leaves the status ended, model/src/orders/mod.rs:1375-1376",
+        "note": "no leg of ours is open to fill; a fill of an ended leg is the event oLF"
+      },
+      "oFF": {
+        "occurs": "no",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZ",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:247, 295; a part leaves the status ended, model/src/orders/mod.rs:1375-1376",
+        "note": "no leg of ours is open to fill; a fill of an ended leg is the event oLF"
+      },
+      "oVOID": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZ",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:248, 293, 296, 298",
+        "note": "no effect in this row"
+      },
+      "oLF": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "not long_remains",
+            "next": "X",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          },
+          {
+            "when": "long_remains",
+            "next": "FZ",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:247, 295, 1375-1376",
+        "note": "quantities re-read from every leg of ours; the fill is ours, not a shrink"
+      },
+      "oINI": {
+        "occurs": "unexpected",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZ",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:227, 229, 237, 239, 242, 283, 285",
+        "note": "an event the table has no column for (none is produced for a plain limit we never modify): named once, nothing else; an echo not expected in this row answers as the catch-all does"
+      },
+      "oPCN": {
+        "occurs": "unexpected",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZ",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:227, 229, 237, 239, 242, 283, 285",
+        "note": "an event the table has no column for (none is produced for a plain limit we never modify): named once, nothing else; an echo not expected in this row answers as the catch-all does"
+      },
+      "oOTH": {
+        "occurs": "unexpected",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZ",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:227, 229, 237, 239, 242, 283, 285",
+        "note": "an event the table has no column for (none is produced for a plain limit we never modify): named once, nothing else"
+      }
+    },
+    "FZW": {
+      "QU": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZW",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "QA": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZW",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "NQ": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZW",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "HG": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZW",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "HS": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZW",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "CP": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZW",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "CL": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZW",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "MO": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZP",
+            "send": false,
+            "cancel": true,
+            "alert": false
+          }
+        ],
+        "note": "the cut holds while frozen: a cancel is not a send"
+      },
+      "HE": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "OX",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "note": "the freeze ends with the holding; MO follows"
+      },
+      "ST": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "cancelable",
+            "next": "PCT",
+            "send": false,
+            "cancel": true,
+            "alert": false
+          },
+          {
+            "when": "not cancelable",
+            "next": "TW",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          }
+        ]
+      },
+      "FRZ": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZW",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "oUPD": {
+        "occurs": "unexpected",
+        "branches": [
+          {
+            "when": "ends_filled and not long_remains",
+            "next": "X",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          },
+          {
+            "when": "ends_filled and long_remains",
+            "next": "FZ",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          },
+          {
+            "when": "not ends_filled",
+            "next": "FZW",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:243, 291, 1322-1324",
+        "note": "a reconciliation update can end the leg as sold; any other changes no row"
+      },
+      "oSUB": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZW",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "oACC": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZW",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "oREJ": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZ",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:209, 231-232, 236, 241, 244, 287-288"
+      },
+      "oDEN": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZ",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:209, 231-232, 236, 241, 244, 287-288"
+      },
+      "oCXL": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZ",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:209, 231-232, 236, 241, 244, 287-288"
+      },
+      "oCRJ": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZW",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "oEXP": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZ",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:209, 231-232, 236, 241, 244, 287-288"
+      },
+      "oPF": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZW",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "oFF": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "not long_remains",
+            "next": "X",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          },
+          {
+            "when": "long_remains",
+            "next": "FZ",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:235, 245, 289"
+      },
+      "oVOID": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZW",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "oLF": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "not long_remains",
+            "next": "OX",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          },
+          {
+            "when": "long_remains",
+            "next": "FZW",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:247, 295, 1375-1376",
+        "note": "quantities re-read from every leg of ours; the fill is ours, not a shrink; MO follows in the same step when ours is then too large"
+      },
+      "oINI": {
+        "occurs": "unexpected",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZW",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:227, 229, 237, 239, 242, 283, 285",
+        "note": "an event the table has no column for (none is produced for a plain limit we never modify): named once, nothing else; an echo not expected in this row answers as the catch-all does"
+      },
+      "oPCN": {
+        "occurs": "unexpected",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZW",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:227, 229, 237, 239, 242, 283, 285",
+        "note": "an event the table has no column for (none is produced for a plain limit we never modify): named once, nothing else; an echo not expected in this row answers as the catch-all does"
+      },
+      "oOTH": {
+        "occurs": "unexpected",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZW",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:227, 229, 237, 239, 242, 283, 285",
+        "note": "an event the table has no column for (none is produced for a plain limit we never modify): named once, nothing else"
+      }
+    },
+    "FZP": {
+      "QU": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZP",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "QA": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZP",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "NQ": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZP",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "HG": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZP",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "HS": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZP",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "CP": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZP",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "CL": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZP",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "MO": {
+        "occurs": "n/a",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZP",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "note": "emitted only for a cancelable sale of ours with no cancel pending"
+      },
+      "HE": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PCX",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "ST": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PCT",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "FRZ": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZP",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "oUPD": {
+        "occurs": "unexpected",
+        "branches": [
+          {
+            "when": "ends_filled and not long_remains",
+            "next": "X",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          },
+          {
+            "when": "ends_filled and long_remains",
+            "next": "FZ",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          },
+          {
+            "when": "not ends_filled",
+            "next": "FZW",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:270, 1313-1320, 1322-1324",
+        "note": "a reconciliation update whose quantity equals the filled quantity ENDS the leg as sold; any other restores the status from before the cancel request and is read as a refusal"
+      },
+      "oSUB": {
+        "occurs": "no",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZP",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:263-272"
+      },
+      "oACC": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZW",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:269",
+        "note": "the engine's 'failed cancel request': read as a refusal"
+      },
+      "oREJ": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZ",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:263",
+        "note": "frozen with the alert: a definitive refusal is not cured by sending again"
+      },
+      "oDEN": {
+        "occurs": "no",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZP",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:263-272"
+      },
+      "oCXL": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZ",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:267; trading/src/strategy/mod.rs:818-865",
+        "note": "THE acknowledgement"
+      },
+      "oCRJ": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZW",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:266, 943-951, 1067-1068",
+        "note": "our cancel REFUSED; the engine restores the status it had"
+      },
+      "oEXP": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZ",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:268",
+        "note": "ended, but not by our cancel: NEVER the acknowledgement (D3); no next leg"
+      },
+      "oPF": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZP",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:271, 1378-1386",
+        "note": "stays pending; quantities re-read"
+      },
+      "oFF": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "not long_remains",
+            "next": "X",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          },
+          {
+            "when": "long_remains",
+            "next": "FZ",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:271, 1369-1371"
+      },
+      "oVOID": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZP",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:272"
+      },
+      "oLF": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "not long_remains",
+            "next": "PCX",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          },
+          {
+            "when": "long_remains",
+            "next": "FZP",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:247, 295, 1375-1376",
+        "note": "quantities re-read from every leg of ours; the fill is ours, not a shrink"
+      },
+      "oINI": {
+        "occurs": "unexpected",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZP",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:227, 229, 237, 239, 242, 283, 285",
+        "note": "an event the table has no column for (none is produced for a plain limit we never modify): named once, nothing else; an echo not expected in this row answers as the catch-all does"
+      },
+      "oPCN": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZP",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "trading/src/strategy/mod.rs:836-862",
+        "note": "the echo of the cancel that entered this row: nothing"
+      },
+      "oOTH": {
+        "occurs": "unexpected",
+        "branches": [
+          {
+            "when": "always",
+            "next": "FZP",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:227, 229, 237, 239, 242, 283, 285",
+        "note": "an event the table has no column for (none is produced for a plain limit we never modify): named once, nothing else"
+      }
+    },
+    "PCT": {
+      "QU": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PCT",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "QA": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PCT",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "NQ": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PCT",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "HG": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PCT",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "HS": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PCT",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "CP": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PCT",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "CL": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PCT",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "MO": {
+        "occurs": "n/a",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PCT",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "note": "emitted only for a cancelable sale of ours with no cancel pending"
+      },
+      "HE": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PCT",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "ST": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PCT",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "FRZ": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PCT",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "oUPD": {
+        "occurs": "unexpected",
+        "branches": [
+          {
+            "when": "ends_filled",
+            "next": "T0",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          },
+          {
+            "when": "not ends_filled",
+            "next": "TW",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:270, 1313-1320, 1322-1324",
+        "note": "a reconciliation update whose quantity equals the filled quantity ENDS the leg as sold; any other restores the status from before the cancel request and is read as a refusal"
+      },
+      "oSUB": {
+        "occurs": "no",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PCT",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:263-272"
+      },
+      "oACC": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "TW",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:269",
+        "note": "the engine's 'failed cancel request': read as a refusal"
+      },
+      "oREJ": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "T0",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:263",
+        "note": "frozen with the alert: a definitive refusal is not cured by sending again"
+      },
+      "oDEN": {
+        "occurs": "no",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PCT",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:263-272"
+      },
+      "oCXL": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "T0",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:267; trading/src/strategy/mod.rs:818-865",
+        "note": "THE acknowledgement"
+      },
+      "oCRJ": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "TW",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:266, 943-951, 1067-1068",
+        "note": "our cancel REFUSED; the engine restores the status it had"
+      },
+      "oEXP": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "T0",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:268",
+        "note": "ended, but not by our cancel: NEVER the acknowledgement (D3); no next leg"
+      },
+      "oPF": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PCT",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:271, 1378-1386",
+        "note": "stays pending; quantities re-read"
+      },
+      "oFF": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "T0",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:271, 1369-1371"
+      },
+      "oVOID": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PCT",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:272"
+      },
+      "oLF": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PCT",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:247, 295, 1375-1376",
+        "note": "quantities re-read from every leg of ours; the fill is ours, not a shrink"
+      },
+      "oINI": {
+        "occurs": "unexpected",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PCT",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:227, 229, 237, 239, 242, 283, 285",
+        "note": "an event the table has no column for (none is produced for a plain limit we never modify): named once, nothing else; an echo not expected in this row answers as the catch-all does"
+      },
+      "oPCN": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PCT",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "trading/src/strategy/mod.rs:836-862",
+        "note": "the echo of the cancel that entered this row: nothing"
+      },
+      "oOTH": {
+        "occurs": "unexpected",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PCT",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:227, 229, 237, 239, 242, 283, 285",
+        "note": "an event the table has no column for (none is produced for a plain limit we never modify): named once, nothing else"
+      }
+    },
+    "TW": {
+      "QU": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "TW",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "QA": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "TW",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "NQ": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "TW",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "HG": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "TW",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "HS": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "TW",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "CP": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "TW",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "CL": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "TW",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "MO": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PCT",
+            "send": false,
+            "cancel": true,
+            "alert": false
+          }
+        ],
+        "note": "a stopped holding's open sale that exceeds the long is cut too"
+      },
+      "HE": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "TW",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "ST": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "TW",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "FRZ": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "TW",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "oUPD": {
+        "occurs": "unexpected",
+        "branches": [
+          {
+            "when": "ends_filled",
+            "next": "T0",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          },
+          {
+            "when": "not ends_filled",
+            "next": "TW",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:243, 291, 1322-1324"
+      },
+      "oSUB": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "TW",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "oACC": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PCT",
+            "send": false,
+            "cancel": true,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:233",
+        "note": "acknowledged at last: the stop could not ask its cancel while the leg was in flight; it asks when the leg can take one"
+      },
+      "oREJ": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "T0",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:209, 231-232, 236, 241, 244-245, 287-289"
+      },
+      "oDEN": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "T0",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:209, 231-232, 236, 241, 244-245, 287-289"
+      },
+      "oCXL": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "T0",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:209, 231-232, 236, 241, 244-245, 287-289"
+      },
+      "oCRJ": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "TW",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "oEXP": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "T0",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:209, 231-232, 236, 241, 244-245, 287-289"
+      },
+      "oPF": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "PCT",
+            "send": false,
+            "cancel": true,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:235, 245",
+        "note": "the stop could not ask its cancel while the leg was in flight; it asks when the leg can take one"
+      },
+      "oFF": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "T0",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:209, 231-232, 236, 241, 244-245, 287-289"
+      },
+      "oVOID": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "TW",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "oLF": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "TW",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:247, 295, 1375-1376",
+        "note": "quantities re-read from every leg of ours; the fill is ours, not a shrink"
+      },
+      "oINI": {
+        "occurs": "unexpected",
+        "branches": [
+          {
+            "when": "always",
+            "next": "TW",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:227, 229, 237, 239, 242, 283, 285",
+        "note": "an event the table has no column for (none is produced for a plain limit we never modify): named once, nothing else; an echo not expected in this row answers as the catch-all does"
+      },
+      "oPCN": {
+        "occurs": "unexpected",
+        "branches": [
+          {
+            "when": "always",
+            "next": "TW",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:227, 229, 237, 239, 242, 283, 285",
+        "note": "an event the table has no column for (none is produced for a plain limit we never modify): named once, nothing else; an echo not expected in this row answers as the catch-all does"
+      },
+      "oOTH": {
+        "occurs": "unexpected",
+        "branches": [
+          {
+            "when": "always",
+            "next": "TW",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:227, 229, 237, 239, 242, 283, 285",
+        "note": "an event the table has no column for (none is produced for a plain limit we never modify): named once, nothing else"
+      }
+    },
+    "T0": {
+      "QU": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "T0",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "QA": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "T0",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "NQ": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "T0",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "HG": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "T0",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "HS": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "T0",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "CP": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "T0",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "CL": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "T0",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "MO": {
+        "occurs": "n/a",
+        "branches": [
+          {
+            "when": "always",
+            "next": "T0",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "note": "emitted only for a cancelable sale of ours with no cancel pending"
+      },
+      "HE": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "T0",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "ST": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "T0",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "FRZ": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "T0",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "oUPD": {
+        "occurs": "unexpected",
+        "branches": [
+          {
+            "when": "always",
+            "next": "T0",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:249, 294, 297",
+        "note": "allowed on a closed order; no effect"
+      },
+      "oSUB": {
+        "occurs": "no",
+        "branches": [
+          {
+            "when": "always",
+            "next": "T0",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:247-249, 293-299",
+        "note": "a closed order takes only a fill, a void or an update; or no order exists"
+      },
+      "oACC": {
+        "occurs": "no",
+        "branches": [
+          {
+            "when": "always",
+            "next": "T0",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:247-249, 293-299",
+        "note": "a closed order takes only a fill, a void or an update; or no order exists"
+      },
+      "oREJ": {
+        "occurs": "no",
+        "branches": [
+          {
+            "when": "always",
+            "next": "T0",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:247-249, 293-299",
+        "note": "a closed order takes only a fill, a void or an update; or no order exists"
+      },
+      "oDEN": {
+        "occurs": "no",
+        "branches": [
+          {
+            "when": "always",
+            "next": "T0",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:247-249, 293-299",
+        "note": "a closed order takes only a fill, a void or an update; or no order exists"
+      },
+      "oCXL": {
+        "occurs": "no",
+        "branches": [
+          {
+            "when": "always",
+            "next": "T0",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:247-249, 293-299",
+        "note": "a closed order takes only a fill, a void or an update; or no order exists"
+      },
+      "oCRJ": {
+        "occurs": "no",
+        "branches": [
+          {
+            "when": "always",
+            "next": "T0",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:247-249, 293-299",
+        "note": "a closed order takes only a fill, a void or an update; or no order exists"
+      },
+      "oEXP": {
+        "occurs": "no",
+        "branches": [
+          {
+            "when": "always",
+            "next": "T0",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:247-249, 293-299",
+        "note": "a closed order takes only a fill, a void or an update; or no order exists"
+      },
+      "oPF": {
+        "occurs": "no",
+        "branches": [
+          {
+            "when": "always",
+            "next": "T0",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:247, 295; a part leaves the status ended, model/src/orders/mod.rs:1375-1376",
+        "note": "no leg of ours is open to fill; a fill of an ended leg is the event oLF"
+      },
+      "oFF": {
+        "occurs": "no",
+        "branches": [
+          {
+            "when": "always",
+            "next": "T0",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:247, 295; a part leaves the status ended, model/src/orders/mod.rs:1375-1376",
+        "note": "no leg of ours is open to fill; a fill of an ended leg is the event oLF"
+      },
+      "oVOID": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "T0",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:248, 293, 296, 298",
+        "note": "no effect in this row"
+      },
+      "oLF": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "T0",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:247, 295, 1375-1376",
+        "note": "quantities re-read from every leg of ours; the fill is ours, not a shrink"
+      },
+      "oINI": {
+        "occurs": "unexpected",
+        "branches": [
+          {
+            "when": "always",
+            "next": "T0",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:227, 229, 237, 239, 242, 283, 285",
+        "note": "an event the table has no column for (none is produced for a plain limit we never modify): named once, nothing else; an echo not expected in this row answers as the catch-all does"
+      },
+      "oPCN": {
+        "occurs": "unexpected",
+        "branches": [
+          {
+            "when": "always",
+            "next": "T0",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:227, 229, 237, 239, 242, 283, 285",
+        "note": "an event the table has no column for (none is produced for a plain limit we never modify): named once, nothing else; an echo not expected in this row answers as the catch-all does"
+      },
+      "oOTH": {
+        "occurs": "unexpected",
+        "branches": [
+          {
+            "when": "always",
+            "next": "T0",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:227, 229, 237, 239, 242, 283, 285",
+        "note": "an event the table has no column for (none is produced for a plain limit we never modify): named once, nothing else"
+      }
+    },
+    "X": {
+      "QU": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "X",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "QA": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "X",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "NQ": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "X",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "HG": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "X",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "HS": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "X",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "CP": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "X",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "CL": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "X",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "MO": {
+        "occurs": "n/a",
+        "branches": [
+          {
+            "when": "always",
+            "next": "X",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "note": "emitted only for a cancelable sale of ours with no cancel pending"
+      },
+      "HE": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "X",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "ST": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "X",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "FRZ": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "X",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ]
+      },
+      "oUPD": {
+        "occurs": "unexpected",
+        "branches": [
+          {
+            "when": "always",
+            "next": "X",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:249, 294, 297",
+        "note": "allowed on a closed order; no effect"
+      },
+      "oSUB": {
+        "occurs": "no",
+        "branches": [
+          {
+            "when": "always",
+            "next": "X",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:247-249, 293-299",
+        "note": "a closed order takes only a fill, a void or an update; or no order exists"
+      },
+      "oACC": {
+        "occurs": "no",
+        "branches": [
+          {
+            "when": "always",
+            "next": "X",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:247-249, 293-299",
+        "note": "a closed order takes only a fill, a void or an update; or no order exists"
+      },
+      "oREJ": {
+        "occurs": "no",
+        "branches": [
+          {
+            "when": "always",
+            "next": "X",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:247-249, 293-299",
+        "note": "a closed order takes only a fill, a void or an update; or no order exists"
+      },
+      "oDEN": {
+        "occurs": "no",
+        "branches": [
+          {
+            "when": "always",
+            "next": "X",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:247-249, 293-299",
+        "note": "a closed order takes only a fill, a void or an update; or no order exists"
+      },
+      "oCXL": {
+        "occurs": "no",
+        "branches": [
+          {
+            "when": "always",
+            "next": "X",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:247-249, 293-299",
+        "note": "a closed order takes only a fill, a void or an update; or no order exists"
+      },
+      "oCRJ": {
+        "occurs": "no",
+        "branches": [
+          {
+            "when": "always",
+            "next": "X",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:247-249, 293-299",
+        "note": "a closed order takes only a fill, a void or an update; or no order exists"
+      },
+      "oEXP": {
+        "occurs": "no",
+        "branches": [
+          {
+            "when": "always",
+            "next": "X",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:247-249, 293-299",
+        "note": "a closed order takes only a fill, a void or an update; or no order exists"
+      },
+      "oPF": {
+        "occurs": "no",
+        "branches": [
+          {
+            "when": "always",
+            "next": "X",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:247, 295; a part leaves the status ended, model/src/orders/mod.rs:1375-1376",
+        "note": "no leg of ours is open to fill; a fill of an ended leg is the event oLF"
+      },
+      "oFF": {
+        "occurs": "no",
+        "branches": [
+          {
+            "when": "always",
+            "next": "X",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:247, 295; a part leaves the status ended, model/src/orders/mod.rs:1375-1376",
+        "note": "no leg of ours is open to fill; a fill of an ended leg is the event oLF"
+      },
+      "oVOID": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "X",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:248, 293, 296, 298",
+        "note": "no effect in this row"
+      },
+      "oLF": {
+        "occurs": "yes",
+        "branches": [
+          {
+            "when": "always",
+            "next": "X",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:247, 295, 1375-1376",
+        "note": "quantities re-read from every leg of ours; the fill is ours, not a shrink"
+      },
+      "oINI": {
+        "occurs": "unexpected",
+        "branches": [
+          {
+            "when": "always",
+            "next": "X",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:227, 229, 237, 239, 242, 283, 285",
+        "note": "an event the table has no column for (none is produced for a plain limit we never modify): named once, nothing else; an echo not expected in this row answers as the catch-all does"
+      },
+      "oPCN": {
+        "occurs": "unexpected",
+        "branches": [
+          {
+            "when": "always",
+            "next": "X",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:227, 229, 237, 239, 242, 283, 285",
+        "note": "an event the table has no column for (none is produced for a plain limit we never modify): named once, nothing else; an echo not expected in this row answers as the catch-all does"
+      },
+      "oOTH": {
+        "occurs": "unexpected",
+        "branches": [
+          {
+            "when": "always",
+            "next": "X",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          }
+        ],
+        "pin": "model/src/orders/mod.rs:227, 229, 237, 239, 242, 283, 285",
+        "note": "an event the table has no column for (none is produced for a plain limit we never modify): named once, nothing else"
+      }
+    }
+  }
+}

@@ -1,0 +1,1673 @@
+{
+  "named_paths": {
+    "cover-clears-count": {
+      "steps": [
+        {
+          "row": "G",
+          "event": "QU",
+          "when": "not count_complete",
+          "does": "IF not count_complete: nothing sent; -> G, count + 1",
+          "occurs": "yes"
+        },
+        {
+          "row": "G",
+          "event": "CP",
+          "when": "whole_cover",
+          "does": "IF whole_cover: nothing sent; -> GC",
+          "occurs": "yes"
+        },
+        {
+          "row": "GC",
+          "event": "QU",
+          "when": "always",
+          "does": "nothing sent; -> GC",
+          "occurs": "yes"
+        },
+        {
+          "row": "GC",
+          "event": "CL",
+          "when": "not whole_cover",
+          "does": "IF not whole_cover: nothing sent; -> G, count 0",
+          "occurs": "yes"
+        },
+        {
+          "row": "G",
+          "event": "QU",
+          "when": "not count_complete",
+          "does": "IF not count_complete: nothing sent; -> G, count + 1",
+          "occurs": "yes"
+        }
+      ],
+      "ends_in": "G",
+      "sends": 0
+    },
+    "size-cancel-cover-lifts-timer": {
+      "steps": [
+        {
+          "row": "G",
+          "event": "QU",
+          "when": "not count_complete",
+          "does": "IF not count_complete: nothing sent; -> G, count + 1",
+          "occurs": "yes"
+        },
+        {
+          "row": "G",
+          "event": "QU",
+          "when": "count_complete and leg_positive and formable",
+          "does": "IF count_complete and leg_positive and formable: SEND a leg; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "oSUB",
+          "when": "always",
+          "does": "nothing sent; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "oACC",
+          "when": "always",
+          "does": "nothing sent; -> WK",
+          "occurs": "yes"
+        },
+        {
+          "row": "WK",
+          "event": "CP",
+          "when": "always",
+          "does": "nothing sent; -> WK",
+          "occurs": "yes"
+        },
+        {
+          "row": "WK",
+          "event": "MO",
+          "when": "always",
+          "does": "CANCEL ours; -> PCO",
+          "occurs": "yes"
+        },
+        {
+          "row": "PCO",
+          "event": "oCXL",
+          "when": "whole_cover",
+          "does": "IF whole_cover: nothing sent; -> GC",
+          "occurs": "yes"
+        },
+        {
+          "row": "GC",
+          "event": "CL",
+          "when": "not whole_cover",
+          "does": "IF not whole_cover: nothing sent; -> G, count 0",
+          "occurs": "yes"
+        },
+        {
+          "row": "G",
+          "event": "NQ",
+          "when": "always",
+          "does": "nothing sent; -> G, count unchanged",
+          "occurs": "yes"
+        },
+        {
+          "row": "G",
+          "event": "QU",
+          "when": "not count_complete",
+          "does": "IF not count_complete: nothing sent; -> G, count + 1",
+          "occurs": "yes"
+        }
+      ],
+      "ends_in": "G",
+      "sends": 1
+    },
+    "reprice-refused-expiry-timer": {
+      "steps": [
+        {
+          "row": "G",
+          "event": "QU",
+          "when": "not count_complete",
+          "does": "IF not count_complete: nothing sent; -> G, count + 1",
+          "occurs": "yes"
+        },
+        {
+          "row": "G",
+          "event": "QU",
+          "when": "count_complete and leg_positive and formable",
+          "does": "IF count_complete and leg_positive and formable: SEND a leg; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "oSUB",
+          "when": "always",
+          "does": "nothing sent; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "oACC",
+          "when": "always",
+          "does": "nothing sent; -> WK",
+          "occurs": "yes"
+        },
+        {
+          "row": "WK",
+          "event": "QU",
+          "when": "reprice_due",
+          "does": "IF reprice_due: CANCEL ours; -> PCR",
+          "occurs": "yes"
+        },
+        {
+          "row": "PCR",
+          "event": "oCRJ",
+          "when": "not filled_part",
+          "does": "IF not filled_part: ALERT; -> WK",
+          "occurs": "yes"
+        },
+        {
+          "row": "WK",
+          "event": "oEXP",
+          "when": "not whole_cover",
+          "does": "IF not whole_cover: nothing sent; -> G, count 0",
+          "occurs": "yes"
+        },
+        {
+          "row": "G",
+          "event": "NQ",
+          "when": "always",
+          "does": "nothing sent; -> G, count unchanged",
+          "occurs": "yes"
+        },
+        {
+          "row": "G",
+          "event": "QU",
+          "when": "not count_complete",
+          "does": "IF not count_complete: nothing sent; -> G, count + 1",
+          "occurs": "yes"
+        }
+      ],
+      "ends_in": "G",
+      "sends": 1
+    },
+    "two-legs-complete": {
+      "steps": [
+        {
+          "row": "G",
+          "event": "QU",
+          "when": "not count_complete",
+          "does": "IF not count_complete: nothing sent; -> G, count + 1",
+          "occurs": "yes"
+        },
+        {
+          "row": "G",
+          "event": "QU",
+          "when": "count_complete and leg_positive and formable",
+          "does": "IF count_complete and leg_positive and formable: SEND a leg; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "oSUB",
+          "when": "always",
+          "does": "nothing sent; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "oACC",
+          "when": "always",
+          "does": "nothing sent; -> WK",
+          "occurs": "yes"
+        },
+        {
+          "row": "WK",
+          "event": "QU",
+          "when": "reprice_due",
+          "does": "IF reprice_due: CANCEL ours; -> PCR",
+          "occurs": "yes"
+        },
+        {
+          "row": "PCR",
+          "event": "QA",
+          "when": "always",
+          "does": "nothing sent; -> PCR",
+          "occurs": "yes"
+        },
+        {
+          "row": "PCR",
+          "event": "oCXL",
+          "when": "leg_positive and formable",
+          "does": "IF leg_positive and formable: SEND a leg; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "oACC",
+          "when": "always",
+          "does": "nothing sent; -> WK",
+          "occurs": "yes"
+        },
+        {
+          "row": "WK",
+          "event": "oFF",
+          "when": "not long_remains",
+          "does": "IF not long_remains: nothing sent; -> X",
+          "occurs": "yes"
+        }
+      ],
+      "ends_in": "X",
+      "sends": 2
+    },
+    "growth-then-recount": {
+      "steps": [
+        {
+          "row": "G",
+          "event": "QU",
+          "when": "not count_complete",
+          "does": "IF not count_complete: nothing sent; -> G, count + 1",
+          "occurs": "yes"
+        },
+        {
+          "row": "G",
+          "event": "QU",
+          "when": "count_complete and leg_positive and formable",
+          "does": "IF count_complete and leg_positive and formable: SEND a leg; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "oSUB",
+          "when": "always",
+          "does": "nothing sent; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "oACC",
+          "when": "always",
+          "does": "nothing sent; -> WK",
+          "occurs": "yes"
+        },
+        {
+          "row": "WK",
+          "event": "HG",
+          "when": "always",
+          "does": "nothing sent; -> WK",
+          "occurs": "yes"
+        },
+        {
+          "row": "WK",
+          "event": "oFF",
+          "when": "long_remains and not whole_cover",
+          "does": "IF long_remains and not whole_cover: nothing sent; -> G, count 0",
+          "occurs": "yes"
+        },
+        {
+          "row": "G",
+          "event": "QU",
+          "when": "not count_complete",
+          "does": "IF not count_complete: nothing sent; -> G, count + 1",
+          "occurs": "yes"
+        }
+      ],
+      "ends_in": "G",
+      "sends": 1
+    },
+    "stop-before-cancel-ack": {
+      "steps": [
+        {
+          "row": "G",
+          "event": "QU",
+          "when": "not count_complete",
+          "does": "IF not count_complete: nothing sent; -> G, count + 1",
+          "occurs": "yes"
+        },
+        {
+          "row": "G",
+          "event": "QU",
+          "when": "count_complete and leg_positive and formable",
+          "does": "IF count_complete and leg_positive and formable: SEND a leg; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "oSUB",
+          "when": "always",
+          "does": "nothing sent; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "oACC",
+          "when": "always",
+          "does": "nothing sent; -> WK",
+          "occurs": "yes"
+        },
+        {
+          "row": "WK",
+          "event": "QU",
+          "when": "reprice_due",
+          "does": "IF reprice_due: CANCEL ours; -> PCR",
+          "occurs": "yes"
+        },
+        {
+          "row": "PCR",
+          "event": "ST",
+          "when": "always",
+          "does": "nothing sent; -> PCT",
+          "occurs": "yes"
+        },
+        {
+          "row": "PCT",
+          "event": "oCXL",
+          "when": "always",
+          "does": "nothing sent; -> T0",
+          "occurs": "yes"
+        }
+      ],
+      "ends_in": "T0",
+      "sends": 1
+    },
+    "foreign-sell-before-cancel-ack": {
+      "steps": [
+        {
+          "row": "G",
+          "event": "QU",
+          "when": "not count_complete",
+          "does": "IF not count_complete: nothing sent; -> G, count + 1",
+          "occurs": "yes"
+        },
+        {
+          "row": "G",
+          "event": "QU",
+          "when": "count_complete and leg_positive and formable",
+          "does": "IF count_complete and leg_positive and formable: SEND a leg; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "oSUB",
+          "when": "always",
+          "does": "nothing sent; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "oACC",
+          "when": "always",
+          "does": "nothing sent; -> WK",
+          "occurs": "yes"
+        },
+        {
+          "row": "WK",
+          "event": "QU",
+          "when": "reprice_due",
+          "does": "IF reprice_due: CANCEL ours; -> PCR",
+          "occurs": "yes"
+        },
+        {
+          "row": "PCR",
+          "event": "CP",
+          "when": "always",
+          "does": "nothing sent; -> PCO",
+          "occurs": "yes"
+        },
+        {
+          "row": "PCO",
+          "event": "oCXL",
+          "when": "not whole_cover",
+          "does": "IF not whole_cover: nothing sent; -> G, count 0",
+          "occurs": "yes"
+        }
+      ],
+      "ends_in": "G",
+      "sends": 1
+    },
+    "partial-accepted-rejected": {
+      "steps": [
+        {
+          "row": "G",
+          "event": "QU",
+          "when": "not count_complete",
+          "does": "IF not count_complete: nothing sent; -> G, count + 1",
+          "occurs": "yes"
+        },
+        {
+          "row": "G",
+          "event": "QU",
+          "when": "count_complete and leg_positive and formable",
+          "does": "IF count_complete and leg_positive and formable: SEND a leg; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "oSUB",
+          "when": "always",
+          "does": "nothing sent; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "oACC",
+          "when": "always",
+          "does": "nothing sent; -> WK",
+          "occurs": "yes"
+        },
+        {
+          "row": "WK",
+          "event": "oPF",
+          "when": "always",
+          "does": "nothing sent; -> PF",
+          "occurs": "yes"
+        },
+        {
+          "row": "PF",
+          "event": "oACC",
+          "when": "always",
+          "does": "nothing sent; -> PF",
+          "occurs": "unexpected"
+        },
+        {
+          "row": "PF",
+          "event": "oREJ",
+          "when": "always",
+          "does": "ALERT; -> FZ",
+          "occurs": "unexpected"
+        }
+      ],
+      "ends_in": "FZ",
+      "sends": 1
+    },
+    "update-ends-pending-leg": {
+      "steps": [
+        {
+          "row": "G",
+          "event": "QU",
+          "when": "not count_complete",
+          "does": "IF not count_complete: nothing sent; -> G, count + 1",
+          "occurs": "yes"
+        },
+        {
+          "row": "G",
+          "event": "QU",
+          "when": "count_complete and leg_positive and formable",
+          "does": "IF count_complete and leg_positive and formable: SEND a leg; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "oSUB",
+          "when": "always",
+          "does": "nothing sent; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "oACC",
+          "when": "always",
+          "does": "nothing sent; -> WK",
+          "occurs": "yes"
+        },
+        {
+          "row": "WK",
+          "event": "QU",
+          "when": "reprice_due",
+          "does": "IF reprice_due: CANCEL ours; -> PCR",
+          "occurs": "yes"
+        },
+        {
+          "row": "PCR",
+          "event": "oPF",
+          "when": "always",
+          "does": "nothing sent; -> PCR",
+          "occurs": "yes"
+        },
+        {
+          "row": "PCR",
+          "event": "oUPD",
+          "when": "ends_filled and long_remains and not whole_cover",
+          "does": "IF ends_filled and long_remains and not whole_cover: nothing sent; -> G, count 0",
+          "occurs": "unexpected"
+        }
+      ],
+      "ends_in": "G",
+      "sends": 1
+    },
+    "expired-late-fill-covered": {
+      "steps": [
+        {
+          "row": "G",
+          "event": "QU",
+          "when": "not count_complete",
+          "does": "IF not count_complete: nothing sent; -> G, count + 1",
+          "occurs": "yes"
+        },
+        {
+          "row": "G",
+          "event": "QU",
+          "when": "count_complete and leg_positive and formable",
+          "does": "IF count_complete and leg_positive and formable: SEND a leg; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "oSUB",
+          "when": "always",
+          "does": "nothing sent; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "oACC",
+          "when": "always",
+          "does": "nothing sent; -> WK",
+          "occurs": "yes"
+        },
+        {
+          "row": "WK",
+          "event": "oEXP",
+          "when": "not whole_cover",
+          "does": "IF not whole_cover: nothing sent; -> G, count 0",
+          "occurs": "yes"
+        },
+        {
+          "row": "G",
+          "event": "oLF",
+          "when": "long_remains and whole_cover",
+          "does": "IF long_remains and whole_cover: nothing sent; -> GC",
+          "occurs": "yes"
+        }
+      ],
+      "ends_in": "GC",
+      "sends": 1
+    },
+    "late-fill-ends-holding-during-next-leg": {
+      "steps": [
+        {
+          "row": "G",
+          "event": "QU",
+          "when": "not count_complete",
+          "does": "IF not count_complete: nothing sent; -> G, count + 1",
+          "occurs": "yes"
+        },
+        {
+          "row": "G",
+          "event": "QU",
+          "when": "count_complete and leg_positive and formable",
+          "does": "IF count_complete and leg_positive and formable: SEND a leg; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "oSUB",
+          "when": "always",
+          "does": "nothing sent; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "oACC",
+          "when": "always",
+          "does": "nothing sent; -> WK",
+          "occurs": "yes"
+        },
+        {
+          "row": "WK",
+          "event": "QU",
+          "when": "reprice_due",
+          "does": "IF reprice_due: CANCEL ours; -> PCR",
+          "occurs": "yes"
+        },
+        {
+          "row": "PCR",
+          "event": "oCXL",
+          "when": "leg_positive and formable",
+          "does": "IF leg_positive and formable: SEND a leg; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "oSUB",
+          "when": "always",
+          "does": "nothing sent; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "oACC",
+          "when": "always",
+          "does": "nothing sent; -> WK",
+          "occurs": "yes"
+        },
+        {
+          "row": "WK",
+          "event": "oLF",
+          "when": "not long_remains",
+          "does": "IF not long_remains: nothing sent; -> OX",
+          "occurs": "yes"
+        },
+        {
+          "row": "OX",
+          "event": "MO",
+          "when": "always",
+          "does": "CANCEL ours; -> PCX",
+          "occurs": "yes"
+        },
+        {
+          "row": "PCX",
+          "event": "oCXL",
+          "when": "always",
+          "does": "nothing sent; -> X",
+          "occurs": "yes"
+        }
+      ],
+      "ends_in": "X",
+      "sends": 2
+    },
+    "above-level-keeps-working": {
+      "steps": [
+        {
+          "row": "G",
+          "event": "QU",
+          "when": "not count_complete",
+          "does": "IF not count_complete: nothing sent; -> G, count + 1",
+          "occurs": "yes"
+        },
+        {
+          "row": "G",
+          "event": "QU",
+          "when": "count_complete and leg_positive and formable",
+          "does": "IF count_complete and leg_positive and formable: SEND a leg; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "oSUB",
+          "when": "always",
+          "does": "nothing sent; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "oACC",
+          "when": "always",
+          "does": "nothing sent; -> WK",
+          "occurs": "yes"
+        },
+        {
+          "row": "WK",
+          "event": "QA",
+          "when": "always",
+          "does": "nothing sent; -> WK",
+          "occurs": "yes"
+        },
+        {
+          "row": "WK",
+          "event": "NQ",
+          "when": "always",
+          "does": "nothing sent; -> WK",
+          "occurs": "yes"
+        },
+        {
+          "row": "WK",
+          "event": "QA",
+          "when": "always",
+          "does": "nothing sent; -> WK",
+          "occurs": "yes"
+        }
+      ],
+      "ends_in": "WK",
+      "sends": 1
+    },
+    "other-order-event-freezes-working": {
+      "steps": [
+        {
+          "row": "G",
+          "event": "QU",
+          "when": "not count_complete",
+          "does": "IF not count_complete: nothing sent; -> G, count + 1",
+          "occurs": "yes"
+        },
+        {
+          "row": "G",
+          "event": "QU",
+          "when": "count_complete and leg_positive and formable",
+          "does": "IF count_complete and leg_positive and formable: SEND a leg; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "oSUB",
+          "when": "always",
+          "does": "nothing sent; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "oACC",
+          "when": "always",
+          "does": "nothing sent; -> WK",
+          "occurs": "yes"
+        },
+        {
+          "row": "WK",
+          "event": "oOTH",
+          "when": "always",
+          "does": "ALERT; -> FZW",
+          "occurs": "unexpected"
+        },
+        {
+          "row": "FZW",
+          "event": "QU",
+          "when": "always",
+          "does": "nothing sent; -> FZW",
+          "occurs": "yes"
+        },
+        {
+          "row": "FZW",
+          "event": "NQ",
+          "when": "always",
+          "does": "nothing sent; -> FZW",
+          "occurs": "yes"
+        }
+      ],
+      "ends_in": "FZW",
+      "sends": 1
+    },
+    "shrink-under-part-cover": {
+      "steps": [
+        {
+          "row": "G",
+          "event": "CP",
+          "when": "not whole_cover",
+          "does": "IF not whole_cover: nothing sent; -> G, count 0",
+          "occurs": "yes"
+        },
+        {
+          "row": "G",
+          "event": "QU",
+          "when": "not count_complete",
+          "does": "IF not count_complete: nothing sent; -> G, count + 1",
+          "occurs": "yes"
+        },
+        {
+          "row": "G",
+          "event": "HS",
+          "when": "whole_cover",
+          "does": "IF whole_cover: nothing sent; -> GC",
+          "occurs": "yes"
+        },
+        {
+          "row": "GC",
+          "event": "QU",
+          "when": "always",
+          "does": "nothing sent; -> GC",
+          "occurs": "yes"
+        },
+        {
+          "row": "GC",
+          "event": "QU",
+          "when": "always",
+          "does": "nothing sent; -> GC",
+          "occurs": "yes"
+        }
+      ],
+      "ends_in": "GC",
+      "sends": 0
+    },
+    "external-cancel-second-leg": {
+      "steps": [
+        {
+          "row": "G",
+          "event": "QU",
+          "when": "not count_complete",
+          "does": "IF not count_complete: nothing sent; -> G, count + 1",
+          "occurs": "yes"
+        },
+        {
+          "row": "G",
+          "event": "QU",
+          "when": "count_complete and leg_positive and formable",
+          "does": "IF count_complete and leg_positive and formable: SEND a leg; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "oSUB",
+          "when": "always",
+          "does": "nothing sent; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "oACC",
+          "when": "always",
+          "does": "nothing sent; -> WK",
+          "occurs": "yes"
+        },
+        {
+          "row": "WK",
+          "event": "QU",
+          "when": "reprice_due",
+          "does": "IF reprice_due: CANCEL ours; -> PCR",
+          "occurs": "yes"
+        },
+        {
+          "row": "PCR",
+          "event": "oCXL",
+          "when": "leg_positive and formable",
+          "does": "IF leg_positive and formable: SEND a leg; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "oACC",
+          "when": "always",
+          "does": "nothing sent; -> WK",
+          "occurs": "yes"
+        },
+        {
+          "row": "WK",
+          "event": "oCXL",
+          "when": "always",
+          "does": "ALERT; -> FZ",
+          "occurs": "yes"
+        },
+        {
+          "row": "FZ",
+          "event": "QU",
+          "when": "always",
+          "does": "nothing sent; -> FZ",
+          "occurs": "yes"
+        },
+        {
+          "row": "FZ",
+          "event": "NQ",
+          "when": "always",
+          "does": "nothing sent; -> FZ",
+          "occurs": "yes"
+        }
+      ],
+      "ends_in": "FZ",
+      "sends": 2
+    },
+    "local-echoes-through-two-legs": {
+      "steps": [
+        {
+          "row": "G",
+          "event": "QU",
+          "when": "not count_complete",
+          "does": "IF not count_complete: nothing sent; -> G, count + 1",
+          "occurs": "yes"
+        },
+        {
+          "row": "G",
+          "event": "QU",
+          "when": "count_complete and leg_positive and formable",
+          "does": "IF count_complete and leg_positive and formable: SEND a leg; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "oINI",
+          "when": "always",
+          "does": "nothing sent; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "oSUB",
+          "when": "always",
+          "does": "nothing sent; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "oACC",
+          "when": "always",
+          "does": "nothing sent; -> WK",
+          "occurs": "yes"
+        },
+        {
+          "row": "WK",
+          "event": "QU",
+          "when": "reprice_due",
+          "does": "IF reprice_due: CANCEL ours; -> PCR",
+          "occurs": "yes"
+        },
+        {
+          "row": "PCR",
+          "event": "oPCN",
+          "when": "always",
+          "does": "nothing sent; -> PCR",
+          "occurs": "yes"
+        },
+        {
+          "row": "PCR",
+          "event": "oCXL",
+          "when": "leg_positive and formable",
+          "does": "IF leg_positive and formable: SEND a leg; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "oINI",
+          "when": "always",
+          "does": "nothing sent; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "oSUB",
+          "when": "always",
+          "does": "nothing sent; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "oACC",
+          "when": "always",
+          "does": "nothing sent; -> WK",
+          "occurs": "yes"
+        }
+      ],
+      "ends_in": "WK",
+      "sends": 2
+    },
+    "unasked-pending-cancel": {
+      "steps": [
+        {
+          "row": "G",
+          "event": "QU",
+          "when": "not count_complete",
+          "does": "IF not count_complete: nothing sent; -> G, count + 1",
+          "occurs": "yes"
+        },
+        {
+          "row": "G",
+          "event": "QU",
+          "when": "count_complete and leg_positive and formable",
+          "does": "IF count_complete and leg_positive and formable: SEND a leg; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "oSUB",
+          "when": "always",
+          "does": "nothing sent; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "oACC",
+          "when": "always",
+          "does": "nothing sent; -> WK",
+          "occurs": "yes"
+        },
+        {
+          "row": "WK",
+          "event": "oPCN",
+          "when": "always",
+          "does": "ALERT; -> FZW",
+          "occurs": "unexpected"
+        },
+        {
+          "row": "FZW",
+          "event": "QU",
+          "when": "always",
+          "does": "nothing sent; -> FZW",
+          "occurs": "yes"
+        },
+        {
+          "row": "FZW",
+          "event": "NQ",
+          "when": "always",
+          "does": "nothing sent; -> FZW",
+          "occurs": "yes"
+        }
+      ],
+      "ends_in": "FZW",
+      "sends": 1
+    }
+  },
+  "histories_walked": {
+    "cover-lifts-recount": {
+      "steps": [
+        {
+          "row": "G",
+          "event": "QU",
+          "when": "not count_complete",
+          "does": "IF not count_complete: nothing sent; -> G, count + 1",
+          "occurs": "yes"
+        },
+        {
+          "row": "G",
+          "event": "CP",
+          "when": "whole_cover",
+          "does": "IF whole_cover: nothing sent; -> GC",
+          "occurs": "yes"
+        },
+        {
+          "row": "GC",
+          "event": "QU",
+          "when": "always",
+          "does": "nothing sent; -> GC",
+          "occurs": "yes"
+        },
+        {
+          "row": "GC",
+          "event": "CL",
+          "when": "not whole_cover",
+          "does": "IF not whole_cover: nothing sent; -> G, count 0",
+          "occurs": "yes"
+        },
+        {
+          "row": "G",
+          "event": "QU",
+          "when": "not count_complete",
+          "does": "IF not count_complete: nothing sent; -> G, count + 1",
+          "occurs": "yes"
+        }
+      ],
+      "ends_in": "G",
+      "sends": 0
+    },
+    "foreign-cover-cancel-recount": {
+      "steps": [
+        {
+          "row": "G",
+          "event": "QU",
+          "when": "not count_complete",
+          "does": "IF not count_complete: nothing sent; -> G, count + 1",
+          "occurs": "yes"
+        },
+        {
+          "row": "G",
+          "event": "QU",
+          "when": "count_complete and leg_positive and formable",
+          "does": "IF count_complete and leg_positive and formable: SEND a leg; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "oSUB",
+          "when": "always",
+          "does": "nothing sent; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "oACC",
+          "when": "always",
+          "does": "nothing sent; -> WK",
+          "occurs": "yes"
+        },
+        {
+          "row": "WK",
+          "event": "CP",
+          "when": "always",
+          "does": "nothing sent; -> WK",
+          "occurs": "yes"
+        },
+        {
+          "row": "WK",
+          "event": "MO",
+          "when": "always",
+          "does": "CANCEL ours; -> PCO",
+          "occurs": "yes"
+        },
+        {
+          "row": "PCO",
+          "event": "oCXL",
+          "when": "whole_cover",
+          "does": "IF whole_cover: nothing sent; -> GC",
+          "occurs": "yes"
+        },
+        {
+          "row": "GC",
+          "event": "CL",
+          "when": "not whole_cover",
+          "does": "IF not whole_cover: nothing sent; -> G, count 0",
+          "occurs": "yes"
+        },
+        {
+          "row": "G",
+          "event": "NQ",
+          "when": "always",
+          "does": "nothing sent; -> G, count unchanged",
+          "occurs": "yes"
+        },
+        {
+          "row": "G",
+          "event": "QU",
+          "when": "not count_complete",
+          "does": "IF not count_complete: nothing sent; -> G, count + 1",
+          "occurs": "yes"
+        }
+      ],
+      "ends_in": "G",
+      "sends": 1
+    },
+    "refused-cancel-expiry-recount": {
+      "steps": [
+        {
+          "row": "G",
+          "event": "QU",
+          "when": "not count_complete",
+          "does": "IF not count_complete: nothing sent; -> G, count + 1",
+          "occurs": "yes"
+        },
+        {
+          "row": "G",
+          "event": "QU",
+          "when": "count_complete and leg_positive and formable",
+          "does": "IF count_complete and leg_positive and formable: SEND a leg; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "oSUB",
+          "when": "always",
+          "does": "nothing sent; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "oACC",
+          "when": "always",
+          "does": "nothing sent; -> WK",
+          "occurs": "yes"
+        },
+        {
+          "row": "WK",
+          "event": "QU",
+          "when": "reprice_due",
+          "does": "IF reprice_due: CANCEL ours; -> PCR",
+          "occurs": "yes"
+        },
+        {
+          "row": "PCR",
+          "event": "oCRJ",
+          "when": "not filled_part",
+          "does": "IF not filled_part: ALERT; -> WK",
+          "occurs": "yes"
+        },
+        {
+          "row": "WK",
+          "event": "oEXP",
+          "when": "not whole_cover",
+          "does": "IF not whole_cover: nothing sent; -> G, count 0",
+          "occurs": "yes"
+        },
+        {
+          "row": "G",
+          "event": "NQ",
+          "when": "always",
+          "does": "nothing sent; -> G, count unchanged",
+          "occurs": "yes"
+        },
+        {
+          "row": "G",
+          "event": "QU",
+          "when": "not count_complete",
+          "does": "IF not count_complete: nothing sent; -> G, count + 1",
+          "occurs": "yes"
+        }
+      ],
+      "ends_in": "G",
+      "sends": 1
+    },
+    "earlier-fill-ends-holding": {
+      "steps": [
+        {
+          "row": "G",
+          "event": "QU",
+          "when": "not count_complete",
+          "does": "IF not count_complete: nothing sent; -> G, count + 1",
+          "occurs": "yes"
+        },
+        {
+          "row": "G",
+          "event": "QU",
+          "when": "count_complete and leg_positive and formable",
+          "does": "IF count_complete and leg_positive and formable: SEND a leg; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "oSUB",
+          "when": "always",
+          "does": "nothing sent; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "oACC",
+          "when": "always",
+          "does": "nothing sent; -> WK",
+          "occurs": "yes"
+        },
+        {
+          "row": "WK",
+          "event": "QU",
+          "when": "reprice_due",
+          "does": "IF reprice_due: CANCEL ours; -> PCR",
+          "occurs": "yes"
+        },
+        {
+          "row": "PCR",
+          "event": "oCXL",
+          "when": "leg_positive and formable",
+          "does": "IF leg_positive and formable: SEND a leg; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "oSUB",
+          "when": "always",
+          "does": "nothing sent; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "oACC",
+          "when": "always",
+          "does": "nothing sent; -> WK",
+          "occurs": "yes"
+        },
+        {
+          "row": "WK",
+          "event": "HE",
+          "when": "always",
+          "does": "nothing sent; -> OX",
+          "occurs": "yes"
+        },
+        {
+          "row": "OX",
+          "event": "MO",
+          "when": "always",
+          "does": "CANCEL ours; -> PCX",
+          "occurs": "yes"
+        },
+        {
+          "row": "PCX",
+          "event": "oCXL",
+          "when": "always",
+          "does": "nothing sent; -> X",
+          "occurs": "yes"
+        }
+      ],
+      "ends_in": "X",
+      "sends": 2
+    },
+    "growth-partial-full-recount": {
+      "steps": [
+        {
+          "row": "G",
+          "event": "QU",
+          "when": "not count_complete",
+          "does": "IF not count_complete: nothing sent; -> G, count + 1",
+          "occurs": "yes"
+        },
+        {
+          "row": "G",
+          "event": "QU",
+          "when": "count_complete and leg_positive and formable",
+          "does": "IF count_complete and leg_positive and formable: SEND a leg; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "oSUB",
+          "when": "always",
+          "does": "nothing sent; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "oACC",
+          "when": "always",
+          "does": "nothing sent; -> WK",
+          "occurs": "yes"
+        },
+        {
+          "row": "WK",
+          "event": "HG",
+          "when": "always",
+          "does": "nothing sent; -> WK",
+          "occurs": "yes"
+        },
+        {
+          "row": "WK",
+          "event": "oPF",
+          "when": "always",
+          "does": "nothing sent; -> PF",
+          "occurs": "yes"
+        },
+        {
+          "row": "PF",
+          "event": "oFF",
+          "when": "long_remains and not whole_cover",
+          "does": "IF long_remains and not whole_cover: nothing sent; -> G, count 0",
+          "occurs": "yes"
+        },
+        {
+          "row": "G",
+          "event": "QU",
+          "when": "not count_complete",
+          "does": "IF not count_complete: nothing sent; -> G, count + 1",
+          "occurs": "yes"
+        }
+      ],
+      "ends_in": "G",
+      "sends": 1
+    },
+    "external-cancel-first-leg": {
+      "steps": [
+        {
+          "row": "G",
+          "event": "QU",
+          "when": "not count_complete",
+          "does": "IF not count_complete: nothing sent; -> G, count + 1",
+          "occurs": "yes"
+        },
+        {
+          "row": "G",
+          "event": "QU",
+          "when": "count_complete and leg_positive and formable",
+          "does": "IF count_complete and leg_positive and formable: SEND a leg; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "oSUB",
+          "when": "always",
+          "does": "nothing sent; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "oACC",
+          "when": "always",
+          "does": "nothing sent; -> WK",
+          "occurs": "yes"
+        },
+        {
+          "row": "WK",
+          "event": "oCXL",
+          "when": "always",
+          "does": "ALERT; -> FZ",
+          "occurs": "yes"
+        },
+        {
+          "row": "FZ",
+          "event": "QU",
+          "when": "always",
+          "does": "nothing sent; -> FZ",
+          "occurs": "yes"
+        },
+        {
+          "row": "FZ",
+          "event": "NQ",
+          "when": "always",
+          "does": "nothing sent; -> FZ",
+          "occurs": "yes"
+        }
+      ],
+      "ends_in": "FZ",
+      "sends": 1
+    },
+    "expiry-new-count-new-episode": {
+      "steps": [
+        {
+          "row": "G",
+          "event": "QU",
+          "when": "not count_complete",
+          "does": "IF not count_complete: nothing sent; -> G, count + 1",
+          "occurs": "yes"
+        },
+        {
+          "row": "G",
+          "event": "QU",
+          "when": "count_complete and leg_positive and formable",
+          "does": "IF count_complete and leg_positive and formable: SEND a leg; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "oSUB",
+          "when": "always",
+          "does": "nothing sent; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "oACC",
+          "when": "always",
+          "does": "nothing sent; -> WK",
+          "occurs": "yes"
+        },
+        {
+          "row": "WK",
+          "event": "oEXP",
+          "when": "not whole_cover",
+          "does": "IF not whole_cover: nothing sent; -> G, count 0",
+          "occurs": "yes"
+        },
+        {
+          "row": "G",
+          "event": "NQ",
+          "when": "always",
+          "does": "nothing sent; -> G, count unchanged",
+          "occurs": "yes"
+        },
+        {
+          "row": "G",
+          "event": "QU",
+          "when": "not count_complete",
+          "does": "IF not count_complete: nothing sent; -> G, count + 1",
+          "occurs": "yes"
+        },
+        {
+          "row": "G",
+          "event": "QU",
+          "when": "count_complete and leg_positive and formable",
+          "does": "IF count_complete and leg_positive and formable: SEND a leg; -> FL",
+          "occurs": "yes"
+        }
+      ],
+      "ends_in": "FL",
+      "sends": 2
+    },
+    "partial-reprice-complete": {
+      "steps": [
+        {
+          "row": "G",
+          "event": "QU",
+          "when": "not count_complete",
+          "does": "IF not count_complete: nothing sent; -> G, count + 1",
+          "occurs": "yes"
+        },
+        {
+          "row": "G",
+          "event": "QU",
+          "when": "count_complete and leg_positive and formable",
+          "does": "IF count_complete and leg_positive and formable: SEND a leg; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "oSUB",
+          "when": "always",
+          "does": "nothing sent; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "oACC",
+          "when": "always",
+          "does": "nothing sent; -> WK",
+          "occurs": "yes"
+        },
+        {
+          "row": "WK",
+          "event": "oPF",
+          "when": "always",
+          "does": "nothing sent; -> PF",
+          "occurs": "yes"
+        },
+        {
+          "row": "PF",
+          "event": "QU",
+          "when": "reprice_due",
+          "does": "IF reprice_due: CANCEL ours; -> PCR",
+          "occurs": "yes"
+        },
+        {
+          "row": "PCR",
+          "event": "oCXL",
+          "when": "leg_positive and formable",
+          "does": "IF leg_positive and formable: SEND a leg; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "oSUB",
+          "when": "always",
+          "does": "nothing sent; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "oACC",
+          "when": "always",
+          "does": "nothing sent; -> WK",
+          "occurs": "yes"
+        },
+        {
+          "row": "WK",
+          "event": "oFF",
+          "when": "not long_remains",
+          "does": "IF not long_remains: nothing sent; -> X",
+          "occurs": "yes"
+        }
+      ],
+      "ends_in": "X",
+      "sends": 2
+    },
+    "cancel-crosses-complete-fill": {
+      "steps": [
+        {
+          "row": "G",
+          "event": "QU",
+          "when": "not count_complete",
+          "does": "IF not count_complete: nothing sent; -> G, count + 1",
+          "occurs": "yes"
+        },
+        {
+          "row": "G",
+          "event": "QU",
+          "when": "count_complete and leg_positive and formable",
+          "does": "IF count_complete and leg_positive and formable: SEND a leg; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "oSUB",
+          "when": "always",
+          "does": "nothing sent; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "oACC",
+          "when": "always",
+          "does": "nothing sent; -> WK",
+          "occurs": "yes"
+        },
+        {
+          "row": "WK",
+          "event": "QU",
+          "when": "reprice_due",
+          "does": "IF reprice_due: CANCEL ours; -> PCR",
+          "occurs": "yes"
+        },
+        {
+          "row": "PCR",
+          "event": "oFF",
+          "when": "not long_remains",
+          "does": "IF not long_remains: nothing sent; -> X",
+          "occurs": "yes"
+        }
+      ],
+      "ends_in": "X",
+      "sends": 1
+    },
+    "second-leg-rejected": {
+      "steps": [
+        {
+          "row": "G",
+          "event": "QU",
+          "when": "not count_complete",
+          "does": "IF not count_complete: nothing sent; -> G, count + 1",
+          "occurs": "yes"
+        },
+        {
+          "row": "G",
+          "event": "QU",
+          "when": "count_complete and leg_positive and formable",
+          "does": "IF count_complete and leg_positive and formable: SEND a leg; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "oSUB",
+          "when": "always",
+          "does": "nothing sent; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "oACC",
+          "when": "always",
+          "does": "nothing sent; -> WK",
+          "occurs": "yes"
+        },
+        {
+          "row": "WK",
+          "event": "QU",
+          "when": "reprice_due",
+          "does": "IF reprice_due: CANCEL ours; -> PCR",
+          "occurs": "yes"
+        },
+        {
+          "row": "PCR",
+          "event": "oCXL",
+          "when": "leg_positive and formable",
+          "does": "IF leg_positive and formable: SEND a leg; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "oSUB",
+          "when": "always",
+          "does": "nothing sent; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "oREJ",
+          "when": "always",
+          "does": "ALERT; -> FZ",
+          "occurs": "yes"
+        },
+        {
+          "row": "FZ",
+          "event": "NQ",
+          "when": "always",
+          "does": "nothing sent; -> FZ",
+          "occurs": "yes"
+        }
+      ],
+      "ends_in": "FZ",
+      "sends": 2
+    }
+  }
+}

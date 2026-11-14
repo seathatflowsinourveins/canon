@@ -1,0 +1,486 @@
+"""Cases generated from sale_table.json, the pinned plain-limit sale contract.
+
+Cell/branch expectations and histories are data, not a second transition table.
+All writes (the relocated-package check) use pytest's temporary directory.
+"""
+
+import ast
+import hashlib
+import importlib.util
+import itertools
+import json
+import sys
+from copy import deepcopy
+from pathlib import Path
+
+import pytest
+from nautilus_trader import model
+
+from canon_trading import sale_table as sale
+
+DATA_PATH = Path(__file__).resolve().parents[1] / "src/canon_trading/sale_table.json"
+DATA = json.loads(DATA_PATH.read_text())
+HISTORIES = json.loads(Path(__file__).with_name("sale_table_histories.json").read_text())
+CELLS_HASH = "37c87d8ab087b05a84d67ea18e118ca4b15a8c449f360d7b3bdd697f431653b6"
+CELLS = [(r, e, c) for r, row in DATA["cells"].items() for e, c in row.items()]
+BRANCHES = [(r, e, b) for r, e, c in CELLS for b in c["branches"]]
+
+
+def names(when):
+    return set(when.split()) - {"always", "and", "not"}
+
+
+def holds(when, facts):
+    if when == "always":
+        return True
+    return all(
+        facts[term.removeprefix("not ")] == (not term.startswith("not "))
+        for term in when.split(" and ")
+    )
+
+
+def assignments(cell):
+    predicates = sorted(set().union(*(names(b["when"]) for b in cell["branches"])))
+    return [
+        dict(zip(predicates, values))
+        for values in itertools.product((False, True), repeat=len(predicates))
+    ]
+
+
+def inputs(row, facts):
+    count = int(facts.get("count_complete", True)) if row == "G" else None
+    return sale.State(row, count), {k: v for k, v in facts.items() if k != "count_complete"}
+
+
+def expected_count(state, branch):
+    if branch["next"] != "G":
+        return None
+    match branch.get("count", "="):
+        case "0":
+            return 0
+        case "+1":
+            return state.count + 1
+        case "=":
+            return state.count
+    raise AssertionError(branch)
+
+
+@pytest.mark.parametrize(
+    "row,event,branch", BRANCHES, ids=[f"{r}-{e}-{b['when']}" for r, e, b in BRANCHES]
+)
+def test_each_generated_branch(row, event, branch):
+    cell = DATA["cells"][row][event]
+    facts = next(f for f in assignments(cell) if holds(branch["when"], f))
+    state, supplied = inputs(row, facts)
+    result = sale.transition(state, 2, event, supplied)
+    assert result.state == sale.State(branch["next"], expected_count(state, branch))
+    assert result.actions == tuple(
+        action
+        for key, action in (
+            ("send", sale.Action.SEND),
+            ("cancel", sale.Action.CANCEL),
+            ("alert", sale.Action.ALERT),
+        )
+        if branch[key]
+    )
+    assert result.when == branch["when"]
+
+
+@pytest.mark.parametrize("row,event,cell", CELLS, ids=[f"{r}-{e}" for r, e, _ in CELLS])
+def test_every_assignment_selects_exactly_one_branch(row, event, cell):
+    for facts in assignments(cell):
+        matches = [b for b in cell["branches"] if holds(b["when"], facts)]
+        assert len(matches) == 1, (row, event, facts, matches)
+        state, supplied = inputs(row, facts)
+        assert sale.transition(state, 2, event, supplied).when == matches[0]["when"]
+
+
+def test_tracked_table_has_exact_contract_and_cells():
+    assert set(DATA) == {
+        "pin",
+        "pin_paths",
+        "applies",
+        "rows",
+        "events",
+        "predicates",
+        "step_order",
+        "order_event_inventory",
+        "properties_for_step_d",
+        "sending_transitions",
+        "cells",
+    }
+    encoded = json.dumps(DATA["cells"], sort_keys=True, separators=(",", ":")).encode()
+    assert hashlib.sha256(encoded).hexdigest() == CELLS_HASH
+    assert len(DATA["rows"]) == 16
+    assert len(DATA["events"]) == 26
+    assert len(CELLS) == 416
+    assert set(sale.TABLE.rows) == set(DATA["rows"])
+    assert set(sale.TABLE.events) == set(DATA["events"])
+
+
+def test_module_header_names_current_cells():
+    assert sale.__doc__ is not None and CELLS_HASH in sale.__doc__
+
+
+def test_quantity_and_cover_properties_are_in_the_contract():
+    assert {"no_leg_of_size_zero", "nothing_for_a_whole_cover"} <= set(
+        DATA["properties_for_step_d"]
+    )
+
+
+def test_first_send_branches_use_the_modules_count():
+    cell = DATA["cells"]["G"]["QU"]
+    # The frozen JSON has five branches over four predicates, including whole_cover.
+    assert len(cell["branches"]) == 5
+    assert set().union(*(names(b["when"]) for b in cell["branches"])) == {
+        "count_complete",
+        "leg_positive",
+        "formable",
+        "whole_cover",
+    }
+    for n in (2, 3):
+        for count in range(n):
+            for facts in assignments(cell):
+                facts["count_complete"] = count == n - 1
+                branch = next(b for b in cell["branches"] if holds(b["when"], facts))
+                supplied = {k: v for k, v in facts.items() if k != "count_complete"}
+                result = sale.transition(sale.State("G", count), n, "QU", supplied)
+                assert result.when == branch["when"]
+                assert result.state == sale.State(
+                    branch["next"], expected_count(sale.State("G", count), branch)
+                )
+                if count == n - 1 and not supplied["leg_positive"]:
+                    assert result.actions == ()
+                    assert result.state.row == ("GC" if supplied["whole_cover"] else "G")
+
+
+@pytest.mark.parametrize("row", ["G", "GC"])
+@pytest.mark.parametrize("event", ["HS", "HG", "CP", "CL", "oLF"])
+def test_size_and_cover_events_reread_cover(row, event):
+    branches = DATA["cells"][row][event]["branches"]
+    nexts = {b["next"]: b["when"].split(" and ") for b in branches}
+    assert "whole_cover" in nexts.get("GC", ())
+    assert "not whole_cover" in nexts.get("G", ())
+
+
+@pytest.mark.parametrize("event", ["oACC", "oPF", "MO"])
+def test_stopped_open_sale_asks_the_owed_cancel(event):
+    result = sale.transition(sale.State("TW"), 2, event, {})
+    assert result.state == sale.State("PCT")
+    assert result.actions == (sale.Action.CANCEL,)
+
+
+def test_data_loads_beside_relocated_module(tmp_path, monkeypatch):
+    """The existing uv_build backend includes all files under the package root."""
+    source = Path(sale.__file__)
+    target = tmp_path / "sale_table.py"
+    target.write_bytes(source.read_bytes())
+    target.with_suffix(".json").write_bytes(DATA_PATH.read_bytes())
+    spec = importlib.util.spec_from_file_location("relocated_sale_table", target)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, spec.name, module)
+    spec.loader.exec_module(module)
+    assert module.transition(module.State("G", 0), 2, "NQ", {}).state.count == 0
+
+
+def test_module_imports_only_pure_standard_library_dependencies():
+    tree = ast.parse(Path(sale.__file__).read_text())
+    allowed = {
+        "__future__",
+        "collections",
+        "dataclasses",
+        "enum",
+        "json",
+        "pathlib",
+        "types",
+        "typing",
+    }
+    imports = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imports.update(alias.name.split(".")[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            assert node.level == 0
+            imports.add((node.module or "").split(".")[0])
+    assert imports <= allowed
+    assert not any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id in {"eval", "exec", "__import__"}
+        for node in ast.walk(tree)
+    )
+
+
+def test_transition_and_step_do_not_read_resources(monkeypatch):
+    def refused(*args, **kwargs):
+        raise AssertionError("transition read a resource")
+
+    monkeypatch.setattr(Path, "read_text", refused)
+    facts = {"formable": True, "leg_positive": True, "whole_cover": False}
+    state = sale.State("G", 0)
+    events = (sale.Event("QU", facts), sale.Event("oOTH", {}))
+    before = deepcopy(facts)
+    assert sale.apply_step(state, 2, events) == sale.apply_step(state, 2, events)
+    assert facts == before
+
+
+def test_exactly_two_sending_transitions_into_flight():
+    actual = [{"row": r, "event": e, "when": b["when"]} for r, e, b in BRANCHES if b["send"]]
+    assert actual == DATA["sending_transitions"]
+    assert [(s["row"], s["event"]) for s in actual] == [("G", "QU"), ("PCR", "oCXL")]
+    assert all(b["next"] == "FL" for _, _, b in BRANCHES if b["send"])
+    assert all("leg_positive" in b["when"].split(" and ") for _, _, b in BRANCHES if b["send"])
+
+
+@pytest.mark.parametrize("row", DATA["rows"])
+def test_timer_event_changes_nothing(row):
+    state = sale.State(row, 1 if row == "G" else None)
+    result = sale.apply_step(state, 2, [sale.Event("NQ", {})])
+    assert result.state == state
+    assert result.actions == ()
+    assert all(
+        b["next"] == row and not (b["send"] or b["cancel"])
+        for b in DATA["cells"][row]["NQ"]["branches"]
+    )
+
+
+def test_open_sale_entered_only_by_first_send():
+    for row, event, branch in BRANCHES:
+        if DATA["rows"][row]["phase"] == "none" and DATA["rows"][branch["next"]]["phase"] != "none":
+            assert (row, event, branch["next"], branch["send"]) == ("G", "QU", "FL", True)
+
+
+def test_reprice_cancel_entry_only_under_level():
+    for row, event, branch in BRANCHES:
+        if row != "PCR" and branch["next"] == "PCR":
+            assert row in {"WK", "PF"}
+            assert event == "QU" and branch["cancel"] and not branch["send"]
+
+
+def test_count_reentry_is_zero_and_cancel_has_no_send():
+    for row, _, branch in BRANCHES:
+        if row != "G" and branch["next"] == "G":
+            assert branch["count"] == "0"
+        if branch["cancel"]:
+            assert row in {"WK", "PF", "OX", "FZW", "TW"}
+            assert DATA["rows"][branch["next"]]["phase"] == "pc"
+            assert not branch["send"]
+
+
+def test_every_row_reachable_from_counting():
+    reached = {"G"}
+    while True:
+        next_rows = reached | {b["next"] for r, _, b in BRANCHES if r in reached}
+        if reached == next_rows:
+            break
+        reached = next_rows
+    assert reached == set(DATA["rows"])
+
+
+@pytest.mark.parametrize("invalidation", ["ST", "HE", "HS", "CP", "FRZ"])
+@pytest.mark.parametrize("row,trigger", [("G", "QU"), ("PCR", "oCXL")])
+def test_invalidation_precedes_send_trigger(invalidation, row, trigger):
+    facts = {name: True for name in DATA["predicates"] if name != "count_complete"}
+    facts["whole_cover"] = False
+    result = sale.apply_step(
+        sale.State(row, 1 if row == "G" else None),
+        2,
+        [sale.Event(trigger, facts), sale.Event(invalidation, facts)],
+    )
+    assert sale.Action.SEND not in result.actions
+    assert result.events == (invalidation, trigger)
+
+
+def test_step_order_preserves_order_event_arrivals():
+    codes = ["QU", "oPF", "CL", "MO", "FRZ", "oCXL", "HG", "CP", "ST", "HS", "HE"]
+    events = [sale.Event(code, {}) for code in codes]
+    assert tuple(e.code for e in sale.order_step(events)) == (
+        "ST",
+        "HE",
+        "HS",
+        "HG",
+        "CP",
+        "CL",
+        "FRZ",
+        "oPF",
+        "oCXL",
+        "MO",
+        "QU",
+    )
+
+
+@pytest.mark.parametrize(
+    "row,event,cell",
+    [(r, e, c) for r, e, c in CELLS if c["occurs"] in {"no", "n/a"}],
+    ids=lambda x: str(x) if isinstance(x, str) else x["occurs"],
+)
+def test_impossible_or_not_emitted_event_is_named_and_inert(row, event, cell):
+    state = sale.State(row, 1 if row == "G" else None)
+    result = sale.transition(state, 2, event, {})
+    assert result.state == state and result.actions == ()
+    assert result.named and row in result.named and event in result.named
+
+
+@pytest.mark.parametrize(
+    "group,name,history",
+    [(g, n, h) for g, histories in HISTORIES.items() for n, h in histories.items()],
+    ids=[f"{g}-{n}" for g, histories in HISTORIES.items() for n in histories],
+)
+def test_recorded_history(group, name, history):
+    state = sale.State("G", 0)
+    sends = 0
+    for step in history["steps"]:
+        assert state.row == step["row"], (group, name, step)
+        candidates = assignments(DATA["cells"][state.row][step["event"]])
+        facts = next(f for f in candidates if holds(step["when"], f))
+        supplied = {k: v for k, v in facts.items() if k != "count_complete"}
+        result = sale.transition(state, 2, step["event"], supplied)
+        assert result.when == step["when"]
+        sends += result.actions.count(sale.Action.SEND)
+        state = result.state
+    assert (state.row, sends) == (history["ends_in"], history["sends"])
+
+
+def test_all_histories_are_present_with_public_names():
+    assert len(HISTORIES["named_paths"]) == 17
+    assert len(HISTORIES["histories_walked"]) == 10
+    for group in HISTORIES.values():
+        for name in group:
+            assert name == name.lower() and all(c.islower() or c == "-" for c in name)
+            assert "reader" not in name
+
+
+def test_missing_fact_and_caller_supplied_count_are_named():
+    with pytest.raises(sale.MissingPredicate, match="formable"):
+        sale.transition(sale.State("G", 0), 2, "QU", {})
+    with pytest.raises(sale.InvalidFacts, match="count_complete"):
+        sale.transition(sale.State("G", 0), 2, "QU", {"count_complete": True, "formable": True})
+    with pytest.raises(sale.InvalidFacts, match="formable"):
+        sale.transition(sale.State("G", 0), 2, "QU", json.loads('{"formable": 1}'))
+    with pytest.raises(sale.InvalidFacts, match="unknown_fact"):
+        sale.transition(sale.State("G", 0), 2, "NQ", {"unknown_fact": True})
+
+
+@pytest.mark.parametrize(
+    "row,event,error", [("unknown", "NQ", sale.UnknownRow), ("G", "unknown", sale.UnknownEvent)]
+)
+def test_unknown_row_or_event_raises(row, event, error):
+    with pytest.raises(error, match="unknown"):
+        sale.transition(sale.State(row, 0), 2, event, {})
+
+
+@pytest.mark.parametrize(
+    "state,n",
+    [
+        (sale.State("G", -1), 2),
+        (sale.State("G", 2), 2),
+        (sale.State("G", None), 2),
+        (sale.State("GC", 0), 2),
+        (sale.State("G", 0), 1),
+        (sale.State("G", True), 2),
+    ],
+)
+def test_invalid_count_state_is_refused(state, n):
+    with pytest.raises(sale.InvalidState):
+        sale.transition(state, n, "NQ", {})
+
+
+@pytest.mark.parametrize(
+    "mode,error", [("none", sale.NoMatchingBranch), ("two", sale.AmbiguousBranch)]
+)
+def test_missing_or_overlapping_branch_raises_by_name(mode, error):
+    data = deepcopy(DATA)
+    branch = data["cells"]["G"]["QU"]["branches"][0]
+    data["cells"]["G"]["QU"]["branches"] = [branch] if mode == "none" else [branch, branch]
+    with pytest.raises(error, match="G.*QU"):
+        sale.transition(
+            sale.State("G", 1 if mode == "none" else 0),
+            2,
+            "QU",
+            {"formable": True, "leg_positive": True, "whole_cover": False},
+            table=sale.table_from_data(data),
+        )
+
+
+def test_step_rejects_two_quotes_or_unknown_event():
+    with pytest.raises(sale.InvalidFacts, match="quote"):
+        sale.order_step([sale.Event("QU", {}), sale.Event("NQ", {})])
+    with pytest.raises(sale.UnknownEvent, match="unknown"):
+        sale.order_step([sale.Event("unknown", {})])
+
+
+def test_order_inventory_is_complete_and_reaches_every_order_column():
+    kinds = DATA["order_event_inventory"]["kinds"]
+    assert len(kinds) == 17
+    reached = set()
+    for spec in kinds.values():
+        reached.update(spec["columns"])
+        if spec["treatment"] == "own column":
+            assert len(spec["columns"]) == 1 and spec["columns"] != ["oOTH"]
+        elif spec["treatment"] == "cannot occur":
+            assert spec["reason"] and spec["columns"] == ["oOTH"]
+        else:
+            assert spec["treatment"] == "folded into named columns"
+            assert spec["reason"]
+    assert reached == {e for e, spec in DATA["events"].items() if spec["kind"] == "order"}
+
+
+def test_inventory_matches_installed_pins_order_event_classes():
+    # The pin exports all event classes at model's Python surface (python/model
+    # __init__.py:22; crates/model/src/python/mod.rs:315-332). Events carry
+    # event_id; OrderSnapshot and OrderStatusReport are not order events.
+    offered = {
+        name.removeprefix("Order")
+        for name in dir(model)
+        if name.startswith("Order")
+        and isinstance(getattr(model, name), type)
+        and hasattr(getattr(model, name), "event_id")
+    }
+    assert offered == set(DATA["order_event_inventory"]["kinds"])
+
+
+@pytest.mark.parametrize("ended,remainder", list(itertools.product((False, True), repeat=2)))
+def test_event_mapping_comes_only_from_inventory(ended, remainder):
+    for kind, spec in DATA["order_event_inventory"]["kinds"].items():
+        columns = spec["columns"]
+        expected = (
+            columns[0] if len(columns) == 1 else columns[0 if ended else 1 if remainder else 2]
+        )
+        assert (
+            sale.order_event_column("Order" + kind, leg_ended=ended, leaves_remainder=remainder)
+            == expected
+        )
+    assert sale.order_event_column("OrderNotInThisPin") == "oOTH"
+    changed = deepcopy(DATA)
+    changed["order_event_inventory"]["kinds"]["Accepted"]["columns"] = ["oSUB"]
+    assert sale.order_event_column("OrderAccepted", table=sale.table_from_data(changed)) == "oSUB"
+
+
+@pytest.mark.parametrize("row", DATA["rows"])
+@pytest.mark.parametrize("echo", ["oINI", "oPCN"])
+def test_every_echo_cell(row, echo):
+    state = sale.State(row, 1 if row == "G" else None)
+    result = sale.transition(state, 2, echo, {})
+    inert = row == "FL" if echo == "oINI" else DATA["rows"][row]["phase"] == "pc"
+    if inert:
+        assert result.state == state and result.actions == () and result.named is None
+    else:
+        other = sale.transition(state, 2, "oOTH", {})
+        assert result.state == other.state and result.actions == other.actions
+        assert bool(result.named) == bool(other.named)
+
+
+@pytest.mark.parametrize(
+    "row,event,branch", [(r, e, b) for r, e, b in BRANCHES if b["send"] or b["cancel"]]
+)
+def test_action_echo_requires_the_destination_row(row, event, branch):
+    cell = DATA["cells"][row][event]
+    facts = next(f for f in assignments(cell) if holds(branch["when"], f))
+    state, supplied = inputs(row, facts)
+    result = sale.transition(state, 2, event, supplied)
+    echo = "oINI" if branch["send"] else "oPCN"
+    during = sale.transition(result.state, 2, echo, {})
+    assert during.state == result.state and during.actions == () and during.named is None
+    premature = sale.transition(state, 2, echo, {})
+    assert premature.named is not None
