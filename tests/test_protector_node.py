@@ -1184,7 +1184,7 @@ def test_this_trees_protector_reads_the_book():
     assert subject()._protector_takes_book() is True
 
 
-@pytest.mark.parametrize("text", [None, "not json", '{"schema": 3, "entries": []}'])
+@pytest.mark.parametrize("text", [None, "not json", '{"schema": 4, "entries": []}'])
 def test_an_unreadable_book_refuses_the_start_by_name(controls, tmp_path, monkeypatch, text):
     module, settings, _strategy, _foreign, _reads, built = booked(monkeypatch, controls)
     book = tmp_path / "owner-levels.json"
@@ -1486,9 +1486,17 @@ def test_two_builder_segments_carry_the_level_distance_and_offset(controls, tmp_
         for kind, params in requests
         if kind == "quotes"
     )
+    # DeepSeek P2-2: segment 1 reads the found holding's fills (clock, both sides, position);
+    # segment 2's same-holding verdict reads both sides and carries that reading on.
     assert [query["side"] for path, query in venue.reads if path == "/orders" and query] == [
         "sell",
         "buy",
+        "sell",
+        "buy",
+    ]
+    assert [path for path, _query in venue.reads if path in ("/clock", "/positions/AAA")] == [
+        "/clock",
+        "/positions/AAA",
     ]
 
 

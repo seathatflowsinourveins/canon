@@ -17,7 +17,7 @@ Read at NautilusTrader d53849b216e2, v2.0.0rc8:
   `canon-protect-`), never one of our nodes' (the lead's ruling, 2026-11-13, 16:04:49).
 * crates/live/src/python/node.rs:1326-1370: add_strategy registers the constructed strategy and
   its config. The level-book keywords implement OwnerProtectorConfig's composed U-e contract;
-  start_level.book_path names its account file and start_level.SCHEMA names its written format.
+  start_level.book_path names its account file and start_level.SCHEMAS_READ the formats both readers accept.
 
 owner_execution_config enables the adapter's reduce_only_sells and external reports; execution.py
 checks the reduce-only side/type at :2542-2553 and writes SELL_TO_CLOSE at :2594-2595. The emulator
@@ -67,7 +67,7 @@ from .owner_protector import OwnerProtector
 from .owner_protector import OwnerProtectorConfig
 from .owner_protector import owner_execution_config
 from .protect import ROWS
-from .start_level import SCHEMA
+from .start_level import SCHEMAS_READ
 from .start_level import book_path
 
 if TYPE_CHECKING:
@@ -270,8 +270,8 @@ start_level.book_path()'s file. Read only once both locks are held (the lead's r
 def _book_levels(path: Path, account: str) -> dict[InstrumentId, Price]:
     """Check the runner's supplied book and count this account's priced rows under the locks.
 
-    Accept both formats read by start_level.LevelBook: legacy schema 1 and the composed writer's
-    SCHEMA. A missing or unreadable runner-supplied book refuses the start; a malformed level is
+    Accept every format start_level.LevelBook reads (start_level.SCHEMAS_READ, one tuple for both
+    readers). A missing or unreadable runner-supplied book refuses the start; a malformed level is
     skipped by name. This summary selects no carried holding: OwnerProtector reads the whole book
     through LevelBook.read and decides identity through its venue reader.
     """
@@ -280,10 +280,12 @@ def _book_levels(path: Path, account: str) -> dict[InstrumentId, Price]:
         entries = data["entries"] if isinstance(data, dict) else None
         if (
             type(data.get("schema")) is not int
-            or data["schema"] not in (1, SCHEMA)
+            or data["schema"] not in SCHEMAS_READ
             or not isinstance(entries, list)
         ):
-            raise ValueError(f"expected schema 1 or {SCHEMA} and an entries array")
+            raise ValueError(
+                f"expected schema {', '.join(map(str, SCHEMAS_READ))} and an entries array"
+            )
     except (OSError, ValueError, KeyError, AttributeError) as e:
         raise window.WindowRefused(
             f"level book unreadable at {path}: {type(e).__name__}; nothing started"
