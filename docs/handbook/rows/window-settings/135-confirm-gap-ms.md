@@ -1,0 +1,1 @@
+| `CONFIRM_GAP_MS` | 100 ms at least between two counted prints of a breach or a new high, in either arm (zero admits any strictly newer print); the count it spaces is off by default and counts prints only under `LAST_PRICE` | UNCALIBRATED | ADR 0119; `mover.py` `confirm_gap_ms` | 2026-11-12 |
