@@ -7642,7 +7642,14 @@
         "occurs": "unexpected",
         "branches": [
           {
-            "when": "ends_filled",
+            "when": "ends_filled and not long_remains",
+            "next": "X",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          },
+          {
+            "when": "ends_filled and long_remains",
             "next": "T0",
             "send": false,
             "cancel": false,
@@ -7690,7 +7697,14 @@
         "occurs": "yes",
         "branches": [
           {
-            "when": "always",
+            "when": "not long_remains",
+            "next": "X",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          },
+          {
+            "when": "long_remains",
             "next": "T0",
             "send": false,
             "cancel": false,
@@ -7717,7 +7731,14 @@
         "occurs": "yes",
         "branches": [
           {
-            "when": "always",
+            "when": "not long_remains",
+            "next": "X",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          },
+          {
+            "when": "long_remains",
             "next": "T0",
             "send": false,
             "cancel": false,
@@ -7745,7 +7766,14 @@
         "occurs": "yes",
         "branches": [
           {
-            "when": "always",
+            "when": "not long_remains",
+            "next": "X",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          },
+          {
+            "when": "long_remains",
             "next": "T0",
             "send": false,
             "cancel": false,
@@ -7773,7 +7801,14 @@
         "occurs": "yes",
         "branches": [
           {
-            "when": "always",
+            "when": "not long_remains",
+            "next": "X",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          },
+          {
+            "when": "long_remains",
             "next": "T0",
             "send": false,
             "cancel": false,
@@ -8024,7 +8059,14 @@
         "occurs": "unexpected",
         "branches": [
           {
-            "when": "ends_filled",
+            "when": "ends_filled and not long_remains",
+            "next": "X",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          },
+          {
+            "when": "ends_filled and long_remains",
             "next": "T0",
             "send": false,
             "cancel": false,
@@ -8070,40 +8112,64 @@
         "occurs": "yes",
         "branches": [
           {
-            "when": "always",
+            "when": "not long_remains",
+            "next": "X",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          },
+          {
+            "when": "long_remains",
             "next": "T0",
             "send": false,
             "cancel": false,
             "alert": false
           }
         ],
-        "pin": "model/src/orders/mod.rs:209, 231-232, 236, 241, 244-245, 287-289"
+        "pin": "model/src/orders/mod.rs:209, 231-232, 236, 241, 244-245, 287-289",
+        "note": "the stopped sale's leg is gone. A holding that went flat while its stopped sale was open has ENDED (X): nothing of it, its level least of all, is kept for the release or for a later holding of the instrument. While the long remains the stop stands (T0)"
       },
       "oDEN": {
         "occurs": "yes",
         "branches": [
           {
-            "when": "always",
+            "when": "not long_remains",
+            "next": "X",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          },
+          {
+            "when": "long_remains",
             "next": "T0",
             "send": false,
             "cancel": false,
             "alert": false
           }
         ],
-        "pin": "model/src/orders/mod.rs:209, 231-232, 236, 241, 244-245, 287-289"
+        "pin": "model/src/orders/mod.rs:209, 231-232, 236, 241, 244-245, 287-289",
+        "note": "the stopped sale's leg is gone. A holding that went flat while its stopped sale was open has ENDED (X): nothing of it, its level least of all, is kept for the release or for a later holding of the instrument. While the long remains the stop stands (T0)"
       },
       "oCXL": {
         "occurs": "yes",
         "branches": [
           {
-            "when": "always",
+            "when": "not long_remains",
+            "next": "X",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          },
+          {
+            "when": "long_remains",
             "next": "T0",
             "send": false,
             "cancel": false,
             "alert": false
           }
         ],
-        "pin": "model/src/orders/mod.rs:209, 231-232, 236, 241, 244-245, 287-289"
+        "pin": "model/src/orders/mod.rs:209, 231-232, 236, 241, 244-245, 287-289",
+        "note": "the stopped sale's leg is gone. A holding that went flat while its stopped sale was open has ENDED (X): nothing of it, its level least of all, is kept for the release or for a later holding of the instrument. While the long remains the stop stands (T0)"
       },
       "oCRJ": {
         "occurs": "yes",
@@ -8121,14 +8187,22 @@
         "occurs": "yes",
         "branches": [
           {
-            "when": "always",
+            "when": "not long_remains",
+            "next": "X",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          },
+          {
+            "when": "long_remains",
             "next": "T0",
             "send": false,
             "cancel": false,
             "alert": false
           }
         ],
-        "pin": "model/src/orders/mod.rs:209, 231-232, 236, 241, 244-245, 287-289"
+        "pin": "model/src/orders/mod.rs:209, 231-232, 236, 241, 244-245, 287-289",
+        "note": "the stopped sale's leg is gone. A holding that went flat while its stopped sale was open has ENDED (X): nothing of it, its level least of all, is kept for the release or for a later holding of the instrument. While the long remains the stop stands (T0)"
       },
       "oPF": {
         "occurs": "yes",
@@ -8148,14 +8222,22 @@
         "occurs": "yes",
         "branches": [
           {
-            "when": "always",
+            "when": "not long_remains",
+            "next": "X",
+            "send": false,
+            "cancel": false,
+            "alert": false
+          },
+          {
+            "when": "long_remains",
             "next": "T0",
             "send": false,
             "cancel": false,
             "alert": false
           }
         ],
-        "pin": "model/src/orders/mod.rs:209, 231-232, 236, 241, 244-245, 287-289"
+        "pin": "model/src/orders/mod.rs:209, 231-232, 236, 241, 244-245, 287-289",
+        "note": "the stopped sale's leg is gone. A holding that went flat while its stopped sale was open has ENDED (X): nothing of it, its level least of all, is kept for the release or for a later holding of the instrument. While the long remains the stop stands (T0)"
       },
       "oVOID": {
         "occurs": "yes",

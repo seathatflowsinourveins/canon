@@ -260,6 +260,10 @@ def assert_agreement(world):
     row, account = world.state.row, world.account
     assert len(account.legs) <= 1, "one_open_leg"
     assert bool(account.legs) == (row not in NO_SALE), "row_account_agree"
+    if account.ended and account.long <= 0 and not account.legs:
+        # ONE property over ALL rows: a holding that ended, with nothing of ours open, has ended.
+        # No stop, count, cover or freeze of it is kept for a release or a later holding.
+        assert row == "X", "an_ended_holding_keeps_no_row"
     if row in CANCEL_ASKED:
         assert account.legs[0].pending, "cancel_row_has_pending_cancel"
     elif account.legs:
@@ -1408,6 +1412,29 @@ HELD_WITH_A_FAULT = FROZEN_WORKING + (Seen("ST"), Seen("oCXL"))
 def test_tenth_form_mutations_have_teeth(row, event, when, changes, history, property_name):
     with pytest.raises(AssertionError, match=property_name):
         walk(history, table=mutated_branch(row, event, when, **changes))
+
+
+STOPPED_AND_ASKED = WORKING + (Seen("ST"),)
+STOPPED_IN_FLIGHT = (Seen("QU"), Seen("QU"), Seen("ST"))
+
+
+@pytest.mark.parametrize(
+    "row,event,history",
+    [
+        ("PCT", "oCXL", STOPPED_AND_ASKED + (Seen("HE"), Seen("oCXL"))),
+        ("PCT", "oEXP", STOPPED_AND_ASKED + (Seen("HE"), Seen("oEXP"))),
+        ("PCT", "oREJ", STOPPED_AND_ASKED + (Seen("HE"), Seen("oREJ"))),
+        ("TW", "oCXL", STOPPED_IN_FLIGHT + (Seen("HE"), Seen("oCXL"))),
+        ("TW", "oREJ", STOPPED_IN_FLIGHT + (Seen("HE"), Seen("oREJ"))),
+        ("TW", "oEXP", STOPPED_IN_FLIGHT + (Seen("HE"), Seen("oEXP"))),
+        ("TW", "oDEN", STOPPED_IN_FLIGHT + (Seen("HE"), Seen("oDEN"))),
+    ],
+)
+def test_eleventh_form_mutations_have_teeth(row, event, history):
+    """A holding that went flat while its stopped sale was open ends when that sale's leg ends."""
+    assert walk(history).state.row == "X"
+    with pytest.raises(AssertionError, match="an_ended_holding_keeps_no_row"):
+        walk(history, table=mutated_branch(row, event, "not long_remains", next="T0"))
 
 
 def test_a_hold_and_its_release_through_the_table():

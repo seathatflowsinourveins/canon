@@ -22,7 +22,7 @@ from canon_trading import sale_table as sale
 DATA_PATH = Path(__file__).resolve().parents[1] / "src/canon_trading/sale_table.json"
 DATA = json.loads(DATA_PATH.read_text())
 HISTORIES = json.loads(Path(__file__).with_name("sale_table_histories.json").read_text())
-CELLS_HASH = "3b994bc6214fef921560cb1674590a238b6bb7360984f7b3e7fba2ac04110496"
+CELLS_HASH = "f3d589f0ec10a4dcd52199ab8a1a5eae82954470ed285d7adb7a45294efa9b3c"
 CELLS = [(r, e, c) for r, row in DATA["cells"].items() for e, c in row.items()]
 BRANCHES = [(r, e, b) for r, e, c in CELLS for b in c["branches"]]
 

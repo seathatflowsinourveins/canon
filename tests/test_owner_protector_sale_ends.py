@@ -141,3 +141,38 @@ def test_a_stopped_sale_whose_cancel_was_refused_is_asked_again_when_its_holding
     step(strategy, 6)
     assert strategy.canceled == [leg.client_order_id] * 2, "asked again at the holding's end"
     assert c.row(strategy).row == "PCT", c.row(strategy)
+
+
+def test_a_holding_that_goes_flat_while_its_stopped_sale_is_open_has_ended(tmp_path: Path) -> None:
+    """A hold with our leg in flight, the cancel asked at the acknowledgement (PCT); the owner then
+    sells the whole long. When our leg's cancel is acknowledged nothing of the holding is left: it
+    has ended, and the hold's release must find no level and start no count for it."""
+    strategy = c.counted(symbol_holds_dir=tmp_path)
+    strategy.observe("9.89", h.T0 + h.SECOND)
+    strategy.observe("9.88", h.T0 + 2 * h.SECOND)
+    (leg,) = strategy.sent
+    symbol_hold.write_hold(tmp_path, "AAA")
+    step(strategy, 3)
+    ours = strategy.cache.order(leg.client_order_id)
+    strategy.deliver("Submitted", leg=ours)
+    strategy.deliver("Accepted", leg=ours)
+    step(strategy, 4)
+    assert strategy.canceled == [leg.client_order_id] and c.row(strategy).row == "PCT"
+    held = strategy.cached.held[0]
+    held.signed_qty, held.quantity = Decimal(0), h.Quantity.from_int(0)
+    strategy.cached.held.clear()
+    step(strategy, 5)
+    assert c.row(strategy).row == "PCT", "the cancel is still owed its answer"
+    strategy.deliver("Canceled", leg=ours)
+    step(strategy, 6)
+    assert c.row(strategy).row == "X", c.row(strategy)
+    assert h.AAA not in strategy.levels, "an ended holding keeps no level"
+    symbol_hold.remove_hold(tmp_path, "AAA")
+    said = len(strategy.said)
+    for seconds in (7, 8, 9):
+        step(strategy, seconds)
+    later = strategy.said[said:]
+    assert not [line for line in later if "count starts again" in line], later
+    assert h.AAA not in strategy.levels
+    slot = strategy.slots.get(h.AAA)
+    assert slot is None or slot.ended, "nothing of the ended holding is judged again"

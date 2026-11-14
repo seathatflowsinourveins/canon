@@ -1262,7 +1262,7 @@ ENGINE_CASES = [
             [
                 ("FL", "ST", "always"),
                 ("TW", "oACC", "always"),
-                ("PCT", "oCXL", "always"),
+                ("PCT", "oCXL", "long_remains"),
             ],
             "T0",
         ),

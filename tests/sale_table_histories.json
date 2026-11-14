@@ -357,8 +357,8 @@
         {
           "row": "PCT",
           "event": "oCXL",
-          "when": "always",
-          "does": "nothing sent; -> T0",
+          "when": "long_remains",
+          "does": "IF long_remains: nothing sent; -> T0",
           "occurs": "yes"
         }
       ],
