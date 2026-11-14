@@ -496,7 +496,7 @@ def test_cli_rejects_quote_bounds_before_building_a_client(catalog, monkeypatch,
         ({"start": datetime(2024, 12, 31, tzinfo=UTC)}, "2025"),
         ({"start": START - timedelta(days=91)}, "90.*ADR 0066"),
         ({"feed": DataFeed.DELAYED_SIP}, "iex.*ADR 0151"),
-        ({"feed": DataFeed.BOATS}, "iex.*ADR 0151"),
+        ({"feed": DataFeed.OVERNIGHT}, "iex.*ADR 0151"),
         ({"max_rows": 0}, "row bound"),
     ],
 )
@@ -954,13 +954,15 @@ def test_a_blank_symbol_gets_the_empty_symbol_message_before_the_sip_bound(venue
 
 @pytest.mark.parametrize("data", ["bars", "trades"])
 def test_a_bars_or_trades_run_builds_no_feed_value(catalog, monkeypatch, data):
-    """The quote feed exists only on the quotes path: bars and trades load sip, never an iex value."""
+    """The quote feed exists only on the quotes path: bars and trades load sip unless `--feed boats`
+    names theirs, never an iex value."""
     monkeypatch.setattr(history_load, "utc_now", lambda: NOW)
     built = []
 
     class Guard:
         SIP = DataFeed.SIP
         IEX = DataFeed.IEX
+        BOATS = DataFeed.BOATS
 
         def __new__(cls, value):
             built.append(value)
@@ -985,3 +987,113 @@ def test_a_bars_or_trades_run_builds_no_feed_value(catalog, monkeypatch, data):
 def test_a_sip_bound_refusal_cites_the_amended_record(venue, catalog, options):
     with pytest.raises(HistoryStopped, match="ADR 0151"):
         run(catalog, feed=DataFeed.SIP, **options)
+
+
+def test_boats_quotes_are_asked_for_on_boats_and_claim_a_boats_root(venue, catalog):
+    """Alpaca's historical quotes take `feed=boats` (https://docs.alpaca.markets/us/reference/stockquotes-1.md,
+    read 2026-11-13)."""
+    assert run(catalog, feed=DataFeed.BOATS) == 4
+    assert {q["feed"][0] for _, q in venue.sent} == {"boats"}
+    assert (catalog / FEED_FILE).read_text() == "boats\n"
+
+
+def test_boats_quotes_go_in_a_root_with_no_bars_or_trades(venue, catalog):
+    _sip_bars_root(catalog)
+    (catalog / FEED_FILE).write_text("boats\n")  # boats bars, as a boats bars load leaves them
+    with pytest.raises(HistoryStopped, match=r"holds bars.*boats quotes.*root of their own"):
+        run(catalog, feed=DataFeed.BOATS)
+    assert venue.sent == []
+
+
+@pytest.mark.parametrize(
+    ("options", "message"),
+    [
+        ({"symbols": [f"S{i}" for i in range(9)]}, "BOATS_MAX_SYMBOLS"),
+        ({"end": START + timedelta(hours=8, minutes=1)}, "BOATS_MAX_SPAN"),
+    ],
+    ids=["nine-symbols", "over-one-overnight-session"],
+)
+def test_a_boats_quote_load_over_its_bound_is_refused_before_any_request(
+    venue, catalog, options, message
+):
+    with pytest.raises(HistoryStopped, match=message):
+        run(catalog, feed=DataFeed.BOATS, **options)
+    assert venue.sent == []
+
+
+def test_a_boats_quote_load_of_one_whole_overnight_session_is_accepted(venue, catalog):
+    """Alpaca's overnight session runs 8:00 PM to 4:00 AM ET (its 24/5 page, read 2026-11-13): a load
+    of exactly that session is within the bound."""
+    start = datetime(2026, 11, 11, 1, tzinfo=UTC)  # 20:00 New York, 2026-11-10
+    end = start + timedelta(hours=8)
+    venue.rows = []
+    assert run(catalog, symbols=["AAPL"], start=start, end=end, feed=DataFeed.BOATS) == 0
+    assert {q["feed"][0] for _, q in venue.sent} == {"boats"}
+
+
+@pytest.mark.parametrize("data", ["quotes", "trades", "bars"])
+def test_cli_refuses_feed_overnight_by_name_with_alpacas_words(catalog, monkeypatch, capsys, data):
+    """Alpaca's 24/5 page: "To access delayed historical overnight data, make sure to include the
+    parameter `feed=boats` in your request, `feed=overnight` will give error" (read 2026-11-13)."""
+    monkeypatch.setattr(history_load, "utc_now", lambda: NOW)
+    _forbid_client(monkeypatch)
+    argv = cli(catalog, "--symbols", "AAPL", "--feed", "overnight", "--bars", "1-MINUTE")
+    argv[argv.index("quotes")] = data
+    with pytest.raises(SystemExit) as stopped:
+        history_load.main(argv)
+    assert stopped.value.code == 2
+    err = capsys.readouterr().err
+    assert "--feed overnight is refused" in err and "feed=overnight` will give error" in err, err
+
+
+@pytest.mark.parametrize(
+    "extra,message",
+    [
+        (["--symbols", ",".join(f"S{i}" for i in range(9))], "BOATS_MAX_SYMBOLS"),
+        (
+            ["--symbols", "AAPL", "--end", (START + timedelta(hours=8, minutes=1)).isoformat()],
+            "BOATS_MAX_SPAN",
+        ),
+        (["--symbols-file", "FILE"], "boats loads take --symbols"),
+        (["--symbols", "AAPL", "--end", (NOW - timedelta(minutes=14)).isoformat()], "15 minutes"),
+    ],
+    ids=["nine-symbols", "over-one-session", "symbols-file", "end-too-recent"],
+)
+@pytest.mark.parametrize("data", ["quotes", "trades", "bars"])
+def test_cli_refuses_a_boats_load_outside_its_bound_before_building_a_client(
+    catalog, monkeypatch, capsys, tmp_path, extra, message, data
+):
+    monkeypatch.setattr(history_load, "utc_now", lambda: NOW)
+    _forbid_client(monkeypatch)
+    path = tmp_path / "symbols.txt"
+    path.write_text("AAPL\n")
+    extra = [str(path) if arg == "FILE" else arg for arg in extra]
+    argv = cli(catalog, "--feed", "boats", "--bars", "1-MINUTE", *extra)
+    argv[argv.index("quotes")] = data
+    with pytest.raises(SystemExit) as stopped:
+        history_load.main(argv)
+    assert stopped.value.code == 2
+    assert message in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("data", "root"), [("quotes", "boats-quotes"), ("trades", "boats"), ("bars", "boats")]
+)
+def test_cli_boats_loads_default_to_their_own_roots(monkeypatch, data, root):
+    monkeypatch.setattr(history_load, "utc_now", lambda: NOW)
+    seen: list = []
+
+    def capture(root_at: int):
+        def load(*args, **kwargs):
+            seen.append((args[root_at], kwargs.get("feed")))
+            return 0
+
+        return load
+
+    monkeypatch.setattr(history_load, "history_client", lambda: None)
+    for name, root_at in (("load_quotes", 4), ("load_trades", 4), ("load_history", 5)):
+        monkeypatch.setattr(history_load, name, capture(root_at))
+    argv = ["--data", data, "--start", START.isoformat(), "--end", END.isoformat()]
+    argv += ["--symbols", "AAPL", "--feed", "boats", "--bars", "1-MINUTE"]
+    assert history_load.main(argv) == 0
+    assert seen == [(DEFAULT_CATALOG / root, DataFeed.BOATS)]

@@ -525,10 +525,16 @@ def test_every_version_of_an_equity_counts_once(tmp_path, alpaca_bars):
         build(root, tmp_path / "again", max_excluded_share=0.4)
 
 
-def _route(tmp_path, **usage):
+def _route(tmp_path, security_answers=False, **usage):
+    """Run the task's script with its process boundaries replaced. The keychain stand-in refuses, or
+    with `security_answers` prints a placeholder that is no key, so a load reaches the `uv` stand-in."""
     task = tomllib.loads((SOURCE_ROOT / "mise.toml").read_text())["tasks"]["paper:history"]
     security = tmp_path / "security"
-    security.write_text("#!/bin/sh\necho forbidden-credential-access >&2\nexit 99\n")
+    security.write_text(
+        "#!/bin/sh\necho placeholder\n"
+        if security_answers
+        else "#!/bin/sh\necho forbidden-credential-access >&2\nexit 99\n"
+    )
     security.chmod(0o700)
     timeout = tmp_path / "timeout"
     timeout.write_text('#!/bin/sh\nif [ "$1" = -s ]; then shift 2; fi\nshift\nexec "$@"\n')
@@ -555,14 +561,15 @@ def _route(tmp_path, **usage):
 @pytest.mark.parametrize(
     "usage",
     [
-        {"usage_feed": "boats", "usage_symbols": "AAPL"},
         {"usage_sessions_file": "/calendar.txt", "usage_symbols": "AAPL"},
         {"usage_max_excluded_share": "0.3", "usage_symbols": "AAPL"},
     ],
-    ids=["feed", "sessions-file", "excluded-share"],
+    ids=["sessions-file", "excluded-share"],
 )
 def test_load_mode_refuses_a_baseline_flag_before_any_credential(tmp_path, usage):
-    """--feed boats in load mode would load sip into a boats root (Antigravity, baseline finding 3)."""
+    """A baseline flag in load mode is refused by name. `--feed boats` was one until history_load took
+    the boats feed itself (Antigravity, baseline finding 3: it would have loaded sip into a boats
+    root)."""
     completed = _route(tmp_path, **usage)
     assert completed.returncode == 3
     assert "baseline" in completed.stderr
@@ -612,3 +619,44 @@ def test_batched_reads_give_the_same_file_as_one_symbol_at_a_time(
         del document["source"]["written_at"]
     assert together == alone
     assert set(together["symbols"]) == {"AAPL"}
+
+
+@pytest.mark.parametrize(
+    ("data", "root"),
+    [("quotes", "catalog/boats-quotes"), ("trades", "catalog/boats"), ("bars", "catalog/boats")],
+)
+def test_load_mode_sends_boats_to_the_loader_in_a_root_of_its_own(tmp_path, data, root):
+    """history_load takes `--feed boats` for bars, trades and quotes; the task passes it on, with the
+    boats root the module defaults to, and holds the module's symbol bound before any pair is read."""
+    completed = _route(
+        tmp_path,
+        usage_feed="boats",
+        usage_data=data,
+        usage_symbols="AAPL,MSFT",
+        usage_start="2026-11-12T20:00:00-05:00",
+        usage_end="2026-11-13T04:00:00-05:00",
+        security_answers=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+    args = (tmp_path / "sent").read_text().splitlines()
+    assert args[args.index("--feed") + 1] == "boats"
+    assert args[args.index("--catalog") + 1] == root
+    assert args[args.index("--data") + 1] == data
+    assert args[args.index("--bars") + 1] == "1-MINUTE"  # boats bars are 1-MINUTE only
+
+
+@pytest.mark.parametrize(
+    "usage",
+    [
+        {"usage_symbols_file": "/symbols.txt"},
+        {"usage_symbols": ",".join(f"S{i}" for i in range(9))},
+    ],
+    ids=["symbols-file", "nine-symbols"],
+)
+@pytest.mark.parametrize("data", ["quotes", "trades", "bars"])
+def test_load_mode_holds_the_boats_bound_before_any_credential(tmp_path, usage, data):
+    completed = _route(tmp_path, usage_feed="boats", usage_data=data, **usage)
+    assert completed.returncode == 3
+    assert "boats loads take" in completed.stderr, completed.stderr
+    assert "baseline" not in completed.stderr and "credential" not in completed.stderr
+    assert not (tmp_path / "sent").exists()
