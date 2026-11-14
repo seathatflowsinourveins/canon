@@ -7,17 +7,24 @@
 #   <account>   live: the owner's live account, canon-live.lock and canon-alpaca-stream-live.lock, which nothing
 #               else in this repository names; or a paper account, by the name and the lock files mise.toml's
 #               paper tasks use, so the same task shape can be proven on paper first and excludes a paper run
-#               there: tests (account A), windows (account B) or protect (account C, ADR 0114, which has an
-#               account lock and no stream lock, so --stream is refused for it)
+#               there: tests (account A), windows (account B) or protect (account C, ADR 0114). A paper
+#               account's stream lock is canon-alpaca-stream-<account>.lock, the name the Python holder builds
+#               (session_window.paper_start, under which paper:protector starts), account C's included
 #   --stream    also take the account's stream lock, after the account's lock, so no run waits for an account's
 #               lock while it holds a stream (ADR 0069)
 #   --wait      seconds to wait for the lock, or for both; when it runs out nothing is run, exit 1
-#   --deadline  seconds the command may run; then it is stopped, its whole process group with it
+#   --deadline  seconds the command may run; then it is stopped, its whole process group with it. Not from a
+#               person's terminal: there neither the deadline nor the grace applies (the note below)
 #   --grace     0, the default: SIGKILL at the deadline. Above 0: SIGTERM at the deadline, or when this script
 #               is told to stop, then SIGKILL that many seconds later, for a command that cancels what it sent
 #               when it is told to end (as paper:close's uv runs under `timeout -s TERM -k 30`)
-# Exit: the command's own status; 1 when a lock stayed held or the temporary folder is not known; 3 for a wrong
-# call; timeout(1)'s status when the deadline stopped the command (124, or 137 for a SIGKILL).
+#   Each number of seconds is whole, of at most six digits, with no leading zero.
+# Exit: the command's own status; 1 when a lock stayed held or its file could not be opened, the temporary
+# folder is not known or CANON_PAPER_SESSION_DIR is set; 3 for a wrong call; timeout(1)'s status when the
+# deadline stopped the command (124, or 137 for a SIGKILL); 143, 129 or 130 when this script was told to stop
+# by SIGTERM, SIGHUP or SIGINT. A command that itself ends 1 or 3 reads the same as a refusal here: each refusal
+# says so on stderr, in a line that ends "nothing was run", and that line, not the status, tells them apart.
+# The command reads this script's own standard input.
 #
 # How the lock is held, as in mise.toml's paper tasks (the note above paper:test): the lock file is opened on
 # descriptor 9 (the stream lock on 7) and that descriptor is locked (lockf(1): "Protect a section of a shell
@@ -30,40 +37,58 @@
 # files are in the per-user temporary folder, the same for every process of the user whatever TMPDIR a session
 # sets, and are kept, as a descriptor implies and lockf(1) advises when processes contend.
 # No option or variable moves the lock folder: two runs that named different folders would not exclude each
-# other. scripts/test-account-lock runs a copy with getconf swapped for a stand-in.
+# other. One variable moves the folder on the other side, the Python holder's, and a run with it set is refused
+# by name (below). scripts/test-account-lock runs a copy with getconf swapped for a stand-in.
 set -uo pipefail
+# usage <what was wrong>: a wrong call, refused by name, then the usage line; exit 3
 usage() {
+  echo "account-lock: $1; nothing was run" >&2
   echo "account-lock: usage: scripts/account-lock <live|tests|windows|protect> [--stream] --wait <secs> --deadline <secs> [--grace <secs>] -- <command...>" >&2
   exit 3
 }
-[ $# -ge 1 ] || usage
+[ $# -ge 1 ] || usage "no account was named"
 account=$1; shift
 case "$account" in
   live) alock=canon-live.lock; slock=canon-alpaca-stream-live.lock ;;
   tests) alock=canon-paper-test.lock; slock=canon-alpaca-stream-tests.lock ;;
   windows) alock=canon-paper-windows.lock; slock=canon-alpaca-stream-windows.lock ;;
-  protect) alock=canon-paper-protect.lock; slock= ;;
+  protect) alock=canon-paper-protect.lock; slock=canon-alpaca-stream-protect.lock ;;
   *) echo "account-lock: no account named '$account'; the names are live, tests, windows and protect; nothing was run" >&2; exit 3 ;;
 esac
 stream=0; lockwait=""; deadline=""; grace=0; sep=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --stream) stream=1; shift ;;
-    --wait) [ $# -ge 2 ] || usage; lockwait=$2; shift 2 ;;
-    --deadline) [ $# -ge 2 ] || usage; deadline=$2; shift 2 ;;
-    --grace) [ $# -ge 2 ] || usage; grace=$2; shift 2 ;;
+    --wait) [ $# -ge 2 ] || usage "--wait is given no seconds"; lockwait=$2; shift 2 ;;
+    --deadline) [ $# -ge 2 ] || usage "--deadline is given no seconds"; deadline=$2; shift 2 ;;
+    --grace) [ $# -ge 2 ] || usage "--grace is given no seconds"; grace=$2; shift 2 ;;
     --) sep=1; shift; break ;;
-    *) usage ;;
+    *) usage "'$1' is not an option of this script, and the command comes after --" ;;
   esac
 done
 # whole <value>: a whole number of seconds, digits only and at most six of them
 whole() { case "$1" in ''|*[!0-9]*|???????*) return 1 ;; esac; }
-if ! whole "$lockwait" || ! whole "$deadline" || ! whole "$grace"; then usage; fi
-if [ "$deadline" -le 0 ] || [ "$sep" != 1 ] || [ $# -eq 0 ]; then usage; fi
-if [ "$stream" = 1 ] && [ -z "$slock" ]; then
-  echo "account-lock: account $account has no market-data stream lock (none is defined for it in mise.toml); nothing was run" >&2; exit 3
+whole "$lockwait" || usage "--wait takes a whole number of seconds, of at most six digits, and was given '$lockwait'"
+whole "$deadline" || usage "--deadline takes a whole number of seconds, of at most six digits, and was given '$deadline'"
+whole "$grace" || usage "--grace takes a whole number of seconds, of at most six digits, and was given '$grace'"
+# No leading zero: the shell's arithmetic reads one as octal, where 010 is eight and 08 is an error. Every
+# number that reaches an arithmetic below (the wait, the grace) or timeout (the deadline) is therefore the
+# decimal that was written, or the call is refused here by name.
+for secs in "$lockwait" "$deadline" "$grace"; do
+  case "$secs" in 0?*) echo "account-lock: '$secs' has a leading zero, which the shell's arithmetic would read as octal; write the seconds without it; nothing was run" >&2; exit 3 ;; esac
+done
+[ "$deadline" -gt 0 ] || usage "--deadline takes at least 1 second"
+[ "$sep" = 1 ] || usage "there is no --, after which the command comes"
+[ $# -gt 0 ] || usage "there is no command after --"
+# The one variable that moves a lock on the other side: the Python holder that paper:protector starts under
+# (session_window.paper_start) locks in the parent of its records folder, and CANON_PAPER_SESSION_DIR names that
+# folder. With it set, a run here and a run there would each hold a lock the other never asks for.
+if [ -n "${CANON_PAPER_SESSION_DIR:-}" ]; then
+  echo "account-lock: CANON_PAPER_SESSION_DIR is set, which moves the folder paper:protector takes its locks in, so a run here and a run there would not exclude each other; unset it; nothing was run" >&2; exit 1
 fi
 start=$(/bin/date +%s)
+# a clock that gives no time cannot bound a wait: refused here, before any lock
+case "$start" in ''|*[!0-9]*) echo "account-lock: the clock gave no time (/bin/date +%s printed '$start'), so no wait can be bounded; nothing was run" >&2; exit 1 ;; esac
 # the folder's name, or a stop: none would leave a lock file of this run's own, beside no other run's
 tmp="$(/usr/bin/getconf DARWIN_USER_TEMP_DIR)" || tmp=""
 case "$tmp" in /*/) ;; *) echo "account-lock: the per-user temporary folder is not known (DARWIN_USER_TEMP_DIR gave '$tmp'), so there is no lock to take; nothing was run" >&2; exit 1 ;; esac
@@ -82,25 +107,50 @@ lock_wait() {
     sleep 1
   done
 }
-exec 9>>"${tmp}${alock}"
-lock_wait 9 "$lockwait" || { echo "account-lock: account ${account}'s lock stayed held for $lockwait s; nothing was run" >&2; exit 1; }
+# No failure in a lock step lets the command run. An error inside lock_wait (an arithmetic the shell cannot
+# read) ends the whole command it was called from, a refusal written after `||` on the same line included, and
+# the script goes on at the next one. So each step only notes its result, `yes` when lock_wait returned 0 and
+# `no` when it returned 1, and the lines after it, commands of their own, refuse on anything but `yes`.
+# And a shell that ends inside a step (bash 3.2 ends itself, with status 0, at a word in an arithmetic that it
+# takes for an unset variable) must not read as a run that succeeded: until `locked` is set, after both
+# steps, an exit with status 0 is turned into a refusal by name.
+held=failed; sheld=failed; locked=""
+trap '[ "$?" != 0 ] || [ -n "$locked" ] || { echo "account-lock: the run ended inside a lock step, before its locks were held; nothing was run" >&2; exit 1; }' EXIT
+# an open that fails must end the run: descriptor 9 or 7 may be one the caller passed down, on another file
+exec 9>>"${tmp}${alock}" || { echo "account-lock: account ${account}'s lock file could not be opened in the per-user temporary folder; nothing was run" >&2; exit 1; }
+if lock_wait 9 "$lockwait"; then held=yes; else held=no; fi
+case "$held" in
+  yes) ;;
+  no) echo "account-lock: account ${account}'s lock stayed held for $lockwait s; nothing was run" >&2; exit 1 ;;
+  *) echo "account-lock: the step that takes account ${account}'s lock failed, so the lock is not held; nothing was run" >&2; exit 1 ;;
+esac
 if [ "$stream" = 1 ]; then
   left=$(( lockwait - ($(/bin/date +%s) - start) )); [ "$left" -ge 0 ] || left=0
-  exec 7>>"${tmp}${slock}"
-  lock_wait 7 "$left" || { echo "account-lock: account ${account}'s market-data stream lock stayed held ($lockwait s for both locks); nothing was run" >&2; exit 1; }
+  exec 7>>"${tmp}${slock}" || { echo "account-lock: account ${account}'s market-data stream lock file could not be opened in the per-user temporary folder; nothing was run" >&2; exit 1; }
+  if lock_wait 7 "$left"; then sheld=yes; else sheld=no; fi
 fi
+case "$stream$sheld" in
+  0*|1yes) ;;
+  1no) echo "account-lock: account ${account}'s market-data stream lock stayed held ($lockwait s for both locks); nothing was run" >&2; exit 1 ;;
+  *) echo "account-lock: the step that takes account ${account}'s market-data stream lock failed, so the lock is not held; nothing was run" >&2; exit 1 ;;
+esac
+locked=1
 # from a person's terminal: in the terminal's process group, the locks inherited (the note at the top)
 [ ! -t 0 ] || exec "$@"
 # bounded <command...>: the command under timeout(1), in the process group timeout leads, with its whole group
 # killed once it ends and on a stop. `g` is timeout's pid, and its group's.
 bounded() {
-  g=""
-  # stop <status>: with a grace, SIGTERM to the group and up to `grace` seconds for timeout, its leader, to end;
-  # then, and with none at once, SIGKILL to what is left of the group
+  g=""; stopping=""
+  # stop <status>: with a grace, SIGTERM to timeout alone, which passes it on ("For any other signals delivered
+  # to timeout, it will propagate them to command", man timeout), so the command is told to end once, and up to
+  # `grace` seconds for timeout to end; then, and with none at once, SIGKILL to what is left of the group. A stop
+  # while one is under way is only noted (both as in mise.toml's bounded), so the run ends with the first
+  # stop's status.
   stop() {
+    [ -z "$stopping" ] || return 0; stopping=1
     if [ -n "$g" ]; then
       if [ "$grace" -gt 0 ]; then
-        kill -TERM -- "-$g" 2>/dev/null
+        kill -TERM "$g" 2>/dev/null
         s_end=$(( $(/bin/date +%s) + grace ))
         while kill -0 "$g" 2>/dev/null && [ "$(/bin/date +%s)" -lt "$s_end" ]; do sleep 0.2; done
       fi
@@ -110,8 +160,8 @@ bounded() {
   }
   # traps first, so a stop at any point after this ends what has started
   trap 'stop 143' TERM; trap 'stop 129' HUP; trap 'stop 130' INT
-  if [ "$grace" -gt 0 ]; then /usr/bin/timeout -s TERM -k "$grace" "$deadline" "$@" & g=$!
-  else /usr/bin/timeout -s KILL "$deadline" "$@" & g=$!; fi
+  if [ "$grace" -gt 0 ]; then /usr/bin/timeout -s TERM -k "$grace" "$deadline" "$@" <&0 & g=$!
+  else /usr/bin/timeout -s KILL "$deadline" "$@" <&0 & g=$!; fi
   # a trapped signal ends `wait` early with a status above 128 and runs its trap, which exits; so past this
   # line timeout itself has ended
   rc=0; wait "$g" || rc=$?
