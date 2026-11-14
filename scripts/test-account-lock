@@ -526,7 +526,7 @@ NOTES
   # stopped <folder> <signal> <expected status> <where>: property 2's checks, the run's status in rc
   stopped() {
     # shellcheck disable=SC2034  # read by the eval'd checks
-    local D="$1" sig="$2" want="$3" got; got=$(tr '\n' ' ' < "$1/got" 2>/dev/null)
+    local D="$1" sig="$2" want="$3" got; got=$(tr '\n' ' ' 2>/dev/null < "$1/got")
     case "$want" in
       3|4) check "live --stream$4, a SIG$sig to the script: the command is told by SIG$sig once (told: ${got:-nothing}), and the run ends after it with its status, $want ($rc)" \
                  eval '[ "$got" = "$sig " ] && [ "$rc" = "$want" ] && ! alive "$D/cmd.pid" && free $LIVE_LOCK && free $LIVE_STREAM' ;;
@@ -535,10 +535,13 @@ NOTES
     esac
   }
   # signalled <folder> <signal>: the stand-in in <folder> under the script, not on a terminal, sent <signal> once
-  # it runs; status in rc. Started under `set -m`: without job control an asynchronous command starts with SIGINT
-  # ignored, which bash then cannot trap (man bash, SIGNALS), so a SIGINT to it would test nothing
+  # it runs; status in rc. The copy starts through perl, which puts SIGINT back at its default and execs it (the
+  # same pid): without job control an asynchronous command starts with SIGINT ignored, which bash then cannot
+  # trap (man bash, SIGNALS), so a SIGINT to it would test nothing. `set -m` here is not enough: this test is
+  # itself such a command when scripts/ci starts it as a job, and an ignore it inherited stays
   signalled() {
-    set -m; "$C" live --stream --wait 2 --deadline 60 -- "$1/cmd" > "$1/out" 2>&1 < /dev/null & op=$!; set +m
+    # shellcheck disable=SC2016  # perl's own variables
+    set -m; /usr/bin/perl -e '$SIG{INT} = "DEFAULT"; exec @ARGV' "$C" live --stream --wait 2 --deadline 60 -- "$1/cmd" > "$1/out" 2>&1 < /dev/null & op=$!; set +m
     while [ ! -s "$1/cmd.pid" ] && kill -0 "$op" 2>/dev/null; do sleep 0.1; done
     kill -"$2" "$op" 2>/dev/null; wait "$op"; rc=$?
   }
@@ -577,15 +580,19 @@ NOTES
     skip "account-lock from a terminal" "no /usr/bin/expect that can open a pseudo-terminal here"
   else
     rm -f "${W:?}/probed"
+    # bounded <secs> <since>: a driver is run under `timeout -s KILL <secs>`, past every wait of its own, since
+    # expect's `timeout` bounds its `expect` and not its `wait`, and a run that never ends would hang this test.
+    # A driver killed at that bound (status 137, <secs> after <since>) is told apart from a run that ended 137
+    bounded() { [ "$rc" != 137 ] || [ $(( $(date +%s) - $2 )) -lt "$1" ] || rc="none: the driver was stopped at its $1 s bound"; }
     # shellcheck disable=SC2034  # rc is read by the eval'd check
-    { AL_COPY="$C" AL_PROBE="$W/probe" /usr/bin/expect -c 'set timeout 30; spawn -noecho $env(AL_COPY) live --stream --wait 2 --deadline 30 -- $env(AL_PROBE); expect eof; lassign [wait] p s o v; exit $v' > "$W/out" 2>&1; rc=$?; }
+    { t0=$(date +%s); AL_COPY="$C" AL_PROBE="$W/probe" /usr/bin/timeout -s KILL 60 /usr/bin/expect -c 'set timeout 30; spawn -noecho $env(AL_COPY) live --stream --wait 2 --deadline 30 -- $env(AL_PROBE); expect eof; lassign [wait] p s o v; exit $v' > "$W/out" 2>&1; rc=$?; bounded 60 "$t0"; }
     check "live --stream on a pseudo-terminal: the command runs holding both locks, and its exit status (7) is the run's" \
           eval '[ "$rc" = 7 ] && probed $LIVE_LOCK 75 && probed $LIVE_STREAM 75 && probed canon-paper-test.lock 0'
     check "... both free once it has ended" eval 'free $LIVE_LOCK && free $LIVE_STREAM'
     # on_term <folder> <none|TERM|INT|ctrl-c>: the stand-in in <folder> under the script on a pseudo-terminal; once
     # it runs, a signal to the script's pid, or a Ctrl-C typed at the terminal (to its foreground process group);
     # status in rc (128 + the signal's number, as a shell reports it, if the process was killed by one), 198 if the
-    # run outlived expect's 40 s
+    # run outlived expect's 40 s, and a word in place of a number if the driver itself met its bound of 90 s
     cat > "$W/on-term.exp" <<'EXP'
 set timeout 40
 set d $env(AL_DIR); set act $env(AL_ACT)
@@ -602,8 +609,9 @@ if {[lindex $r 4] eq "CHILDKILLED"} { exit [expr {128 + [dict get {SIGHUP 1 SIGI
 exit [lindex $r 3]
 EXP
     on_term() {
-      local d="$1" act="$2"; shift 2
-      AL_DIR="$d" AL_ACT="$act" /usr/bin/expect -f "$W/on-term.exp" -- "$C" live --stream --wait 2 --deadline 60 -- "$d/cmd" > "$d/out" 2>&1 < /dev/null; rc=$?
+      local d="$1" act="$2" t0; shift 2; t0=$(date +%s)
+      AL_DIR="$d" AL_ACT="$act" /usr/bin/timeout -s KILL 90 /usr/bin/expect -f "$W/on-term.exp" -- "$C" live --stream --wait 2 --deadline 60 -- "$d/cmd" > "$d/out" 2>&1 < /dev/null; rc=$?
+      bounded 90 "$t0"
     }
     for how in close reopen; do
       D="$TMP/term-drops-$how"; drops "$D" "$how"; on_term "$D" none
@@ -623,6 +631,27 @@ EXP
     check "live --stream on a pseudo-terminal, one Ctrl-C typed there: the command is told by SIGINT once (told: ${got:-nothing}), and the run ends after it with its status, 3 ($rc)" \
           eval '[ "$got" = "INT " ] && [ "$rc" = 3 ] && ! alive "$D/cmd.pid" && free $LIVE_LOCK && free $LIVE_STREAM'
     reap "$D"
+    # What the command can do with the terminal (the script's header, and ADR 0154's clause 5): in a process
+    # group of its own it is not the terminal's foreground group, so it writes there, but a read of the terminal
+    # (SIGTTIN) or a change of its settings (SIGTTOU) stops it, timeout takes the stop for its end, and the run
+    # ends at once with status 1, long before the deadline's 60 s, nothing left and both locks free. A task that
+    # prompts therefore does not run under this lock.
+    # asks <folder> <one line of shell>: a command that runs the line, notes its status in `after`, and ends 7
+    asks() {
+      mkdir -p "$1"
+      printf '#!/bin/bash\necho $$ > "%s/cmd.pid"\n%s\necho $? > "%s/after"\nexit 7\n' "$1" "$2" "$1" > "$1/cmd"; chmod +x "$1/cmd"
+    }
+    D="$TMP/term-writes"; asks "$D" 'echo to the terminal > /dev/tty'; on_term "$D" none
+    check "live --stream on a pseudo-terminal, a command that writes to the terminal: it does (status $(cat "$D/after" 2>/dev/null)), and the run ends with its status, 7 ($rc)" \
+          eval '[ "$rc" = 7 ] && [ "$(cat "$D/after" 2>/dev/null)" = 0 ] && free $LIVE_LOCK && free $LIVE_STREAM'
+    reap "$D"
+    # shellcheck disable=SC2034  # took is read by the eval'd checks
+    for ask in "read -r answer:reads the terminal" "stty -echo:changes the terminal's settings"; do
+      D="$TMP/term-asks-${ask%% *}"; asks "$D" "${ask%%:*}"; s0=$(date +%s); on_term "$D" none; took=$(( $(date +%s) - s0 ))
+      check "live --stream on a pseudo-terminal, a command that ${ask#*:} (${ask%%:*}): the run ends at once with status 1 ($rc, in $took s), the line never returned, nothing left, both locks free" \
+            eval '[ "$rc" = 1 ] && [ "$took" -lt 30 ] && [ -s "$D/cmd.pid" ] && [ ! -e "$D/after" ] && ! alive "$D/cmd.pid" && free $LIVE_LOCK && free $LIVE_STREAM'
+      reap "$D"
+    done
   fi
 fi
 
