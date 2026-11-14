@@ -34,6 +34,25 @@ LIVE = {"G", "GC", "RW", "FL", "WK", "PF", "PCR", "PCO"}
 INVALIDATES = {"ST", "HE", "HS", "CP", "FRZ"}
 MAX_QUANTITY = 3
 DEPTH = 8
+# Prices, for the price rule alone (ruling 18): whole steps, the level fixed. A counted quote under the
+# level has its bid at or under it; one above has it over; a quote that is not counted still prices.
+LEVEL = 8
+PRICE_WALK = False
+# Ruling 23: the leg sent again after a refusal takes the episode's floor. The two switches exist for
+# the mutation cases alone.
+FLOOR_AT_RESEND = True
+CHECK_FLOOR = True
+# The quote in whose handler a cancel was asked is the newest usable quote stored until a later one
+# arrives. Read otherwise (False), a re-price answered before the next quote sends the old limit again.
+QUOTE_THAT_ASKED_COUNTS = True
+
+
+def through(bid, floor):
+    """The chase function's price: a tick through the bid, held at the floor while there is one."""
+    return bid - 1 if floor is None else max(bid - 1, floor)
+
+
+LEG_LIMIT = sale.leg_limit
 
 
 @dataclass(frozen=True)
@@ -43,6 +62,7 @@ class Leg:
     status: str = "flight"
     pending: bool = False
     silent_told: bool = False
+    cancel_told: bool = False
 
     @property
     def remaining(self):
@@ -66,6 +86,11 @@ class Account:
     told: bool = False
     young: bool = False
     unread: bool = False
+    bid: int = LEVEL - 1
+    fresh: bool = True
+    previous: int | None = None
+    floor: int | None = None
+    newer: bool = True
 
     @property
     def uncovered(self):
@@ -73,7 +98,8 @@ class Account:
 
     @property
     def next_quantity(self):
-        return min(self.uncovered, max(0, self.opening - self.sold))
+        # Ruling 19: every leg is the uncovered quantity read at its send.
+        return self.uncovered
 
     @property
     def mismatch(self):
@@ -97,10 +123,16 @@ class Seen:
     ends_filled: bool = False
     earlier_episode: bool = False
     overdue: bool = False
+    bid: int | None = None
+    wait_over: bool = False
 
 
 def facts(account, seen, row):
     leg = account.legs[0] if account.legs else None
+    reprice_due = seen.reprice_due
+    if PRICE_WALK and seen.code == "QU" and row in {"WK", "PF"} and account.previous is not None:
+        # `seen.reprice_due` is then only "the chase interval has passed".
+        reprice_due = reprice_due and through(account.bid, account.floor) < account.previous
     return {
         "whole_cover": account.foreign >= account.long,
         "filled_part": bool(leg and leg.filled > 0),
@@ -108,12 +140,17 @@ def facts(account, seen, row):
         "leg_positive": (account.uncovered if row == "G" else account.next_quantity) > 0,
         "cancelable": bool(leg and leg.cancelable),
         "formable": seen.formable,
-        "reprice_due": seen.reprice_due,
+        "reprice_due": reprice_due,
         "ends_filled": seen.ends_filled,
         "refusal_told": account.told,
         "resend_due": not account.young,
         "flight_alert_due": bool(
-            seen.overdue and leg and leg.status == "flight" and not leg.silent_told
+            seen.overdue
+            and leg
+            and (
+                (leg.pending and not leg.cancel_told)
+                or (not leg.pending and leg.status == "flight" and not leg.silent_told)
+            )
         ),
     }
 
@@ -122,6 +159,19 @@ def account_event(account, seen):
     """Apply event meaning BEFORE asking the table, especially every actual fill."""
     event = seen.code
     leg = account.legs[0] if account.legs else None
+    if event in {"QU", "QA"}:
+        bid = seen.bid if seen.bid is not None else (LEVEL - 1 if event == "QU" else LEVEL + 2)
+        floor = account.floor
+        if (
+            seen.wait_over
+            and leg is not None
+            and leg.cancelable
+            and floor is not None
+            and account.previous == floor
+            and bid - 1 < floor
+        ):
+            floor = None  # The floor's own rule: its wait has run with the price through it.
+        return replace(account, bid=bid, fresh=True, newer=True, floor=floor)
     if event == "FRZ":
         return replace(account, unread=True)
     if event == "UFZ":
@@ -208,6 +258,15 @@ def assert_agreement(world):
         assert world.state.count == world.counted, "count_matches_quotes"
     else:
         assert world.state.count is None, "count_exists_only_in_counting"
+    if PRICE_WALK and row in {"WK", "PF"} and account.legs[0].cancelable:
+        limit, floor, bid = account.previous, account.floor, account.bid
+        assert limit is not None, "a_working_leg_has_a_limit"
+        if CHECK_FLOOR and floor is not None:
+            assert limit >= floor, "a_leg_and_its_floor_agree"
+        if limit > bid:
+            due = through(bid, floor) < limit
+            waiting = floor is not None and limit == floor and bid - 1 < floor
+            assert due or waiting, "no_leg_rests_above_a_falling_market_in_silence"
 
 
 ECHOES: dict[str, int] = {}
@@ -273,15 +332,20 @@ def advance(world, seen, n, table):
         )
     if origin in FAULT | COVER:
         assert sale.Action.SEND not in result.actions, "no_send_from_a_frozen_row"
-    if world.state.row == "FL" and event in {"QU", "QA"}:
-        due = facts(account, seen, "FL")["flight_alert_due"]
+    if world.state.row in CANCEL_ASKED | {"FL"} and event in {"QU", "QA", "NQ"}:
+        due = facts(account, seen, world.state.row)["flight_alert_due"]
         assert (sale.Action.ALERT in result.actions) == due, "a_silent_leg_is_told_once"
         assert result.state == world.state, "a_silent_leg_is_never_resent"
         assert not {sale.Action.SEND, sale.Action.CANCEL} & set(result.actions), (
             "a_silent_leg_is_never_resent"
         )
         if due:
-            account = replace(account, legs=(replace(account.legs[0], silent_told=True),))
+            told = "cancel_told" if account.legs[0].pending else "silent_told"
+            account = replace(account, legs=(replace(account.legs[0], **{told: True}),))
+    if event == "HE" and world.state.row in {"WK", "PF"}:
+        assert sale.Action.CANCEL in result.actions, "the_holdings_end_cancels_a_working_sale"
+    if event == "oLF" and world.state.row in {"WK", "PF"} and account.long <= 0:
+        assert sale.Action.CANCEL in result.actions, "the_holdings_end_cancels_a_working_sale"
     if world.state.row == "G" and event == "QU":
         count += 1
     elif event in {"QA", "HG", "HS", "CP", "CL", "oLF"} or world.state.row != "G":
@@ -291,8 +355,7 @@ def advance(world, seen, n, table):
         assert not account.young, "resend_no_sooner_than_the_interval"
         assert quantity > 0, "send_quantity_positive"
         assert quantity <= account.uncovered, "send_within_uncovered"
-        if world.state.row != "G":
-            assert quantity <= account.opening - account.sold, "send_within_episode_remainder"
+        assert quantity == account.uncovered, "every_leg_is_the_whole_uncovered_quantity"
         assert event != "NQ", "no_timer_send"
         assert not any(leg.pending for leg in account.legs), "no_send_until_cancel_ack"
         assert not account.legs, "one_open_leg"
@@ -301,6 +364,25 @@ def advance(world, seen, n, table):
             ("RW", "QU"),
             ("PCR", "oCXL"),
         ), "send_requires_counted_quote_or_reprice_ack"
+        first = world.state.row == "G"
+        floored = not first and (FLOOR_AT_RESEND or world.state.row != "RW")
+        limit = LEG_LIMIT(
+            account.bid - 1 if account.fresh else None,
+            level=LEVEL,
+            previous=None if first else account.previous,
+            floor=account.floor if floored else None,
+        )
+        assert limit is not None and limit <= LEVEL, "leg_limit_at_or_under_the_level"
+        if not first:
+            assert account.previous is not None, "a_later_leg_has_a_leg_before_it"
+            assert limit <= account.previous, "leg_limit_at_or_under_the_previous_leg"
+            if PRICE_WALK and world.state.row == "PCR" and not account.newer:
+                assert limit < account.previous, "a_reprice_with_no_newer_quote_steps_down"
+            if CHECK_FLOOR and account.floor is not None:
+                assert limit >= account.floor, "a_leg_and_its_floor_agree"
+        account = replace(
+            account, previous=limit, floor=max(1, limit - 2) if first else account.floor
+        )
         if world.state.row == "G":
             assert count == n, "first_leg_requires_fresh_count"
             account = replace(
@@ -317,16 +399,29 @@ def advance(world, seen, n, table):
         assert result.state.row == "PCT", "stopped_sale_cancel_row"
     if sale.Action.CANCEL in result.actions:
         assert account.legs and account.legs[0].cancelable, "cancel_requires_our_cancelable_leg"
-        account = replace(account, legs=(replace(account.legs[0], pending=True),))
+        account = replace(
+            account,
+            fresh=QUOTE_THAT_ASKED_COUNTS,
+            newer=False,
+            legs=(replace(account.legs[0], pending=True, cancel_told=False),),
+        )
     if event == "MO":
         assert sale.Action.CANCEL in result.actions, "mismatch_cancels_in_same_step"
         assert sale.Action.SEND not in result.actions, "mismatch_never_sends"
     if event in {"QA", "NQ"}:
         assert sale.Action.CANCEL not in result.actions, "reprice_only_under_level"
     if event == "NQ":
-        assert result.state == world.state and not result.actions, "timer_event_is_inert"
+        assert result.state == world.state, "timer_event_is_inert"
+        assert not {sale.Action.SEND, sale.Action.CANCEL} & set(result.actions), (
+            "timer_event_is_inert"
+        )
+        if world.state.row not in CANCEL_ASKED | {"FL"}:
+            assert not result.actions, "timer_event_is_inert"
     if world.state.row != "G" and result.state.row == "G":
         assert result.state.count == 0, "count_reentry_is_zero"
+    if result.state.row in NO_SALE - {"RW"}:
+        # The episode is over: its previous limit and its floor bind no later sale.
+        account = replace(account, previous=None, floor=None)
     if result.state.row != "G":
         count = 0
     elif world.state.row == "G" and event == "QU" and count == n:
@@ -354,6 +449,11 @@ def step(world, observations, n=2, table=sale.TABLE, *, sends=None):
     """Use the table's ordering; derive each event's facts from the evolving account."""
     if observations == (Seen("~"),):
         return replace(world, account=replace(world.account, young=False))
+    if len(observations) == 1 and observations[0].code == "p":
+        # A usable quote that is not counted (inside the gap): it changes no row and it prices.
+        return replace(
+            world, account=replace(world.account, bid=observations[0].bid, fresh=True, newer=True)
+        )
     indexed = {str(i): seen for i, seen in enumerate(observations)}
     tagged = [sale.Event(seen.code, {str(i): True}) for i, seen in enumerate(observations)]
     ordered = sale.order_step(tagged, table=table)
@@ -387,6 +487,9 @@ def alternatives(world):
     if world.state.row in COVER:
         # The read may succeed at any step, and the event is emitted in every such step.
         codes.append("UFZ")
+    if PRICE_WALK and (account.legs or world.state.row == "RW"):
+        for bid in (LEVEL - 6, LEVEL + 2):
+            yield (Seen("p", bid=bid),)
     if 0 < account.long < MAX_QUANTITY:
         codes.append("HG")
     if account.long > 1:
@@ -423,8 +526,14 @@ def alternatives(world):
                 if code == "oLF" and not (account.older_owed if earlier else account.owed):
                     continue
                 seen = Seen(code, formable, reprice_due, ends_filled, earlier)
-                if code in {"QU", "QA"} and leg and leg.status == "flight" and not leg.pending:
+                if code in {"QU", "QA", "NQ"} and leg and (leg.status == "flight" or leg.pending):
                     yield (replace(seen, overdue=True),)
+                if PRICE_WALK and code == "QU":
+                    for bid in (LEVEL - 6, LEVEL - 3):
+                        yield (replace(seen, bid=bid),)
+                        if account.floor is not None and leg and leg.cancelable:
+                            yield (replace(seen, bid=bid, wait_over=True),)
+                    seen = replace(seen, bid=LEVEL)
                 yield (seen,)
                 if code == "QU" or (code == "oCXL" and leg and leg.pending):
                     for invalidation in sorted(INVALIDATES.intersection(codes)):
@@ -579,7 +688,7 @@ def mutated(row, event, **changes):
             "QU",
             {"send": True, "next": "FL"},
             REPRICING + (Seen("QU"),),
-            "no_send_until_cancel_ack",
+            "no_send_until_cancel_ack|a_silent_leg_is_never_resent",
         ),
     ],
 )
@@ -680,18 +789,21 @@ def test_dropped_working_fill_is_detected_before_table_decisions(event, monkeypa
         step(world, (Seen(event),))
 
 
-@pytest.mark.parametrize("bound", ["uncovered", "episode_remainder"])
-def test_quantity_upper_bound_oracles_have_teeth(bound, monkeypatch):
-    # A cell emits SEND but has no quantity field to mutate. These are explicit
-    # harness mutations, independent evidence for its two arithmetic assertions.
-    long = 3 if bound == "uncovered" else 4
+@pytest.mark.parametrize(
+    "quantity,bound", [(4, "send_within_uncovered"), (2, "every_leg_is_the_whole")]
+)
+def test_quantity_oracles_have_teeth(quantity, bound, monkeypatch):
+    # A cell emits SEND but has no quantity field to mutate. These are explicit harness mutations,
+    # independent evidence for the two arithmetic assertions: never more than is uncovered, and the
+    # whole of it (ruling 19).
     world = World(
         sale.State("PCR"),
-        Account(long=long, opening=2, legs=(Leg(2, status="working", pending=True),)),
+        Account(
+            long=3, opening=2, previous=3, floor=1, legs=(Leg(2, status="working", pending=True),)
+        ),
     )
-    quantity = 4 if bound == "uncovered" else 3
     monkeypatch.setattr(Account, "next_quantity", property(lambda account: quantity))
-    with pytest.raises(AssertionError, match=f"send_within_{bound}"):
+    with pytest.raises(AssertionError, match=bound):
         step(world, (Seen("oCXL"),))
 
 
@@ -791,7 +903,7 @@ def test_resend_of_nothing_mutation_has_teeth():
         step(world, (Seen("QU"),), table=table)
 
 
-def test_resend_is_the_episode_remainder_within_what_is_uncovered():
+def test_resend_is_what_is_uncovered_then():
     # Two of three sold, then refused: the resend is one share, and none when a foreign sell covers it.
     world = walk(
         (Seen("QU"), Seen("QU"), Seen("oACC"), Seen("oPF"), Seen("oPF"), Seen("oACC"), Seen("oREJ"))
@@ -1011,24 +1123,198 @@ def test_a_sale_inside_the_interval_after_a_cancel_from_elsewhere_has_teeth():
         walk(WORKING + (Seen("oCXL"), Seen("QU"), Seen("QU")), table=table)
 
 
-@pytest.mark.parametrize("row", sorted(FAULT | COVER))
-def test_nothing_sent_from_any_frozen_row_has_teeth(row):
-    leg = () if row in NO_SALE else (Leg(3, status="working", pending=row in CANCEL_ASKED),)
-    world = World(sale.State(row), Account(legs=leg, opening=3))
-    with pytest.raises(AssertionError, match="no_send_from_a_frozen_row"):
-        step(world, (Seen("QU"),), table=mutated(row, "QU", send=True))
+def test_shares_added_while_our_leg_works_are_in_the_next_leg_sent():
+    """Ruling 19: growth asks no cancel, and the next leg is the whole uncovered quantity."""
+    start = World(account=Account(long=2))
+    world = walk(WORKING + (Seen("HG"),), initial=start)
+    assert world.state.row == "WK" and world.account.legs == (Leg(2, status="working"),)
+    world = walk((Seen("QU", reprice_due=True), Seen("oCXL")), initial=world)
+    assert world.state.row == "FL" and world.account.legs == (Leg(3),)
 
 
-def test_unformable_send_and_cover_read_side_effect_mutations_have_teeth():
-    with pytest.raises(AssertionError, match="a_leg_that_cannot_be_formed_is_not_sent"):
-        walk(
-            (Seen("QU"), Seen("QU", formable=False)),
-            table=mutated_branch(
-                "G",
-                "QU",
-                "count_complete and resend_due and leg_positive and not formable and not refusal_told",
-                send=True,
-            ),
+def test_an_unanswered_cancel_is_told_once_and_the_next_leg_waits_for_its_answer():
+    world = walk(REPRICING)
+    assert world.state.row == "PCR"
+    told = walk((Seen("QA", overdue=True),), initial=world)
+    assert told.state.row == "PCR" and told.account.legs[0].cancel_told
+    assert walk((Seen("QU", overdue=True),), initial=told) == replace(
+        told, account=replace(told.account, bid=LEVEL - 1)
+    )
+    assert walk((Seen("oCXL"),), initial=told).state.row == "FL"
+
+
+def test_the_holdings_end_cancels_our_working_sale_in_that_step():
+    world = walk(WORKING + (Seen("HE"),))
+    assert world.state.row == "PCX" and world.account.legs[0].pending
+    assert walk((Seen("oCXL"),), initial=world).state.row == "X"
+
+
+@pytest.mark.parametrize(
+    "row,event,when,changes,history,property_name",
+    [
+        (
+            "WK",
+            "HE",
+            "always",
+            {"next": "OX", "cancel": False},
+            WORKING + (Seen("HE"),),
+            "the_holdings_end_cancels",
+        ),
+        (
+            "PCR",
+            "QU",
+            "flight_alert_due",
+            {"alert": False},
+            REPRICING + (Seen("QU", overdue=True),),
+            "a_silent_leg_is_told_once",
+        ),
+        (
+            "PCR",
+            "QA",
+            "not flight_alert_due",
+            {"alert": True},
+            REPRICING + (Seen("QA"),),
+            "a_silent_leg_is_told_once",
+        ),
+        (
+            "PCO",
+            "QU",
+            "flight_alert_due",
+            {"next": "G", "count": "0"},
+            WORKING + (Seen("HS"), Seen("QU", overdue=True)),
+            "a_silent_leg_is_never_resent",
+        ),
+    ],
+)
+def test_seventh_form_mutations_have_teeth(row, event, when, changes, history, property_name):
+    with pytest.raises(AssertionError, match=property_name):
+        walk(history, table=mutated_branch(row, event, when, **changes))
+
+
+def uncapped(which):
+    def limit(stepped, *, level, previous, floor):
+        price = previous if stepped is None else stepped
+        if which != "floor" and floor is not None:
+            price = max(price, floor)
+        if "level" not in which:
+            price = min(price, level)
+        if "previous" not in which and previous is not None:
+            price = min(price, previous)
+        return price
+
+    return limit
+
+
+def test_the_price_rule_holds_at_every_send_over_the_enumeration(monkeypatch, tmp_path):
+    """Ruling 18's property: at every send the limit is at or under the level and at or under the
+    previous leg's limit, with quotes above, under and far under the level, counted or not."""
+    module = sys.modules[__name__]
+    monkeypatch.setattr(module, "PRICE_WALK", True)
+    monkeypatch.setattr(module, "MAX_QUANTITY", 1)
+    stats = enumerate_sequences(depth=7)
+    print("PRICE ENUM", json.dumps(stats, sort_keys=True))
+    (tmp_path / "price-enumeration.json").write_text(
+        json.dumps(stats, indent=2, sort_keys=True) + "\n"
+    )
+    assert stats["sending_transitions"]["PCR x oCXL"] > 0
+    assert stats["sending_transitions"]["RW x QU"] > 0
+
+
+@pytest.mark.parametrize(
+    "which,property_name",
+    [
+        ("previous", "leg_limit_at_or_under_the_previous_leg"),
+        ("level and previous", "leg_limit_at_or_under_the_(level|previous_leg)"),
+        ("floor", "a_leg_and_its_floor_agree"),
+    ],
+)
+def test_a_price_rule_without_one_cap_fails_the_enumeration(which, property_name, monkeypatch):
+    module = sys.modules[__name__]
+    monkeypatch.setattr(module, "PRICE_WALK", True)
+    monkeypatch.setattr(module, "MAX_QUANTITY", 1)
+    monkeypatch.setattr(module, "LEG_LIMIT", uncapped(which))
+    with pytest.raises(AssertionError, match=property_name):
+        enumerate_sequences(depth=7)
+
+
+def test_the_level_cap_binds_by_itself_where_no_walk_can_reach():
+    """Over the table a first leg is priced from a counted quote under the level and later legs only
+    step down, so the level's cap never binds alone in the walk; the function still holds it."""
+    assert LEG_LIMIT(LEVEL + 1, level=LEVEL, previous=None, floor=None) == LEVEL
+    assert LEG_LIMIT(None, level=LEVEL, previous=LEVEL - 1, floor=None) == LEVEL - 1
+    assert LEG_LIMIT(None, level=LEVEL, previous=None, floor=None) is None
+
+
+def test_a_first_legs_floor_lifts_it_and_never_above_the_level():
+    """The gain lock's applied floor is a first leg's floor; the level's cap is applied after it."""
+    assert LEG_LIMIT(3, level=LEVEL, previous=None, floor=5) == 5
+    assert LEG_LIMIT(3, level=4, previous=None, floor=5) == 4
+    assert LEG_LIMIT(3, level=LEVEL, previous=4, floor=5) == 4
+
+
+@pytest.mark.parametrize(
+    "check_floor,property_name",
+    [
+        (True, "a_leg_and_its_floor_agree"),
+        (False, "no_leg_rests_above_a_falling_market_in_silence"),
+    ],
+)
+def test_a_resend_priced_without_the_episodes_floor_fails_the_enumeration(
+    check_floor, property_name, monkeypatch
+):
+    """The second review's P1: a leg sent again under the episode's floor is never re-priced. With
+    the agreement of leg and floor unchecked, the silence itself is what the walk finds."""
+    module = sys.modules[__name__]
+    monkeypatch.setattr(module, "PRICE_WALK", True)
+    monkeypatch.setattr(module, "MAX_QUANTITY", 1)
+    monkeypatch.setattr(module, "FLOOR_AT_RESEND", False)
+    monkeypatch.setattr(module, "CHECK_FLOOR", check_floor)
+    with pytest.raises(AssertionError, match=property_name):
+        enumerate_sequences(depth=7)
+
+
+def test_the_floors_wait_releases_and_the_leg_is_then_repriced():
+    """A leg at its floor with the price through it: no re-price until the wait has run, then one."""
+    module = sys.modules[__name__]
+    patch = pytest.MonkeyPatch()
+    patch.setattr(module, "PRICE_WALK", True)
+    try:
+        start = walk((Seen("QU", bid=LEVEL), Seen("QU", bid=LEVEL), Seen("oACC")))
+        assert (start.account.previous, start.account.floor) == (LEVEL - 1, LEVEL - 3)
+        fallen = walk(
+            (Seen("QU", bid=LEVEL - 6, reprice_due=True), Seen("oCXL"), Seen("oACC")), initial=start
         )
-    with pytest.raises(AssertionError, match="cover_read_again_does_nothing_else"):
-        walk((Seen("FRZ"), Seen("UFZ")), table=mutated("FC", "UFZ", alert=True))
+        assert fallen.state.row == "WK" and fallen.account.previous == LEVEL - 3, fallen
+        held = walk((Seen("QU", bid=LEVEL - 6, reprice_due=True),), initial=fallen)
+        assert held.state.row == "WK", "at the floor the chase asks nothing until the wait has run"
+        freed = walk((Seen("QU", bid=LEVEL - 6, reprice_due=True, wait_over=True),), initial=fallen)
+        assert freed.state.row == "PCR" and freed.account.floor is None
+        after = walk((Seen("p", bid=LEVEL - 6), Seen("oCXL")), initial=freed)
+        assert after.state.row == "FL" and after.account.previous == LEVEL - 7
+    finally:
+        patch.undo()
+
+
+def test_a_silent_leg_is_told_on_a_timer_step_once():
+    world = walk(IN_FLIGHT + (Seen("NQ", overdue=True),))
+    assert world.state.row == "FL" and world.account.legs[0].silent_told
+    assert walk((Seen("NQ", overdue=True),), initial=world) == world
+
+
+def test_a_timer_step_that_keeps_a_commands_silence_quiet_has_teeth():
+    with pytest.raises(AssertionError, match="a_silent_leg_is_told_once"):
+        walk(
+            IN_FLIGHT + (Seen("NQ", overdue=True),),
+            table=mutated_branch("FL", "NQ", "flight_alert_due", alert=False),
+        )
+
+
+def test_a_reprice_that_forgets_the_quote_that_asked_it_fails_the_enumeration(monkeypatch):
+    """Were the quote that asked the cancel not the newest usable quote at the send, a re-price whose
+    acknowledgement arrives before the next quote would send the replaced leg's limit again."""
+    module = sys.modules[__name__]
+    monkeypatch.setattr(module, "PRICE_WALK", True)
+    monkeypatch.setattr(module, "MAX_QUANTITY", 1)
+    monkeypatch.setattr(module, "QUOTE_THAT_ASKED_COUNTS", False)
+    with pytest.raises(AssertionError, match="a_reprice_with_no_newer_quote_steps_down"):
+        enumerate_sequences(depth=7)

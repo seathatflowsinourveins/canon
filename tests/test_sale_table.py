@@ -11,6 +11,7 @@ import itertools
 import json
 import sys
 from copy import deepcopy
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -21,7 +22,7 @@ from canon_trading import sale_table as sale
 DATA_PATH = Path(__file__).resolve().parents[1] / "src/canon_trading/sale_table.json"
 DATA = json.loads(DATA_PATH.read_text())
 HISTORIES = json.loads(Path(__file__).with_name("sale_table_histories.json").read_text())
-CELLS_HASH = "ee8b277596cf8f1630a03beed06ee3767c1aeed05631cfe69e89f67e1f64f38b"
+CELLS_HASH = "7a39ab781d94fec8946c245eeea25b07d0fc16110486ab606ee8030e7b5ef95c"
 CELLS = [(r, e, c) for r, row in DATA["cells"].items() for e, c in row.items()]
 BRANCHES = [(r, e, b) for r, e, c in CELLS for b in c["branches"]]
 
@@ -107,6 +108,7 @@ def test_tracked_table_has_exact_contract_and_cells():
         "order_event_inventory",
         "properties_for_step_d",
         "sending_transitions",
+        "price_rule",
         "freeze_causes",
         "cells",
     }
@@ -121,6 +123,70 @@ def test_tracked_table_has_exact_contract_and_cells():
 
 def test_module_header_names_current_cells():
     assert sale.__doc__ is not None and CELLS_HASH in sale.__doc__
+
+
+@pytest.mark.parametrize(
+    "stepped,level,previous,floor,expected",
+    [
+        (11, 10, None, None, 10),
+        (9, 10, 8, None, 8),
+        (7, 10, None, 8, 8),
+        (7, 10, None, 11, 10),
+        (7, 10, 8, 9, 8),
+        (None, 10, 8, 9, 8),
+        (None, 10, None, 9, None),
+    ],
+)
+def test_leg_limit_caps_floor_and_no_quote(stepped, level, previous, floor, expected):
+    assert (
+        sale.leg_limit(
+            None if stepped is None else Decimal(stepped),
+            level=Decimal(level),
+            previous=None if previous is None else Decimal(previous),
+            floor=None if floor is None else Decimal(floor),
+        )
+        == expected
+    )
+
+
+def test_seventh_form_properties_are_in_the_contract():
+    assert {
+        "every_leg_steps_down_and_stays_under_the_level",
+        "every_leg_is_the_whole_uncovered_quantity",
+        "no_leg_rests_above_a_falling_market_in_silence",
+        "a_leg_and_its_floor_agree",
+        "order_events_are_judged_in_a_step",
+        "an_unanswered_cancel_is_told_once",
+        "the_holdings_end_cancels_a_working_sale",
+        "no_timer_transition",
+    } <= set(DATA["properties_for_step_d"])
+
+
+def test_silence_predicate_is_used_only_by_waiting_rows_and_quote_or_timer():
+    waiting = {"FL", "PCR", "PCO", "PCX", "PCT", "FZP", "FCP"}
+    for row, event, cell in CELLS:
+        reads = any("flight_alert_due" in names(b["when"]) for b in cell["branches"])
+        assert reads == (row in waiting and event in {"QU", "QA", "NQ"})
+        if reads:
+            assert {b["when"] for b in cell["branches"]} == {
+                "flight_alert_due",
+                "not flight_alert_due",
+            }
+
+
+@pytest.mark.parametrize("row", ["WK", "PF"])
+@pytest.mark.parametrize("event", ["HE", "oLF"])
+def test_holdings_end_cancels_the_working_sale_in_that_step(row, event):
+    result = sale.transition(sale.State(row), 2, event, {"long_remains": False})
+    assert result.state == sale.State("PCX")
+    assert sale.Action.CANCEL in result.actions
+
+
+def test_resting_rows_without_a_chase_are_entered_with_an_alert():
+    resting = {"FZW", "FCW", "TW", "OX"}
+    for row, _, branch in BRANCHES:
+        if row not in resting and branch["next"] in resting:
+            assert branch["alert"]
 
 
 def test_quantity_and_cover_properties_are_in_the_contract():
@@ -233,11 +299,12 @@ def test_refusal_cells_and_waiting_row_obey_ruling_fifteen():
             assert not branch["send"]
 
 
-@pytest.mark.parametrize("event", ["QU", "QA"])
-def test_silent_flight_alert_is_the_only_change(event):
+@pytest.mark.parametrize("row", ["FL", "PCR", "PCO", "PCX", "PCT", "FZP", "FCP"])
+@pytest.mark.parametrize("event", ["QU", "QA", "NQ"])
+def test_silent_flight_alert_is_the_only_change(row, event):
     for due in (False, True):
-        result = sale.transition(sale.State("FL"), 2, event, {"flight_alert_due": due})
-        assert result.state == sale.State("FL")
+        result = sale.transition(sale.State(row), 2, event, {"flight_alert_due": due})
+        assert result.state == sale.State(row)
         assert result.actions == ((sale.Action.ALERT,) if due else ())
 
 
@@ -318,6 +385,7 @@ def test_module_imports_only_pure_standard_library_dependencies():
         "__future__",
         "collections",
         "dataclasses",
+        "decimal",
         "enum",
         "json",
         "pathlib",
@@ -372,11 +440,13 @@ def test_exactly_three_sending_transitions_into_flight():
 
 
 @pytest.mark.parametrize("row", DATA["rows"])
-def test_timer_event_changes_nothing(row):
+def test_timer_event_changes_no_row_and_only_alerts_silence(row):
     state = sale.State(row, 1 if row == "G" else None)
-    result = sale.apply_step(state, 2, [sale.Event("NQ", {})])
-    assert result.state == state
-    assert result.actions == ()
+    for due in (False, True):
+        result = sale.apply_step(state, 2, [sale.Event("NQ", {"flight_alert_due": due})])
+        assert result.state == state
+        silent = row == "FL" or DATA["rows"][row]["phase"] == "pc"
+        assert result.actions == ((sale.Action.ALERT,) if due and silent else ())
     assert all(
         b["next"] == row and not (b["send"] or b["cancel"])
         for b in DATA["cells"][row]["NQ"]["branches"]
@@ -483,7 +553,7 @@ def test_recorded_history(group, name, history):
 
 
 def test_all_histories_are_present_with_public_names():
-    assert len(HISTORIES["named_paths"]) == 29
+    assert len(HISTORIES["named_paths"]) == 33
     assert len(HISTORIES["histories_walked"]) == 10
     for group in HISTORIES.values():
         for name in group:

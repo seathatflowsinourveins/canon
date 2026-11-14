@@ -106,7 +106,7 @@ def test_a_table_ordered_freeze_is_not_ended_by_a_cover_that_reads():
     strategy = counted()
     strategy.observe("9.89", h.T0 + h.SECOND)
     strategy.observe("9.88", h.T0 + 2 * h.SECOND)
-    strategy.deliver("Denied")
+    strategy.deliver_then_step("Denied")
     assert row(strategy).row == "FZ"
     step(strategy, 3)
     strategy.observe("9.87", h.T0 + 4 * h.SECOND)
@@ -182,7 +182,9 @@ def test_fault_while_cover_unread_keeps_reason_after_recovery():
     strategy.cached.working.append(foreign)
     step(strategy, 3)
     assert row(strategy).row == "FCW" and not strategy.canceled
-    strategy.deliver("Unrecognized", leg=strategy.cache.order(strategy.slots[h.AAA].protect_id))
+    strategy.deliver_then_step(
+        "Unrecognized", leg=strategy.cache.order(strategy.slots[h.AAA].protect_id)
+    )
     assert row(strategy).row == "FZW"
     reason = strategy.frozen[h.AAA]
     strategy.cached.working.remove(foreign)
@@ -197,13 +199,13 @@ def test_unformable_leg_retries_without_building_an_order_or_repeating_alert(sou
     if source != "G":
         first_leg(strategy)
         if source == "RW":
-            strategy.deliver("Rejected")
+            strategy.deliver_then_step("Rejected")
         else:
             strategy.observe("9.80", h.T0 + 62 * h.SECOND)
     instrument = strategy.cached.instrument
     monkeypatch.setattr(strategy.cached, "instrument", lambda _: None)
     if source == "PCR":
-        strategy.deliver("Canceled")
+        strategy.deliver_then_step("Canceled")
         assert row(strategy).row == "RW"
     before = len(strategy.sent)
     strategy.observe("9.79", h.T0 + 123 * h.SECOND)
@@ -220,13 +222,13 @@ def test_unformable_leg_retries_without_building_an_order_or_repeating_alert(sou
 def test_external_cancel_alert_interval_and_fresh_quantity():
     strategy = counted()
     first_leg(strategy)
-    strategy.deliver("Canceled", reason="x" * 300)
+    strategy.deliver_then_step("Canceled", reason="x" * 300)
     assert row(strategy) == sale_table.State("G", 0)
     assert len(alerts(strategy)) == 1
     from canon_trading.owner_protector import HOLD_ONE_SYMBOL
 
     alert = alerts(strategy)[0]
-    assert "canceled by another hand" in alert and "60 s" in alert
+    assert "canceled, and not by us (the venue or another hand)" in alert and "60 s" in alert
     assert "full new count" in alert and HOLD_ONE_SYMBOL in alert
     strategy.observe("9.87", h.T0 + 3 * h.SECOND)
     strategy.observe("9.86", h.T0 + 4 * h.SECOND)
@@ -244,7 +246,7 @@ def test_alert_keeps_cell_reason_then_event_reason(kind, venue):
     strategy = counted()
     strategy.observe("9.89", h.T0 + h.SECOND)
     strategy.observe("9.88", h.T0 + 2 * h.SECOND)
-    strategy.deliver(kind, reason=venue)
+    strategy.deliver_then_step(kind, reason=venue)
     alert = alerts(strategy)[-1]
     note = sale_table.TABLE.cells["FL", sale_table.order_event_column(kind)].note
     label = "FL x oDEN: " if kind == "Denied" else "FL x oOTH: UNEXPECTED; "
@@ -275,7 +277,7 @@ def test_each_sale_end_writes_one_final_record(kind):
         strategy.cached.held[0].signed_qty = Decimal(0)
         step(strategy, 3)
     else:
-        strategy.deliver(kind, quantity=10 if kind == "Filled" else 0)
+        strategy.deliver_then_step(kind, quantity=10 if kind == "Filled" else 0)
     final = records(strategy)[before:]
     assert len(final) == 1
     assert {"refusal_reason", "refusal_first", "refusals", "confirm_gap_ms"} <= final[0].keys()
@@ -291,7 +293,7 @@ def test_gain_lock_measure_on_counted_sale_fill():
     slot.gain_armed_at, slot.gain_entry = h.T0, Decimal("9.00")
     slot.gain_floor = h.Price.from_str("9.50")
     first_leg(strategy)
-    filled = strategy.deliver("Filled", quantity=3)
+    filled = strategy.deliver_then_step("Filled", quantity=3)
     # The pin calls the specific handler before the generic handler. This stand-in
     # exercises the same specific entry explicitly while the sale is still open.
     strategy.on_order_filled(filled)
@@ -358,15 +360,25 @@ def test_unread_cover_with_unknown_own_remainder_uses_base_oversell_check(monkey
     assert called and ours.client_order_id in strategy.canceled
 
 
-def test_cover_freeze_retries_refused_oversell_cancel_on_timer():
+def test_cover_freeze_retries_refused_oversell_cancel_in_the_judging_step(monkeypatch):
     strategy = counted()
     first_leg(strategy)
     ours = strategy.cache.order(strategy.slots[h.AAA].protect_id)
     strategy.cached.working.append(h.working_sell(FOREIGN, qty="1", filled="0"))
     step(strategy, 3)
     assert row(strategy).row == "FCP" and len(strategy.canceled) == 1
-    strategy.deliver("CancelRejected", leg=ours)
-    assert row(strategy).row == "FCW"
+    observed = []
+    transition = sale_table.transition
+
+    def traced(state, n, code, facts):
+        result = transition(state, n, code, facts)
+        observed.append((code, result.state.row))
+        return result
+
+    monkeypatch.setattr(sale_table, "transition", traced)
+    strategy.deliver_then_step("CancelRejected", leg=ours)
+    assert ("oCRJ", "FCW") in observed and ("MO", "FCP") in observed
+    assert row(strategy).row == "FCP" and len(strategy.canceled) == 2
     step(strategy, 4)
     assert len(strategy.canceled) == 2 and len(strategy.sent) == 1
 
@@ -381,7 +393,7 @@ def test_refusal_of_cancel_pending_leg_keeps_the_ruled_result(target):
         strategy.cached.held[0].signed_qty = Decimal(7)
         step(strategy, 3)
     assert row(strategy).row == target
-    strategy.deliver("Rejected", reason="synthetic venue refusal")
+    strategy.deliver_then_step("Rejected", reason="synthetic venue refusal")
     assert h.AAA not in strategy.frozen
     if target == "PCR":
         assert row(strategy).row == "RW" and strategy.slots[h.AAA].refusals == 1
@@ -416,7 +428,7 @@ def test_cover_reads_again_uses_current_leg_state(state):
     if state == "flight":
         ours.status = h.OrderStatus.SUBMITTED
     elif state == "partial":
-        strategy.deliver("Filled", quantity=1, leg=ours)
+        strategy.deliver_then_step("Filled", quantity=1, leg=ours)
     elif state == "cancel":
         strategy.observe("9.80", h.T0 + 62 * h.SECOND)
     # Another strategy's position makes the read ambiguous without an oversell.
@@ -431,7 +443,7 @@ def test_cover_reads_again_uses_current_leg_state(state):
         == {"flight": "FL", "working": "WK", "partial": "PF", "cancel": "FCP"}[state]
     )
     if state == "cancel":
-        strategy.deliver("Canceled", leg=ours)
+        strategy.deliver_then_step("Canceled", leg=ours)
         assert row(strategy).row == "FC"
         step(strategy, 65)
         assert row(strategy) == sale_table.State("G", 0)

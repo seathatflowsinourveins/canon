@@ -223,6 +223,16 @@ no measured source (UNCALIBRATED); 1000 ms is the node configuration's starting 
 U-c2 ruling 15/16: a venue refusal waits for a counted quote after RESEND_SECS; an unanswered
 leg is told once after FLIGHT_SECS and never duplicated. Refusal data lives on the holding,
 not the sale or level book. Native statuses follow model/src/orders/mod.rs:207-302.
+Named limits at a count above one: added shares wait for the next leg; while the chase floor
+holds, one ALERT names the uncovered quantity beside the working remainder. An acknowledgement
+waits for the next quote or timer step, up to STEP_NS, before its next leg is sent; the send line
+records ack_to_send_ms. An event on an ended holding's leg judges the following holding's row:
+its late fill resets the count and its voided fill freezes the new holding. After a fill void
+that did not reopen its order, remaining quantity cannot be read back by _remaining; the holding
+is already frozen and a subsequent fill is read as its last. The adapter builds no voided fill.
+Order handlers only enqueue event payloads. Steps replay them on independent native LimitOrders,
+in arrival order (python/orders/limit.rs:463-466, 470-572), so a later cached state cannot supply
+an earlier event's facts. Local echoes produced by a step wait for the following step too.
 """
 
 from __future__ import annotations
@@ -254,6 +264,7 @@ from nautilus_trader.model import BarType
 from nautilus_trader.model import ClientOrderId
 from nautilus_trader.model import ContingencyType
 from nautilus_trader.model import InstrumentId
+from nautilus_trader.model import LimitOrder
 from nautilus_trader.model import OmsType
 from nautilus_trader.model import OrderReleased
 from nautilus_trader.model import OrderSide
@@ -314,6 +325,8 @@ HOLD_ONE_SYMBOL = "hold this symbol: stop the node"
 SALE_FAULT_ROWS = frozenset({"FZ", "FZW", "FZP"})
 SALE_COVER_ROWS = frozenset({"FC", "FCW", "FCP"})
 SALE_CANCEL_ROWS = frozenset({"PCR", "PCO", "PCX", "FZP", "FCP", "PCT"})
+# What answers a cancel of ours: its acknowledgement, its refusal, or the leg's own end.
+SALE_CANCEL_ANSWERS = frozenset({"oCXL", "oCRJ", "oEXP", "oFF", "oREJ", "oDEN"})
 # UNCALIBRATED (U-c2 ruling 16). paper_node.exec_engine_config deliberately retains
 # unresolved submits: Alpaca's timeout instruction there says never resend one.
 # The venue may hold it; a second sell beside it could sell more than is held.
@@ -582,6 +595,9 @@ class Sale:
     filled_ns: int | None = None
     order_ids: set[ClientOrderId] = field(default_factory=set)
     end_recorded: bool = False
+    resends: int = 0
+    cancel_ns: int | None = None
+    growth_told: bool = False
 
     def record(self, now: int) -> dict[str, Any]:
         return {
@@ -650,6 +666,7 @@ class Holding:
     current_from: int | None = None
     sale_state: sale_table.State | None = None
     counted_quote: QuoteTick | None = None
+    usable_quote: QuoteTick | None = None
     opening_quantity: Decimal = Decimal(0)
     # Observed quantities identify changes, net of all our fills; never cached predicates.
     observed_quantities: tuple[Decimal, Decimal] | None = None
@@ -664,6 +681,8 @@ class Holding:
     flight_sent_ns: int | None = None
     flight_told: bool = False
     flight_answered: bool = False
+    flight_command: str = "submit"
+    flight_answer_ns: int | None = None
 
 
 STREAM_LOGGER = "alpaca.data.live.websocket"
@@ -782,6 +801,8 @@ class OwnerProtector(Strategy):
         self.stopped_sales: dict[InstrumentId, Holding] = {}
         self.readoption_named: set[InstrumentId] = set()
         self._sale_reading: set[InstrumentId] = set()
+        self._sale_events: dict[InstrumentId, list[Any]] = {}
+        self._sale_orders: dict[ClientOrderId, Any] = {}
 
     @property
     def cache(self) -> Any:
@@ -1519,17 +1540,6 @@ class OwnerProtector(Strategy):
         leg for size in this event, not at the next quote or step (the lead, 2026-11-13 19:17).
         """
         if self.settings.breach_count > 1:
-            slot = self.slots.get(event.instrument_id) or self.stopped_sales.get(
-                event.instrument_id
-            )
-            if (
-                slot is not None
-                and slot.sale is not None
-                and event.client_order_id in slot.sale.order_ids
-                and slot.gain_armed_at is not None
-                and slot.gain_entry is not None
-            ):
-                self._gain_lock_sale(event, slot)
             return
         slot = self.slots.get(event.instrument_id)
         if slot is None or not (
@@ -2052,8 +2062,13 @@ class OwnerProtector(Strategy):
             )
         tick = self.venue_quotes.get(instrument_id)
         was_unplanned = slot.level is None
-        if slot.distance is None and tick is not None:
-            self._plan_holding(instrument_id, slot, tick)
+        if slot.distance is None:
+            if tick is None:
+                self._record_unprotected(
+                    instrument_id, slot.seed_error or "no two-sided quote to plan protection"
+                )
+            else:
+                self._plan_holding(instrument_id, slot, tick)
         events = []
         if quote is None:
             events.append("NQ")
@@ -2078,7 +2093,12 @@ class OwnerProtector(Strategy):
             reason = "one-sided, crossed or zero bid quote not counted"
         elif not advanced or not _sane(quote):
             reason = "quote refused by the venue clock; not counted"
-        elif slot.armed_at is None or quote.ts_init <= slot.armed_at:
+        if reason is not None:
+            self._say(f"{instrument_id}: {reason}")
+            return None
+        # Pricing uses every usable stream maximum, independently of arming and count gap.
+        slot.usable_quote = quote
+        if slot.armed_at is None or quote.ts_init <= slot.armed_at:
             reason = "quote before the arming; not counted"
         elif slot.armed_event is not None and quote.ts_event < slot.armed_event:
             reason = "quote before the arming's venue stamp; not counted"
@@ -2165,7 +2185,9 @@ class OwnerProtector(Strategy):
             Decimal(0),
         )
 
-    def _sale_reprice_due(self, instrument_id: InstrumentId, slot: Holding, order: Any) -> bool:
+    def _sale_reprice_due(
+        self, instrument_id: InstrumentId, slot: Holding, order: Any, uncovered: Decimal | None
+    ) -> bool:
         """The base chase arithmetic as a question, asked only for a counted QU."""
         sale, quote = slot.sale, slot.counted_quote
         if (
@@ -2186,6 +2208,19 @@ class OwnerProtector(Strategy):
             sale.floor_reached = True
             if sale.floor_since is None:
                 sale.floor_since = now
+            remaining = _remaining(order)
+            if (
+                not sale.growth_told
+                and uncovered is not None
+                and remaining is not None
+                and uncovered > remaining
+            ):
+                self._sale_alert(
+                    instrument_id,
+                    f"floor wait: uncovered {uncovered}, working remainder {remaining}; "
+                    "the rest is sold with the next leg",
+                )
+                sale.growth_told = True
             if now - sale.floor_since >= FLOOR_WAIT_SECS * SECOND_NS:
                 sale.floor_wait_ns += now - sale.floor_since
                 sale.floor_since, sale.floor, sale.floor_release_price = None, None, through
@@ -2196,44 +2231,72 @@ class OwnerProtector(Strategy):
             self._log_sale(instrument_id, sale)
         return (
             now - sale.priced_ns >= protect.PLANNER.chase_secs * SECOND_NS
+            and (
+                sale.cancel_ns is None
+                or now - sale.cancel_ns >= protect.PLANNER.chase_secs * SECOND_NS
+            )
             and exit_price(bid, protect.PLANNER.exit_ticks, sale.floor) < order.price.as_decimal()
         )
 
     def _sale_facts(
-        self, instrument_id: InstrumentId, slot: Holding, code: str, snapshot: tuple[Any, ...]
+        self,
+        instrument_id: InstrumentId,
+        slot: Holding,
+        code: str,
+        snapshot: tuple[Any, ...],
+        *,
+        judged: bool = False,
+        event_held: Decimal | None = None,
     ) -> tuple[dict[str, bool], Any]:
         assert slot.sale_state is not None
-        position, held, uncovered, _, _ = snapshot
+        _, held, uncovered, _, _ = snapshot
         # Actions can replace the leg inside this callback. Coverage is read once;
         # the current leg is always read after the preceding action.
-        order = None if slot.protect_id is None else self.cache.order(slot.protect_id)
+        order = (
+            self._sale_orders.get(slot.protect_id)
+            if judged
+            else None
+            if slot.protect_id is None
+            else self.cache.order(slot.protect_id)
+        )
         quantity = uncovered or Decimal(0)
-        if slot.sale_state.row != "G":
-            sold = self._sale_sold(
-                instrument_id, set() if slot.sale is None else slot.sale.order_ids
-            )
-            quantity = min(quantity, max(Decimal(0), slot.opening_quantity - sold))
+        event_uncovered = uncovered
+        if event_held is not None and uncovered is not None:
+            # A later queued fill must not turn an earlier cancellation/expiry into
+            # whole cover. Candidate sizes still use the actual uncovered quantity.
+            event_uncovered = max(Decimal(0), uncovered + event_held - held)
         candidate = None
         cell = sale_table.TABLE.cells[slot.sale_state.row, code]
         if quantity > 0 and any(sale_table.Action.SEND in b.actions for b in cell.branches):
-            quote = slot.counted_quote
+            quote = slot.usable_quote
             instrument = self.cache.instrument(instrument_id)
-            if quote is not None and instrument is not None:
+            if slot.level is not None and instrument is not None:
+                first = slot.sale_state.row == "G"
                 floor = (
-                    None
-                    if slot.sale_state.row in {"G", "RW"} or slot.sale is None
-                    else slot.sale.floor
+                    (
+                        None
+                        if slot.gain_applied_floor is None
+                        else slot.gain_applied_floor.as_decimal()
+                    )
+                    if first
+                    else (None if slot.sale is None else slot.sale.floor)
                 )
-                price = exit_price(quote.bid_price.as_decimal(), protect.PLANNER.exit_ticks, floor)
-                if slot.level is not None:
-                    price = min(price, slot.level.as_decimal())
+                price = sale_table.leg_limit(
+                    None
+                    if quote is None
+                    else exit_price(quote.bid_price.as_decimal(), protect.PLANNER.exit_ticks, None),
+                    level=slot.level.as_decimal(),
+                    previous=None if first or slot.sale is None else slot.sale.last_price,
+                    floor=floor,
+                )
                 try:
                     size = instrument.make_qty(quantity)
-                    limit = instrument.make_price(price)
+                    limit = None if price is None else instrument.make_price(price)
                 except ValueError, OverflowError:
                     size = limit = None  # The table's formable predicate is false.
                 if (
-                    price > 0
+                    price is not None
+                    and price > 0
                     and size is not None
                     and limit is not None
                     and size.as_decimal() == quantity
@@ -2241,15 +2304,15 @@ class OwnerProtector(Strategy):
                 ):
                     candidate = (size, limit)
         return {
-            "whole_cover": uncovered == 0,
+            "whole_cover": event_uncovered == 0,
             "filled_part": order is not None and order.filled_qty.as_decimal() > 0,
-            "long_remains": held > 0 and position is not None and not slot.ended,
+            "long_remains": (held if event_held is None else event_held) > 0 and not slot.ended,
             "leg_positive": quantity > 0,
             "cancelable": order is not None
             and order.status in (OrderStatus.ACCEPTED, OrderStatus.PARTIALLY_FILLED),
             "formable": candidate is not None,
-            "reprice_due": self._sale_reprice_due(instrument_id, slot, order)
-            if code == "QU"
+            "reprice_due": self._sale_reprice_due(instrument_id, slot, order, uncovered)
+            if code == "QU" and slot.sale_state.row in {"WK", "PF"}
             else False,
             "ends_filled": order is not None and order.status == OrderStatus.FILLED,
             "refusal_told": slot.refusal_told,
@@ -2258,13 +2321,11 @@ class OwnerProtector(Strategy):
                 at is None or self.clock.timestamp_ns() - at >= RESEND_SECS * SECOND_NS
                 for at in (slot.refusal_last_ns, slot.external_cancel_ns)
             ),
-            "flight_alert_due": code in {"QU", "QA"}
-            and slot.sale_state.row == "FL"
+            "flight_alert_due": code in {"QU", "QA", "NQ"}
+            and slot.sale_state.row in SALE_CANCEL_ROWS | {"FL"}
             and not slot.flight_told
             and not slot.flight_answered
             and slot.flight_sent_ns is not None
-            and order is not None
-            and order.status in {OrderStatus.INITIALIZED, OrderStatus.SUBMITTED}
             and self.clock.timestamp_ns() - slot.flight_sent_ns >= FLIGHT_SECS * SECOND_NS,
         }, candidate
 
@@ -2276,12 +2337,14 @@ class OwnerProtector(Strategy):
         reason: str = "",
         order_event_ns: int | None = None,
     ) -> None:
-        """One driver, including synchronous engine echoes: order, transition, store, execute."""
+        """Take one event batch, invalidate first, replay arrivals, cut, then judge the quote."""
         slot = self.slots.get(instrument_id) or self.stopped_sales.get(instrument_id)
         if slot is None:
             return
         if slot.sale_state is None:
             slot.sale_state = sale_table.State("G", 0)
+        # Detach before doing any work. Submit/cancel echoes append to the next batch.
+        queued = self._sale_events.pop(instrument_id, [])
         events = list(events)
         snapshot = self._sale_snapshot(instrument_id, slot)
         position, held, uncovered, order, position_readable = snapshot
@@ -2321,34 +2384,66 @@ class OwnerProtector(Strategy):
             uncovered is not None and "FRZ" not in events and slot.sale_state.row in SALE_COVER_ROWS
         ):
             events.append("UFZ")
-        if (
-            order is not None
-            and slot.sale_state.row not in SALE_CANCEL_ROWS
-            and order.client_order_id not in self.cancel_requested
-            and order.status
-            in (
-                OrderStatus.ACCEPTED,
-                OrderStatus.PARTIALLY_FILLED,
-            )
-        ):
-            remaining = _remaining(order)
-            if (
-                remaining is not None and remaining > uncovered
-                if uncovered is not None
-                else self._oversell_possible(instrument_id)
-            ) and (
-                "NQ" in events
-                or any(
-                    code in events
-                    for code in ("HE", "HS", "CP", "FRZ", "UFZ", "oACC", "oPF", "oLF")
-                )
-            ):
-                events.append("MO")
+        # The position already includes the entire batch. Undo its fills for the event
+        # projection, then consume them in arrival order; invalidations above still use
+        # the actual holding net of ALL native fills. Sends use actual uncovered shares.
+        event_held = held + sum(
+            (item.last_qty.as_decimal() for item in queued if type(item).__name__ == "OrderFilled"),
+            Decimal(0),
+        )
+        entries = [(code, None) for code in events]
+        entries.extend(
+            (sale_table.order_event_column(type(item).__name__), item) for item in queued
+        )
+        derive_mismatch = "MO" not in events
+        if derive_mismatch:
+            entries.append(("MO", None))
         cell = f"{slot.sale_state.row} x {events[-1] if events else 'step'}"
         try:
-            for event in sale_table.order_step(sale_table.Event(code, {}) for code in events):
+            for tagged in sale_table.order_step(
+                sale_table.Event(code, {str(index): True})
+                for index, (code, _) in enumerate(entries)
+            ):
+                code, item = entries[int(next(iter(tagged.facts)))]
+                current_reason, current_ns = reason, order_event_ns
+                if item is not None:
+                    code = self._judge_sale_event(slot, item)
+                    current_reason = str(getattr(item, "reason", None) or "")
+                    current_ns = item.ts_event
+                    if type(item).__name__ == "OrderFilled":
+                        event_held -= item.last_qty.as_decimal()
+                if code == "MO" and derive_mismatch:
+                    current = self._sale_orders.get(slot.protect_id)
+                    if current is None:
+                        current = (
+                            None if slot.protect_id is None else self.cache.order(slot.protect_id)
+                        )
+                    if (
+                        current is None
+                        or slot.sale_state.row in SALE_CANCEL_ROWS
+                        or current.client_order_id in self.cancel_requested
+                        or current.status
+                        not in (OrderStatus.ACCEPTED, OrderStatus.PARTIALLY_FILLED)
+                    ):
+                        continue
+                    remaining = _remaining(current)
+                    too_large = (
+                        remaining is not None and remaining > uncovered
+                        if uncovered is not None
+                        else self._oversell_possible(instrument_id)
+                    )
+                    if not too_large:
+                        continue
+                event = sale_table.Event(code, {})
                 cell = f"{slot.sale_state.row} x {event.code}"
-                facts, candidate = self._sale_facts(instrument_id, slot, event.code, snapshot)
+                facts, candidate = self._sale_facts(
+                    instrument_id,
+                    slot,
+                    event.code,
+                    snapshot,
+                    judged=bool(queued),
+                    event_held=event_held if item is not None else None,
+                )
                 before = slot.sale_state
                 result = sale_table.transition(
                     before, self.settings.breach_count, event.code, facts
@@ -2364,25 +2459,28 @@ class OwnerProtector(Strategy):
                     cell_reason = (
                         f"{cell}: {self.frozen.get(instrument_id, reason or 'cover unread')}"
                     )
-                action_reason = cell_reason + (f"; {reason}" if reason else "")
-                if event.code == "ST" and reason:
-                    action_reason = reason  # The whole-node stop names the leg and its consequence.
-                refusal = event.code == "oREJ" and result.state.row == "RW"
-                silence = before.row == "FL" and event.code in {"QU", "QA"}
+                action_reason = cell_reason + (f"; {current_reason}" if current_reason else "")
+                if event.code == "ST" and current_reason:
+                    action_reason = current_reason
+                terms = set(result.when.split(" and "))
+                refusal = event.code == "oREJ" and bool(
+                    terms & {"refusal_told", "not refusal_told"}
+                )
+                silence = "flight_alert_due" in terms
                 unformed = "not formable" in result.when
                 external_cancel = event.code == "oCXL" and before.row in {"FL", "WK", "PF"}
                 if refusal:
-                    now = self.clock.timestamp_ns()
+                    now = self.clock.timestamp_ns() if current_ns is None else current_ns
                     slot.refusal_last_ns = now
                     if slot.refusal_first is None:
                         slot.refusal_first = datetime.fromtimestamp(
-                            (now if order_event_ns is None else order_event_ns) / SECOND_NS, UTC
+                            now / SECOND_NS, UTC
                         ).isoformat()
-                    slot.refusal_reason = reason
+                    slot.refusal_reason = self._sale_reason(instrument_id, current_reason)
                     slot.refusals += 1
                     action_reason = (
                         f"{cell}: venue refused our sale (REJECTED); sent again on a counted quote "
-                        f"under the level after {RESEND_SECS} s; {reason}"
+                        f"under the level after {RESEND_SECS} s; {current_reason}"
                     )
                     if slot.refusal_told:
                         self._say(
@@ -2391,7 +2489,7 @@ class OwnerProtector(Strategy):
                         )
                 elif silence:
                     action_reason = (
-                        f"our sale has no answer after {FLIGHT_SECS} s; "
+                        f"our sale {slot.flight_command} has no answer after {FLIGHT_SECS} s; "
                         "outcome unknown, never sent again while unresolved"
                     )
                 elif unformed:
@@ -2399,9 +2497,11 @@ class OwnerProtector(Strategy):
                         f"{cell}: our sale cannot be formed; next counted quote judged again"
                     )
                 elif external_cancel:
-                    slot.external_cancel_ns = self.clock.timestamp_ns()
+                    slot.external_cancel_ns = (
+                        self.clock.timestamp_ns() if current_ns is None else current_ns
+                    )
                     action_reason = (
-                        f"{cell}: our sale canceled by another hand; no sale of this holding for "
+                        f"{cell}: our sale canceled, and not by us (the venue or another hand); no sale for "
                         f"{RESEND_SECS} s; then a full new count; {HOLD_ONE_SYMBOL}"
                     )
                 if result.state.row in SALE_FAULT_ROWS and before.row not in SALE_FAULT_ROWS:
@@ -2425,11 +2525,15 @@ class OwnerProtector(Strategy):
                     | SALE_COVER_ROWS
                     | {"G", "GC", "T0", "X", "OX", "PCX", "PCT", "TW"}
                 ):
-                    self._finish_counted_sale(instrument_id, slot, order_event_ns)
+                    self._finish_counted_sale(instrument_id, slot, current_ns)
                 if before.row == "G" and event.code in {"QU", "QA"}:
                     count = result.state.count
                     if count is None:
-                        count = self.settings.breach_count
+                        count = (
+                            self.settings.breach_count
+                            if sale_table.Action.SEND in result.actions
+                            else 0
+                        )
                     # Only a count that changed is said: a holding above its level, or one held
                     # by the interval, would otherwise write a line for every quote.
                     if count != before.count:
@@ -2449,7 +2553,7 @@ class OwnerProtector(Strategy):
                         action_reason,
                     )
                     if action == sale_table.Action.ALERT:
-                        if refusal or unformed:
+                        if "not refusal_told" in terms:
                             slot.refusal_told = True
                         elif silence:
                             slot.flight_told = True
@@ -2485,14 +2589,16 @@ class OwnerProtector(Strategy):
         filled = [
             getattr(order, "ts_closed", None) or event_ns or self.clock.timestamp_ns()
             for cid in sale.order_ids
-            if (order := self.cache.order(cid)) is not None and order.status == OrderStatus.FILLED
+            if (order := self._sale_orders.get(cid)) is not None
+            and order.status == OrderStatus.FILLED
         ]
         if filled:
             sale.filled_ns = max(filled)
         sale.end_recorded = True
         self._log_sale(instrument_id, sale)
 
-    def _sale_alert(self, instrument_id: InstrumentId, reason: str) -> None:
+    def _sale_reason(self, instrument_id: InstrumentId, reason: str) -> str:
+        """The same bounded, ID-free venue text in alerts and sale records."""
         identities = {str(cid) for cid in self.sent_ids}
         for order in self.cache.orders(instrument_id=instrument_id):
             identities.add(str(order.client_order_id))
@@ -2501,7 +2607,10 @@ class OwnerProtector(Strategy):
                 identities.add(str(venue_id))
         for identity in sorted(identities, key=len, reverse=True):
             reason = reason.replace(identity, "our leg")
-        self._say(f"ALERT: {instrument_id}: {reason.splitlines()[0][:160]}")
+        return (reason.splitlines() or [""])[0][:160]
+
+    def _sale_alert(self, instrument_id: InstrumentId, reason: str) -> None:
+        self._say(f"ALERT: {instrument_id}: {self._sale_reason(instrument_id, reason)}")
 
     def _sale_action(
         self,
@@ -2519,6 +2628,11 @@ class OwnerProtector(Strategy):
         if action == sale_table.Action.ALERT:
             self._sale_alert(instrument_id, reason)
         elif action == sale_table.Action.CANCEL:
+            now = self.clock.timestamp_ns()
+            if slot.sale is not None:
+                slot.sale.cancel_ns = now
+            slot.flight_sent_ns, slot.flight_told, slot.flight_answered = now, False, False
+            slot.flight_command, slot.flight_answer_ns = "cancel", None
             self._cancel_own(slot)
         elif action == sale_table.Action.SEND:
             assert candidate is not None
@@ -2548,37 +2662,65 @@ class OwnerProtector(Strategy):
                     else quote.ask_price.as_decimal() - quote.bid_price.as_decimal()
                 )
             assert slot.sale is not None
-            slot.sale.reprices += int(price != slot.sale.last_price)
+            previous = None if before.row == "G" else slot.sale.last_price
+            slot.sale.reprices += int(before.row == "PCR")
+            slot.sale.resends += int(before.row == "RW")
             slot.sale.last_price, slot.sale.priced_ns = price, now
             slot.sale.order_ids.add(candidate.client_order_id)
             slot.protect_id = candidate.client_order_id
             slot.flight_sent_ns, slot.flight_told, slot.flight_answered = now, False, False
+            ack_ns = slot.flight_answer_ns if before.row == "PCR" else None
+            slot.flight_command, slot.flight_answer_ns = "submit", None
             self.sent_ids.add(candidate.client_order_id)
+            self._sale_orders[candidate.client_order_id] = LimitOrder.from_dict(candidate.to_dict())
+            floor = slot.gain_applied_floor if before.row == "G" else slot.sale.floor
+            self._say(
+                f"{instrument_id}: sale send limit={price} level={slot.level} "
+                f"previous={previous} floor={floor}"
+                + ("" if ack_ns is None else f" ack_to_send_ms={(now - ack_ns) / 1_000_000:g}")
+            )
             self._log_sale(instrument_id, slot.sale)
             self.submit_order(candidate, params={"extended_hours": True})
 
     def on_order_event(self, event: Any) -> None:
         if self.settings.breach_count == 1 or event.client_order_id not in self.sent_ids:
             return
-        order = self.cache.order(event.client_order_id)
-        ended = False
-        if order is not None:
-            ended = any(
-                sale_table.order_event_column(type(prior).__name__) in {"oCXL", "oEXP"}
-                for prior in order.events()
-                if prior is not event
-            )
-            if order.status != OrderStatus.PENDING_CANCEL:
-                self.cancel_requested.discard(event.client_order_id)
+        self._sale_events.setdefault(event.instrument_id, []).append(event)
+
+    def _judge_sale_event(self, slot: Holding, event: Any) -> str:
+        """Replay only arrivals already detached for this step, using the pinned order machine."""
+        order = self._sale_orders.get(event.client_order_id)
+        if order is None:
+            raise sale_table.InvalidFacts("our queued event has no sent leg to replay")
+        ended = any(
+            type(prior).__name__ in {"OrderCanceled", "OrderExpired"} for prior in order.events()
+        )
+        column = sale_table.order_event_column(type(event).__name__)
+        if column not in {"oINI", "oOTH"}:
+            try:
+                order.apply(event)
+            except (ValueError, RuntimeError, TypeError) as exc:
+                raise sale_table.InvalidFacts(
+                    f"native order replay refused {type(event).__name__}: {exc}"
+                ) from exc
+        if order.status != OrderStatus.PENDING_CANCEL:
+            self.cancel_requested.discard(event.client_order_id)
         code = sale_table.order_event_column(
             type(event).__name__,
             leg_ended=ended,
-            leaves_remainder=order is not None and (_remaining(order) or Decimal(0)) > 0,
+            leaves_remainder=(_remaining(order) or Decimal(0)) > 0,
         )
-        slot = self.slots.get(event.instrument_id) or self.stopped_sales.get(event.instrument_id)
         if slot is not None:
-            if event.client_order_id == slot.protect_id and code not in {"oINI", "oSUB"}:
+            # A cancel is answered only by what ends the leg or refuses the cancel: a part fill, an
+            # acceptance or an update while it is pending says nothing of the cancel.
+            answers = (
+                code in SALE_CANCEL_ANSWERS
+                if slot.flight_command == "cancel"
+                else code not in {"oINI", "oSUB", "oPCN"}
+            )
+            if event.client_order_id == slot.protect_id and answers:
                 slot.flight_answered = True
+                slot.flight_answer_ns = event.ts_event
             if code in {"oACC", "oPF", "oFF", "oLF"}:
                 if slot.refusals and code == "oACC":
                     self._say(
@@ -2590,12 +2732,15 @@ class OwnerProtector(Strategy):
                 slot.refusal_reason, slot.refusal_first, slot.refusals = None, None, 0
                 if had_refusal and slot.sale is not None:
                     self._log_sale(event.instrument_id, slot.sale)
-        self._sale_step(
-            event.instrument_id,
-            [code],
-            reason=str(getattr(event, "reason", None) or ""),
-            order_event_ns=event.ts_event,
-        )
+            if (
+                type(event).__name__ == "OrderFilled"
+                and slot.sale is not None
+                and event.client_order_id in slot.sale.order_ids
+                and slot.gain_armed_at is not None
+                and slot.gain_entry is not None
+            ):
+                self._gain_lock_sale(event, slot)
+        return code
 
     def on_position_event(self, event: Any) -> None:
         """Not delivered for these EXTERNAL holdings at d53849b216e2.
@@ -2877,6 +3022,7 @@ class OwnerProtector(Strategy):
             slot = self.slots.get(instrument_id) or self.stopped_sales.get(instrument_id)
             record.update(
                 confirm_gap_ms=self.settings.confirm_gap_ms,
+                resends=sale.resends,
                 refusal_reason=None if slot is None else slot.refusal_reason,
                 refusal_first=None if slot is None else slot.refusal_first,
                 refusals=0 if slot is None else slot.refusals,

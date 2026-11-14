@@ -54,7 +54,9 @@ def alerts(strategy):
 
 
 def refuse(strategy, *, reason="synthetic venue refusal"):
-    return strategy.deliver("Rejected", reason=reason, ts_event=strategy.clock.timestamp_ns())
+    return strategy.deliver_then_step(
+        "Rejected", reason=reason, ts_event=strategy.clock.timestamp_ns()
+    )
 
 
 def records(strategy):
@@ -84,7 +86,7 @@ def test_t1_refusal_told_survives_a_new_first_leg_then_acceptance_resets_it():
     assert len(alerts(strategy)) == 1
     assert any("refusal 2" in line and "ALERT" not in line for line in strategy.said)
     strategy.observe("9.87", h.T0 + 123 * h.SECOND)
-    strategy.deliver("Accepted")
+    strategy.deliver_then_step("Accepted")
     assert any("our sale was accepted after 2 refusals since " in line for line in strategy.said)
     refuse(strategy)
     assert len(alerts(strategy)) == 2
@@ -96,11 +98,12 @@ def test_t1_fill_also_clears_the_holdings_refusal(quantity):
     sent(strategy)
     refuse(strategy)
     strategy.observe("9.87", h.T0 + 62 * h.SECOND)
-    strategy.deliver("Filled", quantity=quantity)
+    strategy.deliver_then_step("Submitted")  # The pin does not accept Initialized -> Filled.
+    strategy.deliver_then_step("Filled", quantity=quantity)
     slot = strategy.slots[h.AAA]
     assert not slot.refusal_told and slot.refusals == 0
     if quantity == 1:
-        strategy.deliver("Accepted")  # Native PF -> Accepted makes Rejected reachable.
+        strategy.deliver_then_step("Accepted")  # Native PF -> Accepted makes Rejected reachable.
         refuse(strategy)
         assert len(alerts(strategy)) == 2
 
@@ -128,9 +131,9 @@ def test_t2_interval_guards_waiting_and_a_recount_not_timers(crosses):
 def test_t2_partial_fill_remainder_keeps_the_episode_floor_and_chases_after_acceptance():
     strategy = counted()
     sent(strategy)
-    strategy.deliver("Accepted")
-    strategy.deliver("Filled", quantity=3)
-    strategy.deliver("Accepted")
+    strategy.deliver_then_step("Accepted")
+    strategy.deliver_then_step("Filled", quantity=3)
+    strategy.deliver_then_step("Accepted")
     sale = strategy.slots[h.AAA].sale
     assert sale is not None
     floor = sale.floor
@@ -138,7 +141,7 @@ def test_t2_partial_fill_remainder_keeps_the_episode_floor_and_chases_after_acce
     strategy.observe("9.87", h.T0 + 62 * h.SECOND)
     assert len(strategy.sent) == 2 and strategy.sent[-1].quantity.as_decimal() == 7
     assert strategy.slots[h.AAA].sale is sale and sale.floor == floor
-    strategy.deliver("Accepted")
+    strategy.deliver_then_step("Accepted")
     strategy.observe("9.80", h.T0 + 122 * h.SECOND)
     assert c.row(strategy).row == "PCR" and len(strategy.canceled) == 1
 
@@ -146,11 +149,11 @@ def test_t2_partial_fill_remainder_keeps_the_episode_floor_and_chases_after_acce
 def test_t2_reprice_ack_after_an_above_level_quote_still_sends_below_level():
     strategy = counted()
     sent(strategy)
-    strategy.deliver("Accepted")
+    strategy.deliver_then_step("Accepted")
     strategy.observe("9.80", h.T0 + 62 * h.SECOND)
     assert c.row(strategy).row == "PCR"
     strategy.observe("10.50", h.T0 + 63 * h.SECOND)
-    strategy.deliver("Canceled")
+    strategy.deliver_then_step("Canceled")
     assert len(strategy.sent) == 2
     c.assert_sale_below_level(strategy, strategy.sent[-1])
 
@@ -219,7 +222,7 @@ def test_t4_record_and_end_carry_reason_first_event_time_and_count():
     strategy = counted()
     sent(strategy)
     first = h.T0 + h.SECOND  # Event time differs from receipt; the record uses the event.
-    strategy.deliver("Rejected", reason="synthetic reason", ts_event=first)
+    strategy.deliver_then_step("Rejected", reason="synthetic reason", ts_event=first)
     record = records(strategy)[-1]
     iso = datetime.fromtimestamp(first / h.SECOND, UTC).isoformat()
     assert (record["refusal_reason"], record["refusal_first"], record["refusals"]) == (
@@ -240,7 +243,7 @@ def test_t4_acceptance_logs_cleared_record():
     sent(strategy)
     refuse(strategy)
     strategy.observe("9.87", h.T0 + 62 * h.SECOND)
-    strategy.deliver("Accepted")
+    strategy.deliver_then_step("Accepted")
     record = records(strategy)[-1]
     assert (record["refusal_reason"], record["refusal_first"], record["refusals"]) == (
         None,
@@ -250,15 +253,15 @@ def test_t4_acceptance_logs_cleared_record():
 
 
 @pytest.mark.parametrize("bid", ["9.87", "10.00"])
-def test_t5_unanswered_leg_is_told_once_on_quotes_never_on_timer(bid):
+def test_t5_unanswered_leg_is_told_once_on_timer_or_quotes(bid):
     strategy = counted()
     sent(strategy)
-    strategy.deliver("Submitted")
+    strategy.deliver_then_step("Submitted")
     strategy.observe(bid, h.T0 + 61 * h.SECOND)
     assert not alerts(strategy)
     strategy.test_clock.set_time(h.T0 + 62 * h.SECOND)
     strategy._on_step(SimpleNamespace(ts_event=strategy.clock.timestamp_ns()))
-    assert not alerts(strategy)
+    assert len(alerts(strategy)) == 1 and "no answer" in alerts(strategy)[0]
     for second in (62, 122, 3602):
         strategy.observe(bid, h.T0 + second * h.SECOND)
     assert len(alerts(strategy)) == 1 and "no answer" in alerts(strategy)[0]
@@ -289,7 +292,7 @@ def test_t6_gap_is_in_arming_count_lines_and_sale_record():
     sent(strategy)
     lines = [line for line in strategy.said if "armed distance" in line or "count=" in line]
     assert len(lines) >= 3 and all("confirm_gap_ms=1000" in line for line in lines)
-    strategy.deliver("Rejected")
+    strategy.deliver_then_step("Rejected")
     assert records(strategy)[-1]["confirm_gap_ms"] == 1000
 
 
@@ -427,10 +430,14 @@ def test_t5_real_engine_unanswered_submit_then_late_answer(answer):
             if answer == "Accepted":
                 clients[0].generate_order_accepted(order, h.VenueOrderId(str(cid)), at)
                 await asyncio.sleep(0.02)
+                assert c.row(probe).row == "FL"
+                c.flush_events(probe)
                 assert c.row(probe).row == "WK"
             elif answer == "Rejected":
                 clients[0].generate_order_rejected(order, "synthetic refusal", at, False)
                 await asyncio.sleep(0.02)
+                assert c.row(probe).row == "FL"
+                c.flush_events(probe)
                 assert c.row(probe).row == "RW" and len(alerts(probe)) == 2
                 await self.publish("9.87", at + 59 * h.SECOND)
                 assert len(self.cache.orders(strategy_id=h.PROTECTOR)) == 1

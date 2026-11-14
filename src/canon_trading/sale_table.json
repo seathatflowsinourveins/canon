@@ -219,15 +219,15 @@
   },
   "predicates": {
     "count_complete": "this quote is the Nth counted quote under the level since the count was last zero",
-    "formable": "the leg can be formed: a positive limit at the pricing quote's bid, the instrument in the cache, its quantity exactly representable, the client order ID unused",
+    "formable": "the leg can be formed: a positive limit under the price rule (ruling 18), the instrument in the cache, its quantity exactly representable, the client order ID unused",
     "whole_cover": "foreign working sells cover the whole long at this step",
     "filled_part": "the engine reads our sale with a filled quantity above zero",
     "cancelable": "the engine reads our sale ACCEPTED or PARTIALLY_FILLED",
-    "reprice_due": "the chase function, called in this counted quote's handler, gives a price under our working leg's limit: the chase interval has passed since this leg's price was set, and the price a tick through this quote's bid, held at the episode's floor until the floor's wait has run, is lower than the leg's limit",
-    "leg_positive": "the leg's quantity is above zero. For the first leg it is the uncovered quantity read in this step; for the next leg, and for a leg sent again after a refusal, it is the quantity at the episode's opening less the shares sold, and never more than the uncovered quantity read in this step",
+    "reprice_due": "the chase function, called in this counted quote's handler, gives a price under our working leg's limit: the chase interval has passed since this leg's price was set and since a cancel of it was last asked, and the price a tick through this quote's bid, held at the episode's floor until the floor's wait has run, is lower than the leg's limit",
+    "leg_positive": "the leg's quantity is above zero. For EVERY leg it is the uncovered quantity read in this step: the long held less every foreign working sell (ruling 19; shares the owner adds while our leg works join at the next leg sent)",
     "refusal_told": "an ALERT that a sale of this holding could not be placed (the venue refused a leg, or a leg could not be formed) has been written and no leg of it has been ACCEPTED or filled since (held by the glue for the holding; a new run starts with none told)",
     "resend_due": "in the last RESEND_SECS (60 s, a named constant) the venue has refused no leg of this holding's sale and no leg of it was canceled by another hand; true when neither happened in this run; judged in this counted quote's handler and never on a timer",
-    "flight_alert_due": "our leg has had no answer of any kind (no Accepted, Rejected, Denied, fill, cancel or expiry) for FLIGHT_SECS (60 s, a named constant) since it was sent, and no ALERT has been written for this leg's silence; judged in a quote's handler and never on a timer",
+    "flight_alert_due": "our last command for this leg (its submit, or our cancel of it) has had no answer of any kind for FLIGHT_SECS (60 s, a named constant), and no ALERT has been written for that command's silence; judged in every step of a row that waits for an answer: a counted quote's, or the timer's (ruling 24: a stream of quotes that are not counted must not keep it silent)",
     "long_remains": "a long of this holding is still held after the fill",
     "ends_filled": "after this Updated the engine reads our sale FILLED: a reconciliation update whose quantity equals a filled quantity above zero (M:1322-1324)"
   },
@@ -401,14 +401,21 @@
     "no_leg_of_size_zero": "no leg of size zero or less is ever sent; a first leg whose size reads zero sends nothing, freezes nothing and alerts nothing",
     "nothing_for_a_whole_cover": "nothing is sent for a holding wholly covered by foreign sells; in a row with no sale of ours open, an event that changes the holding's size or the foreign cover re-reads the cover in that step",
     "invalidation_first": "what a step sees is applied in step_order; no leg is sent in a step that also saw a stop, the holding's end, a shrink, a foreign sell placed or a freeze",
-    "no_timer_transition": "a timer step changes no row, asks no cancel and sends nothing; the floor's wait is started and judged only in the handler of a counted quote under the level",
+    "no_timer_transition": "a timer step changes no row, asks no cancel and sends nothing; the one line it may order is the ALERT for a command of ours left without an answer; the floor's wait is started and judged only in the handler of a counted quote under the level",
     "row_stored_before_actions": "the row a transition leads to is stored BEFORE its actions are carried out: the engine publishes Initialized inside our submit and PendingCancel inside our cancel, so the echo of a send meets the in-flight row and the echo of a cancel meets its cancel-asked row, and each does nothing",
     "one_alert_per_holding_until_accepted": "a venue's refusal of a leg writes ONE ALERT for the holding; no second ALERT for a refusal of it is written until a leg of it has been accepted, however often the price crosses the level or the leg is refused again; each further refusal is a counted line",
     "resend_no_sooner_than_the_interval": "no leg of a holding's sale leaves within RESEND_SECS of a venue's refusal of one or of a cancel of one by another hand, from any row; a leg is sent again only on a counted quote under the level, so a standing refusal costs at most about sixty refused orders an hour; never on a timer step and never on a quote above the level",
     "resend_never_more_than_held": "the leg sent again is sized like any leg: the episode's remainder, never more than the uncovered quantity read in that step, and nothing when that is zero",
+    "every_leg_steps_down_and_stays_under_the_level": "at every send the leg's limit is at or under the level the holding holds and at or under the limit of the leg it replaces or is sent again for, and never under the chase floor; it is priced from the newest usable quote stored at the send, counted or not",
+    "no_leg_rests_above_a_falling_market_in_silence": "in every reachable state where our working leg's limit is above the newest usable bid, either a re-price becomes due at a counted quote once the chase interval has passed, or the floor's wait is running and will release, or ONE ALERT has said why neither can happen",
+    "a_leg_and_its_floor_agree": "no leg rests under its episode's floor unless the floor's own rule released it; a leg sent again after a refusal is priced with the episode's floor like any later leg",
+    "order_events_are_judged_in_a_step": "an order-event handler stores only what its event carries, its own time included; it reads neither the clock nor the cache and neither sends nor cancels. What it stored is judged in the next step (a quote's or the timer's), at its place in step_order and in the order it arrived",
+    "every_leg_is_the_whole_uncovered_quantity": "every leg is sized from the uncovered quantity read at its send, so shares added while our leg works are in the next leg sent; never more working than is held less foreign sells",
+    "an_unanswered_cancel_is_told_once": "a cancel of ours with no answer of any kind for FLIGHT_SECS writes ONE ALERT, on a counted quote or a timer step; nothing else changes",
+    "the_holdings_end_cancels_a_working_sale": "when the holding ends while our sale is working or part filled, the sale is canceled in that step, without waiting for a mismatch of sizes",
     "an_outside_freeze_ends_when_its_cause_ends": "a holding frozen by the cover's read (FC, FCW, FCP) leaves the freeze when the cover reads again: FC to G at zero or the covered row, FCW to the row its leg's state gives, FCP after its cancel's acknowledgement; a fault of ours (FZ, FZW, FZP) is never ended before the next start",
     "never_more_working_than_held_whatever_the_cover": "where the long less foreign sells cannot be computed, our cancelable sale is cut (MO) in the step of the freeze whenever the base's own check says an oversell is possible",
-    "a_silent_leg_is_told_once_and_never_resent": "a leg with no answer of any kind for FLIGHT_SECS writes ONE ALERT, on a quote; nothing is sent, canceled or changed for it, and no second sell is ever sent beside it",
+    "a_silent_leg_is_told_once_and_never_resent": "a leg with no answer of any kind for FLIGHT_SECS writes ONE ALERT, on a counted quote or a timer step; nothing is sent, canceled or changed for it, and no second sell is ever sent beside it",
     "every_kind_has_a_column": "each kind of order event the pin can deliver to a strategy is named to a column by order_event_inventory and by nothing else; a kind the inventory does not know answers as the catch-all"
   },
   "sending_transitions": [
@@ -428,6 +435,18 @@
       "when": "leg_positive and formable"
     }
   ],
+  "price_rule": {
+    "from": "the newest USABLE quote the quote handler has stored at the send: two-sided, not crossed, with size, accepted by the venue clock; counted or not, inside the gap or not. Pricing is not counting",
+    "price": "a tick through that quote's bid, as the chase function steps",
+    "caps": [
+      "never above the level the holding holds",
+      "never above the limit of the leg it replaces or is sent again for: a sale's legs only step down"
+    ],
+    "floor": "never under the leg's floor. A first leg's floor is the gain lock's applied floor where the lock is armed, and none otherwise. Every later leg of the episode, the next leg after a re-price and the leg sent again after a refusal alike, takes the episode's chase floor as the chase function holds and releases it (ruling 23). No leg rests under its episode's floor unless the floor's own rule released it",
+    "order": "the floor is applied first and the two caps last, so no floor lifts a leg above the level or above the leg before it",
+    "function": "one pure function, leg_limit(stepped, level, previous, floor), in the module; the protector calls it at every send and the enumeration checks it at every send",
+    "no_usable_quote": "where no usable quote is stored at the send, the leg takes the limit of the leg it replaces. The quote in whose handler a cancel was asked is a usable quote and stays the newest one stored until a later one arrives, so a re-price answered before the next quote steps down to that quote's price (ruling 18)"
+  },
   "freeze_causes": [
     {
       "event": "FRZ",
@@ -1472,7 +1491,7 @@
             "count": "0"
           }
         ],
-        "note": "S3, THE LEG SENT AGAIN: a plain LIMIT straight to the venue, priced at this counted quote, for the episode's remainder and never more than the uncovered quantity read in this step; no new count is needed, the episode's count stands. Before the interval has passed: nothing; a leg that cannot be formed at this quote is NOT a freeze (ruling 17): nothing is sent, ONE ALERT per holding until a sale of it is accepted, and the next counted quote under the level is judged again"
+        "note": "S3, THE LEG SENT AGAIN: a plain LIMIT straight to the venue, priced under the price rule (never above the level or the refused leg's limit), for the uncovered quantity read in this step; no new count is needed, the episode's count stands. Before the interval has passed: nothing; a leg that cannot be formed at this quote is NOT a freeze (ruling 17): nothing is sent, ONE ALERT per holding until a sale of it is accepted, and the next counted quote under the level is judged again"
       },
       "QA": {
         "occurs": "yes",
@@ -1926,13 +1945,21 @@
         "occurs": "yes",
         "branches": [
           {
-            "when": "always",
+            "when": "flight_alert_due",
+            "next": "FL",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          },
+          {
+            "when": "not flight_alert_due",
             "next": "FL",
             "send": false,
             "cancel": false,
             "alert": false
           }
-        ]
+        ],
+        "note": "never a send and never a cancel on a timer step; a leg with no answer of any kind for FLIGHT_SECS is told ONCE with an ALERT and is NEVER sent again: its outcome is unknown, and a second sell beside it could sell more than is held"
       },
       "HG": {
         "occurs": "yes",
@@ -2419,13 +2446,13 @@
         "branches": [
           {
             "when": "always",
-            "next": "OX",
+            "next": "PCX",
             "send": false,
-            "cancel": false,
+            "cancel": true,
             "alert": false
           }
         ],
-        "note": "MO follows in the same step"
+        "note": "the holding ended (flat, short, or another position under the instrument): our working sale is canceled in this step, whatever its size against what is then held (ruling 21)"
       },
       "ST": {
         "occurs": "yes",
@@ -2656,9 +2683,9 @@
         "branches": [
           {
             "when": "not long_remains",
-            "next": "OX",
+            "next": "PCX",
             "send": false,
-            "cancel": false,
+            "cancel": true,
             "alert": false
           },
           {
@@ -2670,7 +2697,7 @@
           }
         ],
         "pin": "model/src/orders/mod.rs:247, 295, 1375-1376",
-        "note": "quantities re-read from every leg of ours; the fill is ours, not a shrink; MO follows in the same step when ours is then too large"
+        "note": "quantities re-read from every leg of ours; the fill is ours, not a shrink; where it ends the holding our working sale is canceled in this step, as at the holding's end (ruling 21); otherwise MO follows in the same step when ours is then too large"
       },
       "oINI": {
         "occurs": "unexpected",
@@ -2832,13 +2859,13 @@
         "branches": [
           {
             "when": "always",
-            "next": "OX",
+            "next": "PCX",
             "send": false,
-            "cancel": false,
+            "cancel": true,
             "alert": false
           }
         ],
-        "note": "MO follows in the same step"
+        "note": "the holding ended (flat, short, or another position under the instrument): our working sale is canceled in this step, whatever its size against what is then held (ruling 21)"
       },
       "ST": {
         "occurs": "yes",
@@ -3092,9 +3119,9 @@
         "branches": [
           {
             "when": "not long_remains",
-            "next": "OX",
+            "next": "PCX",
             "send": false,
-            "cancel": false,
+            "cancel": true,
             "alert": false
           },
           {
@@ -3106,7 +3133,7 @@
           }
         ],
         "pin": "model/src/orders/mod.rs:247, 295, 1375-1376",
-        "note": "quantities re-read from every leg of ours; the fill is ours, not a shrink; MO follows in the same step when ours is then too large"
+        "note": "quantities re-read from every leg of ours; the fill is ours, not a shrink; where it ends the holding our working sale is canceled in this step, as at the holding's end (ruling 21); otherwise MO follows in the same step when ours is then too large"
       },
       "oINI": {
         "occurs": "unexpected",
@@ -3156,39 +3183,61 @@
         "occurs": "yes",
         "branches": [
           {
-            "when": "always",
+            "when": "flight_alert_due",
+            "next": "PCR",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          },
+          {
+            "when": "not flight_alert_due",
             "next": "PCR",
             "send": false,
             "cancel": false,
             "alert": false
           }
         ],
-        "note": "wait for the acknowledgement; this quote becomes the newest counted quote held"
+        "note": "wait for the acknowledgement; the next leg is priced from the newest usable quote stored then; a cancel of ours with no answer of any kind for FLIGHT_SECS is told ONCE with an ALERT (ruling 20); nothing else changes, and the next leg still waits for the acknowledgement"
       },
       "QA": {
         "occurs": "yes",
         "branches": [
           {
-            "when": "always",
+            "when": "flight_alert_due",
+            "next": "PCR",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          },
+          {
+            "when": "not flight_alert_due",
             "next": "PCR",
             "send": false,
             "cancel": false,
             "alert": false
           }
         ],
-        "note": "a confirmed sale is committed, as a triggered stop is: nothing changes; this quote becomes the newest counted quote held"
+        "note": "a confirmed sale is committed, as a triggered stop is: nothing changes; the next leg is never priced above the level; a cancel of ours with no answer of any kind for FLIGHT_SECS is told ONCE with an ALERT (ruling 20); nothing else changes, and the next leg still waits for the acknowledgement"
       },
       "NQ": {
         "occurs": "yes",
         "branches": [
           {
-            "when": "always",
+            "when": "flight_alert_due",
+            "next": "PCR",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          },
+          {
+            "when": "not flight_alert_due",
             "next": "PCR",
             "send": false,
             "cancel": false,
             "alert": false
           }
-        ]
+        ],
+        "note": "wait for the acknowledgement; a cancel of ours with no answer of any kind for FLIGHT_SECS is told ONCE with an ALERT (ruling 20); nothing else changes, and the next leg still waits for the acknowledgement"
       },
       "HG": {
         "occurs": "yes",
@@ -3457,7 +3506,7 @@
           }
         ],
         "pin": "model/src/orders/mod.rs:267; trading/src/strategy/mod.rs:818-865",
-        "note": "S2, THE NEXT LEG: priced from the newest counted quote held at this step (the one that asked or a newer one), for the quantity at the episode's opening less the shares sold and never more than the uncovered quantity read in this step. PROPERTY (the lead's Q3): the replaced leg's final filled quantity is known before this sizes; the means (every fill emitted before Canceled, or one status read first) is open; a leg that cannot be formed at this quote is NOT a freeze (ruling 17): nothing is sent, ONE ALERT per holding until a sale of it is accepted, and the next counted quote under the level is judged again"
+        "note": "S2, THE NEXT LEG: priced under the price rule (ruling 18: the newest usable quote stored, never above the level or the replaced leg's limit), for the uncovered quantity read in this step (ruling 19). PROPERTY: the replaced leg's final filled quantity is known before this sizes; the means (every fill emitted before Canceled, or one status read first) is open; a leg that cannot be formed at this quote is NOT a freeze (ruling 17): nothing is sent, ONE ALERT per holding until a sale of it is accepted, and the next counted quote under the level is judged again"
       },
       "oCRJ": {
         "occurs": "yes",
@@ -3626,37 +3675,61 @@
         "occurs": "yes",
         "branches": [
           {
-            "when": "always",
+            "when": "flight_alert_due",
+            "next": "PCO",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          },
+          {
+            "when": "not flight_alert_due",
             "next": "PCO",
             "send": false,
             "cancel": false,
             "alert": false
           }
-        ]
+        ],
+        "note": "wait for the acknowledgement; a cancel of ours with no answer of any kind for FLIGHT_SECS is told ONCE with an ALERT (ruling 20); nothing else changes, and the next leg still waits for the acknowledgement"
       },
       "QA": {
         "occurs": "yes",
         "branches": [
           {
-            "when": "always",
+            "when": "flight_alert_due",
+            "next": "PCO",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          },
+          {
+            "when": "not flight_alert_due",
             "next": "PCO",
             "send": false,
             "cancel": false,
             "alert": false
           }
-        ]
+        ],
+        "note": "wait for the acknowledgement; a cancel of ours with no answer of any kind for FLIGHT_SECS is told ONCE with an ALERT (ruling 20); nothing else changes, and the next leg still waits for the acknowledgement"
       },
       "NQ": {
         "occurs": "yes",
         "branches": [
           {
-            "when": "always",
+            "when": "flight_alert_due",
+            "next": "PCO",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          },
+          {
+            "when": "not flight_alert_due",
             "next": "PCO",
             "send": false,
             "cancel": false,
             "alert": false
           }
-        ]
+        ],
+        "note": "wait for the acknowledgement; a cancel of ours with no answer of any kind for FLIGHT_SECS is told ONCE with an ALERT (ruling 20); nothing else changes, and the next leg still waits for the acknowledgement"
       },
       "HG": {
         "occurs": "yes",
@@ -4432,37 +4505,61 @@
         "occurs": "yes",
         "branches": [
           {
-            "when": "always",
+            "when": "flight_alert_due",
+            "next": "PCX",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          },
+          {
+            "when": "not flight_alert_due",
             "next": "PCX",
             "send": false,
             "cancel": false,
             "alert": false
           }
-        ]
+        ],
+        "note": "wait for the acknowledgement; a cancel of ours with no answer of any kind for FLIGHT_SECS is told ONCE with an ALERT (ruling 20); nothing else changes, and the next leg still waits for the acknowledgement"
       },
       "QA": {
         "occurs": "yes",
         "branches": [
           {
-            "when": "always",
+            "when": "flight_alert_due",
+            "next": "PCX",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          },
+          {
+            "when": "not flight_alert_due",
             "next": "PCX",
             "send": false,
             "cancel": false,
             "alert": false
           }
-        ]
+        ],
+        "note": "wait for the acknowledgement; a cancel of ours with no answer of any kind for FLIGHT_SECS is told ONCE with an ALERT (ruling 20); nothing else changes, and the next leg still waits for the acknowledgement"
       },
       "NQ": {
         "occurs": "yes",
         "branches": [
           {
-            "when": "always",
+            "when": "flight_alert_due",
+            "next": "PCX",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          },
+          {
+            "when": "not flight_alert_due",
             "next": "PCX",
             "send": false,
             "cancel": false,
             "alert": false
           }
-        ]
+        ],
+        "note": "wait for the acknowledgement; a cancel of ours with no answer of any kind for FLIGHT_SECS is told ONCE with an ALERT (ruling 20); nothing else changes, and the next leg still waits for the acknowledgement"
       },
       "HG": {
         "occurs": "yes",
@@ -5537,37 +5634,61 @@
         "occurs": "yes",
         "branches": [
           {
-            "when": "always",
+            "when": "flight_alert_due",
+            "next": "FZP",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          },
+          {
+            "when": "not flight_alert_due",
             "next": "FZP",
             "send": false,
             "cancel": false,
             "alert": false
           }
-        ]
+        ],
+        "note": "wait for the acknowledgement; a cancel of ours with no answer of any kind for FLIGHT_SECS is told ONCE with an ALERT (ruling 20); nothing else changes, and the next leg still waits for the acknowledgement"
       },
       "QA": {
         "occurs": "yes",
         "branches": [
           {
-            "when": "always",
+            "when": "flight_alert_due",
+            "next": "FZP",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          },
+          {
+            "when": "not flight_alert_due",
             "next": "FZP",
             "send": false,
             "cancel": false,
             "alert": false
           }
-        ]
+        ],
+        "note": "wait for the acknowledgement; a cancel of ours with no answer of any kind for FLIGHT_SECS is told ONCE with an ALERT (ruling 20); nothing else changes, and the next leg still waits for the acknowledgement"
       },
       "NQ": {
         "occurs": "yes",
         "branches": [
           {
-            "when": "always",
+            "when": "flight_alert_due",
+            "next": "FZP",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          },
+          {
+            "when": "not flight_alert_due",
             "next": "FZP",
             "send": false,
             "cancel": false,
             "alert": false
           }
-        ]
+        ],
+        "note": "wait for the acknowledgement; a cancel of ours with no answer of any kind for FLIGHT_SECS is told ONCE with an ALERT (ruling 20); nothing else changes, and the next leg still waits for the acknowledgement"
       },
       "HG": {
         "occurs": "yes",
@@ -6688,37 +6809,61 @@
         "occurs": "yes",
         "branches": [
           {
-            "when": "always",
+            "when": "flight_alert_due",
+            "next": "FCP",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          },
+          {
+            "when": "not flight_alert_due",
             "next": "FCP",
             "send": false,
             "cancel": false,
             "alert": false
           }
-        ]
+        ],
+        "note": "wait for the acknowledgement; a cancel of ours with no answer of any kind for FLIGHT_SECS is told ONCE with an ALERT (ruling 20); nothing else changes, and the next leg still waits for the acknowledgement"
       },
       "QA": {
         "occurs": "yes",
         "branches": [
           {
-            "when": "always",
+            "when": "flight_alert_due",
+            "next": "FCP",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          },
+          {
+            "when": "not flight_alert_due",
             "next": "FCP",
             "send": false,
             "cancel": false,
             "alert": false
           }
-        ]
+        ],
+        "note": "wait for the acknowledgement; a cancel of ours with no answer of any kind for FLIGHT_SECS is told ONCE with an ALERT (ruling 20); nothing else changes, and the next leg still waits for the acknowledgement"
       },
       "NQ": {
         "occurs": "yes",
         "branches": [
           {
-            "when": "always",
+            "when": "flight_alert_due",
+            "next": "FCP",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          },
+          {
+            "when": "not flight_alert_due",
             "next": "FCP",
             "send": false,
             "cancel": false,
             "alert": false
           }
-        ]
+        ],
+        "note": "wait for the acknowledgement; a cancel of ours with no answer of any kind for FLIGHT_SECS is told ONCE with an ALERT (ruling 20); nothing else changes, and the next leg still waits for the acknowledgement"
       },
       "HG": {
         "occurs": "yes",
@@ -7071,37 +7216,61 @@
         "occurs": "yes",
         "branches": [
           {
-            "when": "always",
+            "when": "flight_alert_due",
+            "next": "PCT",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          },
+          {
+            "when": "not flight_alert_due",
             "next": "PCT",
             "send": false,
             "cancel": false,
             "alert": false
           }
-        ]
+        ],
+        "note": "wait for the acknowledgement; a cancel of ours with no answer of any kind for FLIGHT_SECS is told ONCE with an ALERT (ruling 20); nothing else changes, and the next leg still waits for the acknowledgement"
       },
       "QA": {
         "occurs": "yes",
         "branches": [
           {
-            "when": "always",
+            "when": "flight_alert_due",
+            "next": "PCT",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          },
+          {
+            "when": "not flight_alert_due",
             "next": "PCT",
             "send": false,
             "cancel": false,
             "alert": false
           }
-        ]
+        ],
+        "note": "wait for the acknowledgement; a cancel of ours with no answer of any kind for FLIGHT_SECS is told ONCE with an ALERT (ruling 20); nothing else changes, and the next leg still waits for the acknowledgement"
       },
       "NQ": {
         "occurs": "yes",
         "branches": [
           {
-            "when": "always",
+            "when": "flight_alert_due",
+            "next": "PCT",
+            "send": false,
+            "cancel": false,
+            "alert": true
+          },
+          {
+            "when": "not flight_alert_due",
             "next": "PCT",
             "send": false,
             "cancel": false,
             "alert": false
           }
-        ]
+        ],
+        "note": "wait for the acknowledgement; a cancel of ours with no answer of any kind for FLIGHT_SECS is told ONCE with an ALERT (ruling 20); nothing else changes, and the next leg still waits for the acknowledgement"
       },
       "HG": {
         "occurs": "yes",

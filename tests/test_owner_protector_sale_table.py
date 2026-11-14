@@ -20,6 +20,7 @@ from typing import Any
 from typing import Self
 
 import pytest
+from nautilus_trader import model
 from nautilus_trader.common import TimeEvent
 from nautilus_trader.common import logging_sync_to_disk
 from nautilus_trader.model import OrderPendingCancel
@@ -29,6 +30,7 @@ from canon_trading import sale_table
 from canon_trading.owner_protector import FLIGHT_SECS
 from canon_trading.owner_protector import RESEND_SECS
 from canon_trading.owner_protector import Sale
+from canon_trading.price_step import exit_price
 from canon_trading.start_level import LevelBook
 from tests import test_owner_protector as h
 
@@ -63,6 +65,34 @@ def assert_sale_below_level(strategy, order):
         assert order.price.as_decimal() <= slot.level.as_decimal(), (
             "sale limit exceeds its holding's level"
         )
+        prices = getattr(strategy, "checked_episode_prices", {})
+        episode, previous = prices.get(order.instrument_id, (None, None))
+        if episode is not slot.sale:
+            previous = None
+        if previous is not None:
+            assert order.price.as_decimal() <= previous, "sale limit rose within its episode"
+            if slot.sale.floor is not None:
+                assert order.price.as_decimal() >= slot.sale.floor, "sale limit under its floor"
+        floor = (
+            slot.sale.floor
+            if previous is not None
+            else None
+            if slot.gain_applied_floor is None
+            else slot.gain_applied_floor.as_decimal()
+        )
+        expected = sale_table.leg_limit(
+            None
+            if slot.usable_quote is None
+            else exit_price(
+                slot.usable_quote.bid_price.as_decimal(), h.protect.PLANNER.exit_ticks, None
+            ),
+            level=slot.level.as_decimal(),
+            previous=previous,
+            floor=floor,
+        )
+        assert order.price.as_decimal() == expected, "sale limit differs from the one price rule"
+        prices[order.instrument_id] = slot.sale, order.price.as_decimal()
+        strategy.checked_episode_prices = prices
 
 
 @pytest.fixture(autouse=True)
@@ -259,6 +289,63 @@ def test_count_too_large_for_level_book_is_refused(tmp_path):
 
 
 def event(kind, order, **values):
+    # Native payloads let the driver replay the pin's own status machine at a step.
+    # The table's impossible kinds still use a bare payload when no native shape is needed.
+    if kind == "Initialized" and order.events():
+        return order.events()[0]
+    if kind in {
+        "Submitted",
+        "Accepted",
+        "Rejected",
+        "Denied",
+        "Canceled",
+        "Expired",
+        "PendingCancel",
+        "CancelRejected",
+        "Updated",
+        "Filled",
+    }:
+        at = values.pop("ts_event", h.T0)
+        reason = values.pop("reason", "synthetic refusal")
+        kwargs = {
+            "trader_id": h.TraderId("TESTER-001"),
+            "strategy_id": h.PROTECTOR,
+            "instrument_id": h.AAA,
+            "client_order_id": order.client_order_id,
+            "event_id": h.UUID4(),
+            "ts_event": at,
+            "ts_init": at,
+        }
+        if kind != "Denied":
+            kwargs["account_id"] = h.AccountId("ALPACA-001")
+        if kind not in {"Denied", "Submitted"}:
+            kwargs["reconciliation"] = kind == "Updated"
+        if kind in {
+            "Accepted",
+            "Canceled",
+            "Expired",
+            "PendingCancel",
+            "CancelRejected",
+            "Updated",
+            "Filled",
+        }:
+            kwargs["venue_order_id"] = h.VenueOrderId(str(order.client_order_id))
+        if kind in {"Rejected", "Denied", "Canceled", "CancelRejected"}:
+            kwargs["reason"] = reason
+        if kind == "Updated":
+            kwargs.update(quantity=order.quantity, price=order.price)
+        if kind == "Filled":
+            kwargs.update(
+                trade_id=h.TradeId(str(h.UUID4())),
+                order_side=h.OrderSide.SELL,
+                order_type=h.OrderType.LIMIT,
+                currency=h.USD,
+                liquidity_side=h.LiquiditySide.TAKER,
+                last_qty=h.Quantity.from_int(1),
+                last_px=order.price,
+            )
+        kwargs.update(values)
+        return getattr(model, "Order" + kind)(**kwargs)
     item: Any = type("Order" + kind, (), {})()
     item.instrument_id = h.AAA
     item.client_order_id = order.client_order_id
@@ -303,6 +390,9 @@ class Counted(h.Harness):
 
     def deliver(self, kind, *, quantity=0, leg=None, **values):
         leg = leg or self.cached.working[-1]
+        values.setdefault("ts_event", self.clock.timestamp_ns())
+        if kind == "Filled":
+            values.update(last_qty=h.Quantity.from_str(str(quantity)), last_px=leg.price)
         item = event(kind, leg, **values)
         history = leg.events()
         if kind == "Filled":
@@ -314,8 +404,6 @@ class Counted(h.Harness):
             self.cached.held[0].quantity = h.Quantity.from_str(
                 str(max(0, self.cached.held[0].signed_qty))
             )
-            item.last_qty = h.Quantity.from_str(str(quantity))
-            item.last_px = leg.price
             status = "FILLED" if leg.leaves_qty.as_decimal() == 0 else "PARTIALLY_FILLED"
             if (
                 leg.status in (h.OrderStatus.CANCELED, h.OrderStatus.EXPIRED)
@@ -341,6 +429,21 @@ class Counted(h.Harness):
         self.on_order_event(item)
         return item
 
+    def deliver_then_step(self, kind, **values):
+        item = self.deliver(kind, **values)
+        self._sale_step(h.AAA, ["NQ"])
+        flush_events(self)
+        return item
+
+
+def flush_events(strategy):
+    """Each queued arrival, including an action's echo, needs a subsequent timer step."""
+    for _ in range(4):
+        if not strategy._sale_events.get(h.AAA):
+            return
+        strategy._sale_step(h.AAA, ["NQ"])
+    assert not strategy._sale_events.get(h.AAA), "event batches did not settle"
+
 
 def counted(**settings):
     settings.setdefault("confirm_gap_ms", 0)
@@ -358,8 +461,9 @@ def first_leg(strategy):
     strategy.observe("9.89", h.T0 + h.SECOND)
     strategy.observe("9.88", h.T0 + 2 * h.SECOND)
     assert len(strategy.sent) == 1
-    strategy.deliver("Submitted")
-    strategy.deliver("Accepted")
+    strategy.deliver_then_step("Submitted")
+    strategy.deliver_then_step("Accepted")
+    strategy._sale_step(h.AAA, ["NQ"])
 
 
 def test_counted_quotes_send_one_plain_leg_and_echo_sees_new_row():
@@ -383,14 +487,14 @@ def test_counted_quotes_send_one_plain_leg_and_echo_sees_new_row():
 def test_reprice_only_on_counted_under_quote_and_ack_sends_remainder():
     strategy = counted()
     first_leg(strategy)
-    strategy.deliver("Filled", quantity=3)
+    strategy.deliver_then_step("Filled", quantity=3)
     strategy.test_clock.set_time(h.T0 + 60 * h.SECOND)
     strategy._on_step(SimpleNamespace(ts_event=strategy.clock.timestamp_ns()))
     assert not strategy.canceled
     strategy.observe("9.80", h.T0 + 61 * h.SECOND)
     assert row(strategy).row == "PCR" and len(strategy.canceled) == 1
     strategy.observe("9.79", h.T0 + 62 * h.SECOND)
-    strategy.deliver("Canceled")
+    strategy.deliver_then_step("Canceled")
     assert row(strategy).row == "FL" and len(strategy.sent) == 2
     assert strategy.sent[-1].quantity.as_decimal() == 7
     assert strategy.sent[-1].price.as_decimal() <= Decimal("9.79")
@@ -403,13 +507,13 @@ def test_seed_quote_never_counts_reprices_or_prices_next_leg():
     assert row(strategy).count == 0 and not strategy.sent
     strategy.observe("9.88", h.T0 + 2 * h.SECOND)
     strategy.observe("9.87", h.T0 + 3 * h.SECOND)
-    strategy.deliver("Accepted")
+    strategy.deliver_then_step("Accepted")
     strategy.on_historical_quotes([h.quote("9.70", h.T0 + 60 * h.SECOND)])
     assert not strategy.canceled
     strategy.observe("9.80", h.T0 + 61 * h.SECOND)
     strategy.on_historical_quotes([h.quote("9.50", h.T0 + 62 * h.SECOND)])
     newest = strategy.slots[h.AAA].counted_quote
-    strategy.deliver("Canceled")
+    strategy.deliver_then_step("Canceled")
     assert newest.bid_price.as_decimal() == Decimal("9.80")
     assert strategy.sent[-1].price.as_decimal() > Decimal("9.50")
 
@@ -485,9 +589,9 @@ def test_stop_keeps_flight_state_until_acceptance_and_blocks_readoption():
     strategy.adopt_holding(h.AAA, h.Price.from_str("10.00"))
     strategy.adopt_holding(h.AAA, h.Price.from_str("10.00"))
     assert sum("previous sale" in text for text in strategy.said) == 1
-    strategy.deliver("Accepted")
+    strategy.deliver_then_step("Accepted")
     assert len(strategy.canceled) == 1 and len(strategy.sent) == 1
-    strategy.deliver("Canceled")
+    strategy.deliver_then_step("Canceled")
     assert h.AAA not in strategy.stopped_sales
 
 
@@ -595,6 +699,9 @@ def history_time(now, slot, when):
 def history_observation(strategy, step):
     """Synthetic cache observations, never replacement transition logic."""
     code, when = step["event"], step["when"]
+    if code in {"oINI", "oPCN"} and strategy._sale_events.get(h.AAA):
+        flush_events(strategy)
+        return
     slot = strategy.slots.get(h.AAA) or strategy.stopped_sales.get(h.AAA)
     assert slot is not None
     at = history_time(strategy.clock.timestamp_ns(), slot, when)
@@ -665,7 +772,7 @@ def history_observation(strategy, step):
                     Decimal(0),
                 )
                 quantity = held.signed_qty - foreign
-            strategy.deliver("Filled", quantity=quantity, leg=leg)
+            strategy.deliver_then_step("Filled", quantity=quantity, leg=leg)
         else:
             kind = next(
                 (
@@ -679,7 +786,7 @@ def history_observation(strategy, step):
                 leg.quantity = leg.filled_qty
                 leg.leaves_qty = h.Quantity.from_int(0)
                 leg.status = h.OrderStatus.FILLED
-            strategy.deliver(kind, leg=leg)
+            strategy.deliver_then_step(kind, leg=leg)
 
 
 @pytest.mark.parametrize("group,name,history", CASES, ids=[name for _, name, _ in CASES])
@@ -742,6 +849,13 @@ def test_tracked_history_through_glue(group, name, history, monkeypatch):
         history_observation(strategy, step)
         expected = []
         for state, code, result in transitions:
+            if (
+                code == "NQ"
+                and not result.actions
+                and (index >= len(steps) or steps[index]["event"] != code)
+            ):
+                assert result.state == state
+                continue
             # Engine echoes occur inside the action. Some recorded paths spell them out;
             # every other path has the same inert echoes implicitly.
             if (
@@ -808,6 +922,13 @@ def test_no_action_transition_cannot_send_or_cancel_in_any_history(
         assert observed
         for state, code, result in observed:
             if (
+                code == "NQ"
+                and not result.actions
+                and (index >= len(steps) or steps[index]["event"] != code)
+            ):
+                assert result.state == state
+                continue
+            if (
                 code in {"FRZ", "UFZ"}
                 and result.state == state
                 and not result.actions
@@ -835,17 +956,20 @@ def test_no_action_transition_cannot_send_or_cancel_in_any_history(
                     slot.opening_quantity = quantity
                     price = slot.counted_quote.bid_price.as_decimal()
                     slot.sale = Sale(strategy.clock.timestamp_ns(), price, None, 0, price)
-                else:
-                    quantity = min(
-                        quantity,
-                        slot.opening_quantity - strategy._sale_sold(h.AAA, slot.sale.order_ids),
-                    )
+                slot.sale.priced_ns = strategy.clock.timestamp_ns()
                 cid = h.ClientOrderId(f"canon-protect-20260101T000000Z-{supplied}-12345678")
                 slot.protect_id = cid
                 slot.flight_sent_ns = strategy.clock.timestamp_ns()
                 slot.flight_told = slot.flight_answered = False
                 slot.sale.order_ids.add(cid)
                 strategy.sent_ids.add(cid)
+                strategy._sale_orders[cid] = strategy.order_factory.limit(
+                    h.AAA,
+                    h.OrderSide.SELL,
+                    h.Quantity.from_str(str(quantity)),
+                    slot.counted_quote.bid_price,
+                    client_order_id=cid,
+                )
                 strategy.cached.working.append(
                     h.working_sell(
                         str(cid),
@@ -865,7 +989,7 @@ def test_no_action_transition_cannot_send_or_cancel_in_any_history(
                 slot = strategy.slots.get(h.AAA) or strategy.stopped_sales.get(h.AAA)
                 if result.state.row == "RW" or "not formable" in result.when:
                     slot.refusal_told = True
-                elif state.row == "FL" and code in {"QU", "QA"}:
+                elif "flight_alert_due" in result.when.split(" and "):
                     slot.flight_told = True
             elif sale_table.Action.CANCEL in result.actions:
                 leg = strategy.cache.order(
@@ -873,6 +997,10 @@ def test_no_action_transition_cannot_send_or_cancel_in_any_history(
                 )
                 leg.status = h.OrderStatus.PENDING_CANCEL
                 leg.is_pending_cancel = True
+                slot = strategy.slots.get(h.AAA) or strategy.stopped_sales[h.AAA]
+                slot.flight_sent_ns = strategy.clock.timestamp_ns()
+                slot.flight_told = slot.flight_answered = False
+                slot.flight_command = "cancel"
         assert row(strategy) == observed[-1][2].state
     assert not strategy.sent and not strategy.canceled, (group, name)
 
@@ -929,9 +1057,14 @@ def test_sale_through_real_engine(scenario, monkeypatch):
             self.subscribe_quotes(h.AAA)
 
         def check_timer(self):
+            if getattr(self, "stop_requested", False):
+                self.stop_requested = False
+                self.stop_instrument(h.AAA)
             slot = self.slots.get(h.AAA) or self.stopped_sales.get(h.AAA)
             if slot is None or slot.sale_state is None:
                 return
+            timers.add(slot.sale_state.row)
+            flush_events(self)
             before = slot.sale_state, len(sends), len(cancels)
             self._sale_step(h.AAA, ["NQ"])
             assert (slot.sale_state, len(sends), len(cancels)) == before
@@ -955,10 +1088,9 @@ def test_sale_through_real_engine(scenario, monkeypatch):
 
         def on_order_event(self, event):
             if scenario == "stop-ack" and type(event).__name__ == "OrderCanceled":
-                self.stop_instrument(h.AAA)
+                self.stop_requested = True
             super().on_order_event(event)
             self.callbacks.append(type(event).__name__)
-            self.check_timer()
 
     probe = Probe()
 
@@ -1069,7 +1201,12 @@ def test_sale_through_real_engine(scenario, monkeypatch):
         assert not {"OrderEmulated", "OrderReleased"}.intersection(probe.callbacks)
         if scenario == "reprice":
             assert sends[1].quantity.as_decimal() == 7
-            assert sends[1].price.as_decimal() == Decimal("9.79")
+            # The next quote is the step that judges the acknowledgement, and prices the send.
+            assert sends[1].price.as_decimal() == Decimal("9.78")
+            line = next(note for note in probe.notes if "ack_to_send_ms=" in note)
+            assert all(key in line for key in ("limit=9.78", "level=", "previous=", "floor="))
+            delay = Decimal(line.split("ack_to_send_ms=", 1)[1])
+            assert 0 <= delay <= 1000
         if scenario in {"stop-ack", "flight-stop"}:
             assert last.row == "T0"
         if scenario == "refused-expired":
@@ -1111,7 +1248,6 @@ ENGINE_CASES = [
             [
                 ("FL", "HE", "always"),
                 ("OX", "oACC", "always"),
-                ("PCX", "MO", "always"),
                 ("PCX", "oCXL", "always"),
             ],
             "X",
@@ -1227,6 +1363,7 @@ def test_tracked_history_through_native_cache_and_dispatch(group, name, history,
             return super().cancel_order(*args, **kwargs)
 
         def check_timer(self):
+            flush_events(self)
             slot = self.slots.get(h.AAA) or self.stopped_sales.get(h.AAA)
             at = self.clock.timestamp_ns()
             step = TimeEvent("test-step", h.UUID4(), at, at)
@@ -1465,9 +1602,12 @@ def test_tracked_history_through_native_cache_and_dispatch(group, name, history,
                             venue,
                         )
                     )
+                elif code == "oINI":
+                    flush_events(probe)
                 else:
                     raise AssertionError(f"unconsumed local echo: {code}")
             await self.pause()
+            flush_events(probe)
 
         async def walk(self):
             self.covers = []
@@ -1488,6 +1628,13 @@ def test_tracked_history_through_native_cache_and_dispatch(group, name, history,
                 assert transitions, (name, steps[index], probe.notes)
                 expected = []
                 for state, code, result in transitions:
+                    if (
+                        code == "NQ"
+                        and not result.actions
+                        and (index >= len(steps) or steps[index]["event"] != code)
+                    ):
+                        assert result.state == state
+                        continue
                     if (
                         code in {"oINI", "oPCN", "FRZ", "UFZ"}
                         and not result.actions
@@ -1629,7 +1776,7 @@ def test_alert_redacts_venue_id_and_bounds_reason():
     first_leg(strategy)
     leg = strategy.cached.working[-1]
     leg.venue_order_id = h.VenueOrderId("synthetic-private-order")
-    strategy.deliver(
+    strategy.deliver_then_step(
         "Rejected",
         reason=f"{leg.client_order_id} {leg.venue_order_id} " + "reason " * 50 + "\nsecond line",
     )
@@ -1725,7 +1872,7 @@ def test_new_position_cycle_after_ended_row_gets_its_own_count():
     strategy = counted()
     first_leg(strategy)
     old = strategy.slots[h.AAA]
-    strategy.deliver("Filled", quantity=10)
+    strategy.deliver_then_step("Filled", quantity=10)
     assert row(strategy).row == "X"
     position = strategy.cached.held[0]
     position.signed_qty = Decimal(10)
@@ -1741,8 +1888,8 @@ def test_episode_floor_wait_is_judged_only_by_counted_stream_quotes():
     strategy = counted()
     first_leg(strategy)
     strategy.observe("9.00", h.T0 + 10 * h.SECOND)
-    strategy.deliver("Canceled")
-    strategy.deliver("Accepted")
+    strategy.deliver_then_step("Canceled")
+    strategy.deliver_then_step("Accepted")
     slot = strategy.slots[h.AAA]
     floor = slot.sale.floor
     assert strategy.sent[-1].price.as_decimal() == floor
@@ -1755,7 +1902,7 @@ def test_episode_floor_wait_is_judged_only_by_counted_stream_quotes():
     assert slot.sale.floor == floor and slot.sale.floor_since == since
     strategy.observe("8.50", h.T0 + 122 * h.SECOND)
     assert slot.sale.floor is None and row(strategy).row == "PCR"
-    strategy.deliver("Canceled")
+    strategy.deliver_then_step("Canceled")
     assert strategy.sent[-1].price.as_decimal() < floor
 
 
@@ -1777,7 +1924,7 @@ def test_ended_holding_retires_its_earlier_book_level(tmp_path):
     strategy.level_book_path, strategy.run = path, "example"
     first_leg(strategy)
     assert LevelBook.read(path)["example", h.AAA].last_level is not None
-    strategy.deliver("Filled", quantity=10)
+    strategy.deliver_then_step("Filled", quantity=10)
     strategy._save_levels()
     saved = LevelBook.read(path)["example", h.AAA]
     assert saved.last_level is None and saved.reason == "holding ended"
@@ -1796,7 +1943,7 @@ def test_timer_still_observes_a_stopped_sale_after_cancel_refusal():
     strategy = counted()
     first_leg(strategy)
     strategy.stop_instrument(h.AAA)
-    strategy.deliver("CancelRejected")
+    strategy.deliver_then_step("CancelRejected")
     assert row(strategy).row == "TW" and len(strategy.canceled) == 1
     strategy.cached.held[0].signed_qty = Decimal(5)
     strategy.cached.held[0].quantity = h.Quantity.from_int(5)

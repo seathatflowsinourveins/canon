@@ -3,26 +3,48 @@
 Pin: nautilus-trader v2.0.0rc8 at d53849b216e2, whose order transitions are
 crates/model/src/orders/mod.rs:207-302, with reconciliation at 1314-1325 and
 late fills at 1367-1389. Canonical cells SHA256:
-ee8b277596cf8f1630a03beed06ee3767c1aeed05631cfe69e89f67e1f64f38b.
+7a39ab781d94fec8946c245eeea25b07d0fc16110486ab606ee8030e7b5ef95c.
 Order-event inventory: crates/model/src/events/order/any.rs:39-57 and
-crates/trading/src/strategy/mod.rs:1445-1462. Local echoes enter the row
-already stored by their sender before executing the action.
+crates/trading/src/strategy/mod.rs:1445-1462. Order events, including local echoes,
+are judged in the following step, in the table's step order.
 
 The adjacent data file is loaded once; transitions and whole steps only read
 their arguments and the immutable table. No engine, account, clock, cache,
-environment, pricing or quantity calculation belongs here. Counts of one are
+environment or quantity calculation belongs here. ``leg_limit`` implements only
+the table's pure price rule; the caller supplies the chase price. Counts of one are
 outside this contract. ``named`` is a diagnostic for the caller, never an I/O
 operation. ``Event.facts`` describes the facts at that event in the ordered step.
+
+Named caller limits: added shares wait for the next leg; the acknowledgement's
+next leg waits up to one STEP_NS for a step; an event on an ended holding's leg
+can affect the following holding; remaining quantity after a voided fill that
+did not reopen its order is unread, with the holding frozen.
 """
 
 from collections.abc import Iterable
 from collections.abc import Mapping
 from dataclasses import dataclass
+from decimal import Decimal
 from enum import StrEnum
 from json import loads
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
+
+
+def leg_limit[Value: (Decimal, int)](
+    stepped: Value | None,
+    *,
+    level: Value,
+    previous: Value | None,
+    floor: Value | None,
+) -> Value | None:
+    """Lift the usable quote's chase price to its floor, then apply both caps."""
+    if stepped is None:
+        return previous
+    price = stepped if floor is None else max(stepped, floor)
+    price = min(price, level)
+    return price if previous is None else min(price, previous)
 
 
 class SaleTableError(ValueError):

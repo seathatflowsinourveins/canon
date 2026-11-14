@@ -226,8 +226,8 @@
         {
           "row": "PCR",
           "event": "QA",
-          "when": "always",
-          "does": "nothing sent; -> PCR",
+          "when": "not flight_alert_due",
+          "does": "IF not flight_alert_due: nothing sent; -> PCR",
           "occurs": "yes"
         },
         {
@@ -640,14 +640,7 @@
           "row": "WK",
           "event": "oLF",
           "when": "not long_remains",
-          "does": "IF not long_remains: nothing sent; -> OX",
-          "occurs": "yes"
-        },
-        {
-          "row": "OX",
-          "event": "MO",
-          "when": "always",
-          "does": "CANCEL ours; -> PCX",
+          "does": "IF not long_remains: CANCEL ours; -> PCX",
           "occurs": "yes"
         },
         {
@@ -1811,8 +1804,8 @@
         {
           "row": "FL",
           "event": "NQ",
-          "when": "always",
-          "does": "nothing sent; -> FL",
+          "when": "not flight_alert_due",
+          "does": "IF not flight_alert_due: nothing sent; -> FL",
           "occurs": "yes"
         },
         {
@@ -1825,6 +1818,275 @@
       ],
       "ends_in": "WK",
       "sends": 1
+    },
+    "silent-leg-timer-alert": {
+      "steps": [
+        {
+          "row": "G",
+          "event": "QU",
+          "when": "not count_complete",
+          "does": "IF not count_complete: nothing sent; -> G, count + 1",
+          "occurs": "yes"
+        },
+        {
+          "row": "G",
+          "event": "QU",
+          "when": "count_complete and resend_due and leg_positive and formable",
+          "does": "IF count_complete and resend_due and leg_positive and formable: SEND a leg; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "oINI",
+          "when": "always",
+          "does": "nothing sent; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "NQ",
+          "when": "not flight_alert_due",
+          "does": "IF not flight_alert_due: nothing sent; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "NQ",
+          "when": "flight_alert_due",
+          "does": "IF flight_alert_due: ALERT; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "NQ",
+          "when": "not flight_alert_due",
+          "does": "IF not flight_alert_due: nothing sent; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "oACC",
+          "when": "always",
+          "does": "nothing sent; -> WK",
+          "occurs": "yes"
+        }
+      ],
+      "ends_in": "WK",
+      "sends": 1
+    },
+    "refused-leg-chased-again": {
+      "steps": [
+        {
+          "row": "G",
+          "event": "QU",
+          "when": "not count_complete",
+          "does": "IF not count_complete: nothing sent; -> G, count + 1",
+          "occurs": "yes"
+        },
+        {
+          "row": "G",
+          "event": "QU",
+          "when": "count_complete and resend_due and leg_positive and formable",
+          "does": "IF count_complete and resend_due and leg_positive and formable: SEND a leg; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "oREJ",
+          "when": "not refusal_told",
+          "does": "IF not refusal_told: ALERT; -> RW",
+          "occurs": "yes"
+        },
+        {
+          "row": "RW",
+          "event": "QU",
+          "when": "not resend_due",
+          "does": "IF not resend_due: nothing sent; -> RW",
+          "occurs": "yes"
+        },
+        {
+          "row": "RW",
+          "event": "QU",
+          "when": "resend_due and leg_positive and formable",
+          "does": "IF resend_due and leg_positive and formable: SEND a leg; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "oACC",
+          "when": "always",
+          "does": "nothing sent; -> WK",
+          "occurs": "yes"
+        },
+        {
+          "row": "WK",
+          "event": "QU",
+          "when": "not reprice_due",
+          "does": "IF not reprice_due: nothing sent; -> WK",
+          "occurs": "yes"
+        },
+        {
+          "row": "WK",
+          "event": "QU",
+          "when": "reprice_due",
+          "does": "IF reprice_due: CANCEL ours; -> PCR",
+          "occurs": "yes"
+        },
+        {
+          "row": "PCR",
+          "event": "oCXL",
+          "when": "leg_positive and formable",
+          "does": "IF leg_positive and formable: SEND a leg; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "oACC",
+          "when": "always",
+          "does": "nothing sent; -> WK",
+          "occurs": "yes"
+        },
+        {
+          "row": "WK",
+          "event": "oFF",
+          "when": "not long_remains",
+          "does": "IF not long_remains: nothing sent; -> X",
+          "occurs": "yes"
+        }
+      ],
+      "ends_in": "X",
+      "sends": 3
+    },
+    "holding-end-cancels-working-sale": {
+      "steps": [
+        {
+          "row": "G",
+          "event": "QU",
+          "when": "not count_complete",
+          "does": "IF not count_complete: nothing sent; -> G, count + 1",
+          "occurs": "yes"
+        },
+        {
+          "row": "G",
+          "event": "QU",
+          "when": "count_complete and resend_due and leg_positive and formable",
+          "does": "IF count_complete and resend_due and leg_positive and formable: SEND a leg; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "oSUB",
+          "when": "always",
+          "does": "nothing sent; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "oACC",
+          "when": "always",
+          "does": "nothing sent; -> WK",
+          "occurs": "yes"
+        },
+        {
+          "row": "WK",
+          "event": "HE",
+          "when": "always",
+          "does": "CANCEL ours; -> PCX",
+          "occurs": "yes"
+        },
+        {
+          "row": "PCX",
+          "event": "oPCN",
+          "when": "always",
+          "does": "nothing sent; -> PCX",
+          "occurs": "yes"
+        },
+        {
+          "row": "PCX",
+          "event": "oCXL",
+          "when": "always",
+          "does": "nothing sent; -> X",
+          "occurs": "yes"
+        }
+      ],
+      "ends_in": "X",
+      "sends": 1
+    },
+    "silent-cancel-answered-late": {
+      "steps": [
+        {
+          "row": "G",
+          "event": "QU",
+          "when": "not count_complete",
+          "does": "IF not count_complete: nothing sent; -> G, count + 1",
+          "occurs": "yes"
+        },
+        {
+          "row": "G",
+          "event": "QU",
+          "when": "count_complete and resend_due and leg_positive and formable",
+          "does": "IF count_complete and resend_due and leg_positive and formable: SEND a leg; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "oSUB",
+          "when": "always",
+          "does": "nothing sent; -> FL",
+          "occurs": "yes"
+        },
+        {
+          "row": "FL",
+          "event": "oACC",
+          "when": "always",
+          "does": "nothing sent; -> WK",
+          "occurs": "yes"
+        },
+        {
+          "row": "WK",
+          "event": "QU",
+          "when": "reprice_due",
+          "does": "IF reprice_due: CANCEL ours; -> PCR",
+          "occurs": "yes"
+        },
+        {
+          "row": "PCR",
+          "event": "oPCN",
+          "when": "always",
+          "does": "nothing sent; -> PCR",
+          "occurs": "yes"
+        },
+        {
+          "row": "PCR",
+          "event": "QU",
+          "when": "not flight_alert_due",
+          "does": "IF not flight_alert_due: nothing sent; -> PCR",
+          "occurs": "yes"
+        },
+        {
+          "row": "PCR",
+          "event": "QA",
+          "when": "flight_alert_due",
+          "does": "IF flight_alert_due: ALERT; -> PCR",
+          "occurs": "yes"
+        },
+        {
+          "row": "PCR",
+          "event": "QU",
+          "when": "not flight_alert_due",
+          "does": "IF not flight_alert_due: nothing sent; -> PCR",
+          "occurs": "yes"
+        },
+        {
+          "row": "PCR",
+          "event": "oCXL",
+          "when": "leg_positive and formable",
+          "does": "IF leg_positive and formable: SEND a leg; -> FL",
+          "occurs": "yes"
+        }
+      ],
+      "ends_in": "FL",
+      "sends": 2
     }
   },
   "histories_walked": {
@@ -2075,13 +2337,6 @@
         {
           "row": "WK",
           "event": "HE",
-          "when": "always",
-          "does": "nothing sent; -> OX",
-          "occurs": "yes"
-        },
-        {
-          "row": "OX",
-          "event": "MO",
           "when": "always",
           "does": "CANCEL ours; -> PCX",
           "occurs": "yes"
