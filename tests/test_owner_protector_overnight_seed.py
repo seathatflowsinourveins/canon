@@ -16,6 +16,7 @@ from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from typing import cast
 
 import pytest
 from nautilus_trader.backtest import BacktestEngine
@@ -266,7 +267,10 @@ def test_carried_level_without_distance_uses_cold_rule_at_once_then_replans(
     strategy.seed(bid, ask=ask, age_s=0)
     bars = [bar(OPEN, "0.02")]
     warm_distance, warm = protect.distance_for("AAA", row, Decimal(bid), Decimal(ask), bars)
-    strategy.on_historical_bars(bars)
+    if answer == "pending":  # the day's answer, not a bar ahead of it (code-review-high/1)
+        strategy.answer("bars", bars)
+    else:
+        strategy.on_historical_bars(bars)
     strategy.step()
     assert slot.level is not None
     assert slot.level.as_decimal() == max(initial, up_on_step(Decimal(bid) - warm_distance))
@@ -367,3 +371,91 @@ def test_engine_cold_first_arm_and_no_handler_error(
     assert arms and "cold rule" in arms[0] and "fixed fallback" in arms[0], protector.lines
     distance, _ = protect.distance_for("AAA", "OWN1", Decimal("10.00"), Decimal("10.02"), [])
     assert any(f"armed distance {distance}" in line for line in arms)
+
+
+def carried_without_distance(tmp_path: Path, row: str = "OWN1") -> Cold:
+    path = tmp_path / "levels.json"
+    record = restart_record(
+        last_level="9.50",
+        distance=None,
+        protection_start_ns=OPEN - 3600 * SECOND,
+        written_ns=OPEN - 60 * SECOND,
+    )
+    path.write_text(json.dumps({"schema": 2, "entries": [record]}))
+    return overnight(account_label="shape", level_book_path=path, row=row)
+
+
+def test_a_pending_history_keeps_the_cold_plan_until_the_answer_not_one_live_bar() -> None:
+    """code-review-high/1: while the session day's bars answer is pending, one bar the live
+    subscription cached does not fix the run's distance; the answer does."""
+    strategy = overnight()
+    strategy.on_start()
+    strategy.seed(ask="10.05", age_s=0)
+    slot = strategy.slots[AAA]
+    assert slot.cold and slot.distance is not None, strategy.said
+    cold_distance = slot.distance.distance
+    strategy.test_clock.set_time(OPEN + 61 * SECOND)
+    strategy.cached.history = [bar(OPEN, "0.02")]
+    strategy.seed(ask="10.05", age_s=0)
+    strategy.step()
+    assert slot.cold, "one live bar while the history is pending must not end the cold plan"
+    assert slot.distance.distance == cold_distance
+    n = protect.ATR_BARS
+    history = [bar(OPEN - (n - i) * 60 * SECOND, "0.02") for i in range(n)]
+    strategy.answer("bars", history)
+    strategy.step()
+    assert not slot.cold, strategy.said
+    assert slot.distance.bars == protect.ATR_BARS, strategy.said
+
+
+def test_a_carried_long_without_distance_on_flat_bars_with_no_spread_is_covered(
+    tmp_path: Path,
+) -> None:
+    """code-review-high/3: flat bars and no usable spread give the same fixed fallback as no
+    bars; a carried long with no carried distance takes it, never left bare (the lead's ruling)."""
+    strategy = carried_without_distance(tmp_path)
+    strategy.on_start()
+    strategy.test_clock.set_time(OPEN + 61 * SECOND)
+    strategy.answer("bars", [bar(OPEN, "0")])
+    before = len(strategy.said)
+    strategy.seed("10.00", ask="10.00", age_s=0)
+    slot = strategy.slots[AAA]
+    assert slot.level is not None, strategy.said
+    assert slot.distance is not None and slot.distance.fallback, strategy.said
+    expected = max(Decimal("9.50"), up_on_step(Decimal("10.00") - slot.distance.distance))
+    assert slot.level.as_decimal() == expected
+    assert not [line for line in strategy.said[before:] if "unprotected" in line], strategy.said
+
+
+def test_unsound_last_bars_plan_cold_and_a_carried_long_without_distance_is_covered(
+    tmp_path: Path,
+) -> None:
+    """code-review-high/4: whether bars allow a plan is judged on the slice the planner is given;
+    one sound bar before ATR_BARS unsound ones is no plan, so the cold rule covers the holding."""
+    strategy = carried_without_distance(tmp_path)
+    strategy.on_start()
+    strategy.test_clock.set_time(OPEN + 20 * 60 * SECOND)
+    strategy.answer("bars", [])
+    unsound = {
+        OPEN + i * 60 * SECOND: SimpleNamespace(
+            ts_event=OPEN + i * 60 * SECOND, high=10.10, low=10.05, close=10.00
+        )
+        for i in range(1, protect.ATR_BARS + 1)
+    }
+    strategy.history_bars[AAA] = cast(Any, {OPEN: bar(OPEN, "0.02"), **unsound})
+    before = len(strategy.said)
+    strategy.seed("10.00", ask="10.02", age_s=0)
+    slot = strategy.slots[AAA]
+    assert slot.level is not None and slot.distance is not None, strategy.said
+    assert slot.cold and slot.distance.bars == 0, strategy.said
+    assert not [line for line in strategy.said[before:] if "unprotected" in line], strategy.said
+
+
+def test_a_boats_request_at_0405_never_starts_after_it_ends() -> None:
+    """code-review-high/7: at 04:05 New York the latest 04:00 is after now less the delay; the
+    window is never inverted."""
+    strategy = Cold(feed="boats")
+    strategy.test_clock.set_time(int(datetime(2026, 11, 16, 9, 5, tzinfo=UTC).timestamp()) * SECOND)
+    strategy.on_start()
+    request = strategy.bar_requests[0]
+    assert request["start"] <= request["end"], request

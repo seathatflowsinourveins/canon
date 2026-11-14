@@ -91,7 +91,9 @@ replan the distance without lowering the level or replacing a working sell. A ca
 stays whole; a carried level with no distance takes the higher of its level and the cold rule's
 level until bars allow a plan. One to thirteen bars use their own ATR period; with no spread the
 ATR stands alone. A flat day with no spread retains the named fixed fallback, counted separately
-in END and refused for a carried long. Failed reads are named once and never retried.
+in END; a carried long with no carried distance takes it as the cold rule, planned again on bars.
+Bars allow a plan only once the day's answer is in, or a full ATR's worth exists, judged on the
+slice the planner is given. Failed reads are named once and never retried.
 The adapter config helper enables
 external reports and reduce-only SELL_TO_CLOSE
 (canon_alpaca/execution.py:569,614-646,1578); it constructs no client or node.
@@ -597,6 +599,7 @@ class Holding:
     history_error: str | None = None
     history_error_said: bool = False
     cold: bool = False
+    cold_seen: int | None = None
     seed_error: str | None = None
     first_quote: int | None = None
     last_quote: int | None = None
@@ -890,15 +893,13 @@ class OwnerProtector(Strategy):
             elif instrument_id not in self.venue_quotes:
                 slot.seed_error = "seed empty: no two-sided quote; wait"
 
+        end = now - OVERNIGHT_HISTORY_DELAY if self.settings.feed == OVERNIGHT_HISTORY_FEED else now
         try:
             self.request_bars(
                 BarType.from_str(f"{instrument_id}-1-MINUTE-LAST-EXTERNAL"),
-                start=protect.session_start(now),
-                end=(
-                    now - OVERNIGHT_HISTORY_DELAY
-                    if self.settings.feed == OVERNIGHT_HISTORY_FEED
-                    else now
-                ),
+                # never after its end (code-review-high/7): 04:00-04:15 New York on boats
+                start=min(protect.session_start(now), end),
+                end=end,
                 params={"feed": self.settings.feed},
                 callback=bars_done,
             )
@@ -1817,9 +1818,17 @@ class OwnerProtector(Strategy):
             complete = [
                 b for at, b in sorted(bars.items()) if earliest <= at and at + 60 * SECOND_NS <= now
             ]
-            has_bars = any(protect._sound(bar) for bar in complete)
+            # Bars allow a plan only on the slice the planner is given (code-review-high/4), and
+            # only once the session day's answer is in, or a full ATR's worth has been seen: one
+            # live bar while the answer is pending never fixes the run's distance (-high/1).
+            answered = slot.history_ready or slot.history_error is not None
+            sound = [b for b in complete[-protect.ATR_BARS :] if protect._sound(b)]
+            has_bars = bool(sound) and (answered or len(sound) >= protect.ATR_BARS)
+            newest = sound[-1].ts_event if has_bars else None
             replanning = slot.cold and slot.distance is not None
-            if replanning and not has_bars:
+            # A cold plan is planned again only on a newer sound bar than it last saw: no replan
+            # on every quote or step for the same bars (code-review-high/2, /8).
+            if replanning and (not has_bars or newest == slot.cold_seen):
                 self._name_history_failure(instrument_id, slot)
                 return True  # Keep the first cold plan until bars allow a new one.
             instrument = self.cache.instrument(instrument_id)
@@ -1856,13 +1865,11 @@ class OwnerProtector(Strategy):
                     [] if cold else complete[-protect.ATR_BARS :],
                 )
                 plan = replace(plan, quote_age=age)
-                if carried is not None and plan.fallback and not cold:
-                    # The cold-start amendment permits no-bar cover without a carried distance.
-                    # A flat day's fallback still cannot replan a carried long.
-                    raise ValueError(
-                        f"the row gives only the fixed fallback ({plan.source()}), never used "
-                        "for a carried long"
-                    )
+                if carried is not None and plan.fallback:
+                    # The lead's ruling (2026-11-13, 23:2x): a carried long whose record has no
+                    # distance is covered by the cold rule, never left bare; flat bars give the
+                    # same fixed fallback as none (code-review-high/3), planned again on bars.
+                    cold = True
                 if plan.fallback:
                     self.fallbacks[instrument_id] = self.fallbacks.get(instrument_id, 0) + 1
                     if plan.bars:
@@ -1931,7 +1938,7 @@ class OwnerProtector(Strategy):
                     )
             slot.level = level
             slot.distance, slot.limit_offset = plan, limit
-            slot.cold = cold
+            slot.cold, slot.cold_seen = cold, newest
             self._say(
                 f"{instrument_id}: {'replanned' if replanning else 'armed'} distance {distance}; {source}; "
                 f"quote age {age.total_seconds():.0f} s"
