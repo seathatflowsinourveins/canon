@@ -11,19 +11,24 @@ the lead writes it by hand; nothing here writes it. One key is read:
 
     trading_requests_per_minute = <a positive whole number>
 
-the Trading API's request limit for the live account, a minute, as Alpaca gives it for that account. No
-figure for the live account is written in this repository, and none is guessed:
+the Trading API's request limit for the live account, a minute. What Alpaca's pages state about that limit
+is in ADR 0122's Evidence; the figure of one account is the owner's to take from Alpaca. No figure for the
+live account is written in this repository, and none is guessed:
 
-* no file, or a file that does not set the key: the paper figure,
+* no file, or a file that sets nothing at all: the paper figure,
   `request_budget.TRADING_REQUEST_LIMIT_PER_MINUTE` (ADR 0083), and the answer says so;
-* a file that cannot be read, is not TOML, or sets the key to anything but a positive whole number: an
-  error by name. It is never read as absent, and what it held is never repeated: a wrong value may be a
-  slip of the real one;
-* a path inside this checkout is refused, there or not, so the figure cannot be kept where it could be
-  committed.
+* a file that cannot be read or parsed, is or is under a link whose target is missing, is not TOML, sets
+  any name but that key at its top level (a table, a misspelt key, the key in other case) or sets the key
+  to anything but a positive whole number: an error by name. It is never read as absent, and what it held
+  is never repeated, a name it set included: a wrong value or name may be a slip of the real figure;
+* a path inside this checkout or any other git checkout is refused, there or not and however its folders
+  are spelt, so the figure cannot be kept where it could be committed.
 
-The figure stays out of `repr`, `str` and every message here. A caller that records it does so in a file
-outside the repository (ADR 0103, point 6).
+The figure stays out of `repr`, `str` and every message here. An error raised here carries no cause and no
+context, since the parser's and the decoder's own errors hold the file's text (`TOMLDecodeError.doc`,
+`UnicodeDecodeError.object`), and no frame of this module in its traceback holds what the file held.
+`dataclasses.asdict` and `astuple` do give the figure, as the field does. A caller that records it does so
+in a file outside the repository (ADR 0103, point 6).
 """
 
 from __future__ import annotations
@@ -36,6 +41,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from .request_budget import TRADING_REQUEST_LIMIT_PER_MINUTE
+from .request_budget import check_limit
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -46,6 +52,8 @@ KEY = "trading_requests_per_minute"
 FROM_SETTINGS = "the local settings file"
 NO_FILE = "the paper figure: no local settings file"
 NO_KEY = f"the paper figure: the local settings file sets no {KEY}"
+THE_FILE = f"the local settings file ({SETTINGS_FILE})"
+"""How every refusal names the file: by its place under the config folder, never by the path read."""
 CHECKOUT = Path(__file__).resolve().parents[2]
 """The checkout this module runs from: `src/canon_trading/` is two folders under its root."""
 
@@ -74,33 +82,74 @@ def settings_path(environ: Mapping[str, str] | None = None) -> Path:
     return (Path(config) if config else Path.home() / ".claude") / SETTINGS_FILE
 
 
-def read_request_budget(path: Path | None = None) -> RequestBudget:
-    """Read the budget now, from `path` or this machine's settings file (the module's header)."""
-    path = settings_path() if path is None else path
-    if path.resolve().is_relative_to(CHECKOUT):
-        raise LiveSettingsError(
-            "the live settings file is inside this checkout; it is kept outside the repository "
-            f"({SETTINGS_FILE} under the config folder)"
-        )
+def inside_checkout(path: Path) -> bool:
+    """Whether `path`, there or not, is in this checkout or in any other git checkout, however spelt.
+
+    The rule of `arm_comparison._inside_checkout`, copied since that module imports numpy, pandas and
+    arch: a folder above the path that is this checkout by `samefile` (the device and inode numbers, so
+    another spelling on a volume that does not tell upper case from lower is still found), or that holds
+    a `.git` entry, a folder in a main checkout and a file in a linked worktree
+    (gitrepository-layout(5)). The path is resolved first, so a link is judged where it leads.
+    """
+    resolved = path.resolve()
+    if resolved.is_relative_to(CHECKOUT):
+        return True
+    for folder in (resolved, *resolved.parents):
+        try:
+            if folder.samefile(CHECKOUT) or (folder / ".git").exists():
+                return True
+        except OSError:  # not there, or not to be read: nothing to compare
+            continue
+    return False
+
+
+def link_without_target(path: Path) -> bool:
+    """Whether `path`, or a folder above it, is a symbolic link whose target is missing."""
+    return any(part.is_symlink() and not part.exists() for part in (path, *path.parents))
+
+
+def _read(path: Path) -> RequestBudget | str:
+    """The budget the file at `path` gives, or what is wrong with it, in words that repeat nothing of it.
+
+    A frame of its own, ended before the caller raises on those words: the error then has no context (the
+    parser's and the decoder's errors hold the file's text) and its traceback no frame holding the
+    file's content.
+    """
     try:
         with path.open("rb") as file:
             settings = tomllib.load(file)
     except FileNotFoundError:
+        if link_without_target(path):
+            return f"{THE_FILE} is, or is under, a link whose target is missing"
         return RequestBudget(TRADING_REQUEST_LIMIT_PER_MINUTE, NO_FILE)
     except tomllib.TOMLDecodeError:
-        # no cause kept: the parser's message is not needed, and nothing of the file is repeated
-        raise LiveSettingsError(
-            f"the local settings file ({SETTINGS_FILE}) is not valid TOML"
-        ) from None
+        return f"{THE_FILE} is not valid TOML"
     except (OSError, UnicodeDecodeError) as error:
-        raise LiveSettingsError(
-            f"the local settings file ({SETTINGS_FILE}) could not be read ({type(error).__name__})"
-        ) from None
-    if KEY not in settings:
+        return f"{THE_FILE} could not be read ({type(error).__name__})"
+    except (ValueError, RecursionError) as error:
+        # after the two above, which are ValueErrors too: a number past Python's digit limit for an
+        # integer, or tables nested past its recursion limit
+        return f"{THE_FILE} could not be parsed ({type(error).__name__})"
+    if not settings:
         return RequestBudget(TRADING_REQUEST_LIMIT_PER_MINUTE, NO_KEY)
-    value = settings[KEY]
-    if type(value) is not int or value <= 0:
+    if settings.keys() != {KEY}:
+        return f"{THE_FILE} sets a name other than {KEY} at its top level; it holds that one key and nothing else"
+    try:
+        check_limit(settings[KEY])
+    except ValueError:
+        return f"{KEY} in {THE_FILE} must be a positive whole number"
+    return RequestBudget(settings[KEY], FROM_SETTINGS)
+
+
+def read_request_budget(path: Path | None = None) -> RequestBudget:
+    """Read the budget now, from `path` or this machine's settings file (the module's header)."""
+    path = settings_path() if path is None else path
+    if inside_checkout(path):
         raise LiveSettingsError(
-            f"{KEY} in the local settings file ({SETTINGS_FILE}) must be a positive whole number"
-        ) from None
-    return RequestBudget(value, FROM_SETTINGS)
+            "the live settings file is inside this checkout or another git checkout; it is kept outside "
+            f"every repository ({SETTINGS_FILE} under the config folder)"
+        )
+    answer = _read(path)
+    if isinstance(answer, str):
+        raise LiveSettingsError(answer)
+    return answer

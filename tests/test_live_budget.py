@@ -4,6 +4,8 @@ Every figure here is made up. The file under test is a throwaway in `tmp_path`; 
 folder of the machine it runs on.
 """
 
+import os
+import traceback
 from pathlib import Path
 
 import pytest
@@ -16,6 +18,8 @@ from canon_trading.request_budget import TRADING_REQUEST_LIMIT_PER_MINUTE
 
 MADE_UP = 777
 """A made-up limit, unlike the paper figure, so a test can tell which one it was given."""
+MADE_UP_LONG = "7770777"
+"""A made-up figure long enough that no temporary folder's name holds it by chance."""
 
 
 def settings(tmp_path: Path, text: str) -> Path:
@@ -60,30 +64,115 @@ def test_a_figure_that_is_not_a_positive_whole_number_is_refused_by_name_never_r
     with pytest.raises(LiveSettingsError, match="must be a positive whole number") as raised:
         read_request_budget(path)
     # what was written may be a slip of the real figure: it is never repeated
+    assert value not in str(raised.value)
     assert "777" not in str(raised.value)
     assert raised.value.__cause__ is None
-    assert raised.value.__suppress_context__ is True
+    assert raised.value.__context__ is None
 
 
-@pytest.mark.parametrize("text", ["trading_requests_per_minute = \n", "= 777\n", "[unclosed\n"])
+@pytest.mark.parametrize(
+    ("text", "unknown"),
+    [
+        ("[limits]\ntrading_requests_per_minute = 777\n", "limits"),
+        ('[notes]\nwho = "nobody"\ntrading_requests_per_minute = 777\n', "notes"),
+        ("trading_request_per_minute = 777\n", "trading_request_per_minute"),
+        ("TRADING_REQUESTS_PER_MINUTE = 777\n", "TRADING_REQUESTS_PER_MINUTE"),
+        ("trading_requests_per_minute = 777\nburst = 5\n", "burst"),
+        ("limits.trading_requests_per_minute = 777\n", "limits"),
+        ('"trading_requests_per_minute " = 777\n', '"trading_requests_per_minute "'),
+        ('777 = "a figure where the name goes"\n', "777"),
+    ],
+)
+def test_a_name_the_reader_does_not_know_is_refused_never_read_as_absent(
+    tmp_path: Path, text: str, unknown: str
+) -> None:
+    with pytest.raises(LiveSettingsError, match="sets a name other than") as raised:
+        read_request_budget(settings(tmp_path, text))
+    # a name in the file may be a slip of the figure too (a bare key may be digits): never repeated
+    assert unknown not in str(raised.value)
+    assert "777" not in str(raised.value)
+    assert raised.value.__context__ is None
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "trading_requests_per_minute = \n",
+        "= 777\n",
+        "[unclosed\n",
+        "trading_requests_per_minute = 777 oops\n",
+    ],
+)
 def test_a_file_that_is_not_toml_is_refused_by_name_never_read_as_absent(
     tmp_path: Path, text: str
 ) -> None:
     with pytest.raises(LiveSettingsError, match="is not valid TOML") as raised:
         read_request_budget(settings(tmp_path, text))
     assert raised.value.__cause__ is None
-    assert raised.value.__suppress_context__ is True
+    # the parser's error holds the whole document (`TOMLDecodeError.doc`): it is not kept on ours
+    assert raised.value.__context__ is None
 
 
 def test_a_file_that_cannot_be_read_is_refused_by_name_never_read_as_absent(tmp_path: Path) -> None:
     folder = tmp_path / "settings.toml"
     folder.mkdir()  # a folder of that name: there, and not a file that can be read
-    with pytest.raises(LiveSettingsError, match="could not be read"):
+    with pytest.raises(LiveSettingsError, match="could not be read") as raised:
         read_request_budget(folder)
+    assert raised.value.__context__ is None
     not_text = tmp_path / "bytes.toml"
-    not_text.write_bytes(b"\xff\xfe\x00")
-    with pytest.raises(LiveSettingsError, match="could not be read"):
+    not_text.write_bytes(b"trading_requests_per_minute = 777 \xff\n")
+    with pytest.raises(LiveSettingsError, match="could not be read") as raised:
         read_request_budget(not_text)
+    # the decoder's error holds the file's bytes (`UnicodeDecodeError.object`): it is not kept on ours
+    assert raised.value.__context__ is None
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "trading_requests_per_minute = "
+        + "7" * 5000
+        + "\n",  # past Python's digit limit for an integer
+        "trading_requests_per_minute = " + "[" * 5000 + "\n",  # nested past its recursion limit
+    ],
+)
+def test_a_file_the_parser_gives_up_on_is_refused_by_name(tmp_path: Path, text: str) -> None:
+    with pytest.raises(LiveSettingsError, match="could not be parsed|is not valid TOML") as raised:
+        read_request_budget(settings(tmp_path, text))
+    assert "7777" not in str(raised.value)
+    assert raised.value.__context__ is None
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        f"trading_requests_per_minute = [{MADE_UP_LONG}]\n",
+        f"trading_requests_per_minute = -{MADE_UP_LONG}\n",
+        f"trading_request_per_minute = {MADE_UP_LONG}\n",
+        f"trading_requests_per_minute = {MADE_UP_LONG} oops\n",
+    ],
+)
+def test_no_frame_of_the_reader_in_the_error_s_traceback_holds_what_the_file_held(
+    tmp_path: Path, text: str
+) -> None:
+    with pytest.raises(LiveSettingsError) as raised:
+        read_request_budget(settings(tmp_path, text))
+    # a formatter that prints each frame's variables (`capture_locals`) would print these
+    frames = traceback.TracebackException.from_exception(raised.value, capture_locals=True).stack
+    ours = [frame for frame in frames if frame.filename == live_budget.__file__]
+    assert ours, "the reader's own frame is in the traceback"
+    for frame in ours:
+        assert MADE_UP_LONG not in str(frame.locals)
+
+
+def test_a_link_whose_target_is_missing_is_refused_never_read_as_absent(tmp_path: Path) -> None:
+    link = tmp_path / "settings.toml"
+    os.symlink(tmp_path / "gone" / "settings.toml", link)  # the file's own link, to nothing
+    with pytest.raises(LiveSettingsError, match="a link whose target is missing"):
+        read_request_budget(link)
+    os.symlink(tmp_path / "unmounted", tmp_path / "canon")  # a folder above it, linked to nothing
+    with pytest.raises(LiveSettingsError, match="a link whose target is missing"):
+        read_request_budget(tmp_path / "canon" / "live" / "settings.toml")
 
 
 def test_the_figure_is_in_no_repr_or_message(tmp_path: Path) -> None:
@@ -105,6 +194,39 @@ def test_a_file_inside_this_checkout_is_refused_whether_or_not_it_is_there() -> 
     checkout = Path(live_budget.__file__).resolve().parents[2]
     assert (checkout / "AGENTS.md").is_file()
     for inside in (checkout / "canon" / "live" / "settings.toml", checkout / "mise.toml"):
+        with pytest.raises(LiveSettingsError, match="inside this checkout"):
+            read_request_budget(inside)
+
+
+def test_a_link_that_leads_into_this_checkout_is_refused(tmp_path: Path) -> None:
+    checkout = Path(live_budget.__file__).resolve().parents[2]
+    os.symlink(checkout / "mise.toml", tmp_path / "settings.toml")
+    with pytest.raises(LiveSettingsError, match="inside this checkout"):
+        read_request_budget(tmp_path / "settings.toml")
+
+
+def test_a_file_inside_any_other_git_checkout_is_refused_whether_or_not_it_is_there(
+    tmp_path: Path,
+) -> None:
+    main = tmp_path / "main"  # a made-up main checkout: `.git` is a folder
+    (main / ".git").mkdir(parents=True)
+    linked = tmp_path / "linked"  # a made-up linked worktree: `.git` is a file
+    linked.mkdir()
+    (linked / ".git").write_text("gitdir: elsewhere\n", encoding="utf-8")
+    written = linked / "settings.toml"
+    written.write_text(f"trading_requests_per_minute = {MADE_UP}\n", encoding="utf-8")
+    for inside in (main / "canon" / "live" / "settings.toml", written):
+        with pytest.raises(LiveSettingsError, match="another git checkout"):
+            read_request_budget(inside)
+
+
+def test_a_file_inside_this_checkout_under_another_spelling_of_its_path_is_refused() -> None:
+    checkout = Path(live_budget.__file__).resolve().parents[2]
+    respelt = Path(str(checkout).swapcase())
+    if not (respelt / "AGENTS.md").is_file():
+        pytest.skip("this volume tells upper case from lower: the checkout has one spelling")
+    assert not respelt.resolve().is_relative_to(checkout)  # by name it is another folder
+    for inside in (respelt / "canon" / "live" / "settings.toml", respelt / "mise.toml"):
         with pytest.raises(LiveSettingsError, match="inside this checkout"):
             read_request_budget(inside)
 
