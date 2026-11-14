@@ -93,6 +93,7 @@ class ProtectorRun:
     feed: str | None = None
     lead_go: str | None = None
     lock_wait: int = 0
+    gain_lock: bool = False
 
     def __post_init__(self) -> None:
         if self.account not in window.PAPER_ACCOUNT_LOCKS:
@@ -118,7 +119,9 @@ class ProtectorRun:
         ):
             raise ValueError(f"lock-wait must be between 0 and {LOCK_WAIT_MAX_SECS} seconds")
         # Keep the module's validation, including Price types and positive levels, at the seam.
-        OwnerProtectorConfig(row=self.row, levels=self.levels, feed=self.feed or "sip")
+        OwnerProtectorConfig(
+            row=self.row, levels=self.levels, feed=self.feed or "sip", gain_lock=self.gain_lock
+        )
 
 
 def parse_levels(text: str) -> dict[InstrumentId, Price]:
@@ -180,6 +183,7 @@ def protector_node(
         row=config.row,
         levels=config.levels,
         feed=feed,
+        gain_lock=config.gain_lock,
         strategy_id=StrategyId("OwnerProtector-001"),
         order_id_tag="001",
         manage_stop=False,
@@ -496,6 +500,7 @@ def run_protector(
         # The runner (scripts/automation run-protector) reads the epoch to launch the successor.
         print(
             f"paper:protector: {config.account}, {config.row}, {part}, {feed}; "
+            f"gain-lock={'on' if config.gain_lock else 'off'}; "
             f"ends {ends.isoformat()} (epoch {int(ends.timestamp())})",
             flush=True,
         )
@@ -547,6 +552,9 @@ def parse_args(argv: Sequence[str] | None = None) -> ProtectorRun:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("account", choices=tuple(window.PAPER_ACCOUNT_LOCKS))
     parser.add_argument("--row", required=True, help="OWN1 or OWN3; F2 is refused, no default")
+    parser.add_argument(
+        "--gain-lock", action="store_true", help="enable the gain lock (default off)"
+    )
     parser.add_argument(
         "--levels", default="", help="optional SYMBOL=PRICE,... for starting holdings"
     )

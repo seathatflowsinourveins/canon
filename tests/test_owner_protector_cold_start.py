@@ -637,7 +637,7 @@ def test_a_late_seed_does_not_change_the_spread_at_release() -> None:
 
 
 def test_a_late_seed_does_not_defer_a_gain_floor_raise(monkeypatch) -> None:
-    strategy = Cold(levels={AAA: Price.from_str("9.90")})
+    strategy = Cold(levels={AAA: Price.from_str("9.90")}, gain_lock=True)
     monkeypatch.setattr(strategy, "modify_order", lambda *args, **kwargs: None)
     strategy.cached.held[0].avg_px_open = Decimal("9.80")
     strategy.on_start()
