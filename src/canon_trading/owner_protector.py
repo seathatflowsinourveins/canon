@@ -125,8 +125,11 @@ guard, whether our cancel resized the holding (a growth, property (e)) or our se
 and then ended. Named limits: (1) a host clock more than the bound behind Alpaca's makes every quote
 on time insane, so nothing is placed and every step says why; (2) two different quotes with one
 stamp are one observation, and the second waits for the next greater stamp; (e4) after a DAY expiry
-the level is held and the sell is re-placed at once, the latest quote, however old, deciding only
-the limit's sign; the two observations of the next arming (U-c) cover the election that follows;
+the level is held and the sell is re-placed at once, the latest usable quote, however old, deciding
+only the limit's sign; our own size and re-price cancels use that same retained quote. A crossed
+quote or one with a zero size cannot erase it; without any usable quote the holding is named at
+ERROR as without its working sell until one arrives. The two observations of the next arming
+(U-c) cover the election that follows;
 (b) there is no on_resume or on_reset, so a node stopped and resumed protects nothing until it is
 started fresh, as paper:protector starts each run. A protector that cannot act on its quotes says
 so at every step.
@@ -656,6 +659,9 @@ class OwnerProtector(Strategy):
         self.refused_stamps: dict[InstrumentId, deque[int]] = {}
         # One quote at the running maximum per instrument, independent of levels and planning.
         self.venue_quotes: dict[InstrumentId, QuoteTick] = {}
+        # F8: replacing our ended sell needs the latest usable quote even after bad arrivals
+        # have displaced it from both the venue maximum and the bounded upstream cache.
+        self.replacement_quotes: dict[InstrumentId, QuoteTick] = {}
         self.gain_lock_events: list[dict[str, Any]] = []
         self.gain_lock_sales: list[dict[str, Any]] = []
         self.previous_levels: dict[Key, Entry] = {}
@@ -772,6 +778,17 @@ class OwnerProtector(Strategy):
             and tick.ts_event == previous.ts_event
         ):
             self.venue_quotes[instrument_id] = tick
+        usable = self.replacement_quotes.get(instrument_id)
+        if (
+            not refused
+            and _sane(tick)
+            and tick.bid_price.as_decimal() > 0
+            and tick.ask_price.as_decimal() >= tick.bid_price.as_decimal()
+            and tick.bid_size.as_decimal() > 0
+            and tick.ask_size.as_decimal() > 0
+            and (usable is None or tick.ts_event >= usable.ts_event)
+        ):
+            self.replacement_quotes[instrument_id] = tick
         if self.venue_quotes.get(instrument_id) is tick and (
             previous is None or tick.ts_event > previous.ts_event
         ):
@@ -1989,8 +2006,22 @@ class OwnerProtector(Strategy):
             return
         if uncovered <= 0:
             return
+        usable = self.replacement_quotes.get(instrument_id)
+        if usable is None:
+            self._say(
+                f"{instrument_id}: ALERT: holding without its working sell; no usable quote "
+                "to place its protective sale; waiting for one"
+            )
+        if slot.placed:
+            if usable is None:
+                self._wait(instrument_id, "a usable quote to replace our sell")
+                return
+            # A terminal acknowledgement has removed our cover. Re-place on the retained
+            # usable quote without an age or new-observation gate, never re-plan the level.
+            tick = usable
+            advanced = advanced and tick is quote
         if slot.sale is not None:
-            self._send_sale(instrument_id, slot, uncovered, quote)
+            self._send_sale(instrument_id, slot, uncovered, tick)
             return
         if tick is None or (
             slot.level is None
