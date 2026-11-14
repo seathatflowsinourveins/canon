@@ -8,13 +8,15 @@ when names are given, through alpaca-py's `CorporateActionsClient` at `c42add7c0
 (`alpaca/data/historical/corporate_actions.py`, `api_version="v1"`, `BaseURL.DATA`). Its pages are asked
 one at a time through the client's own `RESTClient.get`, following `next_page_token`, rather than
 `get_corporate_actions`, whose pager (`alpaca/common/rest.py`, `_get_marketdata`) asks pages back to back
-and stops at the request's `limit` (default 1000) without saying so; here each GET is paced at
-`paper:history`'s row of ADR 0093 and a cap reached with a page left stops the run by name. That paper keys
+and stops at the request's `limit` (default 1000) without saying so; here every send, alpaca-py's own
+retries included, is paced at `paper:history`'s row of ADR 0093 by history_load's paced transport, under
+the root's catalog lock, and a cap reached with a page left stops the run by name. That paper keys
 may call the Market Data API is documented (https://docs.alpaca.markets/us/docs/authentication.md); that
 they may call this endpoint is not stated, so a 401 or 403 stops the run by name.
 
 The span is checked first against a date map (`--date-map`, the sim lane's `{"dates": {iso: {"kind"}}}`):
-every day in it must be `development` or `closed`, and a weekday the map omits is refused. `--check-only`
+every day in it must be `development` or `closed`; a weekday the map omits, or any day outside the map's
+first to last date, is refused, and a malformed map is refused by name. `--check-only`
 makes that check and nothing else, with no pair; the task runs it before it reads a pair.
 
 Each row keeps six fields: `type`, `symbol`, `ex_date`, `process_date`, `old_rate` and `new_rate`. Every
@@ -24,20 +26,23 @@ before anything is written or printed. A unit split has no `symbol` or `ex_date`
 `new_symbol` other than its symbol is counted in `renamed_rows`, a named gap: the new ticker is not kept.
 The reference page says the actions "are sorted by their `process_date`" and does not say which date the
 span bounds, so a split whose `ex_date` is in the span but whose `process_date` is not may be missing; that
-is named in `gaps`, and a row whose `ex_date` lies outside the span is marked. An `ex_date` on a day the map
-does not allow is withheld, with its kind. Nothing of the account is read; the answer is market data.
+is named in `gaps`, and a row whose `ex_date` lies outside the span is marked. An `ex_date` or
+`process_date` on a day the map would refuse is withheld, with the reason. A symbol that is not a plain
+ticker is written masked and counted. Nothing of the account is read; the answer is market data.
 
-`crosses_reference` is the exclusion's test: a split moves a name's share basis between its reference
-close and its trade day when its ex-date is after the reference session and on or before the day.
+The file is `splits-<start>_<end>-all.json` for every symbol, or a digest of the names asked in place of
+`all`. `split_read` turns it into the ranking's `movers_rank.SplitRead`, whose `split_since` is the
+exclusion's test.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import os
 import re
 import time
-from collections.abc import Callable
 from collections.abc import Sequence
 from datetime import date
 from datetime import datetime
@@ -49,6 +54,8 @@ from zoneinfo import ZoneInfo
 import requests
 from alpaca.common.exceptions import APIError
 from alpaca.data.historical.corporate_actions import CorporateActionsClient
+from alpaca.data.models.corporate_actions import ForwardSplit
+from alpaca.data.models.corporate_actions import ReverseSplit
 from canon_alpaca.providers import DATA_ONLY_ENV
 from canon_alpaca.providers import credentials_from_env
 from canon_alpaca.providers import data_only
@@ -59,7 +66,10 @@ from canon_alpaca.providers import with_http_timeout
 from canon_trading.history_load import LEDGER
 from canon_trading.history_load import PACE
 from canon_trading.history_load import HistoryStopped
+from canon_trading.history_load import _catalog_lock
+from canon_trading.history_load import _paced_trade_gets
 from canon_trading.history_load import stop_at_429
+from canon_trading.movers_rank import SplitRead
 
 __all__ = [
     "KEPT",
@@ -69,10 +79,11 @@ __all__ = [
     "PATH",
     "TYPES",
     "corporate_actions_client",
-    "crosses_reference",
     "main",
+    "out_path",
     "read_splits",
     "span_refusals",
+    "split_read",
 ]
 
 NY = ZoneInfo("America/New_York")
@@ -94,6 +105,14 @@ MAX_PAGES = 50
 (UNCALIBRATED)."""
 ALLOWED = frozenset({"development", "closed"})
 SYMBOL = re.compile(r"[A-Z0-9][A-Z0-9.\-/]{0,15}")
+CLOCK = time.monotonic
+SLEEP = time.sleep
+"""The pace's clock and wait, history_load's paced transport's (`_paced_trade_gets`), which paces each send
+alpaca-py makes, its own retries included."""
+
+
+class MapUnreadable(ValueError):
+    """The date map is not `{"dates": {iso: {"kind": ...}}}`."""
 
 
 def corporate_actions_client() -> CorporateActionsClient:
@@ -124,38 +143,50 @@ def _stop_at_refusal(
     return response
 
 
-def crosses_reference(ex_date: str | date, *, reference: str | date, day: str | date) -> bool:
-    """Whether a split with this ex-date changes the share basis between the reference session's close
-    and the trade day: after the reference session, on or before the day."""
-    return _day(reference) < _day(ex_date) <= _day(day)
-
-
-def _day(value: str | date) -> date:
-    return value if isinstance(value, date) else date.fromisoformat(value)
-
-
 def _days(start: date, end: date) -> list[date]:
     return [start + timedelta(days=i) for i in range((end - start).days + 1)]
 
 
 def _map(path: Path) -> tuple[dict[str, str], str]:
-    raw = json.loads(path.read_text())
-    return {d: (v or {}).get("kind", "") for d, v in raw["dates"].items()}, str(
-        raw.get("generated", "")
-    )
+    """Each day's kind and the map's `generated` stamp; `MapUnreadable` names the first entry it cannot
+    read."""
+    try:
+        raw = json.loads(path.read_text())
+    except (OSError, ValueError) as e:
+        raise MapUnreadable(f"{path} cannot be read as JSON ({type(e).__name__})") from e
+    dates = raw.get("dates") if isinstance(raw, dict) else None
+    if not isinstance(dates, dict):
+        raise MapUnreadable(f"{path} has no dates")
+    kinds = {}
+    for day, entry in dates.items():
+        if not isinstance(entry, dict):
+            raise MapUnreadable(f"{path}: the entry for {day} is not an object")
+        kind = entry.get("kind")
+        if not isinstance(kind, str) or not kind:
+            raise MapUnreadable(f"{path}: {day} no kind")
+        kinds[day] = kind
+    return kinds, str(raw.get("generated", ""))
+
+
+def _refusal(day: date, kinds: dict[str, str]) -> str | None:
+    """Why the map does not allow a day: its kind when not allowed, `not in the map` for a weekday the map
+    leaves out or any day outside the map's first to last date; None for an allowed day (a weekend day
+    inside the map's range needs no entry)."""
+    kind = kinds.get(day.isoformat())
+    if kind is not None:
+        return None if kind in ALLOWED else kind
+    inside = bool(kinds) and min(kinds) <= day.isoformat() <= max(kinds)
+    return None if inside and day.weekday() >= 5 else "not in the map"
+
+
+def _withheld(day: str, kinds: dict[str, str]) -> str | None:
+    """Why a date the answer names is withheld, by `_refusal`; None for a day the map allows."""
+    return _refusal(date.fromisoformat(day), kinds)
 
 
 def span_refusals(start: date, end: date, kinds: dict[str, str]) -> list[str]:
     """Every day of [start, end] the map does not allow, by name; empty when the span may be read."""
-    bad = []
-    for d in _days(start, end):
-        kind = kinds.get(d.isoformat())
-        if kind is None:
-            if d.weekday() < 5:
-                bad.append(f"{d} not in the map")
-        elif kind not in ALLOWED:
-            bad.append(f"{d} {kind}")
-    return bad
+    return [f"{d} {why}" for d in _days(start, end) if (why := _refusal(d, kinds)) is not None]
 
 
 def read_splits(
@@ -164,17 +195,15 @@ def read_splits(
     start: date,
     end: date,
     symbols: Sequence[str],
-    pace: Callable[[], None],
 ) -> tuple[list[tuple[str, dict[str, Any]]], int]:
-    """Every page of the span's split records, paced, as (type, Alpaca's record) pairs, and the pages
-    read."""
+    """Every page of the span's split records, as (type, Alpaca's record) pairs, and the pages read. The
+    caller paces the client's sends."""
     rows: list[tuple[str, dict[str, Any]]] = []
     token: str | None = None
     pages = 0
     while True:
         if pages == MAX_PAGES:
             raise HistoryStopped(f"{MAX_PAGES} pages read and Alpaca has more; shorten the span")
-        pace()
         query: dict[str, Any] = {
             "types": ",".join(TYPES),
             "start": start.isoformat(),
@@ -207,8 +236,11 @@ def read_splits(
             return rows, pages
 
 
+MASKED = "<masked>"
+
+
 def _symbol(value: object) -> str:
-    return value if isinstance(value, str) and SYMBOL.fullmatch(value) else "<masked>"
+    return value if isinstance(value, str) and SYMBOL.fullmatch(value) else MASKED
 
 
 def _iso(value: object, field: str, kind: str) -> str:
@@ -242,13 +274,56 @@ def masked_row(
     }
     if unit:
         row["mapped_from"] = {"symbol": "old_symbol", "ex_date": "effective_date"}
-    if not row["ex_date_in_read_span"]:
-        held = kinds.get(ex)
-        if held is not None and held not in ALLOWED:
-            row["ex_date"] = None
-            row["ex_date_withheld"] = held
+    for field in ("ex_date", "process_date"):
+        why = _withheld(row[field], kinds)
+        if why is not None:
+            row[field] = None
+            row[f"{field}_withheld"] = why
     new = record.get("new_symbol")
     return row, bool(new) and new != record.get("old_symbol" if unit else "symbol")
+
+
+def out_path(catalog: Path, start: date, end: date, symbols: Sequence[str]) -> Path:
+    """Where a read is written: `-all` for every symbol, else a digest of the names asked, so a named read
+    never replaces the span's read of every symbol."""
+    tag = "all" if not symbols else hashlib.sha256(",".join(symbols).encode()).hexdigest()[:12]
+    return catalog / "corporate-actions" / f"splits-{start}_{end}-{tag}.json"
+
+
+def split_read(record: dict[str, Any]) -> tuple[SplitRead, dict[str, int]]:
+    """The ranking's `SplitRead` from a written record: its forward and reverse splits over the record's
+    span, and what was left out by kind. A unit split is not a forward or reverse split and a row whose
+    ex-date was withheld has none, so neither enters. The models are built without validation
+    (`model_construct`) because the record keeps six fields and the models also require CUSIPs, which
+    the split test does not read."""
+    actions: list[ForwardSplit | ReverseSplit] = []
+    left_out = {"unit_split": 0, "withheld": 0}
+    for row in record["rows"]:
+        if row["type"] == "unit_split":
+            left_out["unit_split"] += 1
+            continue
+        if row["ex_date"] is None:
+            left_out["withheld"] += 1
+            continue
+        model = ForwardSplit if row["type"] == "forward_split" else ReverseSplit
+        actions.append(
+            model.model_construct(
+                corporate_action_type=f"{row['type']}s",
+                symbol=row["symbol"],
+                ex_date=date.fromisoformat(row["ex_date"]),
+                process_date=None
+                if row["process_date"] is None
+                else date.fromisoformat(row["process_date"]),
+                old_rate=row["old_rate"],
+                new_rate=row["new_rate"],
+            )
+        )
+    span = SplitRead(
+        start=date.fromisoformat(record["start"]),
+        end=date.fromisoformat(record["end"]),
+        actions=tuple(actions),
+    )
+    return span, left_out
 
 
 def _span_date(text: str) -> date:
@@ -290,7 +365,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.end < args.start:
         parser.error("--end is before --start")
-    kinds, generated = _map(args.date_map)
+    try:
+        kinds, generated = _map(args.date_map)
+    except MapUnreadable as e:
+        print(
+            f"paper:history corporate-actions: refused: the date map is unreadable: {e}; nothing was read"
+        )
+        return 3
     bad = span_refusals(args.start, args.end, kinds)
     if bad:
         print(
@@ -308,30 +389,54 @@ def main(argv: Sequence[str] | None = None) -> int:
         else (args.symbols or "").replace(",", "\n")
     )
     symbols = sorted({s.strip().upper() for s in text.splitlines() if s.strip()})
-    asked = False
-
-    def pace() -> None:
-        nonlocal asked
-        if asked:
-            time.sleep(60 / PACE.data_per_minute)
-        asked = True
-
+    args.catalog.mkdir(parents=True, exist_ok=True)
+    out = out_path(args.catalog, args.start, args.end, symbols)
     try:
-        client = corporate_actions_client()
-        raw, pages = read_splits(client, start=args.start, end=args.end, symbols=symbols, pace=pace)
-        masked = [masked_row(k, r, start=args.start, end=args.end, kinds=kinds) for k, r in raw]
+        with _catalog_lock(args.catalog):
+            client = corporate_actions_client()
+            with _paced_trade_gets(client, PACE, CLOCK, SLEEP):
+                raw, pages = read_splits(client, start=args.start, end=args.end, symbols=symbols)
+            masked = [masked_row(k, r, start=args.start, end=args.end, kinds=kinds) for k, r in raw]
+            rows = [row for row, _ in masked]
+            renamed = sum(1 for _, new in masked if new)
+            hidden = sum(1 for row in rows if row["symbol"] == MASKED)
+            outside = sum(1 for row in rows if not row["ex_date_in_read_span"])
+            spread = sorted(
+                (date.fromisoformat(r["ex_date"]) - date.fromisoformat(r["process_date"])).days
+                for r in rows
+                if r["ex_date"] is not None and r["process_date"] is not None
+            )
+            record = _record(
+                args, symbols, generated, pages, rows, renamed, hidden, outside, spread
+            )
+            out.parent.mkdir(parents=True, exist_ok=True)
+            partial = out.with_name(f"{out.name}.{os.getpid()}.partial")
+            partial.write_text(json.dumps(record, indent=1) + "\n")
+            partial.replace(out)
     except HistoryStopped as e:
         print(f"paper:history corporate-actions: stopped: {e}")
         return 1
-    rows = [row for row, _ in masked]
-    renamed = sum(1 for _, new in masked if new)
-    outside = sum(1 for row in rows if not row["ex_date_in_read_span"])
-    spread = sorted(
-        (date.fromisoformat(r["ex_date"]) - date.fromisoformat(r["process_date"])).days
-        for r in rows
-        if r["ex_date"] is not None
+    counts = {t: sum(1 for r in rows if r["type"] == t) for t in TYPES}
+    print(
+        f"paper:history corporate-actions: {len(rows)} rows in {pages} pages "
+        f"({', '.join(f'{t} {n}' for t, n in counts.items())}); ex_date outside the span {outside}; "
+        f"renamed {renamed}; masked symbols {hidden}; wrote {out}"
     )
-    record = {
+    return 0
+
+
+def _record(
+    args: argparse.Namespace,
+    symbols: Sequence[str],
+    generated: str,
+    pages: int,
+    rows: list[dict[str, Any]],
+    renamed: int,
+    hidden: int,
+    outside: int,
+    spread: list[int],
+) -> dict[str, Any]:
+    return {
         "source": SOURCE,
         "client": "alpaca-py CorporateActionsClient, pages through RESTClient.get",
         "read_at": datetime.now(NY).isoformat(timespec="seconds"),
@@ -345,6 +450,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "rows": rows,
         "renamed_rows": renamed,
         "ex_date_outside_read_span": outside,
+        "masked_symbols": hidden,
         "ex_minus_process_days": {"min": spread[0], "max": spread[-1]} if spread else None,
         "gaps": [
             (
@@ -355,21 +461,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"{renamed} rows name a new_symbol, which is not kept: a name ranked under its new ticker is "
                 "not matched by symbol"
             ),
+            (
+                f"{hidden} rows have a symbol that is not a plain ticker, written as {MASKED}: their "
+                "splits cannot be matched by symbol"
+            ),
             "Alpaca has no guarantees on the creation time of corporate actions (the reference page)",
         ],
     }
-    out = args.catalog / "corporate-actions" / f"splits-{args.start}_{args.end}.json"
-    out.parent.mkdir(parents=True, exist_ok=True)
-    partial = out.with_name(out.name + ".partial")
-    partial.write_text(json.dumps(record, indent=1) + "\n")
-    partial.replace(out)
-    counts = {t: sum(1 for r in rows if r["type"] == t) for t in TYPES}
-    print(
-        f"paper:history corporate-actions: {len(rows)} rows in {pages} pages "
-        f"({', '.join(f'{t} {n}' for t, n in counts.items())}); ex_date outside the span {outside}; "
-        f"renamed {renamed}; wrote {out}"
-    )
-    return 0
 
 
 if __name__ == "__main__":

@@ -142,7 +142,9 @@ def read(venue: Venue, tmp_path: Path, *extra: str, start="2026-09-05", end="202
         ]
     )
     assert code == 0
-    return json.loads((out / "corporate-actions" / f"splits-{start}_{end}.json").read_text())
+    written = sorted((out / "corporate-actions").glob("splits-*.json"))
+    assert len(written) == 1, written
+    return json.loads(written[0].read_text())
 
 
 def test_one_get_on_v1_corporate_actions_with_the_split_types_and_the_span(
@@ -182,7 +184,8 @@ def test_every_page_is_followed_and_paced_after_the_first(
     }
     venue.pages = [first, second]
     slept: list[float] = []
-    monkeypatch.setattr(ca.time, "sleep", slept.append)
+    monkeypatch.setattr(ca, "SLEEP", slept.append)
+    monkeypatch.setattr(ca, "CLOCK", lambda: 0.0)
     record = read(venue, tmp_path)
     assert [q.get("page_token") for _, _, q in venue.sent] == [None, ["1"]]
     assert slept == [60 / ca.PACE.data_per_minute]
@@ -279,6 +282,7 @@ def test_rows_keep_six_fields_and_mask_the_rest(venue: Venue, tmp_path: Path) ->
         assert set(row) <= set(ca.KEPT) | {
             "ex_date_in_read_span",
             "ex_date_withheld",
+            "process_date_withheld",
             "mapped_from",
         }
     text = json.dumps(record)
@@ -339,11 +343,112 @@ def test_an_ex_date_on_a_day_the_map_forbids_is_withheld(venue: Venue, tmp_path:
         == 0
     )
     record = json.loads(
-        (out / "corporate-actions" / "splits-2026-09-05_2026-09-15.json").read_text()
+        (out / "corporate-actions" / "splits-2026-09-05_2026-09-15-all.json").read_text()
     )
     row = next(r for r in record["rows"] if r["symbol"] == "BBB")
     assert row["ex_date"] is None and row["ex_date_withheld"] == "held"
     assert "2026-09-17" not in json.dumps(record)
+
+
+def test_an_ex_date_on_a_weekday_the_map_omits_is_withheld(venue: Venue, tmp_path: Path) -> None:
+    venue.pages[0]["corporate_actions"]["forward_splits"] = [dict(FORWARD, ex_date="2026-09-21")]
+    record = read(venue, tmp_path)
+    row = next(r for r in record["rows"] if r["symbol"] == "BBB")
+    assert row["ex_date"] is None and row["ex_date_withheld"] == "not in the map"
+    assert "2026-09-21" not in json.dumps(record)
+
+
+def test_a_process_date_on_a_day_the_map_forbids_is_withheld(venue: Venue, tmp_path: Path) -> None:
+    venue.pages[0]["corporate_actions"]["forward_splits"] = [
+        dict(FORWARD, process_date="2026-09-17")
+    ]
+    out = tmp_path / "out"
+    path = date_map(tmp_path, **{"2026_09_17": "judgment"})
+    args = ["--start", "2026-09-05", "--end", "2026-09-15", "--date-map", str(path)]
+    assert ca.main([*args, "--catalog", str(out)]) == 0
+    text = (out / "corporate-actions" / "splits-2026-09-05_2026-09-15-all.json").read_text()
+    row = next(r for r in json.loads(text)["rows"] if r["symbol"] == "BBB")
+    assert row["process_date"] is None and row["process_date_withheld"] == "judgment"
+    assert "2026-09-17" not in text
+
+
+def test_a_named_read_does_not_overwrite_the_span_read_of_every_symbol(
+    venue: Venue, tmp_path: Path
+) -> None:
+    out = tmp_path / "out"
+    args = ["--start", "2026-09-05", "--end", "2026-09-15", "--date-map", str(date_map(tmp_path))]
+    assert ca.main([*args, "--catalog", str(out)]) == 0
+    assert ca.main([*args, "--catalog", str(out), "--symbols", "AAA"]) == 0
+    names = sorted(p.name for p in (out / "corporate-actions").glob("splits-*.json"))
+    assert len(names) == 2 and "splits-2026-09-05_2026-09-15-all.json" in names
+    every = json.loads(
+        (out / "corporate-actions" / "splits-2026-09-05_2026-09-15-all.json").read_text()
+    )
+    assert every["symbols"] == "all" and len(every["rows"]) == 3
+
+
+def test_a_masked_symbol_is_counted_and_named(venue: Venue, tmp_path: Path) -> None:
+    venue.pages[0]["corporate_actions"]["forward_splits"] = [dict(FORWARD, symbol="lower case")]
+    record = read(venue, tmp_path)
+    assert record["masked_symbols"] == 1
+    assert any("masked" in g for g in record["gaps"])
+    assert "lower case" not in json.dumps(record)
+
+
+def test_a_held_catalog_lock_stops_before_any_get(venue: Venue, tmp_path: Path, capsys) -> None:
+    import fcntl
+
+    out = tmp_path / "out"
+    out.mkdir()
+    with (out / ".history-load.lock").open("a") as held:
+        fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        args = [
+            "--start",
+            "2026-09-05",
+            "--end",
+            "2026-09-15",
+            "--date-map",
+            str(date_map(tmp_path)),
+        ]
+        assert ca.main([*args, "--catalog", str(out)]) == 1
+    assert "another history load holds the catalog" in capsys.readouterr().out
+    assert venue.sent == []
+
+
+@pytest.mark.parametrize(
+    ("body", "why"),
+    [
+        ({"generated": "g"}, "no dates"),
+        ({"generated": "g", "dates": {"2026-09-08": "development"}}, "2026-09-08"),
+        ({"generated": "g", "dates": {"2026-09-08": {}}}, "2026-09-08 no kind"),
+    ],
+)
+def test_a_malformed_date_map_is_refused_by_name(
+    tmp_path: Path, body: dict, why: str, capsys
+) -> None:
+    path = tmp_path / "bad-map.json"
+    path.write_text(json.dumps(body))
+    args = ["--start", "2026-09-08", "--end", "2026-09-08", "--date-map", str(path), "--check-only"]
+    assert ca.main(args) == 3
+    assert why in capsys.readouterr().out
+
+
+def test_split_read_feeds_the_rankings_split_test(venue: Venue, tmp_path: Path) -> None:
+    from datetime import date
+
+    from canon_trading import movers_rank
+
+    venue.pages[0]["corporate_actions"]["forward_splits"] = [
+        FORWARD,
+        dict(FORWARD, symbol="EEE", ex_date="2026-09-21"),
+    ]
+    record = read(venue, tmp_path)
+    split_read, left_out = ca.split_read(record)
+    assert left_out == {"unit_split": 1, "withheld": 1}
+    assert (split_read.start, split_read.end) == (date(2026, 9, 5), date(2026, 9, 15))
+    assert movers_rank.split_since(split_read, "BBB", date(2026, 9, 14), date(2026, 9, 15)) is True
+    assert movers_rank.split_since(split_read, "AAA", date(2026, 9, 14), date(2026, 9, 15)) is False
+    assert movers_rank.split_since(split_read, "AAA", date(2026, 9, 11), date(2026, 9, 14)) is True
 
 
 def test_the_record_names_its_source_and_when_it_was_read(venue: Venue, tmp_path: Path) -> None:
@@ -399,6 +504,16 @@ def test_a_weekday_missing_from_the_map_is_refused(venue: Venue, tmp_path: Path,
     assert venue.sent == []
 
 
+def test_a_weekend_inside_the_map_passes_and_a_day_past_its_end_is_refused(
+    tmp_path: Path, capsys
+) -> None:
+    path = str(date_map(tmp_path))
+    inside = ["--start", "2026-09-05", "--end", "2026-09-06", "--date-map", path, "--check-only"]
+    assert ca.main(inside) == 0
+    past = ["--start", "2026-09-18", "--end", "2026-09-19", "--date-map", path, "--check-only"]
+    assert ca.main(past) == 3 and "2026-09-19 not in the map" in capsys.readouterr().out
+
+
 def test_check_only_reads_no_pair_and_sends_nothing(tmp_path: Path, monkeypatch, capsys) -> None:
     monkeypatch.delenv(ENV_API_KEY, raising=False)
     monkeypatch.delenv(ENV_SECRET_KEY, raising=False)
@@ -447,22 +562,6 @@ def test_an_end_before_the_start_is_refused(tmp_path: Path) -> None:
                 "--check-only",
             ]
         )
-
-
-@pytest.mark.parametrize(
-    ("ex_date", "crosses"),
-    [
-        ("2026-09-14", False),
-        ("2026-09-15", True),
-        ("2026-09-16", True),
-        ("2026-09-17", False),
-        ("2026-09-13", False),
-    ],
-)
-def test_a_split_crosses_a_reference_when_it_falls_after_the_close_and_by_the_day(
-    ex_date: str, crosses: bool
-) -> None:
-    assert ca.crosses_reference(ex_date, reference="2026-09-14", day="2026-09-16") is crosses
 
 
 def _route(tmp_path: Path, **usage: str) -> subprocess.CompletedProcess[str]:
