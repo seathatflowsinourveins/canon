@@ -64,8 +64,9 @@ reader bears on the order path and belongs on `scripts/land`'s `TRADING_PATHS`.
 
 ### Consequences
 
-* Good: the figure cannot be committed from where it is kept, and a missing file is visible: the answer's
-  source names it.
+* Good: the default place is outside every checkout, a path under a folder that holds a `.git` entry is
+  refused, and a missing file is visible: the answer's source names it. A work tree whose git folder is
+  kept elsewhere is not recognised.
 * Bad: the file is one per config folder, not one per machine, and the repository does not back it up. A
   session under another config folder, or a second machine, reads the paper figure until someone writes
   the file there; no message names the folder that was read.
@@ -78,12 +79,13 @@ reader bears on the order path and belongs on `scripts/land`'s `TRADING_PATHS`.
 
 ### Confirmation
 
-`tests/test_live_budget.py`, 37 cases with made-up figures in a temporary folder: each case above, the
+`tests/test_live_budget.py`, 39 cases with made-up figures in a temporary folder: each case above, the
 config folder's path with and without `CLAUDE_CONFIG_DIR`, and that the figure is in no `repr` or message.
 One of them, another spelling of the checkout's path, is skipped on a volume that tells upper case from
 lower. With the module absent the file failed at collection; eight test functions of the review's round
-failed before its fix (21 failed, 16 passed, 2026-11-14). No test reads this machine's config folder. No
-paper run applies: the module reaches no account.
+failed before its fix (21 failed, 16 passed, 2026-11-14), and each clause of the checkout rule has a case
+that fails with the clause removed. No test reads this machine's config folder. No paper run applies: the
+module reaches no account.
 
 ## Evidence
 

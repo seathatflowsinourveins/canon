@@ -95,10 +95,12 @@ def inside_checkout(path: Path) -> bool:
     if resolved.is_relative_to(CHECKOUT):
         return True
     for folder in (resolved, *resolved.parents):
+        if (folder / ".git").exists():
+            return True
         try:
-            if folder.samefile(CHECKOUT) or (folder / ".git").exists():
+            if folder.samefile(CHECKOUT):
                 return True
-        except OSError:  # not there, or not to be read: nothing to compare
+        except OSError:  # one of the two is not there, or not to be read: nothing to compare
             continue
     return False
 

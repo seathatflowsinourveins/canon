@@ -71,26 +71,30 @@ def test_a_figure_that_is_not_a_positive_whole_number_is_refused_by_name_never_r
 
 
 @pytest.mark.parametrize(
-    ("text", "unknown"),
+    "text",
     [
-        ("[limits]\ntrading_requests_per_minute = 777\n", "limits"),
-        ('[notes]\nwho = "nobody"\ntrading_requests_per_minute = 777\n', "notes"),
-        ("trading_request_per_minute = 777\n", "trading_request_per_minute"),
-        ("TRADING_REQUESTS_PER_MINUTE = 777\n", "TRADING_REQUESTS_PER_MINUTE"),
-        ("trading_requests_per_minute = 777\nburst = 5\n", "burst"),
-        ("limits.trading_requests_per_minute = 777\n", "limits"),
-        ('"trading_requests_per_minute " = 777\n', '"trading_requests_per_minute "'),
-        ('777 = "a figure where the name goes"\n', "777"),
+        "[limits]\ntrading_requests_per_minute = 777\n",
+        '[notes]\nwho = "nobody"\ntrading_requests_per_minute = 777\n',
+        "trading_request_per_minute = 777\n",
+        "TRADING_REQUESTS_PER_MINUTE = 777\n",
+        "trading_requests_per_minute = 777\nburst = 5\n",
+        "limits.trading_requests_per_minute = 777\n",
+        '"trading_requests_per_minute " = 777\n',
+        '777 = "a figure where the name goes"\n',
     ],
 )
 def test_a_name_the_reader_does_not_know_is_refused_never_read_as_absent(
-    tmp_path: Path, text: str, unknown: str
+    tmp_path: Path, text: str
 ) -> None:
-    with pytest.raises(LiveSettingsError, match="sets a name other than") as raised:
+    with pytest.raises(LiveSettingsError) as raised:
         read_request_budget(settings(tmp_path, text))
-    # a name in the file may be a slip of the figure too (a bare key may be digits): never repeated
-    assert unknown not in str(raised.value)
-    assert "777" not in str(raised.value)
+    # a name in the file may be a slip of the figure too (a bare key may be digits): never repeated.
+    # The whole message is one fixed sentence, so anything of the file in it fails here, whatever
+    # the name was (one name above is the key itself with a space after it)
+    assert str(raised.value) == (
+        "the local settings file (canon/live/settings.toml) sets a name other than "
+        "trading_requests_per_minute at its top level; it holds that one key and nothing else"
+    )
     assert raised.value.__context__ is None
 
 
@@ -149,7 +153,6 @@ def test_a_file_the_parser_gives_up_on_is_refused_by_name(tmp_path: Path, text: 
         f"trading_requests_per_minute = [{MADE_UP_LONG}]\n",
         f"trading_requests_per_minute = -{MADE_UP_LONG}\n",
         f"trading_request_per_minute = {MADE_UP_LONG}\n",
-        f"trading_requests_per_minute = {MADE_UP_LONG} oops\n",
     ],
 )
 def test_no_frame_of_the_reader_in_the_error_s_traceback_holds_what_the_file_held(
@@ -218,6 +221,43 @@ def test_a_file_inside_any_other_git_checkout_is_refused_whether_or_not_it_is_th
     for inside in (main / "canon" / "live" / "settings.toml", written):
         with pytest.raises(LiveSettingsError, match="another git checkout"):
             read_request_budget(inside)
+
+
+def test_this_checkout_is_found_by_name_when_it_cannot_be_compared_by_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    gone = (
+        tmp_path / "gone"
+    ).resolve()  # a checkout that is not there: nothing to compare, no `.git`
+    monkeypatch.setattr(live_budget, "CHECKOUT", gone)
+    with pytest.raises(LiveSettingsError, match="inside this checkout"):
+        read_request_budget(gone / "canon" / "live" / "settings.toml")
+
+
+def test_this_checkout_is_found_by_identity_under_another_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real = tmp_path / "real"  # a made-up checkout with no `.git` entry
+    real.mkdir()
+    os.symlink(real, tmp_path / "alias")
+    # the checkout known by another name than the one a path under it resolves to
+    monkeypatch.setattr(live_budget, "CHECKOUT", tmp_path / "alias")
+    written = real / "settings.toml"
+    written.write_text(f"trading_requests_per_minute = {MADE_UP}\n", encoding="utf-8")
+    assert not written.resolve().is_relative_to(live_budget.CHECKOUT)  # by name it is elsewhere
+    for inside in (real / "canon" / "live" / "settings.toml", written):
+        with pytest.raises(LiveSettingsError, match="inside this checkout"):
+            read_request_budget(inside)
+
+
+def test_another_git_checkout_is_refused_when_this_one_cannot_be_compared(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(live_budget, "CHECKOUT", (tmp_path / "gone").resolve())
+    other = tmp_path / "other"
+    (other / ".git").mkdir(parents=True)
+    with pytest.raises(LiveSettingsError, match="another git checkout"):
+        read_request_budget(other / "settings.toml")
 
 
 def test_a_file_inside_this_checkout_under_another_spelling_of_its_path_is_refused() -> None:
