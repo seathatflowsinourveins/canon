@@ -968,7 +968,12 @@ Each is stated in `execution.py`'s header, with its source.
   upstream's Coinbase adapter keeps its reports to what it loaded), and a report asked for one instrument
   reads no other's. A value that is not a number skips a closed order and fails an open one, as any
   value this slice cannot map. Alpaca does not say whether a short
-  position's `qty` is negative, so the side comes from `side` and the size is its magnitude. Each loaded
+  position's `qty` is negative (UNVERIFIED), so a position is read by custody's one rule: its `qty` must
+  be a finite number, read before the sign is taken off, else the report fails naming it, and with it the node's
+  start-up, as for any position this slice cannot represent (below); it is a short
+  by its `side` or by a `qty` below zero, never reported long; the size is the magnitude. A position
+  labelled long with a `qty` below zero is reported a short and named in a warning with both fields, once per
+  symbol for the client's life and only for a report it makes; a refusal names the symbol. Each loaded
   instrument Alpaca lists no position in is reported flat: Alpaca's positions endpoint lists only open
   positions, and NautilusTrader takes only "An explicit flat report" as evidence of flat. Without it,
   fills inferred from part of the order history left an `EXTERNAL` position Alpaca did not hold. With

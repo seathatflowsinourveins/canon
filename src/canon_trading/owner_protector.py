@@ -651,6 +651,12 @@ class OwnerProtector(Strategy):
         self.frozen: dict[InstrumentId, str] = {}
         self.sent_ids: set[ClientOrderId] = set()
         self.cancel_requested: set[ClientOrderId] = set()
+        # An order event our own submit, cancel or modify publishes reaches its handler while the
+        # strategy is mutably borrowed (nt@d53849b216e2 crates/trading/src/python/strategy.rs:
+        # 2016-2037), where cache, clock and log raise. Such a handler only stores what the event
+        # carries, here, and the next quote or step reads the engine (main's form, mover.py:230-237).
+        self.released_at: dict[ClientOrderId, int] = {}
+        self.deferred_lines: list[str] = []
         self.sells_named = 0
         self.subscribed: set[InstrumentId] = set()
         # The holding (ts_opened, ts_init) whose supplied level was refused: it is named
@@ -1368,7 +1374,13 @@ class OwnerProtector(Strategy):
         )
         self._say(f"{instrument_id}: no carried level ({why}); {how}")
 
+    def _say_deferred(self) -> None:
+        lines, self.deferred_lines = self.deferred_lines, []
+        for line in lines:
+            self._say(line)
+
     def on_quote(self, quote: QuoteTick) -> None:
+        self._say_deferred()
         try:
             self._receive_quote(quote, "stream")
         except Exception as exc:  # noqa: BLE001 - named for its symbol, as a step's failure is.
@@ -1381,26 +1393,30 @@ class OwnerProtector(Strategy):
             self._save_levels()
 
     def on_order_cancel_rejected(self, event: OrderCancelRejected) -> None:
-        if event.strategy_id != self.strategy_id or event.client_order_id not in self.sent_ids:
+        """Stores only (`released_at`'s note): our own IDs are `sent_ids`; the line is said at the
+        next quote or step."""
+        if event.client_order_id not in self.sent_ids:
             return
         self.cancel_requested.discard(event.client_order_id)
-        self._say(
+        self.deferred_lines.append(
             f"{event.instrument_id}: our cancel rejected: {event.reason}; "
             "re-evaluate on the next quote or step"
         )
 
     def on_order_released(self, event: OrderReleased) -> None:
-        """The released trail starts the sale's chase (U-d); a sale the applied gain lock protected
-        also keeps the spread at its release (measure 1)."""
+        """The released trail's sale starts at the next quote or step (U-d), from `_manage`'s
+        `_observe_sale`, stamped at this release: a trail already through the bid is released
+        inside our own submit, where the engine cannot be read (`released_at`'s note). A sale the
+        applied gain lock protected also keeps the spread at its release (measure 1)."""
         slot = self.slots.get(event.instrument_id)
         if slot is None or event.client_order_id != slot.protect_id:
             return
+        self.released_at[event.client_order_id] = event.ts_event
         if slot.gain_applied_floor is not None:
             tick = self.venue_quotes.get(event.instrument_id)
             slot.gain_release_spread = (
                 None if tick is None else tick.ask_price.as_decimal() - tick.bid_price.as_decimal()
             )
-        self._observe_sale(event.instrument_id, slot, self.cache.order(event.client_order_id))
 
     def on_order_filled(self, event: OrderFilled) -> None:
         """Measure 1 for a sale the armed lock protected, then the holding re-evaluated at once.
@@ -1449,6 +1465,7 @@ class OwnerProtector(Strategy):
         )
 
     def _on_step(self, event: TimeEvent) -> None:
+        self._say_deferred()
         if self.stopping:
             return
         lost = len(self.stream_errors.lines)
@@ -2124,7 +2141,11 @@ class OwnerProtector(Strategy):
             if not owned_limit:
                 return
             released = [event for event in order.events() if isinstance(event, OrderReleased)]
-            at = released[0].ts_event if released else self.clock.timestamp_ns()
+            at = (
+                released[0].ts_event
+                if released
+                else self.released_at.get(order.client_order_id, self.clock.timestamp_ns())
+            )
             first = order.price.as_decimal()
             slot.sale = Sale(at, first, chase_floor(first, protect.PLANNER.chase_cap), at, first)
             self._log_sale(instrument_id, slot.sale)
@@ -2338,6 +2359,7 @@ class OwnerProtector(Strategy):
             self._cancel_own(slot)
 
     def on_stop(self) -> None:
+        self._say_deferred()
         self.stopping = True
         logging.getLogger(STREAM_LOGGER).removeHandler(self.stream_errors)
         self._save_levels(final=True)
