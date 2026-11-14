@@ -291,6 +291,8 @@ def _book_levels(path: Path, account: str) -> dict[InstrumentId, Price]:
     for index, row in enumerate(entries):
         if not isinstance(row, dict) or row.get("account_label") != account:
             continue
+        if "last_level" in row and row["last_level"] is None:
+            continue  # A waiting or frozen holding the writer saved with no level carries none.
         try:
             instrument = InstrumentId.from_str(str(row["instrument_id"]))
             level = Price.from_str(str(row["last_level"]))
