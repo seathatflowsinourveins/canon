@@ -317,8 +317,11 @@ bounded() {
 tests() {
   left=$((deadline - ($(/bin/date +%s) - start)))
   [ "$left" -gt 0 ] || { echo "paper:test: no time left before the deadline" >&2; exit 1; }
-  [ ! -t 0 ] || exec uv run --locked pytest -rs packages/canon-alpaca/tests/test_paper_*.py tests/test_paper_*.py "$@"
-  bounded "$left" uv run --locked pytest -rs packages/canon-alpaca/tests/test_paper_*.py tests/test_paper_*.py "$@"
+  # pytest's short traceback hides arguments, but exception text can still contain a header. The plugin
+  # canon_trading.paper_safe_output keeps only identity/type, including in JUnit; mise redaction is not the guard.
+  # --disable-warnings: a thread's or an unraisable exception becomes a warning whose text is its traceback.
+  [ ! -t 0 ] || exec uv run --locked pytest -rs -p canon_trading.paper_safe_output --paper-safe-output --tb=short --no-showlocals --show-capture=no --disable-warnings packages/canon-alpaca/tests/test_paper_*.py tests/test_paper_*.py "$@"
+  bounded "$left" uv run --locked pytest -rs -p canon_trading.paper_safe_output --paper-safe-output --tb=short --no-showlocals --show-capture=no --disable-warnings packages/canon-alpaca/tests/test_paper_*.py tests/test_paper_*.py "$@"
 }
 tests
 '''
