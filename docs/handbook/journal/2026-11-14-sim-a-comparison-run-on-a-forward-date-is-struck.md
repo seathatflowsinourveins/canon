@@ -1,0 +1,14 @@
+### 2026-11-14-sim-a-comparison-run-on-a-forward-date-is-struck: A simulation that compares arms on a forward date is struck as a comparison, so every run is named mechanism, trial or judgment before it starts
+
+* area: strategies
+* session: 2026-11-14
+* result: The gain lock's four variants (off, as shipped, armed only on a gain of the trail's distance, and a trigger held under the bid by the noise floor) were run on NautilusTrader's engine over one day's recorded mover tapes and set side by side. That day, 2026-11-13, is the first date of ADR 0133's forward set (2026-11-13 to 2026-12-14) and inside ADR 0100's later holdout (from 2026-11-12), both still proposed, so the lead struck the run as a comparison on 2026-11-14 at 00:15: no variant is preferred from it. It stands as a mechanism observation only: on some entries the lock armed within seconds and on others minutes later, some never armed, its floor is the entry price, and every run ended flat with no handler error
+* evidence: the sim lane's run report GL, kept outside the repository, which carries the strike as its first lines; the forward set in docs/adr/0133-trail-arms-judged-against-f2-on-sessions-never-loaded-then-confirmed-forward.md; the later holdout in docs/adr/0100-early-entry-factor-arms-registered-before-any-result.md; the ledger in docs/adr/0010-strategy-evaluation.md; one row per session day in docs/adr/0104-arm-comparison-through-archs-spa-and-stepm-beside-the-gate.md
+* lesson: A simulation is as able as a paper window to spend a forward or holdout date, and a side-by-side table reads as a ranking whatever its caveats say. Each run is named before it starts: a MECHANISM run shows that a path works and ranks nothing; a TRIAL compares arms, only on dates the date map marks development, ledgered under ADR 0010 and registered before any run, and is compared by session day under ADR 0104; a JUDGMENT is the gate's read on the dates its record names
+* change: the run report is struck in place, and the lead's rule that names every run before it starts applies to the farm and the sim lane from 2026-11-14: the farm's runner, outside the repository, refuses by name a run with no kind, any judgment, and a trial on a date the date map does not mark development or that is already spent, or one not registered with a session-day comparison; the date map is kept outside the repository too
+* next: The replay 2026-11-13-the-gain-lock-arms-on-noise reports is this struck run, so its figures are a mechanism's and its next replay is this trial; the four variants are registered again and run as a trial on development dates once the date map has unspent ones
+* status: open
+* supersedes: none
+* source: lead
+* owner: the sim lane
+* closes: the gain-lock variants' trial, registered before its run, on development dates the date map marks, compared by session day under ADR 0104
