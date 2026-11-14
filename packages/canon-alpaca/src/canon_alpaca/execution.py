@@ -374,6 +374,13 @@ Known limits:
   limit, stop, stop-limit or trailing stop order with mapped fields. An open stop is reported with its
   stop price as the trigger price and the node's trigger type, else `DEFAULT`; trailing reports also
   carry their offset and type, as above.
+* After start-up, such an open order that the node does not hold (an OCO, bracket or OTO leg placed by
+  someone else, say) is left out of the running open-order check's report, the fill request's open
+  orders and the stream's outside reports. It is named once by an ALERT with a count of those left out,
+  and the count drops when it ends (`_leave_out`). One such order would otherwise fail the whole report,
+  and with it every order's check while it stands. The node does not see that order or the shares it
+  holds, so a cover judged from the node's cache does not count it. An order the node holds that it
+  cannot represent still fails the report.
 * Timestamps lose sub-microsecond precision: alpaca-py parses them into `datetime`.
 * A trading client given to the constructor is the caller's: every connect uses it, a disconnect does not
   drop it, and nothing is built from the environment in its place (the adapter guide closes in
@@ -1673,6 +1680,9 @@ class AlpacaExecutionClient(ExecutionClient):
         self._external_fills: dict[str, dict[str, FillReport]] = {}
         self._external_reconciliation: set[str] = set()
         self._external_unloaded_symbols: set[str] = set()
+        self._left_out: set[str] = set()
+        """Alpaca IDs of the open orders the node does not hold and cannot represent, left out of the
+        running reports and named once each (`_leave_out`)."""
         self._advisory_trigger_warned: set[str] = set()
         self._odd_positions_named: set[str] = set()
         # Clients given here are the caller's: used on every connect, never replaced by ones built from
@@ -2959,6 +2969,52 @@ class AlpacaExecutionClient(ExecutionClient):
             if root is not None and self._index.get(leg_id) == root
         }
 
+    def _unrepresentable_outside(self, order: AlpacaOrder) -> str | None:
+        """Why an open order the node does not hold cannot be represented on its own terms, or None.
+
+        The terms are `mapped_order_report`'s, with the trailing setting an order not held is mapped
+        under; nothing is read. An order the node holds, by its own client order ID, a replacement this
+        client indexed or its venue order ID, is never judged here: one of those it cannot represent
+        stays a refusal (ADR 0030)."""
+        if not is_open_order(order):
+            return None
+        candidates = (
+            holdable_id(order.client_order_id),
+            self._index.get(str(order.id)),
+            self._held_by_venue_id(str(order.id)),
+        )
+        if any(cid is not None and self.cache.order(cid) is not None for cid in candidates):
+            return None
+        try:
+            mapped_order_report(order, 0, trailing=self._report_external_trailing_stops)
+        except ValueError as e:
+            return str(e)
+        return None
+
+    def _leave_out(self, order: AlpacaOrder, reason: str) -> None:
+        """Name an open order of someone else's this client cannot represent once, at ERROR as an ALERT,
+        with how many such orders are left out now; it is left out of the running reports and the
+        stream's outside reports, so it costs no other order's reconciliation. The node does not see it,
+        so neither does any cover judged from the node's cache."""
+        order_id = str(order.id)
+        if order_id in self._left_out:
+            return
+        self._left_out.add(order_id)
+        self._log.error(
+            f"ALERT: {order_description(order)} cannot be represented here ({reason}); left out of "
+            f"this client's reports, so the node does not see it or the shares it holds "
+            f"({len(self._left_out)} such order(s) left out now)"
+        )
+
+    def _no_longer_left_out(self, order_ids: set[str]) -> None:
+        """Forget the left-out orders among `order_ids`, now ended at Alpaca, naming each once."""
+        for order_id in order_ids & self._left_out:
+            self._left_out.discard(order_id)
+            self._log.info(
+                f"An Alpaca order left out of this client's reports has ended "
+                f"({len(self._left_out)} such order(s) left out now)"
+            )
+
     def _leave_external_to_reconciliation(self, order: AlpacaOrder, reason: str) -> None:
         """Drop an incomplete stream fill set and name the order once; reconciliation owns it now."""
         keys = self._external_keys(order)
@@ -2997,6 +3053,15 @@ class AlpacaExecutionClient(ExecutionClient):
                 "its replacement is reported instead"
             )
             return
+        reason = self._unrepresentable_outside(update.order)
+        if reason is not None:
+            # Named once; its stream fills are never shown to the engine, which does not hold it.
+            self._leave_out(update.order, reason)
+            for leg_id in self._external_legs(update.order):
+                self._external_fills.pop(leg_id, None)
+            return
+        if not is_open_order(update.order):
+            self._no_longer_left_out({order_id})
         # Do not mutate the stored set until mapping succeeds and the complete report is sent.
         pending = dict(self._external_fills.get(order_id, {}))
         if event in FILL_EVENTS:
@@ -4603,8 +4668,23 @@ class AlpacaExecutionClient(ExecutionClient):
             else:
                 superseded.add(str(order.replaces))
         reports = []
+        # The running open-order check asks for open orders only (`open_only`, the engine's default,
+        # crates/live/src/node/config.rs:481 at the pin); start-up's mass status never does
+        # (crates/common/src/clients/execution.rs:524-529), so start-up keeps its refusal (ADR 0030).
+        # There an open order of someone else's this client cannot represent is left out, named once:
+        # one such order fails the whole report, and with it every order's check for as long as it
+        # stands (`request_open_order_reports`, crates/live/src/node/reconciliation.rs:553-575). The
+        # engine never takes on an order it does not hold from this check (manager.rs:2312-2318), so
+        # leaving it out takes nothing from it.
+        running = command.open_only
+        left_out: set[str] = set()
         for order in found.values():
             if str(order.id) in superseded or str(order.id) in not_yet:
+                continue
+            reason = self._unrepresentable_outside(order) if running else None
+            if reason is not None:
+                self._leave_out(order, reason)
+                left_out.add(str(order.id))
                 continue
             report = await self._order_report(order, found)
             try:
@@ -4615,6 +4695,9 @@ class AlpacaExecutionClient(ExecutionClient):
                 continue
             if report is not None:
                 reports.append(report)
+        if running and command.instrument_id is None:
+            # Every open order was read: one left out before and not now has ended.
+            self._no_longer_left_out(self._left_out - left_out)
         return reports
 
     async def _fill_reports(self, command: live.GenerateFillReports) -> list[FillReport]:
@@ -4854,6 +4937,12 @@ class AlpacaExecutionClient(ExecutionClient):
                 try:
                     if await self._node_order_id(order) is not None:
                         continue  # the node's own: its reports wait for its fills (`_settled_report`)
+                    reason = self._unrepresentable_outside(order)
+                    if reason is not None:
+                        # Its fills are not shown: the node does not hold it, and neither do its
+                        # reports (`_order_status_reports`), so no fill of it is one the engine infers.
+                        self._leave_out(order, reason)
+                        continue
                     report = await self._order_report(order)
                     if report is None or report.filled_qty.as_decimal() <= 0:
                         continue
