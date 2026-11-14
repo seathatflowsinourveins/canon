@@ -282,6 +282,10 @@ def _cover(
         # R7: any open sell of ours the venue shows, counted or not (being canceled, not yet
         # acknowledged, not a stop kind), is one a node report may not add as engine cover.
         identity = str(_field(order, "client_order_id"))
+        if identity in ended:
+            # The trade date's ended orders, read after the open ones, show this sale ended: the
+            # later fact wins, and none of it is cover (the Codex re-read of 2026-11-14, R1).
+            continue
         venue_stops.add(identity)
         kind = _value(_field(order, "type") or _field(order, "order_type"))
         if status not in ACKNOWLEDGED:

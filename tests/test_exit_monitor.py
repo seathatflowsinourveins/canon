@@ -1787,3 +1787,31 @@ def test_a_fresh_held_report_replaces_a_freeze_carried_from_an_earlier_pass(em, 
     third = run(em, tmp_path, paper, reports=[held])
     assert third["findings"][0]["state"] == "held"
     assert third["alerts"] == []
+
+
+@pytest.mark.parametrize("kind", ["trailing_stop", "limit"])
+def test_a_later_ended_read_overrides_the_same_sale_seen_open_earlier_in_the_pass(
+    em, tmp_path, kind
+):
+    # Codex re-read of 1b8f60b5 (R1, the rest of P1-1): the open GET shows the sale, the closed GET
+    # after it shows the same identity canceled; the later fact wins and nothing of it is cover.
+    limit = "99" if kind == "limit" else None
+    open_sale = order(type=kind, order_type=kind, limit_price=limit)
+    closed_sale = order(
+        type=kind, order_type=kind, limit_price=limit, status="canceled", canceled_at=NOW
+    )
+
+    class Snapshots(Paper):
+        def get_orders(self, request):
+            status = request.status.value
+            self.calls.append(status)
+            return [closed_sale] if status == "closed" else [open_sale]
+
+    paper = Snapshots(positions=[position()])
+    result = run(
+        em, tmp_path, paper, reports=[level_report(quantity="100", client_order_id=PROTECT)]
+    )
+    found = result["findings"][0]
+    assert "closed" in paper.calls
+    assert found["state"] != "covered", found
+    assert found["cover"] == "0", found

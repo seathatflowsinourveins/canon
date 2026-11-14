@@ -87,7 +87,8 @@ node's `ALERT` lines; anything while the Mac sleeps. **Limit:** a stop Alpaca ho
 every part of the day, but Alpaca's trailing stop "will not trigger outside of the regular market hours"
 (ADR 0142's Evidence, ADR 0129). The monitor counts it active only in the regular session, so outside it
 C's holding reads `dormant`, told once on entering that state and then quiet: a stop exists, not one that
-can fire.
+can fire. **Limit:** a working sale of ours that acts only in the regular session is counted as cover
+through a report's after-hours sessions today; the lead's venue-stop ruling of 2026-11-14 owns it.
 
 ### Consequences
 
