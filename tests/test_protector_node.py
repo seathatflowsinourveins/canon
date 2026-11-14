@@ -398,9 +398,9 @@ def runtime(monkeypatch, controls, *, account="windows", lead_go=None):
 
     def positions(_trading):
         reads.append("positions")
-        return {"AAA": Decimal(10), "BBB": Decimal(2)}
+        return {"AAA": Decimal(10), "BBB": Decimal(2)}, {}
 
-    monkeypatch.setattr(window, "positions", positions)
+    monkeypatch.setattr(window, "position_reads", positions)
     monkeypatch.setattr(window, "open_orders", lambda _trading: [])
     clock, calendar = market("2026-11-13T10:00:00")
     monkeypatch.setattr(
@@ -471,7 +471,9 @@ def test_account_a_stream_lock_refuses_before_any_account_read(controls, tmp_pat
     monkeypatch.setattr(
         window, "session_now", lambda _trading: (clock, calendar, window.time.monotonic())
     )
-    monkeypatch.setattr(window, "positions", lambda _trading: pytest.fail("read behind the lock"))
+    monkeypatch.setattr(
+        window, "position_reads", lambda _trading: pytest.fail("read behind the lock")
+    )
     with (tmp_path / "canon-alpaca-stream-tests.lock").open("a") as recorder:
         fcntl.flock(recorder, fcntl.LOCK_EX | fcntl.LOCK_NB)
         with pytest.raises(window.WindowRefused, match="stream.*lock.*held"):
@@ -483,9 +485,9 @@ def test_hold_arriving_during_account_read_refuses_node(controls, tmp_path, monk
 
     def held(_trading):
         (controls[0] / "new-hold").write_text("stop")
-        return {"AAA": Decimal(10)}
+        return {"AAA": Decimal(10)}, {}
 
-    monkeypatch.setattr(window, "positions", held)
+    monkeypatch.setattr(window, "position_reads", held)
     with pytest.raises(window.WindowRefused, match="holds"):
         module.run_protector(settings, trading=object(), lock_dir=tmp_path)
     assert not built
@@ -525,7 +527,7 @@ def test_signalled_main_exits_as_the_window_signal(controls, monkeypatch):
 
 def test_failed_end_read_names_last_seen_holdings(controls, tmp_path, monkeypatch, capsys):
     module, settings, strategy, _foreign, _reads, _built = runtime(monkeypatch, controls)
-    first = window.positions
+    first = window.position_reads
     calls = []
 
     def positions(trading):
@@ -534,7 +536,7 @@ def test_failed_end_read_names_last_seen_holdings(controls, tmp_path, monkeypatc
             raise OSError("end read unavailable")
         return first(trading)
 
-    monkeypatch.setattr(window, "positions", positions)
+    monkeypatch.setattr(window, "position_reads", positions)
     before = list(strategy.sent)
     with pytest.raises(RuntimeError, match="end"):
         module.run_protector(settings, trading=object(), lock_dir=tmp_path)
@@ -571,7 +573,7 @@ def test_failed_end_read_does_not_mask_the_node_failure(controls, tmp_path, monk
         def failed_read(_trading):
             raise OSError("end read unavailable")
 
-        monkeypatch.setattr(window, "positions", failed_read)
+        monkeypatch.setattr(window, "position_reads", failed_read)
         raise RuntimeError("primary node failure")
 
     monkeypatch.setattr(window, "_run_node", failed_node)
@@ -581,7 +583,7 @@ def test_failed_end_read_does_not_mask_the_node_failure(controls, tmp_path, monk
 
 def test_signal_during_end_read_still_names_holdings(controls, tmp_path, monkeypatch, capsys):
     module, settings, strategy, _foreign, _reads, _built = runtime(monkeypatch, controls)
-    before = window.positions
+    before = window.position_reads
 
     def stop(_node, _ends):
         strategy.on_stop()
@@ -592,7 +594,7 @@ def test_signal_during_end_read_still_names_holdings(controls, tmp_path, monkeyp
             window._SIGNALS.handle(signal.SIGTERM, None)
             return before(trading)
 
-        monkeypatch.setattr(window, "positions", signalled)
+        monkeypatch.setattr(window, "position_reads", signalled)
 
     monkeypatch.setattr(window, "_run_node", stop)
     with pytest.raises(window.WindowSignalled, match="stopped by SIGTERM"):
@@ -872,13 +874,13 @@ def test_lock_wait_takes_the_lock_once_released_and_reads_nothing_before(
         held.close()
 
     first_read: list[float] = []
-    positions = window.positions
+    positions = window.position_reads
 
     def stamped(trading):
         first_read.append(window.time.monotonic())
         return positions(trading)
 
-    monkeypatch.setattr(window, "positions", stamped)
+    monkeypatch.setattr(window, "position_reads", stamped)
     timer = threading.Timer(0.6, release)
     timer.start()
     try:
@@ -1502,3 +1504,157 @@ def test_unbooked_overnight_start_can_select_an_eligible_long(controls, tmp_path
     probe = Harness(feed="boats", session_part="overnight", **(built[0][3] or {}))
     probe.on_start()
     assert AAA in probe.slots, probe.said
+
+
+REAL_POSITION_READS = window.position_reads
+"""The real per-symbol reader, kept before any test patches it, so the cases below run it unpatched."""
+
+
+def listed(symbol: str, qty: str, side: str = "long") -> Any:
+    """One position as alpaca-py models Alpaca's listing (`alpaca.trading.models.Position`)."""
+    from alpaca.trading.models import Position as AlpacaPosition
+
+    return AlpacaPosition.model_validate(
+        {
+            "asset_id": "64bbff51-59d6-4b3c-9351-13ad85e3c752",
+            "symbol": symbol,
+            "exchange": "NASDAQ",
+            "asset_class": "us_equity",
+            "avg_entry_price": "10.00",
+            "qty": qty,
+            "side": side,
+            "cost_basis": "100",
+        }
+    )
+
+
+class Listing:
+    """An account whose only read here is its positions, as alpaca-py's `get_all_positions` lists them."""
+
+    def __init__(self, *positions: Any) -> None:
+        self.listed = list(positions)
+
+    def get_all_positions(self) -> list:
+        return list(self.listed)
+
+
+def real_reader(monkeypatch, controls):
+    """`runtime`, with the real per-symbol reader between run_protector and alpaca-py's Positions."""
+    found = runtime(monkeypatch, controls)
+    monkeypatch.setattr(window, "position_reads", REAL_POSITION_READS)
+    return found
+
+
+def test_one_unreadable_position_at_the_start_is_skipped_by_name_and_every_other_long_is_covered(
+    controls, tmp_path, monkeypatch, capsys
+):
+    """The reader follow-up's red case (2026-11-13): with the account listing AAA long 10 and BBB with a
+    quantity that is no number, the start read raised PositionUnread and no node was built, so AAA got
+    no protection. Each position is read by itself: BBB is named with an ALERT and left out of the
+    node, and AAA is covered (the lead, 2026-11-13 21:27, 21:35 and 21:39)."""
+    module, settings, _strategy, _foreign, _reads, built = real_reader(monkeypatch, controls)
+    trading = Listing(listed("AAA", "10"), listed("BBB", "NaN"))
+    module.run_protector(settings, trading=trading, lock_dir=tmp_path)
+    assert len(built) == 1
+    assert set(built[0][1]) == {AAA}
+    said = capsys.readouterr().out
+    start, end = [line for line in said.splitlines() if line.startswith("ALERT BBB:")]
+    assert "position in BBB" in start and "skipped, nothing sent" in start, start
+    assert "position in BBB" in end and "left unprotected by this node" in end, end
+
+
+def test_a_level_for_an_unreadable_position_is_dropped_and_the_rest_start(
+    controls, tmp_path, monkeypatch, capsys
+):
+    """A level supplied for a holding that cannot be read is left out with it, never a refusal of the
+    whole start."""
+    module, settings, _strategy, _foreign, _reads, built = real_reader(monkeypatch, controls)
+    settings = config(controls, levels={AAA: Price.from_str("9.50"), BBB: Price.from_str("1.50")})
+    trading = Listing(listed("AAA", "10"), listed("BBB", "Infinity"))
+    module.run_protector(settings, trading=trading, lock_dir=tmp_path)
+    assert len(built) == 1
+    assert set(built[0][0].levels) == {AAA}
+    assert set(built[0][1]) == {AAA}
+    assert "ALERT BBB:" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(("qty", "side"), [("-3", "long"), ("3", "short"), ("-3", "short")])
+def test_a_short_by_its_label_or_its_sign_is_never_read_as_a_long_at_the_start(
+    controls, tmp_path, monkeypatch, qty, side
+):
+    """Through the real reader a short, by its label or by its sign, is below zero: a level supplied
+    for it finds no starting long and nothing starts."""
+    module, _settings, _strategy, _foreign, _reads, built = real_reader(monkeypatch, controls)
+    settings = config(controls, levels={BBB: Price.from_str("1.50")})
+    trading = Listing(listed("AAA", "10"), listed("BBB", qty, side))
+    with pytest.raises(window.WindowRefused, match="no starting long holding"):
+        module.run_protector(settings, trading=trading, lock_dir=tmp_path)
+    assert not built
+
+
+def test_a_position_unreadable_at_the_end_is_named_with_its_count_last_seen_at_the_start(
+    controls, tmp_path, monkeypatch, capsys
+):
+    """The end read goes through the same per-symbol reader: a position readable at the start and not
+    at the end is named with an ALERT and its count as last seen, the other holdings as read now, and
+    the run is not failed for it."""
+    module, settings, strategy, _foreign, _reads, _built = real_reader(monkeypatch, controls)
+    trading = Listing(listed("AAA", "10"), listed("BBB", "2"))
+
+    def stop(_node, _ends):
+        strategy.on_stop()
+        trading.listed = [listed("AAA", "10"), listed("BBB", "NaN")]
+
+    monkeypatch.setattr(window, "_run_node", stop)
+    before = list(strategy.sent)
+    module.run_protector(settings, trading=trading, lock_dir=tmp_path)
+    said = capsys.readouterr().out
+    assert "AAA: 10 held, left unprotected by this node" in said, said
+    (alert,) = [line for line in said.splitlines() if line.startswith("ALERT BBB:")]
+    assert "2 held, last seen at start" in alert and "left unprotected" in alert, alert
+    assert strategy.sent == before
+
+
+def test_a_position_unreadable_at_the_start_is_named_at_the_end_when_the_end_read_fails(
+    controls, tmp_path, monkeypatch, capsys
+):
+    """A symbol skipped as unreadable at the start is named in the end report when the end read itself
+    fails: what the start could not read is not forgotten by the stop."""
+    module, settings, strategy, _foreign, _reads, built = real_reader(monkeypatch, controls)
+    trading = Listing(listed("AAA", "10"), listed("BBB", "NaN"))
+
+    def failing() -> list:
+        raise ConnectionError("positions offline")
+
+    def stop(_node, _ends):
+        strategy.on_stop()
+        trading.get_all_positions = failing
+
+    monkeypatch.setattr(window, "_run_node", stop)
+    with pytest.raises(RuntimeError, match="end positions read failed"):
+        module.run_protector(settings, trading=trading, lock_dir=tmp_path)
+    assert set(built[0][1]) == {AAA}
+    said = capsys.readouterr().out
+    alerts = [line for line in said.splitlines() if line.startswith("ALERT BBB:")]
+    assert len(alerts) == 2, said
+    assert "left unprotected by this node" in alerts[1], alerts[1]
+
+
+@pytest.mark.parametrize(("qty", "side"), [("0", "long"), ("0", "short"), ("-0", "short")])
+def test_a_holding_with_a_zero_quantity_is_skipped_by_name_and_every_other_long_is_covered(
+    controls, tmp_path, monkeypatch, capsys, qty, side
+):
+    """A position listed with a zero quantity is no holding the node can protect: it is named with an
+    ALERT and left out, a level for it with it, and every other long is covered, never a refusal of the
+    whole node (the lead, 2026-11-13 21:27)."""
+    module, _settings, _strategy, _foreign, _reads, built = real_reader(monkeypatch, controls)
+    settings = config(controls, levels={AAA: Price.from_str("9.50"), BBB: Price.from_str("1.50")})
+    trading = Listing(listed("AAA", "10"), listed("BBB", qty, side))
+    module.run_protector(settings, trading=trading, lock_dir=tmp_path)
+    assert len(built) == 1
+    assert set(built[0][1]) == {AAA}
+    assert set(built[0][0].levels) == {AAA}
+    start = next(
+        line for line in capsys.readouterr().out.splitlines() if line.startswith("ALERT BBB:")
+    )
+    assert "skipped, nothing sent" in start, start

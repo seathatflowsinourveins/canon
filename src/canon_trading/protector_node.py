@@ -46,6 +46,7 @@ from collections.abc import Generator
 from collections.abc import Sequence
 from dataclasses import dataclass
 from dataclasses import field
+from dataclasses import replace
 from datetime import datetime
 from datetime import time
 from pathlib import Path
@@ -469,11 +470,29 @@ def run_protector(
         ends, part, feed = window.protection_span(
             clock, calendar, minutes=config.minutes, feed=config.feed
         )
-        held = window.positions(trading)
+        # Each position read by itself through custody's one rule (`window.position_reads`): a short, by
+        # its label or by its sign, is below zero and never read as a long, and one that cannot be read
+        # is named with an ALERT and skipped, its symbol and any level for it left out of the node, so
+        # every other long is still covered (the lead, 2026-11-13 21:27 and 21:35).
+        held, unread = window.position_reads(trading)
+        # A zero quantity (a short read as -0 among them) is no holding this node can protect: it is
+        # named and skipped like an unreadable one, never a refusal of every other long.
+        for symbol, qty in sorted(held.items()):
+            if qty == 0:
+                unread[symbol] = f"position in {symbol} is listed with quantity {qty}, no holding"
+                del held[symbol]
+        for symbol, why in sorted(unread.items()):
+            print(
+                f"ALERT {symbol}: {why}, so this node does not protect it; skipped, nothing sent for it",
+                flush=True,
+            )
+        if unread and any(instrument.symbol.value in unread for instrument in config.levels):
+            config = replace(
+                config,
+                levels={i: p for i, p in config.levels.items() if i.symbol.value not in unread},
+            )
         if not held:
             raise window.WindowRefused("no starting holding; no protector node started")
-        if any(not qty.is_finite() or qty == 0 for qty in held.values()):
-            raise window.WindowRefused("a starting holding has an invalid quantity")
         for instrument in config.levels:
             if held.get(instrument.symbol.value, 0) <= 0:
                 raise window.WindowRefused(
@@ -481,7 +500,7 @@ def run_protector(
                 )
         # Orders in other symbols must reconcile too, with EXTERNAL ownership and no cancel.
         orders = window.open_orders(trading)
-        symbols = sorted(set(held) | {order.symbol for order in orders})
+        symbols = sorted((set(held) | {order.symbol for order in orders}) - set(unread))
         instruments = tuple(InstrumentId.from_str(f"{symbol}.ALPACA") for symbol in symbols)
         if window.time.monotonic() - read_at >= (ends - clock.timestamp).total_seconds():
             raise window.WindowRefused("the feed span ended during the start reads")
@@ -513,14 +532,29 @@ def run_protector(
                 except Exception as e:  # noqa: BLE001 - report and keep the final holdings read
                     errors.append(f"dispose failed: {type(e).__name__}")
             try:
-                remaining = window.positions(trading)
+                remaining, unread_now = window.position_reads(trading)
                 last_seen = ""
             except Exception as e:  # noqa: BLE001 - last seen is explicitly not a current account read
                 errors.append(f"end positions read failed: {type(e).__name__}")
-                remaining, last_seen = held, "last seen at start; current quantity UNVERIFIED; "
+                # What the start could not read is named again, as the start read it.
+                remaining, unread_now, last_seen = (
+                    held,
+                    unread,
+                    "last seen at start; current quantity UNVERIFIED; ",
+                )
             for symbol, qty in sorted(remaining.items()):
                 print(
                     f"{symbol}: {qty} held, {last_seen}left unprotected by this node; "
+                    "owner's orders untouched"
+                )
+            for symbol, why in sorted(unread_now.items()):
+                known = (
+                    f"{held[symbol]} held, last seen at start; current quantity UNVERIFIED; "
+                    if symbol in held
+                    else ""
+                )
+                print(
+                    f"ALERT {symbol}: {why}; {known}left unprotected by this node; "
                     "owner's orders untouched"
                 )
             try:
