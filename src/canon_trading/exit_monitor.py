@@ -40,8 +40,8 @@ memory.json carries episodes; status.json is for unit two to consume; records/
 has one JSONL file per New York trade date (20:00 rolls the date). alerts.jsonl
 is this monitor's OUTBOX, in the watchdog's form, not its shared alert file.
 Unit two (ADR 0158): scripts/exit-monitor-notify delivers the outbox after each pass;
-scripts/automation install-exit-monitor <account> installs the 60 s agent for one
-account, never by plain install, and status shows its row. C is read only behind
+scripts/automation install-exit-monitor <account>, the owner's command, installs the
+60 s agent for one account, never by plain install, and status shows its row. C is read only behind
 the lead's word, LEAD_GO, which the agent reads from exit-monitor/C/go at every
 firing and passes to the task and to monitor_task, each of which checks it again.
 
@@ -216,7 +216,9 @@ def _fresh(report: Mapping[str, Any], now: datetime) -> bool:
     sessions = report.get("sessions", ["regular"])
     if not isinstance(sessions, list) or not all(isinstance(part, str) for part in sessions):
         raise ReadFailed("node report names no valid session eligibility")
-    for field in ("symbol", "state", "client_order_id"):
+    # A state that is not text is judged in _cover, for its holding alone (ADR 0158); a symbol or an
+    # identity that is not text names no holding, so it still fails the pass.
+    for field in ("symbol", "client_order_id"):
         if report.get(field) is not None and not isinstance(report[field], str):
             raise ReadFailed(f"node report {field} is not text")
     if "last_step_at" in report or "step_seconds" in report:
@@ -373,11 +375,12 @@ def _reason_kind(
         return "partial cover"
     if "no protector running" in note:
         return "no protector running"
-    states = {
+    # A list: a report's state may be any JSON value, and only a word can match (ADR 0158).
+    states = [
         report.get("state")
         for report in reports
         if isinstance(report, Mapping) and report.get("symbol") == symbol and _fresh(report, now)
-    }
+    ]
     for state in ("waiting", "guarded"):
         if state in states:
             return f"node {state}"
@@ -545,7 +548,7 @@ def assess(
                 "frozen_source": frozen_source,
                 "invalid": bool(invalid),
                 "held_by_owner": symbol in held,
-                "cold": cold,
+                "cold": cold and state == "covered",
             }
         )
     return findings

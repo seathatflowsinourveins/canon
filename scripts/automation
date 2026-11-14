@@ -1426,7 +1426,7 @@ show_protector_status() {
 # missing or its last refresh is EXITMON_REFRESH_SECS old; a failed fetch keeps the last good main, which the
 # helper says. At every firing HEAD must be the clone's origin/main with no tracked file changed, or nothing
 # runs (`refused`, not_main): a run is from main at every firing. Nothing installs it but
-# `scripts/automation install-exit-monitor <tests|windows|protect>`, run on the owner's or the lead's word:
+# `scripts/automation install-exit-monitor <tests|windows|protect>`, the owner's command (no session runs it):
 # plain `install`, which the maintenance agent runs, never does, so it is off by default. On C (protect) a
 # firing reads the lead's standing word in canon/exit-monitor/C/go, exactly EXITMON_GO, at every firing, and
 # passes it to the task, which checks it again, as monitor_task does; only the lead writes that file, never
@@ -1620,7 +1620,7 @@ show_exit_monitor_status() {
     else label=UNKNOWN; v="no readable status at $CANON_HOME/watch/exit-monitor-$account.json (first firing $EXITMON_INTERVAL s after install)"; fi
     if ! cmp -s "$ROOT/scripts/automation" "$EXITMON_RUNNER" || ! cmp -s "$ROOT/home/.claude/canon/paper-session.sh" "$EXITMON_HELPER"; then
       [ "$(paper_rank OUTDATED)" -le "$(paper_rank "$label")" ] || label=OUTDATED
-      v="$v; installed runner differs from this tree: run scripts/automation install-exit-monitor $account"
+      v="$v; installed runner differs from this tree: the owner reruns scripts/automation install-exit-monitor $account"
     fi
     check_row "exit monitor $account" "$label" "$v | log $CANON_HOME/watch/exit-monitor-$account.log"
   done

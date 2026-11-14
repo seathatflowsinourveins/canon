@@ -30,10 +30,10 @@ stop Alpaca holds. ADR 0114's closing sentence gives C's pair to no other task; 
 
 ## Decision Outcome
 
-Chosen: **option 1**. **The pass**, GET only: positions, open orders, the trade date's ended orders, the clock, the calendar and
-SIP bars; at most 8 trading GETs, bounded at 45 s, under a monitor-only lock, never an account or stream
-lock. It writes only `canon/exit-monitor/<A|B|C>/`: the pass's `status.json`, `memory.json`,
-`memory.running`, `records/` and outbox `alerts.jsonl`; the carrier's `delivered.json`,
+Chosen: **option 1**. **The pass**, GET only: positions, open orders, the trade date's ended orders, the
+clock, the calendar and SIP bars; at most 8 trading GETs, bounded at 45 s, under a monitor-only lock, never
+an account or stream lock. It writes only `canon/exit-monitor/<A|B|C>/`: the pass's `status.json`,
+`memory.json`, `memory.running`, `records/` and outbox `alerts.jsonl`; the carrier's `delivered.json`,
 `notify-status.json` and `.notify.lock`; the agent's `runner.lock` and `clone-refreshed`; and on C, `go`.
 
 **The node-report contract** (`reports.json`, the module's docstring). Cover is an acknowledged stop-kind
@@ -47,31 +47,31 @@ sell of ours at the venue, or a report fresh within three node steps whose state
 | `held`, `source` `word` or `order` | reads `held`, never uncovered; another source adds no cover, named |
 | `frozen`, `result` `denied` or `rejected` | reads frozen |
 
-A state it does not know, a missing one included, costs that holding the report's cover, named, and never
-the pass. An optional `client_order_id` names one stop of our lineage: not added where the venue shows the
-same stop, counted once if repeated; a report without one adds nothing where another exit could be the
-same. A missing or stale report reads "no protector running". The nodes report; the monitor judges.
-**Not built:** no node writes `reports.json` yet; the warming bound (the node reports `full_window_at`, and
-a holding still `cold` after it raises one notice per holding and node run; one with too few bars, overnight
-say, stays cold and quiet); one notice when a hold by the owner's order begins with shares uncovered.
+A state it does not know, missing or not text included, costs that holding the report's cover, named, and
+never the pass. An optional `client_order_id` names one stop of our lineage: not added where the venue
+shows the same stop, counted once if repeated; a report without one adds nothing where another exit could
+be the same. A missing or stale report reads "no protector running". The nodes report; the monitor judges.
+**Not built:** a writer of `reports.json`; the warming bound (the node reports `full_window_at`; a holding
+still `cold` after it raises one notice per holding and node run; one with too few bars, overnight say,
+stays cold and quiet); one notice when a hold by the owner's order begins with shares uncovered.
 
-**The schedule.** `scripts/automation install-exit-monitor <tests|windows|protect>`, from a tree on `main`,
-writes `local.canon.exit-monitor-<account>`: `StartInterval` 60, not run at load. A firing runs `mise run
-paper:exit-monitor` once in `exit-monitor-<account>-checkout`, a clone of origin's main of its own (ADR
-0050), refreshed by the recorder's `paper-session.sh --recorder-checkout` at most every 30 minutes; HEAD
-must be the clone's `origin/main` with no tracked change, or nothing runs (`not_main`). One firing per
-account at a time; one `scripts/automation status` row per agent; `uninstall-exit-monitor` keeps records.
+**The schedule.** `scripts/automation install-exit-monitor <tests|windows|protect>` is the owner's command,
+as `install-protector` is: no session runs it or its uninstall, whatever a permission rule matches. From a
+tree on `main` it writes `local.canon.exit-monitor-<account>`: `StartInterval` 60, not run at load. A firing
+runs `mise run paper:exit-monitor` once in `exit-monitor-<account>-checkout`, a clone of origin's main of
+its own (ADR 0050), refreshed by the recorder's `paper-session.sh --recorder-checkout` at most every 30
+minutes; HEAD must be the clone's `origin/main` with no tracked change, or nothing runs (`not_main`). One
+firing per account at a time; one `scripts/automation status` row per agent; the uninstall keeps records.
 
 **C: ADR 0114 amended in part.** One more task gains C's pair: `paper:exit-monitor protect`, GET only, no
-order and no lock, behind the lead's standing word read at every firing, from main at every firing. "No task
-reads two pairs" stands: one account per run. The word is `canon/exit-monitor/C/go` reading exactly
-`exit-monitor protect`; the agent, the task and `monitor_task` each refuse C without it, and only the lead
-writes it, after the staging. The undo: removing the go file, which the owner or the lead may do, ends
-the reading of C at the next firing. What it reads of C stays in that folder: no symbol, price or quantity of C in
-a tracked file, a report, a pull request or a message, but for the owner's notice on this machine and what
-goes to the lead. A and B stay off for now: without node reports, every holding protected locally there
-would read "no protector running". The order of enabling: C first, then A once the protector reports, then
-B once the Mover does.
+order and no lock, behind the lead's standing word read at every firing, from main at every firing. "No
+task reads two pairs" stands: one account per run. The word is `canon/exit-monitor/C/go` reading exactly
+`exit-monitor protect`; the agent, the task and `monitor_task` each refuse C without it; only the lead
+writes it, after the staging. The undo: removing the file, which the owner or the lead may do, ends the
+reading of C at the next firing. What it reads of C stays in that folder: no symbol, price or quantity of
+C in a tracked file, a report, a pull request or a message, but for the owner's notice on this machine and
+what goes to the lead. Enabling runs C first, then A once the protector reports, then B once the Mover
+does: without node reports, a holding protected locally reads "no protector running".
 
 **The repeat.** Told once 120 s old, then every 900 s, at once when frozen. The age runs from, first that
 applies: a carried episode, the loss of cover, the removal of the owner's hold, then the fill if the trade
@@ -84,33 +84,34 @@ a banner in at most two periods plus 120 s plus one firing (measured: `UNVERIFIE
 **Not seen:** a stop a node holds locally until it reports; orders submitted on an earlier trade date; a
 node's `ALERT` lines; anything while the Mac sleeps. **Limit:** a stop Alpaca holds counts toward cover in
 every part of the day, but Alpaca's trailing stop "will not trigger outside of the regular market hours"
-(ADR 0129, ADR 0142). The monitor counts it active only in the regular session, so outside it C's holding
-reads `dormant`, told once on entering that state and then quiet: a stop exists, not one that can fire.
+(ADR 0142's Evidence, ADR 0129). The monitor counts it active only in the regular session, so outside it
+C's holding reads `dormant`, told once on entering that state and then quiet: a stop exists, not one that
+can fire.
 
 ### Consequences
 
 * Good: an independent, unattended check on C's venue stops from Monday.
 * Bad: a protector run on C stays attended until its report is shown; 1,440 passes a day per account
   against a rate limit `UNVERIFIED` here (Evidence).
-* To review: `status.json` counts uncovered holdings by a fixed reason kind (`uncovered_by_reason`), never a
-  report's free text. Whether a reason the owner cannot act on, a name with no quote overnight say, keeps
-  the 15-minute repeat is decided from the first nights' counts, not now. A node's no-quote reason is
-  counted only as `node waiting`; a finer split is not built.
+* To review: `status.json` counts `dormant` holdings and uncovered ones by a fixed reason kind
+  (`uncovered_by_reason`), never a report's free text. Whether a reason the owner cannot act on, a name with
+  no quote overnight say, keeps the 15-minute repeat is decided from the first nights' counts, not now. A
+  node's no-quote reason counts only as `node waiting`; a finer split is not built.
 
 ### Confirmation
 
-`scripts/test-exit-monitor-runner` (macOS only; skips without `lockf` or `plutil`): install and its
-refusals, the clone's refresh and `not_main`, one firing at a time, the row, uninstall. N9 in
-`scripts/test-exit-monitor-notify` and `tests/test_exit_monitor.py`: C behind its word, `cold`, `held`, and
-an invented state costing only its holding. Staging, named in the landing: (i) the offline tests; (ii) an
-uncovered long on A, Sunday night after the proof's cells if A's lock is free, with A enabled by hand for it
-alone: the owner or the lead runs `scripts/automation install-exit-monitor tests`; a `paper:test` case opens
-the long, waits for two firings more than 120 s apart and one notice, and closes the long in its `finally`;
-then `scripts/automation uninstall-exit-monitor tests` switches A off, and `scripts/automation status` shows
-no exit-monitor row for it; (iii) a
-long covered by a venue stop on A, Monday's regular session, by hand in sequence (open, `paper:protect
-tests`, two `mise run paper:exit-monitor tests` passes, `--cancel`, `paper:close tests`), since `paper:protect
-tests` takes `paper:test`'s lock.
+`scripts/test-exit-monitor-runner` (macOS only; skips without `lockf` or `plutil`): install and refusals,
+the clone's refresh and `not_main`, one firing at a time, the row, uninstall. N9 in
+`scripts/test-exit-monitor-notify` and `tests/test_exit_monitor.py`: C behind its word, `cold`, `held`, an
+invented state costing only its holding. Staging, named in the landing: (i) the offline tests; (ii) an
+uncovered long on A, Sunday night after the proof's cells if A's lock is free, A enabled for it alone by
+the owner's steps, which the lead brings once the unit is on `main`: the owner runs `scripts/automation
+install-exit-monitor tests`; one `paper:test` case opens a long, waits for two firings over 120 s apart
+and one notice, and closes it in its `finally`; the owner runs `scripts/automation uninstall-exit-monitor
+tests`, and `scripts/automation status` shows no row for A; (iii) a long covered by a venue stop on A,
+Monday's regular session, by hand in sequence (open, `paper:protect tests`, two `mise run
+paper:exit-monitor tests` passes, `--cancel`, `paper:close tests`), as `paper:protect` takes `paper:test`'s
+lock.
 
 ## Evidence
 
@@ -126,8 +127,12 @@ Read 2026-11-14.
   `RunAtLoad` defaults to false — `bundled`.
 * `src/canon_trading/exit_monitor.py`, `scripts/automation`, `home/.claude/canon/paper-session.sh` — the
   contract, the protector runner's go pattern, the recorder's clone mode — read in this repository.
-* ADR 0114, read whole (its closing sentence, amended here); ADR 0142 (the two tasks it admits on C); ADR
-  0103 (no credential read, nothing of the owner's account in this repository); ADR 0050 (a clone of its own).
+* ADR 0114, read whole: its closing sentence, amended here. ADR 0142, read whole: it admits
+  `paper:protect protect` on C and notes the standing protector beside it under ADR 0114's amendment; its
+  Evidence quotes Alpaca's "Trailing stop will not trigger outside of the regular market hours"
+  (orders-at-alpaca, fetched there 2026-11-13), the source of the Limit above. ADR 0129, read at its
+  election row (line 44) only, which quotes the same sentence. ADR 0103, read whole: no credential read,
+  nothing of the owner's account in this repository. ADR 0050: a clone of its own.
 * 2026-11-14, corrected after the deputy's evidence-verifier pass: C's reach amends ADR 0114, not ADRs 0103
   and 0142; "from main" holds at every firing; the identity rule, `held`, the age order, the rate and the
   folder list are stated; a home path is removed; the trailing-stop limit and the undo are added.

@@ -1454,3 +1454,26 @@ def test_a_pass_with_nothing_uncovered_counts_no_reason(em, tmp_path):
     paper = Paper(positions=[position()])
     result = run(em, tmp_path, paper, reports=[level_report(quantity="100")])
     assert result["status"]["uncovered_by_reason"] == {}
+
+
+@pytest.mark.parametrize("state", [["armed"], {"state": "armed"}, 3])
+def test_a_state_that_is_not_a_word_costs_only_its_holding_and_never_the_pass(em, tmp_path, state):
+    paper = Paper(positions=[position(), position(symbol="OTH")])
+    reports = [
+        level_report(quantity="100", state=state),
+        level_report(symbol="OTH", quantity="100", state="armed"),
+    ]
+    result = run(em, tmp_path, paper, reports=reports)
+    assert result["ok"], result["summary"]
+    found = {f["symbol"]: f for f in result["findings"]}
+    assert found["OTH"]["state"] == "covered"
+    assert found["SYN"]["state"] == "uncovered"
+    assert "not known to this monitor" in found["SYN"]["reason"]
+    assert result["status"]["uncovered_by_reason"] == {"report state not known": 1}
+
+
+def test_cold_is_counted_only_for_a_holding_its_cold_stop_covers(em, tmp_path):
+    paper = Paper(positions=[position()])
+    result = run(em, tmp_path, paper, reports=[level_report(quantity="40", state="cold")])
+    assert result["status"]["cold"] == 0
+    assert result["findings"][0]["state"] == "uncovered"
