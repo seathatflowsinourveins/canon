@@ -642,6 +642,7 @@ def test_load_mode_sends_boats_to_the_loader_in_a_root_of_its_own(tmp_path, data
     assert args[args.index("--feed") + 1] == "boats"
     assert args[args.index("--catalog") + 1] == root
     assert args[args.index("--data") + 1] == data
+    assert args[args.index("--bars") + 1] == "1-MINUTE"  # boats bars are 1-MINUTE only
 
 
 @pytest.mark.parametrize(

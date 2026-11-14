@@ -807,3 +807,58 @@ def test_a_feed_bars_do_not_take_is_refused_by_name_before_any_request(venue, ca
     with pytest.raises(HistoryStopped, match="bars feed iex is refused"):
         run(catalog, feed=DataFeed.IEX)
     assert venue.sent == []
+
+
+def test_a_boats_bar_load_takes_minute_bars_only(venue, catalog) -> None:
+    """Code review, 2026-11-13: what a boats day bar means is UNVERIFIED, and an 8-hour window would
+    mark a day bar's coverage over one night; a boats bar load is 1-MINUTE only, refused by name."""
+    from alpaca.data.enums import DataFeed
+
+    with pytest.raises(HistoryStopped, match="boats bars are 1-MINUTE only"):
+        run(catalog, specs=("1-MINUTE", "1-DAY"), feed=DataFeed.BOATS)
+    assert venue.sent == []
+
+
+def test_a_boats_bar_load_from_the_cli_defaults_to_minute_bars(monkeypatch) -> None:
+    """Code review, 2026-11-13: with no --bars, a boats bar load asks for 1-MINUTE bars, so last
+    night's session is not refused for a day bar's margin."""
+    monkeypatch.setattr(history_load, "utc_now", lambda: NOW)
+    seen: list = []
+    monkeypatch.setattr(history_load, "history_client", lambda: None)
+    monkeypatch.setattr(
+        history_load, "load_history", lambda c, symbols, specs, *a, **k: seen.append(specs) or 0
+    )
+    start = NOW - timedelta(hours=9)
+    argv = ["--feed", "boats", "--symbols", "AAPL", "--start", start.isoformat()]
+    argv += ["--end", (NOW - timedelta(hours=1)).isoformat()]
+    assert history_load.main(argv) == 0
+    assert seen == [["1-MINUTE"]]
+
+
+def test_a_boats_bar_load_with_no_root_named_claims_the_boats_root(
+    venue, catalog, monkeypatch
+) -> None:
+    """Code review, 2026-11-13: a library call with feed=BOATS and no root goes to BOATS_CATALOG,
+    never the sip default root."""
+    from alpaca.data.enums import DataFeed
+
+    monkeypatch.setattr(history_load, "BOATS_CATALOG", catalog)
+    monkeypatch.setattr(history_load, "DEFAULT_CATALOG", catalog.parent / "absent")
+    clock = Clock()
+    assert (
+        load_history(
+            history_client(),
+            SYMBOLS,
+            ("1-MINUTE",),
+            MIN_START,
+            MIN_END,
+            feed=DataFeed.BOATS,
+            pace=PACE,
+            clock=clock,
+            sleep=clock.sleep,
+            now=lambda: NOW,
+            out=lambda line: None,
+        )
+        > 0
+    )
+    assert (catalog / FEED_FILE).read_text() == "boats\n"

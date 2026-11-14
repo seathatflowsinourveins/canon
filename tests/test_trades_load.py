@@ -679,3 +679,14 @@ def test_a_boats_trade_load_over_its_bound_is_refused_before_any_request(
     with pytest.raises(HistoryStopped, match=message):
         run(catalog, feed=DataFeed.BOATS, **({"end": BOATS_END} | options))
     assert venue.sent == []
+
+
+def test_a_boats_bound_counts_every_distinct_symbol_as_given(venue, catalog) -> None:
+    """Code review, 2026-11-13: the bound counts the symbols as they reach the request, so nine
+    entries that differ only in case are nine, not eight."""
+    from alpaca.data.enums import DataFeed
+
+    symbols = ["aapl", "AAPL", *(f"S{i}" for i in range(7))]
+    with pytest.raises(HistoryStopped, match="BOATS_MAX_SYMBOLS"):
+        run(catalog, symbols=symbols, end=BOATS_END, feed=DataFeed.BOATS)
+    assert venue.sent == []

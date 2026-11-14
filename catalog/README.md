@@ -156,8 +156,9 @@ with no quote (a night, a weekend) writes no coverage, so a rerun across one ask
 --start <ISO time with zone> --end <ISO time with zone>` loads Blue Ocean ATS's overnight feed
 (`boats`), the only feed Alpaca serves overnight history on: its 24/5 page says to give `feed=boats`
 and that `feed=overnight` "will give error", so `--feed overnight` is refused by name. A boats load
-names its symbols with `--symbols`, never a file, spans at most 8 hours (one 20:00-04:00 New York
-session) and ends at least 15 minutes before now, each held before any pair is read. Bars and trades
+names its symbols with `--symbols`, never a file, spans at most 8 hours (the length of one 20:00-04:00
+New York session; that the window lies inside one is not held) and ends at least 15 minutes before
+now, each held before any pair is read. Boats bars are 1-MINUTE only, the default for this feed. Bars and trades
 go in `catalog/boats`, quotes in `catalog/boats-quotes` by default, and the root must hold the
 definitions. Every other rule of the loads above holds. The baseline writer still refuses
 `--feed boats` until its own change reads a boats root.

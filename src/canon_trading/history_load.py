@@ -474,10 +474,20 @@ def _check_kinds(path: Path, loading: str, feed: DataFeed = FEED) -> None:
         )
 
 
+def _default_root(kind: str, feed: DataFeed) -> Path:
+    """The root a load of `kind` on `feed` writes when none is named: each feed and quotes apart."""
+    if feed == DataFeed.BOATS:
+        return BOATS_QUOTES_CATALOG if kind == "quotes" else BOATS_CATALOG
+    return SIP_QUOTES_CATALOG if kind == "quotes" and feed == DataFeed.SIP else DEFAULT_CATALOG
+
+
 def _boats_bound(symbols: Sequence[str], start: datetime, end: datetime) -> None:
     """Refuse a `boats` load over `BOATS_MAX_SYMBOLS` symbols or `BOATS_MAX_SPAN`, by name, before any
-    lock or request. Symbols count once after strip and upper case; the count is checked first."""
-    count = len({s.strip().upper() for s in symbols})
+    lock or request. Symbols count as given, each distinct string once, so the count is never below the
+    instruments a load asks for; the count is checked first. Only the span is held, not that the window
+    lies inside a 20:00-04:00 New York session: boats serves the overnight session alone, and what it
+    answers for another hour is UNVERIFIED."""
+    count = len(set(symbols))
     if count > BOATS_MAX_SYMBOLS:
         raise HistoryStopped(
             f"a boats load takes at most {BOATS_MAX_SYMBOLS} symbols (BOATS_MAX_SYMBOLS), got {count}; "
@@ -542,7 +552,7 @@ def load_history(
     specs: Sequence[str],
     start: datetime,
     end: datetime,
-    catalog_path: Path = DEFAULT_CATALOG,
+    catalog_path: Path | None = None,
     *,
     feed: DataFeed = FEED,
     pace: Pace = PACE,
@@ -554,8 +564,11 @@ def load_history(
     out: Callable[[str], None] = print,
 ) -> int:
     """Load `specs` bars of `symbols` whose `ts_init` lies in `[start, end]` into the catalog root, and
-    return the bars written. `feed` is `sip` by default, or `boats` within its bound; each feed keeps
-    its own root. Raises `HistoryStopped` (or `RateLimited`) naming what stopped it."""
+    return the bars written. `feed` is `sip` by default, or `boats` within its bound, 1-MINUTE bars
+    only; each feed keeps its own root, the default by `_default_root`. Raises `HistoryStopped` (or
+    `RateLimited`) naming what stopped it."""
+    if catalog_path is None:
+        catalog_path = _default_root("bars", feed)
     try:
         for name, value in (("start", start), ("end", end)):
             if value.tzinfo is None:
@@ -570,6 +583,11 @@ def load_history(
             )
         if feed == DataFeed.BOATS:
             _boats_bound(symbols, start, end)
+            if any(spec != "1-MINUTE" for spec in specs):
+                raise HistoryStopped(
+                    f"boats bars are 1-MINUTE only, got {list(specs)}: what a boats day bar means is "
+                    "UNVERIFIED; nothing was requested"
+                )
         if not specs or any(spec not in BAR_SPECS for spec in specs):
             raise HistoryStopped(
                 f"bar specifications must be one or more of {', '.join(BAR_SPECS)}, got {list(specs)}"
@@ -800,7 +818,7 @@ def load_trades(
     symbols: Sequence[str],
     start: datetime,
     end: datetime,
-    catalog_path: Path = DEFAULT_CATALOG,
+    catalog_path: Path | None = None,
     *,
     feed: DataFeed = FEED,
     pace: Pace = PACE,
@@ -815,6 +833,8 @@ def load_trades(
     writer (contracts in this module's header), an overfull interval in parts. Prints skipped
     rather than written are added to `skipped` by kind (`size 0`), for the caller's done line.
     """
+    if catalog_path is None:
+        catalog_path = _default_root("trades", feed)
     try:
         for name, value in (("start", start), ("end", end)):
             if value.tzinfo is None:
@@ -1118,7 +1138,7 @@ def load_quotes(
     symbols: Sequence[str],
     start: datetime,
     end: datetime,
-    catalog_path: Path = DEFAULT_CATALOG,
+    catalog_path: Path | None = None,
     *,
     feed: DataFeed = DataFeed.IEX,
     pace: Pace = PACE,
@@ -1136,8 +1156,10 @@ def load_quotes(
     timestamps and adapter's dropped-quote rules apply; start after the ambiguous 2025-11-03 unit
     cutover (ADR 0066). `feed` is `iex` by default, `sip` for at most `SIP_QUOTES_MAX_SYMBOLS`
     symbols over at most `SIP_QUOTES_MAX_SPAN`, or `boats` within `BOATS_MAX_SYMBOLS` and
-    `BOATS_MAX_SPAN`; each feed keeps its own root.
+    `BOATS_MAX_SPAN`; each feed keeps its own root, the default by `_default_root`.
     """
+    if catalog_path is None:
+        catalog_path = _default_root("quotes", feed)
     try:
         start_ns, end_ns = _quote_bounds(start, end, now())
         if not symbols or any(not symbol.strip() for symbol in symbols):
@@ -1310,7 +1332,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--start", type=_when, required=True, help="ISO 8601 with a time zone")
     parser.add_argument("--end", type=_when, required=True, help="ISO 8601 with a time zone")
     parser.add_argument(
-        "--bars", default="1-MINUTE,1-DAY", help="1-MINUTE, 1-DAY or both, comma-separated"
+        "--bars",
+        help="1-MINUTE, 1-DAY or both, comma-separated; default both, or 1-MINUTE for boats",
     )
     parser.add_argument(
         "--catalog",
@@ -1351,17 +1374,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             "boats loads take --symbols named on the command line, not --symbols-file "
             f"(at most {BOATS_MAX_SYMBOLS}, BOATS_MAX_SYMBOLS)"
         )
+    if args.bars is None:
+        args.bars = "1-MINUTE" if feed == DataFeed.BOATS else "1-MINUTE,1-DAY"
     if args.catalog is None:
-        if feed == DataFeed.BOATS:
-            args.catalog = BOATS_QUOTES_CATALOG if quote_feed is not None else BOATS_CATALOG
-        else:
-            args.catalog = SIP_QUOTES_CATALOG if quote_feed == DataFeed.SIP else DEFAULT_CATALOG
+        args.catalog = _default_root(args.data, feed)
     for name in ("start", "end"):
         if getattr(args, name).tzinfo is None:
             parser.error(f"--{name} must carry a time zone")
     if args.start >= args.end:
         parser.error(f"--start {args.start} is not before --end {args.end}")
-    if feed == DataFeed.BOATS and args.end > utc_now() - PUBLICATION_DELAY:
+    now = utc_now()
+    if feed == DataFeed.BOATS and args.end > now - PUBLICATION_DELAY:
         parser.error(
             f"--end must be at least {PUBLICATION_DELAY.total_seconds() / 60:.0f} minutes before now "
             "for boats data: Alpaca's 24/5 page gives historical overnight data \"provided that the end "
@@ -1372,7 +1395,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     specs = [s.strip() for s in args.bars.split(",") if s.strip()]
     if args.data == "bars" and (not specs or any(s not in BAR_SPECS for s in specs)):
         parser.error(f"--bars takes {', '.join(BAR_SPECS)}, got {args.bars!r}")
-    now = utc_now()
     if args.data == "quotes":
         try:
             _quote_bounds(args.start, args.end, now)
