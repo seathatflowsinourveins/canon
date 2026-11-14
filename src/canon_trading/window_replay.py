@@ -6,6 +6,13 @@ the three engine reports. trade-execution.md:52-75 and fill-prices-and-matching.
 define the touch/tape presets. Composition is mover_window.mover_universe_parts and
 window_rank; reference_reader/inline_reads are MoversRankActor's offline contract.
 
+Shutdown uses common/__init__.pyi:640-653 (clock alerts), trading/__init__.pyi:511
+(managed Strategy.stop) and crates/backtest/src/engine.rs:1049-1078 (end's timer flush).
+The replay requests the Mover's stop one market-exit interval before window_end, so a
+flat Mover's exit check can finalize it at the boundary (strategy/mod.rs:1861-2004).
+Its regular wind-down and paper managed stop are unchanged; no data or timer is replayed
+past window_end.
+
 The JSON spec names bars_root, quotes_roots (a list), trades_root, baseline_path,
 trade_date, timezone-aware window_start/window_end/wind_down_at, trail_arm, fill_arm,
 slots, entry_notional, starting_balance (Money's "amount USD" form), roster (symbol,
@@ -104,6 +111,7 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
     from collections.abc import Sequence
 
+    from nautilus_trader.common import TimeEvent
     from nautilus_trader.model import Bar
 
 NY = ZoneInfo("America/New_York")
@@ -584,6 +592,18 @@ def _run_replay(spec: Mapping[str, Any]) -> dict[str, Any]:
         engine.add_actor(ranking)
         for cap in caps:
             engine.add_strategy(cap)
+
+        def stop_window(_event: TimeEvent) -> None:
+            if strategy.is_running():
+                strategy.stop()
+
+        # Use run()'s same integer boundary: datetime alerts can otherwise leave the
+        # first exit check a fraction of a microsecond beyond a rounded end timestamp.
+        strategy.clock.set_time_alert_ns(
+            "window-replay-stop",
+            _ns(end) - session_window.MARKET_EXIT_INTERVAL_MS * (SECOND // 1000),
+            stop_window,
+        )
         bar_types = [f"{i.id}-{BAR_SPEC}" for i in instruments]
         for instrument, bar_type in zip(instruments, bar_types, strict=True):
             for low, high in catalog.get_missing_intervals_for_request(

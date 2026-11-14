@@ -393,6 +393,54 @@ Mover.record = observed_record
     json.dumps(report, allow_nan=False)
 
 
+@pytest.mark.parametrize("fill_arm", ["touch", "tape"])
+@pytest.mark.parametrize("tail_seconds", [0, 0.000006, 30])
+def test_regular_mover_finishes_managed_stop_before_engine_disposal(
+    neutral_catalogs, monkeypatch, fill_arm, tail_seconds
+):
+    from canon_trading import window_replay
+
+    spec, *_ = neutral_catalogs
+    # Observe the real composed Mover after engine.end(), before _checked_engine disposes it.
+    # The later bound also exercises shutdown when no market data reaches window_end.
+    injection = """
+from canon_trading.mover import Mover
+record = Mover.record
+on_stop = Mover.on_stop
+def observed_stop(self):
+    on_stop(self)
+    self.observed_stop_ns = self.clock.timestamp_ns()
+def observed_record(self):
+    return {
+        **record(self),
+        "observed_state": str(self.state()),
+        "observed_manage_stop": self.manage_stop_set,
+        "observed_stop_ns": getattr(self, "observed_stop_ns", None),
+    }
+Mover.on_stop = observed_stop
+Mover.record = observed_record
+"""
+    monkeypatch.setattr(
+        window_replay, "_WORKER", OFFLINE_GUARDS + injection + window_replay._WORKER
+    )
+    end = END + timedelta(seconds=tail_seconds)
+    report = window_replay.run_replay({**spec, "fill_arm": fill_arm, "window_end": end.isoformat()})
+    run = report["mover"]["run"]
+    assert run["observed_manage_stop"] is True
+    assert report["open_positions"] == 0
+    assert {fill[1] for fill in run["fills"]} == {"BUY", "SELL"}
+    assert run["observed_state"] == "ComponentState.STOPPED", json.dumps(
+        report["engine_errors"], indent=2
+    )
+    assert run["observed_stop_ns"] >= ns(end)
+    assert not any(
+        "still RUNNING after the backtest end sequence" in row["message"]
+        or "Error disposing trader" in row["message"]
+        or "RUNNING -> DISPOSE" in row["message"]
+        for row in report["engine_errors"]
+    ), report["engine_errors"]
+
+
 def test_full_cli_run_never_reaches_the_outside_world(neutral_catalogs, monkeypatch, tmp_path):
     from alpaca.trading.client import TradingClient
     from canon_alpaca import providers
@@ -558,8 +606,7 @@ def test_checked_engine_fails_on_lifecycle_handler_error(neutral_catalogs, monke
     from canon_trading import window_replay
 
     spec, *_ = neutral_catalogs
-    # A stand-in without managed stopping reaches both callbacks. Mover's managed stop
-    # remains RUNNING at this pin's backtest end and does not invoke its Python on_stop.
+    # A stand-in without managed stopping isolates the log check from Mover's exit timer.
     worker = f"""
 import json
 import sys
