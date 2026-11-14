@@ -194,8 +194,9 @@ leaves the carried level kept and arms nothing, named at each step (ruling (a), 
 A level both supplied and carried arms at the greater, named (ruling (b)). The book carries the
 limit offset beside level and distance; an entry with none takes today's quarter-trail rule, named
 (ruling (c)). The runner supplies session_part and a raw asset reader for overnight runs; an
-answered eligibility is kept for the run, an unread one retried at most once a minute (review F7),
-with refusals named and old entries untouched.
+answered eligibility is kept for the run. Unread names are retried together in discovery, at most
+once a minute measured from the last asset read's end (review F7); slow reads cannot spend the
+cooldown while blocking the event thread. Refusals are named and old entries untouched.
 The book is also the node report (the lead, 2026-11-13 17:13): each entry carries its holding's
 state (_holding_state maps this strategy's records to armed, guarded, counting, waiting, frozen),
 written when it changes, and the file carries last_step_ns per account label, written at most
@@ -695,8 +696,9 @@ class OwnerProtector(Strategy):
         self.replaceable: set[Key] = set()
         # Review F3: entries retired when this run saw their holding end, written with no level.
         self.retired: dict[Key, Entry] = {}
-        # Review F7: an unread eligibility, by the clock of its last attempt, retried once a minute.
-        self.overnight_unread: dict[InstrumentId, tuple[int, str]] = {}
+        # Review F7: all unread names share the cooldown after the last asset read returns.
+        self.overnight_unread: dict[InstrumentId, str] = {}
+        self.overnight_read_ended_ns: int | None = None
         self.history_bars: dict[InstrumentId, dict[int, Bar]] = {}
         self.request_failures: dict[str, str] = {}
         # Each seed request in flight, per instrument, with the holding that sent it and when.
@@ -1124,10 +1126,21 @@ class OwnerProtector(Strategy):
             for position in self.cache.positions_open(strategy_id=EXTERNAL)
             if position.signed_qty > 0
         }
+        # Decide the retry batch once, before any blocking read. Updating its end stamp must
+        # neither admit another retry in this pass nor postpone the other names already due.
+        retry_overnight = (
+            set(self.overnight_unread)
+            if self.settings.session_part == "overnight"
+            and self.overnight_read_ended_ns is not None
+            and self.clock.timestamp_ns() - self.overnight_read_ended_ns >= OVERNIGHT_RETRY_NS
+            else set()
+        )
         for instrument_id in sorted(instruments, key=str):
             if instrument_id in self.slots or instrument_id in self.stopped_instruments:
                 continue
             try:
+                if instrument_id in retry_overnight:
+                    self._read_overnight_eligibility(instrument_id)
                 self._discover_holding(instrument_id)
             except Exception as exc:  # noqa: BLE001 - one holding never costs another discovery.
                 # Codex's P1-b on 62941f39: at the start, a raise here failed on_start, so no other
@@ -1194,6 +1207,7 @@ class OwnerProtector(Strategy):
         logging.getLogger(STREAM_LOGGER).addHandler(self.stream_errors)
         self.overnight_checks.clear()
         self.overnight_unread.clear()
+        self.overnight_read_ended_ns = None
         self._bound_reader()
         self.run = self.settings.run or f"{self.strategy_id}:{self.clock.timestamp_ns()}"
         if self.settings.account_label is not None:
@@ -1223,25 +1237,27 @@ class OwnerProtector(Strategy):
         if isinstance(self.settings.trading, RESTClient):
             with_http_timeout(self.settings.trading)
 
+    def _read_overnight_eligibility(self, instrument_id: InstrumentId) -> None:
+        """Keep an answer, or defer an unread name until a minute after this batch ends."""
+        reason, answered = overnight_answer(self.settings.trading, instrument_id.symbol.value)
+        # overnight_answer also returns after a failed or malformed read. The end of a slow
+        # answered read counts too: the other unread names share this event thread.
+        self.overnight_read_ended_ns = self.clock.timestamp_ns()
+        if answered:
+            self.overnight_checks[instrument_id] = reason
+            self.overnight_unread.pop(instrument_id, None)
+        else:
+            self.overnight_unread[instrument_id] = f"{reason}; read again at most once a minute"
+
     def _overnight_allowed(self, instrument_id: InstrumentId) -> bool:
         if self.settings.session_part != "overnight":
             return True
-        reason = self.overnight_checks.get(instrument_id)
-        if instrument_id not in self.overnight_checks:
-            now = self.clock.timestamp_ns()
-            unread = self.overnight_unread.get(instrument_id)
-            if unread is not None and now - unread[0] < OVERNIGHT_RETRY_NS:
-                reason = unread[1]
-            else:
-                reason, answered = overnight_answer(
-                    self.settings.trading, instrument_id.symbol.value
-                )
-                if answered:
-                    self.overnight_checks[instrument_id] = reason
-                    self.overnight_unread.pop(instrument_id, None)
-                else:
-                    reason = f"{reason}; read again at most once a minute"
-                    self.overnight_unread[instrument_id] = (now, reason)
+        if (
+            instrument_id not in self.overnight_checks
+            and instrument_id not in self.overnight_unread
+        ):
+            self._read_overnight_eligibility(instrument_id)
+        reason = self.overnight_checks.get(instrument_id, self.overnight_unread.get(instrument_id))
         if reason is None:
             return True
         self.frozen[instrument_id] = reason
