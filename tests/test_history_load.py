@@ -12,7 +12,9 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import re
+import subprocess
 import sys
 import tomllib
 from dataclasses import dataclass
@@ -862,3 +864,285 @@ def test_a_boats_bar_load_with_no_root_named_claims_the_boats_root(
         > 0
     )
     assert (catalog / FEED_FILE).read_text() == "boats\n"
+
+
+# One process for a run of days (the lead's fix (c), 2026-11-14): spans, a definitions root, a line per phase.
+
+SPANS = [
+    (MIN_START, MIN_END),
+    (MIN_START + timedelta(hours=1), MIN_END + timedelta(hours=1)),
+    (MIN_START + timedelta(hours=2), MIN_END + timedelta(hours=2)),
+]
+MINUTE = "1-MINUTE-LAST-EXTERNAL"
+
+
+def defined_root(path: Path) -> Path:
+    path.mkdir()
+    ParquetDataCatalog(str(path)).write_instruments(
+        [parse_equity(standins.asset(symbol=s), 0) for s in SYMBOLS]
+    )
+    return path
+
+
+def run_spans(catalog: Path, spans=SPANS, **kw):
+    return run(catalog, start=spans[0][0], end=spans[-1][1], spans=spans, **kw)
+
+
+def ns(moment: datetime) -> int:
+    return int(moment.timestamp() * 1e9)
+
+
+def test_one_coverage_read_clipped_to_each_span_equals_a_read_per_span(venue, catalog) -> None:
+    """The drift check on `_clip`: coverage that ends inside one span and starts inside the next."""
+    run(catalog, start=MIN_START + timedelta(minutes=5), end=MIN_START + timedelta(minutes=65))
+    store = ParquetDataCatalog(str(catalog))
+    bar_type = f"AAPL.ALPACA-{MINUTE}"
+    spans_ns = [(ns(lo), ns(hi)) for lo, hi in SPANS]
+    outer = store.get_missing_intervals_for_request(
+        spans_ns[0][0], spans_ns[-1][1], history_load.NautilusDataType.Bar, bar_type
+    )
+    per_span = tuple(
+        (lo, hi)
+        for a, b in spans_ns
+        for lo, hi in store.get_missing_intervals_for_request(
+            a, b, history_load.NautilusDataType.Bar, bar_type
+        )
+    )
+    assert history_load._clip(outer, spans_ns) == per_span
+    assert len(per_span) == 3  # the start of the first span, the end of the second, all the third
+
+
+def test_a_run_of_spans_loads_what_a_load_per_span_loads_and_nothing_between(
+    venue, catalog, tmp_path
+) -> None:
+    apart = defined_root(tmp_path / "apart")
+    written = run_spans(catalog)
+    each = sum(run(apart, start=lo, end=hi) for lo, hi in SPANS)
+
+    assert written == each == 3 * 11 * len(SYMBOLS)
+    store, other = ParquetDataCatalog(str(catalog)), ParquetDataCatalog(str(apart))
+    for symbol in SYMBOLS:
+        bar_type = f"{symbol}.ALPACA-{MINUTE}"
+        assert [b.ts_init for b in bars_in(catalog, symbol, "1-MINUTE")] == [
+            b.ts_init for b in bars_in(apart, symbol, "1-MINUTE")
+        ]
+        kind = history_load.NautilusDataType.Bar
+        assert store.get_intervals(kind, bar_type) == other.get_intervals(kind, bar_type)
+        assert all(
+            any(ns(lo) <= b.ts_init <= ns(hi) for lo, hi in SPANS)
+            for b in bars_in(catalog, symbol, "1-MINUTE")
+        )
+    venue.sent.clear()
+    run_spans(catalog)
+    assert venue.sent == []
+
+
+def test_a_run_of_spans_keeps_one_pace_across_them(venue, catalog) -> None:
+    """A schedule restarted per span would send each span's first call early."""
+    clock = Clock()
+    run_spans(catalog, clock=clock)
+
+    assert len(venue.bars_sent()) == 3
+    assert clock.slept == [pytest.approx(60 / PACE.data_per_minute)] * 2
+
+
+@pytest.mark.parametrize(
+    ("spans", "message"),
+    [
+        ([(MIN_START, MIN_END), (MIN_END, MIN_END + timedelta(minutes=5))], "do not overlap"),
+        (
+            [(MIN_START + timedelta(hours=1), MIN_END + timedelta(hours=1)), (MIN_START, MIN_END)],
+            "in order",
+        ),
+        ([(MIN_END, MIN_START)], "not before"),
+    ],
+)
+def test_spans_out_of_order_overlapping_or_empty_are_refused_before_any_request(
+    venue, catalog, spans, message
+) -> None:
+    with pytest.raises(HistoryStopped, match=message):
+        run(catalog, start=min(s[0] for s in spans), end=max(s[1] for s in spans), spans=spans)
+    assert venue.sent == []
+    assert not (catalog / ".history-load.lock").exists()
+
+
+def test_spans_that_do_not_run_from_start_to_end_are_refused(venue, catalog) -> None:
+    with pytest.raises(HistoryStopped, match="not from"):
+        run(catalog, start=MIN_START, end=SPANS[-1][1] + timedelta(minutes=1), spans=SPANS)
+    assert venue.sent == []
+
+
+def test_a_definitions_root_supplies_the_instruments_of_a_root_that_has_none(
+    venue, tmp_path
+) -> None:
+    bars_root, defs = tmp_path / "bars", defined_root(tmp_path / "defs")
+    bars_root.mkdir()
+    with pytest.raises(HistoryStopped, match="no instrument definition"):
+        run(bars_root)
+    assert venue.sent == []
+
+    lines: list[str] = []
+    assert run(bars_root, definitions=defs, out=lines.append) == 11 * len(SYMBOLS)
+    assert not (bars_root / "data" / "equity").exists()
+    assert not (defs / "data" / "bars").exists()
+
+
+def test_a_definitions_root_that_holds_data_is_refused_before_any_request(
+    venue, catalog, tmp_path
+) -> None:
+    run(catalog, symbols=["AAPL"])
+    venue.sent.clear()
+    with pytest.raises(HistoryStopped, match="holds bars"):
+        run(defined_root(tmp_path / "defs"), definitions=catalog)
+    assert venue.sent == []
+    with pytest.raises(HistoryStopped, match="ledger"):
+        run(catalog, definitions=Path("ledger/defs"))
+
+
+def test_each_phase_prints_its_wall_and_cpu_time_even_when_the_run_stops(venue, catalog) -> None:
+    lines: list[str] = []
+    run(catalog, out=lines.append)
+    phases = [line for line in lines if line.startswith("paper:history: phase ")]
+    assert [p.split(":")[2].strip() for p in phases] == [
+        "phase definitions",
+        "phase coverage",
+        "phase fetch and parse",
+        "phase write",
+    ]
+    assert all(re.search(r"wall \d+\.\d s, user \d+\.\d s, sys \d+\.\d s$", p) for p in phases)
+
+    venue.answers = [429]
+    stopped: list[str] = []
+    with pytest.raises(RateLimited):
+        run(
+            catalog,
+            start=MIN_START + timedelta(hours=3),
+            end=MIN_END + timedelta(hours=3),
+            out=stopped.append,
+        )
+    assert sum(line.startswith("paper:history: phase ") for line in stopped) == 4
+
+
+@pytest.mark.parametrize(
+    ("extra", "spans_text", "message"),
+    [
+        (["--start", "2026-11-10T14:00:00Z"], None, "takes no --start or --end"),
+        (["--data", "trades"], None, "sip bars only"),
+        (["--feed", "boats"], None, "sip bars only"),
+        (
+            [],
+            "2026-11-10T14:00:00Z 2026-11-10T15:00:00Z\n2026-11-10T14:30:00Z 2026-11-10T16:00:00Z\n",
+            "overlap",
+        ),
+        ([], "2026-11-10T14:00:00Z\n", "give START END"),
+        ([], "2026-11-10T14:00:00 2026-11-10T15:00:00\n", "time zone"),
+        ([], "# nothing\n", "at least one span"),
+    ],
+)
+def test_the_spans_file_is_refused_with_what_it_cannot_take(
+    extra, spans_text, message, tmp_path, capsys, monkeypatch
+) -> None:
+    monkeypatch.setattr(history_load, "utc_now", lambda: NOW)
+    spans = tmp_path / "spans.txt"
+    spans.write_text(spans_text or "2026-11-10T14:00:00Z 2026-11-10T15:00:00Z\n")
+    with pytest.raises(SystemExit) as exit_:
+        history_load.main(
+            ["--symbols", "AAPL", "--bars", "1-MINUTE", "--spans-file", str(spans), *extra]
+        )
+    assert exit_.value.code == 2
+    assert message in capsys.readouterr().err
+
+
+def test_definitions_are_for_bars_only(capsys, monkeypatch) -> None:
+    monkeypatch.setattr(history_load, "utc_now", lambda: NOW)
+    with pytest.raises(SystemExit) as exit_:
+        history_load.main(
+            [
+                "--symbols",
+                "AAPL",
+                "--start",
+                "2026-11-10T14:00:00Z",
+                "--end",
+                "2026-11-10T15:00:00Z",
+                "--data",
+                "trades",
+                "--definitions",
+                "defs",
+            ]
+        )
+    assert exit_.value.code == 2
+    assert "bars only" in capsys.readouterr().err
+
+
+def mise_load(tmp_path: Path, **usage: str) -> subprocess.CompletedProcess:
+    """The task's script with the keychain and uv replaced: what it would send the module, or its refusal."""
+    task = tomllib.loads((SOURCE_ROOT / "mise.toml").read_text())["tasks"]["paper:history"]
+    security = tmp_path / "security"
+    security.write_text("#!/bin/sh\necho placeholder\n")
+    security.chmod(0o700)
+    timeout = tmp_path / "timeout"
+    timeout.write_text('#!/bin/sh\nif [ "$1" = -s ]; then shift 2; fi\nshift\nexec "$@"\n')
+    timeout.chmod(0o700)
+    uv = tmp_path / "uv"
+    uv.write_text('#!/bin/sh\nprintf "%s\\n" "$@" > "$SENT"\n')
+    uv.chmod(0o700)
+    script = (
+        task["run"]
+        .replace("/usr/bin/security", str(security))
+        .replace("/usr/bin/timeout", str(timeout))
+    )
+    env = {
+        "PATH": f"{tmp_path}:{os.defpath}",
+        "SENT": str(tmp_path / "sent"),
+        "usage_account": "windows",
+    }
+    env.update({f"usage_{k}": v for k, v in usage.items()})
+    return subprocess.run(
+        ["bash", "-c", script], env=env, capture_output=True, text=True, check=False
+    )
+
+
+def test_the_task_passes_a_spans_file_and_definitions_and_no_empty_start_or_end(tmp_path) -> None:
+    done = mise_load(
+        tmp_path,
+        symbols_file="/s.txt",
+        spans_file="/spans.txt",
+        definitions="/defs",
+        catalog="/bars",
+    )
+    assert done.returncode == 0, done.stderr
+    sent = (tmp_path / "sent").read_text().splitlines()
+    assert "--start" not in sent and "--end" not in sent
+    assert sent[sent.index("--spans-file") + 1] == "/spans.txt"
+    assert sent[sent.index("--definitions") + 1] == "/defs"
+
+    done = mise_load(
+        tmp_path, symbols="AAPL", start="2026-11-10T14:00:00Z", end="2026-11-10T15:00:00Z"
+    )
+    assert done.returncode == 0, done.stderr
+    sent = (tmp_path / "sent").read_text().splitlines()
+    assert sent[sent.index("--start") + 1] == "2026-11-10T14:00:00Z"
+    assert "--spans-file" not in sent and "--definitions" not in sent
+
+
+@pytest.mark.parametrize(
+    ("usage", "message"),
+    [
+        (
+            {"spans_file": "/spans.txt", "start": "2026-11-10T14:00:00Z"},
+            "takes no --start or --end",
+        ),
+        ({"spans_file": "/spans.txt", "data": "trades"}, "sip bars only"),
+        ({"spans_file": "/spans.txt", "feed": "boats"}, "sip bars only"),
+        ({"definitions": "/defs", "data": "quotes"}, "bars only"),
+        ({"mode": "baseline", "spans_file": "/spans.txt"}, "--spans-file"),
+        ({"mode": "conditions", "definitions": "/defs"}, "--definitions"),
+    ],
+)
+def test_the_task_refuses_a_spans_file_or_definitions_it_cannot_take_before_reading_a_pair(
+    tmp_path, usage, message
+) -> None:
+    done = mise_load(tmp_path, symbols="AAPL", **usage)
+    assert done.returncode == 3
+    assert message in done.stderr
+    assert not (tmp_path / "sent").exists()

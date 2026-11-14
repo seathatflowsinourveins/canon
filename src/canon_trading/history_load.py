@@ -161,12 +161,22 @@ marker refuses another feed's root, `_check_kinds` keeps quotes apart from bars 
 other rule above holds unchanged: GET only, the pace, the first 429 and a refused feed stopping by name,
 nothing falling back to `sip`. Whether the feed answers on a paper pair for trades and bars is
 UNVERIFIED here; `tests/test_paper_quote_history.py` saw its quotes begin on 2024-09-16 (2026-11-10).
+
+A run of days in one process, for sip bars: `--spans-file` names the spans, in order and apart, and the
+load takes one catalog lock and one pace schedule for them all. It reads coverage once per bar type over
+the run with the pin's `get_missing_intervals_for_request`, then clips the result to each span; that equals
+asking span by span, since spans are disjoint and a span's gap is the span less what is covered.
+`--definitions` reads the instruments from a root of definitions alone. The pin's `instruments()` lists
+the whole `data/` tree before it filters, so on a root of bars that listing grows with the bars held. A line
+per phase (definitions, coverage, fetch and parse, write) gives each one's wall, user and system time from
+`resource.getrusage`. The measurement that called for this is in ADR 0153.
 """
 
 from __future__ import annotations
 
 import argparse
 import fcntl
+import resource
 import sys
 import time
 from collections.abc import Callable
@@ -546,6 +556,88 @@ def _paced_trade_gets(
             session.mount(prefix, adapter)
 
 
+class _Phases:
+    """Wall and CPU time per phase of one load, from Python 3.14 `resource.getrusage(RUSAGE_SELF)`, which counts
+    every thread of this process (the catalog's own worker threads with it) and `time.monotonic`."""
+
+    NAMES = ("definitions", "coverage", "fetch and parse", "write")
+
+    def __init__(self) -> None:
+        self.spent = {name: [0.0, 0.0, 0.0] for name in self.NAMES}
+
+    @contextmanager
+    def __call__(self, name: str) -> Generator[None]:
+        wall, used = time.monotonic(), resource.getrusage(resource.RUSAGE_SELF)
+        try:
+            yield
+        finally:
+            after = resource.getrusage(resource.RUSAGE_SELF)
+            spent = self.spent[name]
+            spent[0] += time.monotonic() - wall
+            spent[1] += after.ru_utime - used.ru_utime
+            spent[2] += after.ru_stime - used.ru_stime
+
+    def lines(self) -> list[str]:
+        return [
+            f"paper:history: phase {name}: wall {w:.1f} s, user {u:.1f} s, sys {y:.1f} s"
+            for name, (w, u, y) in self.spent.items()
+        ]
+
+
+def _check_spans(spans: Sequence[tuple[datetime, datetime]]) -> None:
+    """Each span carries a time zone and starts before it ends, and the spans come in order with no overlap."""
+    if not spans:
+        raise HistoryStopped("at least one span is required")
+    for i, (lo, hi) in enumerate(spans):
+        for name, value in (("start", lo), ("end", hi)):
+            if value.tzinfo is None:
+                raise HistoryStopped(f"{name} must carry a time zone, got {value}")
+        if lo >= hi:
+            raise HistoryStopped(f"start {lo} is not before end {hi}")
+        if i and lo <= spans[i - 1][1]:
+            raise HistoryStopped(
+                f"span {lo}..{hi} does not begin after the span before it ends ({spans[i - 1][1]}); "
+                "spans come in order and do not overlap"
+            )
+
+
+def _clip(
+    missing: Sequence[tuple[int, int]], spans_ns: Sequence[tuple[int, int]]
+) -> tuple[tuple[int, int], ...]:
+    """The parts of NautilusTrader's missing intervals over the run's outer bounds that lie in a span, both ends
+    inclusive as the catalog gives them: the same as asking it span by span, since a span's missing part is the
+    span less what is covered (`test_one_coverage_read_clipped_to_each_span_equals_a_read_per_span`)."""
+    return tuple(
+        (max(lo, a), min(hi, b))
+        for lo, hi in missing
+        for a, b in spans_ns
+        if max(lo, a) <= min(hi, b)
+    )
+
+
+def _definitions_root(definitions: Path) -> Path:
+    """A root of instrument definitions alone: never under ledger/, existing, and holding no bars, trades or
+    quotes, so listing it reads the definitions and nothing else (the lead's fix (c), 2026-11-14)."""
+    path = definitions.resolve()
+    if (
+        path == LEDGER.resolve()
+        or LEDGER.resolve() in path.parents
+        or "ledger" in definitions.parts
+    ):
+        raise HistoryStopped(
+            f"the definitions root {definitions} is under ledger/, which holds the trial ledger only"
+        )
+    if not path.is_dir():
+        raise HistoryStopped(f"the definitions root {path} must be an existing directory")
+    data = path / "data"
+    held = sorted(name for name, _ in _KINDS if (data / name).exists())
+    if held:
+        raise HistoryStopped(
+            f"the definitions root {path} holds {' and '.join(held)}; it holds instrument definitions alone"
+        )
+    return path
+
+
 def load_history(
     client: Any,
     symbols: Sequence[str],
@@ -562,19 +654,74 @@ def load_history(
     sleep: Callable[[float], None] = time.sleep,
     now: Callable[[], datetime] = utc_now,
     out: Callable[[str], None] = print,
+    spans: Sequence[tuple[datetime, datetime]] | None = None,
+    definitions: Path | None = None,
 ) -> int:
     """Load `specs` bars of `symbols` whose `ts_init` lies in `[start, end]` into the catalog root, and
     return the bars written. `feed` is `sip` by default, or `boats` within its bound, 1-MINUTE bars
     only; each feed keeps its own root, the default by `_default_root`. Raises `HistoryStopped` (or
-    `RateLimited`) naming what stopped it."""
+    `RateLimited`) naming what stopped it.
+
+    `spans`, ordered and disjoint, from `start` to `end`, loads a run of days in this one process: one
+    catalog lock, one definitions read, one coverage read per bar type over `[start, end]` clipped to each
+    span, and one pace schedule across them all. `definitions` reads the instruments from a root of
+    definitions alone instead of the catalog root. Either way a line per phase gives its wall and CPU time.
+    """
     if catalog_path is None:
         catalog_path = _default_root("bars", feed)
+    phases = _Phases()
     try:
-        for name, value in (("start", start), ("end", end)):
-            if value.tzinfo is None:
-                raise HistoryStopped(f"{name} must carry a time zone, got {value}")
-        if start >= end:
-            raise HistoryStopped(f"start {start} is not before end {end}")
+        return _checked_load(
+            client,
+            symbols,
+            specs,
+            start,
+            end,
+            catalog_path,
+            feed=feed,
+            pace=pace,
+            symbols_per_call=symbols_per_call,
+            max_rows=max_rows,
+            clock=clock,
+            sleep=sleep,
+            now=now,
+            out=out,
+            spans=spans,
+            definitions=definitions,
+            phases=phases,
+        )
+    finally:
+        for line in phases.lines():
+            out(line)
+
+
+def _checked_load(
+    client: Any,
+    symbols: Sequence[str],
+    specs: Sequence[str],
+    start: datetime,
+    end: datetime,
+    catalog_path: Path,
+    *,
+    feed: DataFeed,
+    pace: Pace,
+    symbols_per_call: int,
+    max_rows: int,
+    clock: Callable[[], float],
+    sleep: Callable[[float], None],
+    now: Callable[[], datetime],
+    out: Callable[[str], None],
+    spans: Sequence[tuple[datetime, datetime]] | None,
+    definitions: Path | None,
+    phases: _Phases,
+) -> int:
+    try:
+        spans = list(spans) if spans is not None else [(start, end)]
+        _check_spans(spans)
+        if (spans[0][0], spans[-1][1]) != (start, end):
+            raise HistoryStopped(
+                f"the spans run from {spans[0][0]} to {spans[-1][1]}, not from {start} to {end}"
+            )
         if not symbols:
             raise HistoryStopped("at least one symbol is required")
         if feed not in BAR_FEEDS:
@@ -582,6 +729,8 @@ def load_history(
                 f"bars feed {feed.value} is refused; sip, or boats within its bound; nothing was requested"
             )
         if feed == DataFeed.BOATS:
+            if len(spans) > 1:
+                raise HistoryStopped("boats bars take one span; nothing was requested")
             _boats_bound(symbols, start, end)
             if any(spec != "1-MINUTE" for spec in specs):
                 raise HistoryStopped(
@@ -610,26 +759,30 @@ def load_history(
             )
         if not path.is_dir():
             raise HistoryStopped(f"the catalog at {path} must be an existing directory")
-        _check_kinds(path, "bars")
+        defs_path = _definitions_root(definitions) if definitions is not None else path
+        with phases("coverage"):
+            _check_kinds(path, "bars")
         _check_feed(path, feed)
         catalog = ParquetDataCatalog(str(path))
         ids = [f"{s}.{VENUE}" for s in symbols]
-        instruments = {str(i.id): i for i in catalog.instruments(instrument_ids=ids)}
+        with phases("definitions"):
+            defs = catalog if defs_path == path else ParquetDataCatalog(str(defs_path))
+            instruments = {str(i.id): i for i in defs.instruments(instrument_ids=ids)}
         if absent := [i for i in ids if i not in instruments]:
             raise HistoryStopped(
-                f"no instrument definition in {path} for {', '.join(absent[:20])}"
+                f"no instrument definition in {defs_path} for {', '.join(absent[:20])}"
                 f"{' and more' if len(absent) > 20 else ''}: the asset list load writes them (ADR 0093); "
                 "nothing was requested"
             )
         with _catalog_lock(path):
-            _check_kinds(path, "bars")
+            with phases("coverage"):
+                _check_kinds(path, "bars")
             _check_feed(path, feed)
             return _load_history(
                 client,
                 symbols,
                 specs,
-                start,
-                end,
+                spans,
                 path,
                 catalog,
                 instruments,
@@ -641,6 +794,7 @@ def load_history(
                 sleep=sleep,
                 now=now,
                 out=out,
+                phases=phases,
             )
     except HistoryStopped:
         raise
@@ -655,8 +809,7 @@ def _load_history(
     client: Any,
     symbols: Sequence[str],
     specs: Sequence[str],
-    start: datetime,
-    end: datetime,
+    spans: Sequence[tuple[datetime, datetime]],
     path: Path,
     catalog: ParquetDataCatalog,
     instruments: dict[str, Any],
@@ -669,21 +822,25 @@ def _load_history(
     sleep: Callable[[float], None],
     now: Callable[[], datetime],
     out: Callable[[str], None],
+    phases: _Phases,
 ) -> int:
     written = 0
-    next_at = clock()
-    start_ns, end_ns = dt_to_unix_nanos(start), dt_to_unix_nanos(end)
+    next_at = clock()  # one schedule for every span, so ADR 0093's row holds across them
+    spans_ns = [(dt_to_unix_nanos(lo), dt_to_unix_nanos(hi)) for lo, hi in spans]
+    start_ns, end_ns = spans_ns[0][0], spans_ns[-1][1]
     for spec in specs:
         bar_types = {s: BarType.from_str(f"{s}.{VENUE}-{BAR_SPECS[spec]}") for s in symbols}
         interval = timedelta(microseconds=bar_interval_ns(next(iter(bar_types.values()))) // 1_000)
         timeframe = bar_timeframe(next(iter(bar_types.values())))
         gaps: dict[tuple[tuple[int, int], ...], list[str]] = {}
-        for symbol, bar_type in bar_types.items():
-            missing = catalog.get_missing_intervals_for_request(
-                start_ns, end_ns, NautilusDataType.Bar, str(bar_type)
-            )
-            if missing:
-                gaps.setdefault(tuple((lo, hi) for lo, hi in missing), []).append(symbol)
+        with phases("coverage"):
+            for symbol, bar_type in bar_types.items():
+                missing = catalog.get_missing_intervals_for_request(
+                    start_ns, end_ns, NautilusDataType.Bar, str(bar_type)
+                )
+                # Spans are disjoint, so a write into one never moves another's gaps: one read serves them all.
+                if clipped := _clip(missing, spans_ns):
+                    gaps.setdefault(clipped, []).append(symbol)
         step = bar_interval_ns(next(iter(bar_types.values())))
         if spec == "1-DAY":
             # New York daily opens can be 23 hours apart at spring DST, even though parse_bar
@@ -715,7 +872,8 @@ def _load_history(
                         f"{spec} bars of {len(batch)} symbol(s) from {batch[0]}, feed {feed.value}"
                     )
                     try:
-                        result = client.get_stock_bars(request)
+                        with phases("fetch and parse"):
+                            result = client.get_stock_bars(request)
                     except HistoryStopped:
                         raise
                     except APIError as e:
@@ -761,15 +919,16 @@ def _load_history(
                         rounded = 0
                         first_rounding = ""
                         try:
-                            for bar in result.data.get(symbol, []):
-                                parsed = parse_bar(bar, bar_type, instrument)
-                                if not lo <= parsed.ts_init <= hi:
-                                    continue
-                                bars.append(parsed)
-                                if fields := bar_roundings(bar, parsed):
-                                    rounded += 1
-                                    if not first_rounding:
-                                        first_rounding = f"{bar.timestamp} {', '.join(fields)}"
+                            with phases("fetch and parse"):
+                                for bar in result.data.get(symbol, []):
+                                    parsed = parse_bar(bar, bar_type, instrument)
+                                    if not lo <= parsed.ts_init <= hi:
+                                        continue
+                                    bars.append(parsed)
+                                    if fields := bar_roundings(bar, parsed):
+                                        rounded += 1
+                                        if not first_rounding:
+                                            first_rounding = f"{bar.timestamp} {', '.join(fields)}"
                         except Exception as e:
                             raise HistoryStopped(
                                 f"parsing {bar_type} on feed {feed.value} failed "
@@ -786,7 +945,8 @@ def _load_history(
                             )
                         claimed = _claim_feed(path, feed)
                         try:
-                            catalog.write_bars(bars, start=lo, end=hi)
+                            with phases("write"):
+                                catalog.write_bars(bars, start=lo, end=hi)
                         except Exception as e:
                             if (
                                 claimed
@@ -1322,6 +1482,29 @@ def load_quotes(
         ) from e
 
 
+def _read_spans(parser: argparse.ArgumentParser, file: Path) -> list[tuple[datetime, datetime]]:
+    try:
+        text = file.read_text(encoding="utf-8")
+    except OSError as e:
+        parser.error(f"--spans-file: {e}")
+    spans = []
+    for number, line in enumerate(text.splitlines(), 1):
+        if not (line := line.strip()) or line.startswith("#"):
+            continue
+        parts = line.split()
+        if len(parts) != 2:
+            parser.error(f"--spans-file line {number}: give START END, got {line!r}")
+        try:
+            spans.append((_when(parts[0]), _when(parts[1])))
+        except argparse.ArgumentTypeError as e:
+            parser.error(f"--spans-file line {number}: {e}")
+    try:
+        _check_spans(spans)
+    except HistoryStopped as e:
+        parser.error(f"--spans-file: {e}")
+    return spans
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m canon_trading.history_load", description=__doc__
@@ -1329,8 +1512,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     which = parser.add_mutually_exclusive_group(required=True)
     which.add_argument("--symbols", help="symbols, comma-separated")
     which.add_argument("--symbols-file", type=Path, help="a file of symbols, one a line")
-    parser.add_argument("--start", type=_when, required=True, help="ISO 8601 with a time zone")
-    parser.add_argument("--end", type=_when, required=True, help="ISO 8601 with a time zone")
+    parser.add_argument("--start", type=_when, help="ISO 8601 with a time zone")
+    parser.add_argument("--end", type=_when, help="ISO 8601 with a time zone")
+    parser.add_argument(
+        "--spans-file",
+        type=Path,
+        help=(
+            "sip bars only, in place of --start and --end: a file of spans, one a line as START END, ISO 8601 "
+            "with a time zone, in order and not overlapping, loaded in this one process"
+        ),
+    )
+    parser.add_argument(
+        "--definitions",
+        type=Path,
+        help="bars only: read instrument definitions from this root, which holds definitions alone",
+    )
     parser.add_argument(
         "--bars",
         help="1-MINUTE, 1-DAY or both, comma-separated; default both, or 1-MINUTE for boats",
@@ -1353,6 +1549,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         ),
     )
     args = parser.parse_args(argv)
+    spans: list[tuple[datetime, datetime]] | None = None
+    if args.spans_file is not None:
+        if args.start is not None or args.end is not None:
+            parser.error("--spans-file takes no --start or --end: the file gives every span")
+        if args.data != "bars" or args.feed not in (None, DataFeed.SIP.value):
+            parser.error("--spans-file is for sip bars only")
+        spans = _read_spans(parser, args.spans_file)
+        args.start, args.end = spans[0][0], spans[-1][1]
+    elif args.start is None or args.end is None:
+        parser.error("give --start and --end together, or --spans-file")
+    if args.definitions is not None and args.data != "bars":
+        parser.error("--definitions is for bars only")
     if args.feed == "overnight":
         parser.error(f"--feed overnight is refused; give --feed boats. {OVERNIGHT_REFUSAL}")
     if args.data == "quotes":
@@ -1458,7 +1666,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         else:
             written = load_history(
-                client, symbols, specs, args.start, args.end, args.catalog, feed=feed, now=utc_now
+                client,
+                symbols,
+                specs,
+                args.start,
+                args.end,
+                args.catalog,
+                feed=feed,
+                now=utc_now,
+                spans=spans,
+                definitions=args.definitions,
             )
     except RateLimited as e:
         print(f"paper:history: {e}", file=sys.stderr, flush=True)
@@ -1467,8 +1684,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"paper:history: {e}", file=sys.stderr, flush=True)
         return 1
     unwritten = "".join(f", {n} {kind} skipped" for kind, n in skipped.items())
+    over = f" over {len(spans)} spans" if spans is not None else ""
+    defined = f", definitions from {args.definitions}" if args.definitions is not None else ""
     print(
-        f"paper:history: done, {written} {args.data} written to {args.catalog}{unwritten}",
+        f"paper:history: done, {written} {args.data} written to {args.catalog}{over}{defined}{unwritten}",
         flush=True,
     )
     return 0
