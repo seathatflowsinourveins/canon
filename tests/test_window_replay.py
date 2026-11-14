@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import re
@@ -695,6 +696,7 @@ def test_checked_engine_fails_on_lifecycle_handler_error(neutral_catalogs, monke
     spec, *_ = neutral_catalogs
     # A stand-in without managed stopping isolates the log check from Mover's exit timer.
     worker = f"""
+import copy
 import json
 import sys
 from nautilus_trader.trading import Strategy
@@ -875,6 +877,8 @@ def test_recorded_rankings_match_full_replay_and_load_only_listed_names(
     from canon_trading import rank_record
     from canon_trading import window_replay
 
+    monkeypatch.setenv("CANON_COMMIT", "0" * 40)
+
     worker = window_replay._WORKER
     spec, *_ = neutral_catalogs
     # The public writer refuses repository destinations; fixtures use system temp only.
@@ -939,9 +943,11 @@ movers_rank_actor.MoversRankActor.on_start = no_rank
         assert not any(re.search(HANDLER_ERROR, e["message"]) for e in replay["engine_errors"])
 
 
-def test_empty_recorded_ranking_replays_without_loading_the_universe(neutral_catalogs):
+def test_empty_recorded_ranking_replays_loading_only_the_roster(neutral_catalogs, monkeypatch):
     from canon_trading import rank_record
     from canon_trading import window_replay
+
+    monkeypatch.setenv("CANON_COMMIT", "0" * 40)
 
     spec, *_ = neutral_catalogs
     with TemporaryDirectory(prefix="canon-empty-rank-") as folder:
@@ -961,7 +967,252 @@ def test_empty_recorded_ranking_replays_without_loading_the_universe(neutral_cat
         assert replay["fills"] == full["fills"] == []
         assert replay["open_positions"] == 0
         assert not any(re.search(HANDLER_ERROR, e["message"]) for e in replay["engine_errors"])
-        assert replay["catalog"]["instruments"] == []
-        assert replay["catalog"]["bars_read"] == 0
-        assert replay["catalog"]["quotes_read"] == 0
-        assert replay["catalog"]["trades_read"] == 0
+        # The roster is loaded as the full replay loads it; no other name is.
+        assert replay["catalog"]["instruments"] == ["LLL.ALPACA"]
+        assert replay["catalog"]["bars_read"] < full["catalog"]["bars_read"]
+        assert replay["catalog"]["quotes_read"] == full["catalog"]["quotes_read"]
+        assert replay["catalog"]["trades_read"] == full["catalog"]["trades_read"]
+
+
+CAPTURE = """
+import atexit
+import copy
+import json
+import os
+from nautilus_trader.persistence import ParquetDataCatalog
+from canon_trading import window_replay
+catalog_type = ParquetDataCatalog
+calls = {"instruments": [], "bars": set(), "quotes": set(), "trades": set()}
+class CapturingCatalog:
+    def __init__(self, *args, **kwargs):
+        self.inner = catalog_type(*args, **kwargs)
+    def instruments(self, instrument_ids=None, **kwargs):
+        calls["instruments"].append(None if instrument_ids is None else sorted(instrument_ids))
+        return self.inner.instruments(instrument_ids=instrument_ids, **kwargs)
+    def query_bars(self, identifiers=None, **kwargs):
+        calls["bars"].update(identifiers or ())
+        return self.inner.query_bars(identifiers=identifiers, **kwargs)
+    def query_quote_ticks(self, identifiers=None, **kwargs):
+        calls["quotes"].update(identifiers or ())
+        return self.inner.query_quote_ticks(identifiers=identifiers, **kwargs)
+    def query_trade_ticks(self, identifiers=None, **kwargs):
+        calls["trades"].update(identifiers or ())
+        return self.inner.query_trade_ticks(identifiers=identifiers, **kwargs)
+    def __getattr__(self, name):
+        return getattr(self.inner, name)
+window_replay.ParquetDataCatalog = CapturingCatalog
+def dump():
+    with open(os.environ["CANON_TEST_CAPTURE"], "w") as out:
+        json.dump({k: sorted(v) if isinstance(v, set) else v for k, v in calls.items()}, out)
+atexit.register(dump)
+"""
+
+
+@pytest.fixture
+def wide_listing(neutral_catalogs, alpaca_bars, monkeypatch):
+    """Listed names beyond the roster: PRE ranks only before the window, WIN inside it with ticks
+    of its own, Z0 is never listed. The roster is LLL alone; every file is in system temp."""
+    spec, _, _, baselines = neutral_catalogs
+    monkeypatch.setenv("CANON_COMMIT", "0" * 40)
+    with TemporaryDirectory(prefix="canon-rank-wide-") as folder:
+        snapshot = Path(folder) / "snapshot"
+        shutil.copytree(spec["bars_root"], snapshot)
+        quotes_root, trades_root = Path(folder) / "quotes", Path(folder) / "trades"
+        shutil.copytree(spec["quotes_roots"][0], quotes_root)
+        shutil.copytree(spec["trades_root"], trades_root)
+        bars = ParquetDataCatalog(str(snapshot))
+        extra = [alpaca_bars.equity("PRE"), alpaca_bars.equity("WIN")]
+        bars.write_instruments(extra)
+        sessions = tuple(START.date() - timedelta(days=n) for n in (3, 4, 5, 6, 7))
+        for instrument in extra:
+            earlier = [
+                minute_bar(instrument, OPEN.replace(day=day.day) + timedelta(minutes=i), 8, 1)
+                for day in reversed(sessions)
+                for i in range(720)
+            ]
+            bars.write_bars(earlier, start=earlier[0].ts_event, end=earlier[-1].ts_init)
+            pre = instrument.id.symbol.value == "PRE"
+            series = [
+                minute_bar(
+                    instrument,
+                    OPEN + timedelta(minutes=i),
+                    12 if pre and i < 120 else 8,
+                    100_000 if pre and i < 120 else 100,
+                )
+                for i in range(330)
+            ]
+            series += [
+                minute_bar(
+                    instrument,
+                    START + timedelta(minutes=i),
+                    8 if pre else 8.6,
+                    100 if pre else 100_000,
+                )
+                for i in range(20)
+            ]
+            bars.write_bars(series, start=ns(OPEN), end=ns(END))
+        win = extra[1]
+        tape = [trade(win, ns(START) + (i + 1) * MINUTE - 2, 8.6) for i in range(20)]
+        book = [quote(win, ns(START) + (i + 1) * MINUTE - 1, 8.59, 8.61) for i in range(20)]
+        ParquetDataCatalog(str(trades_root)).write_trade_ticks(tape, start=ns(START), end=ns(END))
+        ParquetDataCatalog(str(quotes_root)).write_quote_ticks(book, start=ns(START), end=ns(END))
+        baseline_path = Path(folder) / "baseline.json"
+        movers_rank.write_baselines(
+            baseline_path,
+            START.date(),
+            {**baselines, **{i.id.symbol.value: baselines["LLL"] for i in extra}},
+        )
+        (snapshot / "SNAPSHOT.json").write_text(json.dumps({"snapshot": str(snapshot)}))
+        references = copy.deepcopy(spec["reference_closes"])
+        for instrument in extra:
+            references[instrument.id.symbol.value] = dict(references["LLL"])
+        yield {
+            **spec,
+            "bars_root": str(snapshot),
+            "quotes_roots": [str(quotes_root)],
+            "trades_root": str(trades_root),
+            "baseline_path": str(baseline_path),
+            "reference_closes": references,
+            "slots": 2,
+            "fill_arm": "tape",
+        }
+
+
+def _captured_replay(spec, monkeypatch, path, preamble=""):
+    from canon_trading import window_replay
+
+    monkeypatch.setattr(window_replay, "_WORKER", preamble + CAPTURE + OFFLINE_GUARDS + WORKER)
+    monkeypatch.setenv("CANON_TEST_CAPTURE", str(path))
+    report = window_replay.run_replay(spec)
+    return report, json.loads(Path(path).read_text())
+
+
+WORKER = """
+import copy
+import json
+import sys
+from canon_trading.window_replay import _run_replay
+print(json.dumps(_run_replay(json.load(sys.stdin)), allow_nan=False))
+"""
+
+
+def test_recorded_replay_gives_the_mover_the_full_replays_view_when_listing_exceeds_roster(
+    wide_listing, monkeypatch, tmp_path
+):
+    from canon_trading import rank_record
+    from canon_trading.movers_rank_signal import decode_ranking
+
+    spec = wide_listing
+    signal_file = Path(spec["bars_root"]).parent / "rank.json"
+    monkeypatch.setattr(rank_record, "_WORKER", OFFLINE_GUARDS + rank_record._WORKER)
+    record = rank_record.record_rankings(spec, signal_file)
+    listed = {
+        str(e.instrument_id)
+        for row in record["generations"]
+        if row["published_ns"] <= ns(END)
+        for e in decode_ranking(row["value"])
+    }
+    before = {
+        str(e.instrument_id)
+        for row in record["generations"]
+        if row["published_ns"] < ns(START)
+        for e in decode_ranking(row["value"])
+    }
+    # The fixture exercises the findings: a name listed only before the window, one listed
+    # inside it with ticks of its own, both outside the roster, and one never listed.
+    assert "PRE.ALPACA" in before and "PRE.ALPACA" in listed
+    assert "WIN.ALPACA" in listed and "Z0.ALPACA" not in listed
+    full, full_calls = _captured_replay(spec, monkeypatch, tmp_path / "full.json")
+    no_rank = """
+from canon_trading import movers_rank_actor
+def no_rank(*args, **kwargs):
+    raise AssertionError('recorded replay recomputed ranking')
+movers_rank_actor.MoversRankActor.on_start = no_rank
+"""
+    replay, calls = _captured_replay(
+        {**spec, "rank_file": str(signal_file)}, monkeypatch, tmp_path / "cached.json", no_rank
+    )
+    # Ticks only for the names the full replay loads them for: the roster.
+    assert full_calls["quotes"] == full_calls["trades"] == ["LLL.ALPACA"]
+    assert calls["quotes"] == calls["trades"] == ["LLL.ALPACA"]
+    # Definitions and minute bars for the roster and every name listed up to the window's end.
+    assert calls["instruments"] == [sorted(listed | {"LLL.ALPACA"})]
+    assert {b.split("-")[0] for b in calls["bars"]} == listed | {"LLL.ALPACA"}
+    assert replay["catalog"]["quotes_read"] == full["catalog"]["quotes_read"]
+    assert replay["catalog"]["trades_read"] == full["catalog"]["trades_read"]
+    assert {"PRE.ALPACA", "WIN.ALPACA"} <= set(full["mover"]["run"]["opened_slots"])
+    assert full["mover"]["run"]["ranking_records"]
+    assert replay["rank_signals"] == full["rank_signals"]
+    # The Mover's own record, every key but the host's wall clock.
+    mover_full = {k: v for k, v in full["mover"]["run"].items() if k != "host_clock"}
+    mover_replay = {k: v for k, v in replay["mover"]["run"].items() if k != "host_clock"}
+    assert [k for k in mover_full if mover_full[k] != mover_replay.get(k)] == []
+    assert mover_replay == mover_full
+    assert replay["generations"] == full["generations"]
+    native_ids = {"init_id", "event_id", "venue_order_id", "trade_id"}
+    for key in ("orders", "fills"):
+        expected_rows = [{k: v for k, v in r.items() if k not in native_ids} for r in full[key]]
+        actual_rows = [{k: v for k, v in r.items() if k not in native_ids} for r in replay[key]]
+        assert actual_rows == expected_rows
+    assert replay["orders"] and replay["fills"]
+    assert not any(re.search(HANDLER_ERROR, e["message"]) for e in replay["engine_errors"])
+
+
+@pytest.mark.parametrize("case", ["undefined", "no_context", "unreferenced"])
+def test_recorded_replay_refuses_the_roster_the_full_replay_refuses(
+    wide_listing, monkeypatch, case
+):
+    from canon_trading import rank_record
+    from canon_trading import window_replay
+
+    spec = copy.deepcopy(wide_listing)
+    symbol = "NOPE" if case == "undefined" else "Z0"
+    spec["roster"].append({"symbol": symbol, "entry_limit": "8.01"})
+    if case != "no_context":
+        spec["entry_contexts"][f"{symbol}.ALPACA"] = dict(spec["entry_contexts"]["LLL.ALPACA"])
+    if case == "unreferenced":
+        del spec["reference_closes"]["Z0"]
+    signal_file = Path(spec["bars_root"]).parent / f"rank-{case}.json"
+    monkeypatch.setattr(rank_record, "_WORKER", OFFLINE_GUARDS + rank_record._WORKER)
+    rank_record.record_rankings(spec, signal_file)
+    monkeypatch.setattr(window_replay, "_WORKER", OFFLINE_GUARDS + WORKER)
+    reason = {
+        "undefined": "roster must be distinct equities defined",
+        "no_context": "no recorded entry context for Z0",
+        "unreferenced": "no usable prior-session reference for Z0",
+    }[case]
+    with pytest.raises(RuntimeError, match=reason):
+        window_replay.run_replay(spec)
+    with pytest.raises(RuntimeError, match=reason):
+        window_replay.run_replay({**spec, "rank_file": str(signal_file)})
+
+
+@pytest.mark.parametrize(
+    "change,reason",
+    [
+        ({"rank_without_baseline": True, "baseline_path": "absent"}, "rank_without_baseline"),
+        ({"max_data_age_secs": 60}, "max_data_age_secs"),
+    ],
+)
+def test_full_replay_refuses_actor_settings_it_does_not_apply(
+    neutral_catalogs, monkeypatch, tmp_path, change, reason
+):
+    from canon_trading import window_replay
+
+    spec, *_ = neutral_catalogs
+    if change.get("baseline_path") == "absent":
+        missing = tmp_path / "no-baseline.json"
+        change = {**change, "baseline_path": str(missing)}
+    monkeypatch.setattr(window_replay, "_WORKER", OFFLINE_GUARDS + WORKER)
+    with pytest.raises(RuntimeError, match=reason):
+        window_replay.run_replay({**spec, **change})
+
+
+def test_full_replay_reports_the_count_of_instruments_not_their_list(neutral_catalogs, monkeypatch):
+    from canon_trading import window_replay
+
+    spec, *_ = neutral_catalogs
+    monkeypatch.setattr(window_replay, "_WORKER", OFFLINE_GUARDS + WORKER)
+    report = window_replay.run_replay(spec)
+    assert report["catalog"]["instruments_loaded"] == 2
+    assert "instruments" not in report["catalog"]

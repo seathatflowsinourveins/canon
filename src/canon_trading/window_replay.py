@@ -35,10 +35,17 @@ and roster ticks are queried in <=60-minute batches on ts_init, including every 
 batch boundary exactly once.
 
 Optional rank_file replaces the ranking actor with rank_record.RecordedRankings. Its snapshot,
-day, actor settings, references, baselines and commit must match. Only names in generations
-active during the window get definitions or ticks; only their Mover contexts get bars. Without
-rank_file the full actor remains the default. rank_signals is an in-engine bus observation in
-both modes, retaining exact values, ts_event and publication times for equivalence checks.
+day, actor settings, references, baselines and commit must match. RecordedRankings publishes
+from 04:00 as the actor does, so the roster and every name a generation published up to the
+window's end lists get definitions and minute bars from 04:00: the Mover watches, warms and
+drops exactly those names in either mode (its _watch reads cache.instrument, its slots
+cache.bars). Ticks are the roster's alone in both modes. The roster is refused on the same
+grounds in both: undefined, without an entry context, or without a usable reference (the
+recording's unreferenced list). The actor's per-tick records reach the Mover's
+ranking_records at their engine times. Without rank_file the full actor remains the default.
+rank_signals is an in-engine bus observation in both modes, retaining exact values, ts_event
+and publication times for equivalence checks. The report counts loaded instruments; only a
+recorded replay lists them.
 
 No live client or node is constructed. Both presets ingest trades, because Mover builds
 its INTERNAL entry bars from them; only tape uses the prints as matching liquidity.
@@ -540,27 +547,31 @@ def _run_replay(spec: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError("quotes_roots needs at least one catalog")
     trades = ParquetDataCatalog(str(_local(spec["trades_root"], directory=True)))
     recorded = rank_record.read_record(spec["rank_file"], spec) if "rank_file" in spec else None
-    selected = rank_record.listed_names(recorded, _ns(start), _ns(end)) if recorded else None
-    instruments = [
-        i
-        for i in (catalog.instruments(instrument_ids=selected) if selected != [] else [])
-        if isinstance(i, Equity) and i.id.venue == VENUE
-    ]
-    if not instruments and recorded is None:
-        raise ValueError("the bars catalog holds no ALPACA equity definitions")
-    universe = {i.id for i in instruments}
     prices = {
         InstrumentId.from_str(f"{row['symbol']}.{VENUE}"): Decimal(str(row["entry_limit"]))
         for row in spec["roster"]
     }
-    if len(prices) != len(spec["roster"]) or not prices:
+    listed: list[str] = []
+    if recorded is None:
+        found = catalog.instruments()
+    else:
+        listed = rank_record.listed_names(recorded, _ns(end))
+        found = catalog.instruments(instrument_ids=sorted({*listed, *map(str, prices)}))
+    instruments = [i for i in found if isinstance(i, Equity) and i.id.venue == VENUE]
+    if not instruments:
+        raise ValueError("the bars catalog holds no ALPACA equity definitions")
+    universe = {i.id for i in instruments}
+    if len(prices) != len(spec["roster"]) or not prices or not prices.keys() <= universe:
         raise ValueError("the roster must be distinct equities defined in the bars catalog")
-    if recorded is None and not prices.keys() <= universe:
-        raise ValueError("the roster must be distinct equities defined in the bars catalog")
-    if selected is not None and set(selected) != {str(i) for i in universe}:
+    if not set(listed) <= {str(i) for i in universe}:
         raise ValueError("rank file lists equities not defined in the bars snapshot")
-    context_prices = {i: price for i, price in prices.items() if i in universe}
-    contexts = _contexts(spec, catalog, context_prices, start)
+    contexts = _contexts(spec, catalog, prices, start)
+    if recorded is not None:
+        # The full replay's _references refuses a roster name without a usable reference; the
+        # recording names every such name of the snapshot.
+        for instrument in prices:
+            if instrument.symbol.value in recorded["unreferenced"]:
+                raise ValueError(f"no usable prior-session reference for {instrument}")
     opened = datetime.combine(day, time(4), NY)
 
     notional = Decimal(str(spec["entry_notional"]))
@@ -588,6 +599,8 @@ def _run_replay(spec: Mapping[str, Any]) -> dict[str, Any]:
     else:
         ranking = rank_record.RecordedRankings()
         ranking.generations = [r for r in recorded["generations"] if r["published_ns"] <= _ns(end)]
+        ranking.records = [r for r in recorded["records"] if r["latency_ns"]["handled"] <= _ns(end)]
+        ranking.target = strategy.ranking_records
         unreferenced = recorded["unreferenced"]
     subscriber = rank_record.RankSubscriber()
     evidence: dict[str, Any] = {
@@ -595,8 +608,10 @@ def _run_replay(spec: Mapping[str, Any]) -> dict[str, Any]:
         "quotes_read": 0,
         "trades_read": 0,
         "missing": [],
-        "instruments": sorted(str(i.id) for i in instruments),
+        "instruments_loaded": len(instruments),
     }
+    if recorded is not None:
+        evidence["instruments"] = sorted(str(i.id) for i in instruments)
     engine_errors: list[dict[str, Any]] = []
     batches = []
     with _checked_engine(
@@ -624,11 +639,8 @@ def _run_replay(spec: Mapping[str, Any]) -> dict[str, Any]:
             _ns(end) - EXIT_INTERVAL_MS * (SECOND // 1000),
             lambda _event: replay_stop.update(_stop_if_flat(strategy)),
         )
-        bar_instruments = (
-            instruments if recorded is None else [i for i in instruments if i.id in context_prices]
-        )
-        bar_types = [f"{i.id}-{BAR_SPEC}" for i in bar_instruments]
-        for instrument, bar_type in zip(bar_instruments, bar_types, strict=True):
+        bar_types = [f"{i.id}-{BAR_SPEC}" for i in instruments]
+        for instrument, bar_type in zip(instruments, bar_types, strict=True):
             for low, high in catalog.get_missing_intervals_for_request(
                 _ns(opened), _ns(end), NautilusDataType.Bar, bar_type
             ):
@@ -640,7 +652,7 @@ def _run_replay(spec: Mapping[str, Any]) -> dict[str, Any]:
                         "end_ns": high,
                     }
                 )
-        ids = [str(i) for i in prices] if selected is None else selected
+        ids = [str(i) for i in prices]
         for identifier in ids:
             for data_type, roots in (
                 (NautilusDataType.QuoteTick, quote_catalogs),
@@ -659,11 +671,9 @@ def _run_replay(spec: Mapping[str, Any]) -> dict[str, Any]:
         first = True
         while low <= last:
             high = min(low + 60 * MINUTE - 1, last)
-            bars = (
-                catalog.query_bars(identifiers=bar_types, start=low, end=high) if bar_types else []
-            )
+            bars = catalog.query_bars(identifiers=bar_types, start=low, end=high)
             quote_ticks, trade_ticks = [], []
-            if high >= _ns(start) and ids:
+            if high >= _ns(start):
                 quote_ticks = _quotes(quote_catalogs, ids, max(low, _ns(start)), high)
                 trade_ticks = trades.query_trade_ticks(
                     identifiers=ids, start=max(low, _ns(start)), end=high

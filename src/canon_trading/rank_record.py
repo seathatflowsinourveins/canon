@@ -8,26 +8,44 @@ The recording engine has only that actor, a bus subscriber, and minute bars; its
 bar execution off and no strategy or ticks. Regular recordings retain the 04:00 prefix,
 just as window_replay does, through 16:00 New York. Other session parts are refused.
 
-The JSON records exact signal text, ts_event and engine publication time, snapshot identity,
-input digests, actor settings and code commit. Snapshot catalogs and reference roots must
-remain immutable. Exit arms and fill presets are deliberately not ranking configuration.
-Signal files live in or beside the snapshot, outside tracked repository content (ignored
-catalog snapshots inside a worktree are allowed). Existing files are read
-and validated, never silently overwritten or recomputed. Each recording owns a process for
-the native logger, like window_replay. RecordedRankings follows FixedRank and the local
-p1_overnight RecordedRankings pattern, using one native alert per publication.
+The JSON (schema 2) records exact signal text, ts_event and engine publication time, and
+every record the actor kept on each tick (the Mover run's `ranking_records`), with snapshot
+identity, input digests (the reference root's daily-bar files included), actor settings and
+code commit. The actor's settings are the regular replay's own, so a spec naming another
+part, feed, interval, data age or baseline rule is refused by name, in the full replay too.
+A recording and its replay need a clean commit (a 40-hex `running_commit`): code that is
+dirty or unknown is refused, never matched as text. Exit arms and fill presets are
+deliberately not ranking configuration. Signal files live in or beside the snapshot, outside
+tracked repository content (ignored catalog snapshots inside a worktree are allowed). The
+destination folder is probed with a partial file before the ranking process starts, and the
+finished record is linked into place exclusively, so no unwritable folder costs a whole
+ranking and no failed run leaves a file. Existing files are read and validated, never
+silently overwritten or recomputed. Each recording owns a process for the native logger,
+like window_replay. RecordedRankings follows FixedRank and the local p1_overnight
+RecordedRankings pattern, with one native alert per recorded tick, named after the actor's
+own timer so it keeps the actor's place among timers due at the same nanosecond (rc8
+crates/backtest/src/accumulator.rs:44-52 orders them by ts_event, then by name).
+
+Named limit: commit equality is conservative. Any later commit, including one that changes
+no ranking code (an exit arm in session_window.TRAIL_ARMS), voids every recording until it
+is recorded again.
 """
 
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
+import os
+import re
 import subprocess
 import sys
+import tempfile
 from datetime import date
 from datetime import datetime
 from datetime import time
+from decimal import Decimal
 from pathlib import Path
 from typing import TYPE_CHECKING
 from typing import Any
@@ -68,24 +86,58 @@ def _digest(value: Any) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True, allow_nan=False).encode()).hexdigest()
 
 
+ACTOR_SETTINGS = {
+    "feed": "sip",
+    "part": "regular",
+    "rank_without_baseline": False,
+    "publish_interval_secs": movers_rank_actor.PUBLISH_INTERVAL_SECS,
+    "max_data_age_secs": movers_rank_actor.MAX_DATA_AGE_SECS,
+}
+"""The ranking actor's settings in a regular replay, as window_replay has always built it."""
+
+COMMIT = re.compile(r"[0-9a-f]{40}")
+
+
+def clean_commit() -> str:
+    """The running code's commit, refused unless it names the code exactly."""
+    commit = session_window.running_commit()
+    if not COMMIT.fullmatch(commit):
+        raise ValueError(f"rank record commit must be a clean commit, not {commit!r}")
+    return commit
+
+
+def _reference_root_sha256(root: Path) -> str:
+    """Every daily-bar file under the root, by relative path and content: a re-fetch or repair
+    of a prior close changes it."""
+    files = sorted(
+        path
+        for path in (root / "data").rglob("*")
+        if path.is_file() and any("-1-DAY-" in part for part in path.relative_to(root).parts)
+    )
+    digest = hashlib.sha256()
+    for path in files:
+        digest.update(str(path.relative_to(root)).encode() + b"\0")
+        digest.update(hashlib.sha256(path.read_bytes()).digest())
+    return digest.hexdigest()
+
+
 def configuration(spec: Mapping[str, Any]) -> dict[str, Any]:
+    for key, supported in ACTOR_SETTINGS.items():
+        if key in spec and spec[key] != supported:
+            raise ValueError(f"{key} must be {supported!r} for a regular replay")
     baseline = Path(spec["baseline_path"])
+    reference_root = Path(spec["reference_root"]) if "reference_root" in spec else None
     return {
-        "feed": spec.get("feed", "sip"),
-        "part": spec.get("part", "regular"),
-        "rank_without_baseline": spec.get("rank_without_baseline", False),
-        "publish_interval_secs": spec.get(
-            "publish_interval_secs", movers_rank_actor.PUBLISH_INTERVAL_SECS
-        ),
+        **ACTOR_SETTINGS,
         "publish_offset_secs": movers_rank_actor.PUBLISH_OFFSET_SECS,
-        "max_data_age_secs": spec.get("max_data_age_secs", movers_rank_actor.MAX_DATA_AGE_SECS),
         "entry_notional": float(spec["entry_notional"]),
         "baseline_path": str(baseline.resolve()),
         "baseline_sha256": hashlib.sha256(baseline.read_bytes()).hexdigest()
         if baseline.exists()
         else None,
-        "reference_root": str(Path(spec["reference_root"]).resolve())
-        if "reference_root" in spec
+        "reference_root": str(reference_root.resolve()) if reference_root is not None else None,
+        "reference_root_sha256": _reference_root_sha256(reference_root)
+        if reference_root is not None
         else None,
         "reference_closes_sha256": _digest(spec.get("reference_closes")),
         "splits_sha256": _digest(spec.get("splits", [])),
@@ -108,22 +160,18 @@ def make_actor(
     roster: set[InstrumentId],
     records: list[dict[str, object]],
 ) -> tuple[movers_rank_actor.MoversRankActor, list[str]]:
-    """The full replay and bars-only recorder use exactly the same offline actor wiring."""
+    """The full replay and bars-only recorder use exactly the same offline actor wiring: the
+    configuration window_replay built before rank_file existed, with any baseline problem refused."""
     from .window_replay import NY
+    from .window_replay import _local
     from .window_replay import _ns
     from .window_replay import _references
 
-    settings = configuration(spec)
-    for key, supported in (
-        ("feed", "sip"),
-        ("part", "regular"),
-        ("publish_interval_secs", movers_rank_actor.PUBLISH_INTERVAL_SECS),
-    ):
-        if settings[key] != supported:
-            raise ValueError(f"{key} must be {supported!r} for a regular replay")
+    configuration(spec)
     day = date.fromisoformat(spec["trade_date"])
-    baseline = movers_rank.read_baselines(Path(spec["baseline_path"]), day)
-    if baseline.problem and not (baseline.absent and settings["rank_without_baseline"]):
+    baseline_path = _local(spec["baseline_path"], directory=False)
+    baseline = movers_rank.read_baselines(baseline_path, day)
+    if baseline.problem:
         raise ValueError(f"baseline not usable: {baseline.problem}")
     references, unreferenced = _references(spec, instruments, day, roster)
     actions = tuple(
@@ -148,13 +196,11 @@ def make_actor(
 
     actor = window_rank(
         MoversRankActorConfig(
-            feed=settings["feed"],
-            order_cap=settings["entry_notional"],
-            baseline_path=settings["baseline_path"],
+            feed="sip",
+            order_cap=float(Decimal(str(spec["entry_notional"]))),
+            baseline_path=str(baseline_path),
             reference_reader=read_references,
             inline_reads=True,
-            max_data_age_secs=settings["max_data_age_secs"],
-            rank_without_baseline=settings["rank_without_baseline"],
         ),
         records,
     )
@@ -182,23 +228,34 @@ class RankSubscriber(DataActor):
 
 
 class RecordedRankings(DataActor):
-    """Publish the recorded value at its recorded engine time, preserving ts_event."""
+    """At each recorded tick's engine time, publish its signal with its ts_event, then append the
+    actor's record of that tick to `target`, as mover_window.window_rank does after on_tick."""
 
     def __init__(self) -> None:
         super().__init__()
         self.generations: list[dict[str, Any]] = []
+        self.records: list[dict[str, Any]] = []
+        self.target: list[dict[str, object]] = []
+        self._due: dict[int, tuple[list[dict[str, Any]], list[dict[str, Any]]]] = {}
 
     def on_start(self) -> None:
         now = self.clock.timestamp_ns()
-        for index, row in enumerate(self.generations):
-            if row["published_ns"] >= now:
-                self.clock.set_time_alert_ns(
-                    f"recorded-rank-{index}", row["published_ns"], callback=self._publish
-                )
+        due: dict[int, tuple[list[dict[str, Any]], list[dict[str, Any]]]] = {}
+        for row in self.generations:
+            due.setdefault(row["published_ns"], ([], []))[0].append(row)
+        for record in self.records:
+            due.setdefault(record["latency_ns"]["handled"], ([], []))[1].append(record)
+        self._due = {at: rows for at, rows in due.items() if at >= now}
+        for index, at in enumerate(sorted(self._due)):
+            self.clock.set_time_alert_ns(
+                f"{movers_rank_actor.TIMER}-{index:06d}", at, callback=self._publish
+            )
 
     def _publish(self, event: TimeEvent) -> None:
-        row = self.generations[int(event.name.rsplit("-", 1)[1])]
-        self.publish_signal(SIGNAL_NAME, row["value"], ts_event=row["ts_event"])
+        generations, records = self._due.pop(event.ts_event)
+        for row in generations:
+            self.publish_signal(SIGNAL_NAME, row["value"], ts_event=row["ts_event"])
+        self.target.extend(copy.deepcopy(records))
 
     def on_stop(self) -> None:
         for name in self.clock.timer_names():
@@ -212,10 +269,10 @@ def read_record(path: str | Path, spec: Mapping[str, Any]) -> dict[str, Any]:
 
     record = json.loads(Path(path).read_text())
     for key, expected in (
-        ("schema", 1),
+        ("schema", 2),
         ("trade_date", spec["trade_date"]),
         ("snapshot", snapshot_identity(spec)),
-        ("commit", session_window.running_commit()),
+        ("commit", clean_commit()),
     ):
         if record.get(key) != expected:
             raise ValueError(f"rank record {key} differs from replay")
@@ -236,19 +293,25 @@ def read_record(path: str | Path, spec: Mapping[str, Any]) -> dict[str, Any]:
             raise ValueError("rank record ts_event is outside its publication bounds")
         decode_ranking(row["value"])
         previous = published
+    previous = opened
+    for row in record["records"]:
+        latency = row.get("latency_ns") if isinstance(row, dict) else None
+        handled = latency.get("handled") if isinstance(latency, dict) else None
+        if type(handled) is not int or not previous <= handled <= closed:
+            raise ValueError(
+                "rank record records' handled time is outside the part or out of order"
+            )
+        previous = handled
     return record
 
 
-def listed_names(record: Mapping[str, Any], start: int, end: int) -> list[str]:
-    """Names published in the window, plus the generation still active at its start.
+def listed_names(record: Mapping[str, Any], end: int) -> list[str]:
+    """Every name a generation published up to `end` lists, from 04:00.
 
-    A window may start between publications. The preceding signal remains the Mover's input
-    until the next publication; omitting its names would change those first seconds.
+    RecordedRankings publishes from the replay's 04:00 start, as the actor does in the full
+    replay, so the Mover watches pre-window names too: each needs its definition and bars.
     """
-    rows = [r for r in record["generations"] if start <= r["published_ns"] <= end]
-    prior = [r for r in record["generations"] if r["published_ns"] < start]
-    if prior:
-        rows.append(prior[-1])
+    rows = [r for r in record["generations"] if r["published_ns"] <= end]
     return sorted({str(e.instrument_id) for row in rows for e in decode_ranking(row["value"])})
 
 
@@ -260,7 +323,7 @@ def _record_rankings(spec: Mapping[str, Any]) -> dict[str, Any]:
     from .window_replay import _ns
     from .window_replay import add_replay_venue
 
-    snapshot, settings = snapshot_identity(spec), configuration(spec)
+    snapshot, settings, commit = snapshot_identity(spec), configuration(spec), clean_commit()
     catalog = ParquetDataCatalog(snapshot["path"])
     instruments = [
         i for i in catalog.instruments() if isinstance(i, Equity) and i.id.venue == VENUE
@@ -298,14 +361,15 @@ def _record_rankings(spec: Mapping[str, Any]) -> dict[str, Any]:
         engine.end()
         check()
     return {
-        "schema": 1,
+        "schema": 2,
         "trade_date": spec["trade_date"],
         "snapshot": snapshot,
         "configuration": settings,
-        "commit": session_window.running_commit(),
+        "commit": commit,
         "start_ns": opened,
         "end_ns": closed,
         "generations": subscriber.generations,
+        "records": records,
         "unreferenced": unreferenced,
         "bars_read": bars_read,
         "engine_errors": errors,
@@ -334,19 +398,31 @@ def record_rankings(spec: Mapping[str, Any], path: str | Path) -> dict[str, Any]
             raise RuntimeError(f"rank file repository check failed: {ignored.stderr}")
     if target.exists():
         return read_record(target, spec)
-    result = subprocess.run(
-        [sys.executable, "-c", _WORKER],
-        input=json.dumps(dict(spec), allow_nan=False),
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=12 * 3600,
-    )
-    if result.returncode:
-        raise RuntimeError(f"ranking process failed ({result.returncode}):\n{result.stderr}")
-    record = json.loads(result.stdout)
-    with target.open("x") as output:
-        output.write(json.dumps(record, indent=2, allow_nan=False) + "\n")
+    configuration(spec)
+    clean_commit()
+    # Probe the folder before the long ranking process: a folder that takes no file is refused
+    # now, not after the whole day is ranked.
+    with tempfile.NamedTemporaryFile(
+        dir=target.parent, prefix=f".{target.name}.", suffix=".partial", delete=False
+    ) as handle:
+        partial = Path(handle.name)
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", _WORKER],
+            input=json.dumps(dict(spec), allow_nan=False),
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=12 * 3600,
+        )
+        if result.returncode:
+            raise RuntimeError(f"ranking process failed ({result.returncode}):\n{result.stderr}")
+        record = json.loads(result.stdout)
+        partial.write_text(json.dumps(record, indent=2, allow_nan=False) + "\n")
+        # Exclusive: a record another recorder published meanwhile is never overwritten.
+        os.link(partial, target)
+    finally:
+        partial.unlink(missing_ok=True)
     return record
 
 

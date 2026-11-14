@@ -26,7 +26,9 @@ SECOND = 1_000_000_000
 
 
 @pytest.fixture
-def rank_spec(alpaca_bars):
+def rank_spec(alpaca_bars, monkeypatch):
+    # A record names clean code; the tests stand in a commit for the working tree.
+    monkeypatch.setenv("CANON_COMMIT", "0" * 40)
     with TemporaryDirectory(prefix="canon-rank-record-test-") as folder:
         root = Path(folder)
         catalog = ParquetDataCatalog(str(root))
@@ -185,7 +187,9 @@ def test_existing_record_is_reused_without_running_an_engine(rank_spec, monkeypa
     assert rank_record.record_rankings(rank_spec, target) == first
 
 
-def test_selected_names_include_the_signal_still_active_at_window_start():
+def test_selected_names_are_every_name_published_up_to_the_window_end():
+    """RecordedRankings publishes from 04:00, so a name listed only before the window is one the
+    Mover watches then, as it does in the full replay; a name published after the end is not."""
     from canon_trading import rank_record
 
     record = {
@@ -196,4 +200,64 @@ def test_selected_names_include_the_signal_still_active_at_window_start():
             {"value": "LATE.ALPACA=0.3", "published_ns": 60},
         ]
     }
-    assert rank_record.listed_names(record, 30, 50) == ["AAA.ALPACA", "BBB.ALPACA"]
+    assert rank_record.listed_names(record, 50) == ["AAA.ALPACA", "BBB.ALPACA", "OLD.ALPACA"]
+
+
+def test_record_refuses_an_unwritable_destination_before_ranking(rank_spec, monkeypatch):
+    from canon_trading import rank_record
+
+    monkeypatch.setattr(rank_record, "_WORKER", "raise AssertionError('ranking ran')")
+    root = Path(rank_spec["bars_root"])
+    root.chmod(0o555)
+    try:
+        with pytest.raises(PermissionError):
+            rank_record.record_rankings(rank_spec, root / "rank.json")
+    finally:
+        root.chmod(0o755)
+    assert not (root / "rank.json").exists()
+
+
+def test_a_failed_recording_leaves_no_file(rank_spec, monkeypatch):
+    from canon_trading import rank_record
+
+    monkeypatch.setattr(rank_record, "_WORKER", "raise SystemExit(3)")
+    target = Path(rank_spec["bars_root"]) / "rank.json"
+    before = sorted(target.parent.iterdir())
+    with pytest.raises(RuntimeError, match="ranking process failed"):
+        rank_record.record_rankings(rank_spec, target)
+    assert sorted(target.parent.iterdir()) == before
+
+
+@pytest.mark.parametrize("commit", ["0" * 40 + " with uncommitted changes", "unknown: OSError: x"])
+def test_record_refuses_code_it_cannot_name(rank_spec, monkeypatch, commit):
+    from canon_trading import rank_record
+
+    target = Path(rank_spec["bars_root"]) / "rank.json"
+    rank_record.record_rankings(rank_spec, target)
+    monkeypatch.setenv("CANON_COMMIT", commit)
+    with pytest.raises(ValueError, match="commit"):
+        rank_record.read_record(target, rank_spec)
+    with pytest.raises((ValueError, RuntimeError), match="commit"):
+        rank_record.record_rankings(rank_spec, Path(rank_spec["bars_root"]) / "other.json")
+
+
+def test_record_refuses_a_changed_reference_root(rank_spec, alpaca_bars, tmp_path):
+    from canon_trading import rank_record
+
+    references = tmp_path / "references"
+    references.mkdir()
+    catalog = ParquetDataCatalog(str(references))
+    first = datetime(2025, 11, 3, tzinfo=NY)
+    for symbol in ("AAA", "BBB", "CCC"):
+        catalog.write_bars(alpaca_bars.daily(alpaca_bars.equity(symbol), (8.0,) * 4, first=first))
+    spec = {k: v for k, v in rank_spec.items() if k != "reference_closes"}
+    spec["reference_root"] = str(references)
+    target = Path(spec["bars_root"]) / "rank.json"
+    rank_record.record_rankings(spec, target)
+    rank_record.read_record(target, spec)
+    repaired = alpaca_bars.daily(
+        alpaca_bars.equity("AAA"), (7.0,), first=datetime(2025, 11, 7, tzinfo=NY)
+    )
+    catalog.write_bars(repaired)
+    with pytest.raises(ValueError, match="reference_root"):
+        rank_record.read_record(target, spec)
