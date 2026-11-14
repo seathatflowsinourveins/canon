@@ -47,6 +47,8 @@ level_book_path, run_label. Optional venue_fills ({"LLL": [{"side": "sell", "qua
 touch is a named departure without trades, consumption or queue tracking. Optional booking
 defaults to foreign; own buys from the protector's hook as a bounded experiment,
 without changing its custody decisions. An own run is a measurement, never a counted proof.
+Optional latency ({"insert_ns", "update_ns", "delete_ns"}, whole nanoseconds) gives the venue
+send_latency.SendLatency, a named departure from v1's none; absent, the venue has no latency model.
 Timestamps are integer nanoseconds, decimal
 nanosecond strings, or timezone-aware ISO strings with at most microsecond precision. Paths
 are local; relative paths in a CLI spec are relative to that spec's directory. Segments use
@@ -59,6 +61,7 @@ from __future__ import annotations
 import argparse
 import json
 from collections import Counter
+from collections.abc import Mapping
 from datetime import UTC
 from datetime import datetime
 from datetime import timedelta
@@ -85,6 +88,7 @@ from nautilus_trader.persistence import ParquetDataCatalog
 from nautilus_trader.trading import Strategy
 
 from . import protect
+from . import send_latency
 from .backtest import FEE_RATES
 from .backtest import VENUE_SETTINGS
 from .owner_protector import OwnerProtector
@@ -194,7 +198,7 @@ def _checked(spec: Any, base: Path) -> dict[str, Any]:
         "level_book_path",
         "run_label",
     }
-    allowed = required | {"fill_arm", "booking", "venue_fills"}
+    allowed = required | {"fill_arm", "booking", "venue_fills", "latency"}
     if not required <= spec.keys() or spec.keys() - allowed:
         raise ValueError(
             f"spec keys: missing {sorted(required - spec.keys())}; unknown {sorted(spec.keys() - allowed)}"
@@ -204,6 +208,7 @@ def _checked(spec: Any, base: Path) -> dict[str, Any]:
         raise ValueError(f"unknown fill arm {spec['fill_arm']!r}; use touch or tape")
     if spec["booking"] not in ("foreign", "own"):
         raise ValueError(f"unknown booking {spec['booking']!r}; use foreign or own")
+    send_latency.checked(spec.get("latency"))
     if not isinstance(spec["run_label"], str) or not spec["run_label"].strip():
         raise ValueError("run_label must be nonempty text")
     pairs = spec["segments"]
@@ -796,7 +801,8 @@ class _RecordedProtector(OwnerProtector):
         self.trace.capture("Stop")
 
 
-def _venue(arm: str) -> dict[str, Any]:
+def _venue(arm: str, latency: Mapping[str, int] | None = None) -> dict[str, Any]:
+    """add_venue's settings; a fresh SendLatency per engine when the spec names its delays."""
     return {
         **VENUE_SETTINGS,
         "bar_execution": False,
@@ -804,7 +810,7 @@ def _venue(arm: str) -> dict[str, Any]:
         "liquidity_consumption": arm == "tape",
         "queue_position": arm == "tape",
         "fill_model": None,
-        "latency_model": None,
+        "latency_model": send_latency.model(latency),
         "use_reduce_only": True,
         "reject_stop_orders": True,
         "support_contingent_orders": True,
@@ -837,7 +843,7 @@ def _segment(
             fee_model=MakerTakerFeeModel(
                 maker_rate=FEE_RATES["maker_rate"], taker_rate=FEE_RATES["taker_rate"]
             ),
-            **_venue(spec["fill_arm"]),
+            **_venue(spec["fill_arm"], spec.get("latency")),
         )
         for instrument in instruments:
             engine.add_instrument(instrument)
@@ -920,15 +926,26 @@ def replay(spec: Any, *, base: Path | None = None) -> dict[str, Any]:
             "It never changes custody, the row, gain lock, guard, matching or chase. "
             "No protective fill or equivalence is presumed."
         )
+    latency = send_latency.describe(checked.get("latency"))
     report["venue"] = {
         "name": "ALPACA",
         "trader_id": "TESTER-001",
         "profile": "alpaca-paper-sim-v1",
-        "departures": (
-            ["touch: trade_execution=False, liquidity_consumption=False, queue_position=False"]
-            if checked["fill_arm"] == "touch"
-            else []
-        ),
+        "departures": [
+            *(
+                ["touch: trade_execution=False, liquidity_consumption=False, queue_position=False"]
+                if checked["fill_arm"] == "touch"
+                else []
+            ),
+            *(
+                []
+                if latency is None
+                else [
+                    "latency: SendLatency, counted from send (insert {insert_ns}, update "
+                    "{update_ns}, delete {delete_ns} ns); v1 has none".format(**latency)
+                ]
+            ),
+        ],
         "starting_balances": [STARTING_BALANCE],
         **{
             key: value.name if hasattr(value, "name") else value
@@ -937,8 +954,15 @@ def replay(spec: Any, *, base: Path | None = None) -> dict[str, Any]:
         "fee_rates": {key: str(value) for key, value in FEE_RATES.items()},
         "fill_model": "DefaultFillModel",
         "fee_model": "MakerTakerFeeModel",
-        "latency_ns": 0,
+        **({"latency_ns": 0} if latency is None else {"latency_model": latency}),
     }
+    if latency is not None:
+        report["limits"] = [
+            limit.replace(
+                "Zero latency; ", "Latency counted from each send, as the spec names it; "
+            )
+            for limit in report["limits"]
+        ]
     try:
         _config(checked, 0)  # F2's refusal belongs to OwnerProtectorConfig, before any engine.
     except (ValueError, TypeError) as exc:

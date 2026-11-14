@@ -24,6 +24,8 @@ entry_limit), and entry_contexts in the window record's summary shape. reference
 maps each universe symbol to {close, session}; alternatively reference_root holds daily
 bars. Optional splits are alpaca-py's ForwardSplit/ReverseSplit payloads with their
 corporate_action_type. All roots are local and already exist; this module fetches nothing.
+Optional latency ({insert_ns, update_ns, delete_ns}, whole nanoseconds) gives the venue
+send_latency.SendLatency, named in the report's venue; absent, the venue has no latency model.
 
 The bars root defines the universe through its equity definitions. It also supplies the
 registered entry arm's prior sessions and current-day prefix: summary counts are checked,
@@ -107,6 +109,7 @@ from nautilus_trader.risk import RiskEngineConfig
 from . import early_entry_study as study
 from . import movers_rank
 from . import rank_record
+from . import send_latency
 from . import session_window
 from .backtest import FEE_RATES
 from .backtest import VENUE_SETTINGS
@@ -187,10 +190,12 @@ def _checked_engine(
         check()
 
 
-def venue_preset(fill_arm: str) -> dict[str, Any]:
-    """The complete preset, printable without native enum objects."""
+def venue_preset(fill_arm: str, latency: Mapping[str, int] | None = None) -> dict[str, Any]:
+    """The complete preset, printable without native enum objects. A spec's optional latency
+    (send_latency's three delays) is named only when given; without it the venue has none."""
     if fill_arm not in ("touch", "tape"):
         raise ValueError("fill_arm must be touch or tape")
+    described = send_latency.describe(latency)
     return {
         "name": str(VENUE),
         "preset": fill_arm,
@@ -199,18 +204,26 @@ def venue_preset(fill_arm: str) -> dict[str, Any]:
         "bar_execution": False,
         "trade_execution": fill_arm == "tape",
         "liquidity_consumption": fill_arm == "tape",
+        **({} if described is None else {"latency": described}),
     }
 
 
-def add_replay_venue(engine: BacktestEngine, fill_arm: str, starting_balance: str) -> None:
-    """Apply the same preset that the report names, with the existing zero-fee rates."""
-    preset = venue_preset(fill_arm)
+def add_replay_venue(
+    engine: BacktestEngine,
+    fill_arm: str,
+    starting_balance: str,
+    latency: Mapping[str, int] | None = None,
+) -> None:
+    """Apply the same preset that the report names, with the existing zero-fee rates, and the
+    spec's latency counted from each send (send_latency), or none."""
+    preset = venue_preset(fill_arm, latency)
     engine.add_venue(
         VENUE,
         starting_balances=account_balances([starting_balance]),
         fee_model=MakerTakerFeeModel(
             maker_rate=FEE_RATES["maker_rate"], taker_rate=FEE_RATES["taker_rate"]
         ),
+        latency_model=send_latency.model(latency),
         **VENUE_SETTINGS,
         **{
             key: preset[key]
@@ -537,7 +550,7 @@ def _run_replay(spec: Mapping[str, Any]) -> dict[str, Any]:
     arm = spec["trail_arm"]
     if arm not in session_window.TRAIL_ARMS:
         raise ValueError("trail_arm must be F2, OWN1 or OWN3")
-    preset = venue_preset(spec["fill_arm"])
+    preset = venue_preset(spec["fill_arm"], spec.get("latency"))
     bars_root = _local(spec["bars_root"], directory=True)
     catalog = ParquetDataCatalog(str(bars_root))
     quote_catalogs = [
@@ -621,7 +634,7 @@ def _run_replay(spec: Mapping[str, Any]) -> dict[str, Any]:
             max_notional_per_order={str(i): str(notional * OUTER_BOUND_MULTIPLE) for i in prices}
         ),
     ) as (engine, check_log):
-        add_replay_venue(engine, spec["fill_arm"], spec["starting_balance"])
+        add_replay_venue(engine, spec["fill_arm"], spec["starting_balance"], spec.get("latency"))
         for instrument in instruments:
             engine.add_instrument(instrument)
         engine.add_strategy(strategy)

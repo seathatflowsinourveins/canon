@@ -301,6 +301,84 @@ def test_venue_presets_release_owned_limit_at_touch_or_print_size(alpaca_bars, a
         engine.dispose()
 
 
+MS = 1_000_000
+LATENCY = {"insert_ns": 5 * MS, "update_ns": 7 * MS, "delete_ns": 7 * MS}
+
+
+def _event_times(order) -> dict[str, int]:
+    return {type(event).__name__: event.ts_event for event in order.events()}
+
+
+def _latency_run(alpaca_bars, latency) -> tuple[dict[str, int], dict[str, int]]:
+    """OwnedLimit's market BUY (a direct submit) and its emulated SELL, sent at one second with its
+    trigger (bid 10) not yet touched and released when the bid falls to it a second later, on a venue
+    with the given latency. A quote of the same instrument follows every send by 20 ms, so each
+    command settles on its own instrument's data, not on a later timer step (exchange.rs:99-107)."""
+    from canon_trading.window_replay import add_replay_venue
+
+    instrument = alpaca_bars.equity("LLL")
+    engine = BacktestEngine(BacktestEngineConfig(logging=LoggerConfig(bypass_logging=True)))
+    add_replay_venue(engine, "touch", "5000 USD", latency=latency)
+    engine.add_instrument(instrument)
+    strategy = OwnedLimit(StrategyConfig())
+    strategy.instrument = instrument
+    engine.add_strategy(strategy)
+    at = ns(START)
+    engine.add_data(
+        [
+            quote(instrument, at, 9.99, 10.01),
+            quote(instrument, at + 20 * MS, 9.99, 10.01),
+            quote(instrument, at + SECOND, 10.50, 10.51),
+            quote(instrument, at + SECOND + 20 * MS, 10.50, 10.51),
+            quote(instrument, at + 2 * SECOND, 9.99, 10.01),
+            quote(instrument, at + 2 * SECOND + 20 * MS, 9.99, 10.01),
+        ]
+    )
+    try:
+        engine.run()
+        assert strategy.sell is not None
+        assert strategy.released == [strategy.sell.client_order_id]
+        orders = {order.side: order for order in engine.cache.orders()}
+        return _event_times(orders[OrderSide.BUY]), _event_times(orders[OrderSide.SELL])
+    finally:
+        engine.dispose()
+
+
+def test_a_released_order_meets_the_insert_latency_from_its_release(alpaca_bars):
+    """The emulator resends a released order's first SubmitOrder, keeping its ts_init
+    (emulator.rs:1522-1594), so a fixed latency, counted from that ts_init, is past by the release.
+    The replay's model counts from the send: the released SELL is accepted no sooner than the insert
+    latency after its release, and the direct BUY is answered as a fixed latency answers it."""
+    from nautilus_trader.execution import StaticLatencyModel
+
+    from canon_trading import window_replay
+
+    buy, sell = _latency_run(alpaca_bars, LATENCY)
+    assert sell["OrderAccepted"] - sell["OrderReleased"] >= LATENCY["insert_ns"]
+    assert buy["OrderFilled"] - buy["OrderSubmitted"] >= LATENCY["insert_ns"]
+
+    static = StaticLatencyModel(
+        base_latency_nanos=0,
+        insert_latency_nanos=LATENCY["insert_ns"],
+        update_latency_nanos=LATENCY["update_ns"],
+        cancel_latency_nanos=LATENCY["delete_ns"],
+    )
+    original = window_replay.BacktestEngine.add_venue
+
+    def fixed(self, *args, **kwargs):
+        kwargs["latency_model"] = static
+        return original(self, *args, **kwargs)
+
+    window_replay.BacktestEngine.add_venue = fixed
+    try:
+        fixed_buy, fixed_sell = _latency_run(alpaca_bars, LATENCY)
+    finally:
+        window_replay.BacktestEngine.add_venue = original
+    assert fixed_buy == buy
+    # The upstream behaviour this model corrects: under a fixed latency the release is accepted at once.
+    assert fixed_sell["OrderAccepted"] == fixed_sell["OrderReleased"]
+
+
 def test_every_generation_matches_pure_rank_over_the_same_prefix(neutral_catalogs, monkeypatch):
     from canon_trading import window_replay
 
