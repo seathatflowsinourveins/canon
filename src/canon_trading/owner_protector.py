@@ -214,6 +214,36 @@ one file per account label, and each read, merge and replace holds LevelBook.loc
 A write failure is named once per kind.
 An omitted account label disables persistence by name; no guessed account shares a book key.
 There is no runner here to start nodes back to back or supply their history and session bounds.
+
+Review F1 of #443's max review (the lead's ruling, 2026-11-13 22:47 and 22:52): a holding first bought
+after the start, in a symbol the node did not load, is named at once and has its exit within a bound.
+The node loads the account's symbols once, at its start (protector_node.run_protector), and the
+adapter reports no fill or position in an instrument it did not load
+(packages/canon-alpaca/src/canon_alpaca/execution.py:369), so no such holding ever reaches the cache.
+Given its `roster` (the node's instruments), the protector reads the account's positions
+(Alpaca's GET /v2/positions, alpaca-py's get_all_positions, through session_window.position_reads)
+at its first step and every ROSTER_POLL_SECS after, in the step timer's handler, which no command of
+ours publishes, so the rule for order-event handlers (mover.py:231-238) does not bind it. A whole-share
+long outside the roster is named by one alert line with its symbol and quantity, and the run ends by name,
+ROSTER_ENDED, through the pinned Strategy.shutdown_system (nautilus-trader d53849b216e2
+python/nautilus_trader/trading/__init__.pyi:525, crates/common/src/actor/data_actor.rs:4568-4582): the
+live node shuts down on it (crates/live/src/node/mod.rs:1636-1641) as the backtest engine ends on it
+(crates/backtest/src/engine.rs:882-884), and the runner's successor reads the account fresh at its
+start, so the holding is on its roster. A long outside the roster that the start skips or refuses is
+named once and does not itself end the run, since a successor would not protect it. What the successor's
+start skips and refuses is one predicate, `session_window.start_account`, which the start and this read
+both call: an unreadable position, or one listed at zero, is skipped by name, and a fractional one,
+inside or outside the roster, refused, by the adapter's own whole-share rule. While the start would
+refuse the account read, a whole-share long outside the roster does not end the run: it is named once as
+unprotected with what blocks the restart, the run protects its roster to its planned end, and the first
+read the start would accept ends it. The order half of the start's refusal, an open order the adapter
+cannot map, runs inside reconciliation and is not called here, so a new holding beside such an order
+still ends the run into a refused start (the deputy's ruling, 2026-11-13 23:53). The bound: the buy is
+named, and the end asked for, at the first read after it, so within ROSTER_POLL_SECS and one step of the
+venue listing it, when the read answers within its own bound (the same reader and the same limit as the
+GETs above). The node's stop, the runner's seam and the successor's arming come after that and are not in
+the bound; how long they take live is not measured (UNVERIFIED). A failed read is an alert line, read
+again at the next interval. A holding outside the roster is never armed by this run.
 """
 
 from __future__ import annotations
@@ -299,6 +329,12 @@ REFUSED_KEPT = 64
 WAITING = "unprotected: waiting"
 STEP_NS = 1_000_000_000  # The step timer's interval (on_start), the floor between step writes.
 OVERNIGHT_RETRY_NS = 60 * STEP_NS  # Review F7: an unread eligibility is read again after a minute.
+ROSTER_POLL_SECS = 30
+"""Review F1: how often the account's positions are read for a holding outside the roster. With a read
+that answers in its bound, a new holding is named and the run's end asked for within this and one step
+of the venue listing it; the stop and the successor's arming after it are not bounded here."""
+ROSTER_ENDED = "new holding outside the roster"
+"""The run's end by name when a whole-share long outside the roster is found (review F1)."""
 
 GAIN_QUOTE_FORWARD_SKEW_NS = 100_000_000
 """100 ms forward event/receipt tolerance; UNCALIBRATED row GAIN_QUOTE_FORWARD_SKEW."""
@@ -340,6 +376,7 @@ class OwnerProtectorConfig(StrategyConfig):
         run: str = "",
         session_part: str = "regular",
         trading: Any = None,
+        roster: Sequence[InstrumentId] | None = None,
         **_kwargs: Any,
     ) -> None:
         super().__init__()
@@ -355,6 +392,8 @@ class OwnerProtectorConfig(StrategyConfig):
         self.run = run
         self.session_part = session_part
         self.trading = trading
+        # Review F1: the instruments the node loaded at its start; None reads no account.
+        self.roster = None if roster is None else tuple(roster)
         self.validate_protection()
 
     def validate_protection(self) -> None:
@@ -401,6 +440,10 @@ class OwnerProtectorConfig(StrategyConfig):
             if not isinstance(instrument_id, InstrumentId):
                 raise TypeError("levels must map InstrumentId to Price")
             _check_level(level)
+        if self.roster is not None and not all(
+            isinstance(instrument_id, InstrumentId) for instrument_id in self.roster
+        ):
+            raise TypeError("roster must name InstrumentIds")
 
 
 def owner_execution_config(**kwargs: Any) -> AlpacaExecutionClientConfig:
@@ -744,6 +787,11 @@ class OwnerProtector(Strategy):
         self.fallbacks: dict[InstrumentId, int] = {}
         self.flat_fallbacks: dict[InstrumentId, int] = {}
         self.quote_refusals: dict[InstrumentId, str] = {}
+        # Review F1: the step that last read the account for the roster, the run's end by name once
+        # asked for, and the holdings outside the roster already named, by symbol and kind.
+        self.roster_read_ns: int | None = None
+        self.ended_for: str | None = None
+        self.roster_named: set[tuple[str, str]] = set()
 
     def _note(self, tick: QuoteTick | None) -> bool:
         """Record every quote; return whether it raises an already established venue clock.
@@ -1174,6 +1222,8 @@ class OwnerProtector(Strategy):
         for instrument_id in sorted(instruments, key=str):
             if instrument_id in self.slots or instrument_id in self.stopped_instruments:
                 continue
+            if self.settings.roster is not None and instrument_id not in self.settings.roster:
+                continue  # Review F1: named by the roster's read; this run never arms it.
             try:
                 self._discover_holding(instrument_id)
             except Exception as exc:  # noqa: BLE001 - one holding never costs another discovery.
@@ -1543,11 +1593,93 @@ class OwnerProtector(Strategy):
                 # A protector that cannot act on its quotes says so at every step (the lead's
                 # ruling, 2026-11-13, 16:3x).
                 self._say(f"{instrument_id}: {waiting}; no sell yet")
+        stamp = getattr(event, "ts_event", None)
+        self._read_roster(stamp if type(stamp) is int else self.clock.timestamp_ns())
         self._discover_holdings()
         # Item 4: the step's time reaches the book at most once per step, so a monitor sees a
         # killed run as a last_step_ns that stops advancing. A TimeEvent's ts_event is the step.
         at = getattr(event, "ts_event", None)
         self._save_levels(step_ns=at if type(at) is int else self.clock.timestamp_ns())
+
+    def _read_roster(self, now: int) -> None:
+        """Review F1: at the first step and every ROSTER_POLL_SECS, name each long the account holds
+        outside the roster, and end the run by name for a whole-share one, unless the start's own
+        predicate (`session_window.start_account`) would refuse the account read (module header)."""
+        roster = self.settings.roster
+        if roster is None or self.ended_for is not None:
+            return
+        if (
+            self.roster_read_ns is not None
+            and now - self.roster_read_ns < ROSTER_POLL_SECS * STEP_NS
+        ):
+            return
+        self.roster_read_ns = now
+        if self.settings.trading is None:
+            if ("", "no reader") not in self.roster_named:
+                self.roster_named.add(("", "no reader"))
+                self._say(
+                    "ALERT: no account reader: a holding bought after the start outside the roster "
+                    "cannot be named by this run"
+                )
+            return
+        try:
+            held, unread = session_window.position_reads(self.settings.trading)
+        except Exception as exc:  # noqa: BLE001 - an unread account is named, never taken as flat.
+            self._say(
+                f"ALERT: the account's positions could not be read ({type(exc).__name__}: {exc}): "
+                "a holding bought after the start outside the roster may be unnamed; read again in "
+                f"{ROSTER_POLL_SECS} s"
+            )
+            return
+        loaded = {instrument_id.symbol.value for instrument_id in roster}
+        # The start's own predicate, called, never copied (the lead's term (a), 2026-11-13 23:49): the
+        # successor reads this same account, skips what it skips and refuses what it refuses.
+        start = session_window.start_account(held, unread)
+        for symbol, why in sorted(start.skipped.items()):
+            if symbol not in loaded and (symbol, "skipped") not in self.roster_named:
+                self.roster_named.add((symbol, "skipped"))
+                self._say(
+                    f"{symbol}.ALPACA: ALERT: held outside the roster and unprotected, its quantity "
+                    f"unreadable or none ({why}): no exit in this run, and the next start skips it "
+                    "too, so it does not end this run"
+                )
+        for symbol, why in sorted(start.refused.items()):
+            if symbol not in loaded and (symbol, "refused") not in self.roster_named:
+                self.roster_named.add((symbol, "refused"))
+                self._say(
+                    f"{symbol}.ALPACA: ALERT: held outside the roster and unprotected: {held[symbol]} "
+                    f"held, which the next start refuses ({why}), so this run goes on; it has no exit "
+                    "here"
+                )
+        whole = [
+            (symbol, qty)
+            for symbol, qty in sorted(start.held.items())
+            if symbol not in loaded and qty > 0 and symbol not in start.refused
+        ]
+        if not whole:
+            return
+        if start.refused:
+            # An end into a start that refuses leaves every holding, the roster's too, with no stop of
+            # ours: the run goes on, protects its roster, and names each new holding once. Decided at
+            # every read, never latched (term (b)): the first read the start would accept ends it.
+            because = "; ".join(start.refused[symbol] for symbol in sorted(start.refused))
+            for symbol, qty in whole:
+                if (symbol, "blocked") not in self.roster_named:
+                    self.roster_named.add((symbol, "blocked"))
+                    self._say(
+                        f"{symbol}.ALPACA: ALERT: unprotected: {qty} held, bought after this run's "
+                        "start outside the roster; this run does not end, since the next start would "
+                        f"refuse the account ({because}); it protects its roster to its planned end "
+                        "and ends at the first read the start would accept"
+                    )
+            return
+        for symbol, qty in whole:
+            self._say(
+                f"{symbol}.ALPACA: ALERT: {ROSTER_ENDED}: {qty} held, bought after this run's "
+                "start; this run ends now, so the next start reads the account and protects it"
+            )
+        self.ended_for = f"{ROSTER_ENDED}: " + ", ".join(f"{s} {q}" for s, q in whole)
+        self.shutdown_system(self.ended_for)
 
     def _wait(self, instrument_id: InstrumentId, reason: str) -> None:
         """A holding with no sell of ours that waits on its quotes: a named record, said each step."""

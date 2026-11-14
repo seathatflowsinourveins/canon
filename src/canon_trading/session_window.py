@@ -2413,6 +2413,49 @@ def position_reads(trading: TradingClient) -> tuple[dict[str, Decimal], dict[str
     return held, unread
 
 
+@dataclass(frozen=True)
+class StartAccount:
+    """What a protector start makes of one account read (`start_account`): `held`, each symbol it loads,
+    with its signed quantity; `skipped`, each symbol it names and leaves out of the node, with why; and
+    `refused`, each symbol that makes the start refuse the account, with the refusal's text."""
+
+    held: dict[str, Decimal]
+    skipped: dict[str, str]
+    refused: dict[str, str]
+
+
+def start_account(
+    held: dict[str, Decimal], unread: dict[str, str], orders: Sequence[Any] = ()
+) -> StartAccount:
+    """The protector start's per-symbol rule, the one predicate the start (`protector_node.run_protector`)
+    and the running protector's roster read (`owner_protector`, review F1) both call, so that a change to
+    what a start accepts reaches both (the lead's term (a), 2026-11-13 23:49). From `position_reads`'
+    two maps: an unreadable position, or one listed with a zero quantity, is skipped by name (the lead,
+    2026-11-13 21:27 and 21:35); every other symbol is loaded, and one the adapter's start-up refuses
+    in an instrument it loads, a fractional position (its own whole-share rule,
+    `canon_alpaca.execution.whole_quantity`, which `position_status_report` applies at reconciliation),
+    is refused. `orders`, the account's open orders, is taken and not read: the order half of the
+    start's refusal (an open order the adapter cannot map) runs inside reconciliation and is not
+    called here (the deputy's ruling, 2026-11-13 23:53; review F2's lane owns it)."""
+    from canon_alpaca.execution import whole_quantity  # the adapter's own rule, called
+
+    del orders
+    kept: dict[str, Decimal] = {}
+    skipped = dict(unread)
+    refused: dict[str, str] = {}
+    for symbol, qty in sorted(held.items()):
+        if qty == 0:
+            # A zero quantity (a short read as -0 among them) is no holding a node can protect.
+            skipped[symbol] = f"position in {symbol} is listed with quantity {qty}, no holding"
+            continue
+        kept[symbol] = qty
+        try:
+            whole_quantity(abs(qty), f"{symbol} position quantity")
+        except ValueError as exc:
+            refused[symbol] = str(exc)
+    return StartAccount(kept, skipped, refused)
+
+
 def positions(trading: TradingClient) -> dict[str, Decimal]:
     """The signed quantity Alpaca holds in each symbol of the account, a symbol with none absent, each
     read by `position_reads`; any position that cannot be read raises `PositionUnread` naming it, so a
