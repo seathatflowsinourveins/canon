@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
+import subprocess
 import tomllib
 from dataclasses import dataclass
 from dataclasses import field
@@ -31,11 +33,16 @@ from canon_alpaca.data import parse_quote
 from canon_alpaca.providers import DATA_ONLY_ENV
 from canon_alpaca.providers import parse_equity
 from nautilus_trader.core.datetime import dt_to_unix_nanos
+from nautilus_trader.model import Bar
+from nautilus_trader.model import BarType
 from nautilus_trader.model import NautilusDataType
+from nautilus_trader.model import Price
+from nautilus_trader.model import Quantity
 from nautilus_trader.persistence import ParquetDataCatalog
 from requests.adapters import HTTPAdapter
 
 from canon_trading import history_load
+from canon_trading.bars_to_catalog import DEFAULT_CATALOG
 from canon_trading.bars_to_catalog import FEED_FILE
 from canon_trading.history_load import HistoryStopped
 from canon_trading.history_load import RateLimited
@@ -488,7 +495,8 @@ def test_cli_rejects_quote_bounds_before_building_a_client(catalog, monkeypatch,
         ({"end": NOW + timedelta(days=1)}, "now"),
         ({"start": datetime(2024, 12, 31, tzinfo=UTC)}, "2025"),
         ({"start": START - timedelta(days=91)}, "90.*ADR 0066"),
-        ({"feed": DataFeed.SIP}, "iex.*ADR 0066"),
+        ({"feed": DataFeed.DELAYED_SIP}, "iex.*ADR 0151"),
+        ({"feed": DataFeed.BOATS}, "iex.*ADR 0151"),
         ({"max_rows": 0}, "row bound"),
     ],
 )
@@ -587,3 +595,393 @@ def test_mise_exposes_quotes_mode():
     task = tomllib.loads((SOURCE_ROOT / "mise.toml").read_text())["tasks"]["paper:history"]
     assert 'choices "bars" "trades" "quotes"' in task["usage"]
     assert "IEX" in task["description"]
+
+
+# SIP quotes, bounded: named symbols, at most `SIP_QUOTES_MAX_SYMBOLS`, at most `SIP_QUOTES_MAX_SPAN`.
+
+
+def test_the_sip_quote_bounds_are_eight_symbols_and_sixty_minutes():
+    assert history_load.SIP_QUOTES_MAX_SYMBOLS == 8
+    assert history_load.SIP_QUOTES_MAX_SPAN == timedelta(minutes=60)
+
+
+def test_a_sip_quote_load_within_the_bound_names_sip_and_writes_to_the_root(venue, catalog):
+    assert run(catalog, feed=DataFeed.SIP) == 4
+    assert venue.sent
+    assert all(m == "GET" and q["feed"] == ["sip"] for m, q in venue.sent)
+    assert (catalog / FEED_FILE).read_text() == "sip\n"
+    assert len(ticks_in(catalog)) == 2 and len(ticks_in(catalog, "MSFT")) == 2
+
+
+def test_a_sip_quote_load_of_exactly_sixty_minutes_is_accepted(venue, catalog):
+    venue.rows = [quote(), quote("2026-11-10T21:59:59Z")]
+    end = START + timedelta(minutes=60)
+    assert run(catalog, symbols=["AAPL"], end=end, feed=DataFeed.SIP) == 2
+    assert all(q["feed"] == ["sip"] for _, q in venue.sent)
+
+
+@pytest.mark.parametrize(
+    "options,message",
+    [
+        ({"end": START + timedelta(minutes=60, microseconds=1)}, "SIP_QUOTES_MAX_SPAN"),
+        ({"end": START + timedelta(hours=2)}, "SIP_QUOTES_MAX_SPAN"),
+        ({"symbols": [f"S{i}" for i in range(9)]}, "SIP_QUOTES_MAX_SYMBOLS"),
+    ],
+    ids=["one-microsecond-over", "two-hours", "nine-symbols"],
+)
+def test_a_sip_quote_load_over_the_bound_is_refused_by_name_before_any_request(
+    venue, catalog, options, message
+):
+    with pytest.raises(HistoryStopped, match=message):
+        run(catalog, feed=DataFeed.SIP, **options)
+    assert venue.sent == []
+    assert not (catalog / ".history-load.lock").exists()
+    assert not (catalog / FEED_FILE).exists()
+
+
+def test_eight_sip_symbols_pass_the_bound_and_meet_the_definition_check(venue, catalog):
+    """Eight is inside the bound: what refuses them is the root's missing definitions, not the count."""
+    symbols = [*SYMBOLS, *(f"S{i}" for i in range(6))]
+    with pytest.raises(HistoryStopped, match="no instrument definition"):
+        run(catalog, symbols=symbols, feed=DataFeed.SIP)
+    assert venue.sent == []
+
+
+def test_repeated_sip_symbols_count_once_toward_the_bound(venue, catalog):
+    assert run(catalog, symbols=["AAPL"] * 9, feed=DataFeed.SIP) == 2
+
+
+@pytest.mark.parametrize("first,second", [("iex", "sip"), ("sip", "iex")])
+def test_sip_and_iex_quotes_never_share_a_root(venue, catalog, first, second):
+    assert run(catalog, symbols=["AAPL"], feed=DataFeed(first)) == 2
+    sent = len(venue.sent)
+    with pytest.raises(HistoryStopped, match=f"holds {first} data and this load is {second}"):
+        run(catalog, symbols=["MSFT"], feed=DataFeed(second))
+    assert len(venue.sent) == sent
+    assert (catalog / FEED_FILE).read_text() == f"{first}\n"
+    assert ticks_in(catalog, "MSFT") == []
+
+
+def test_a_sip_quote_load_into_a_legacy_iex_root_is_refused(venue, catalog):
+    """A root holding data with no marker is IEX (`bars_to_catalog.catalog_feed`)."""
+    assert run(catalog, symbols=["AAPL"]) == 2
+    (catalog / FEED_FILE).unlink()
+    with pytest.raises(HistoryStopped, match="holds iex"):
+        run(catalog, symbols=["MSFT"], feed=DataFeed.SIP)
+
+
+def test_the_quote_feed_defaults_to_iex():
+    import inspect
+
+    assert inspect.signature(history_load.load_quotes).parameters["feed"].default is DataFeed.IEX
+
+
+def _forbid_client(monkeypatch):
+    def forbidden():
+        pytest.fail("a refused CLI reached history_client")
+
+    monkeypatch.setattr(history_load, "history_client", forbidden)
+
+
+@pytest.mark.parametrize("feed", [None, "iex", "sip"])
+def test_cli_quotes_take_feed_iex_by_default_or_sip(venue, catalog, monkeypatch, feed):
+    monkeypatch.setattr(history_load, "utc_now", lambda: NOW)
+    extra = [] if feed is None else ["--feed", feed]
+    assert history_load.main(cli(catalog, "--symbols", "AAPL", *extra)) == 0
+    assert {q["feed"][0] for _, q in venue.sent} == {feed or "iex"}
+    assert (catalog / FEED_FILE).read_text() == f"{feed or 'iex'}\n"
+
+
+@pytest.mark.parametrize(
+    "extra,message",
+    [
+        (["--symbols", ",".join(f"S{i}" for i in range(9))], "SIP_QUOTES_MAX_SYMBOLS"),
+        (
+            ["--symbols", "AAPL", "--end", (START + timedelta(minutes=61)).isoformat()],
+            "SIP_QUOTES_MAX_SPAN",
+        ),
+        (["--symbols-file", "FILE"], "sip quotes take --symbols"),
+    ],
+    ids=["nine-symbols", "sixty-one-minutes", "symbols-file"],
+)
+def test_cli_refuses_sip_quotes_outside_the_bound_before_building_a_client(
+    catalog, monkeypatch, capsys, tmp_path, extra, message
+):
+    monkeypatch.setattr(history_load, "utc_now", lambda: NOW)
+    _forbid_client(monkeypatch)
+    path = tmp_path / "symbols.txt"
+    path.write_text("AAPL\n")
+    extra = [str(path) if arg == "FILE" else arg for arg in extra]
+    with pytest.raises(SystemExit) as stopped:
+        history_load.main(cli(catalog, "--feed", "sip", *extra))
+    assert stopped.value.code == 2
+    assert message in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("data", ["trades", "bars"])
+def test_cli_refuses_feed_iex_for_trades_and_bars_by_name(catalog, monkeypatch, capsys, data):
+    monkeypatch.setattr(history_load, "utc_now", lambda: NOW)
+    _forbid_client(monkeypatch)
+    argv = cli(catalog, "--symbols", "AAPL", "--feed", "iex")
+    argv[argv.index("quotes")] = data
+    with pytest.raises(SystemExit) as stopped:
+        history_load.main(argv)
+    assert stopped.value.code == 2
+    assert "--feed iex is for --data quotes only" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("data", ["trades", "bars"])
+def test_cli_keeps_sip_for_trades_and_bars_when_feed_sip_is_named(catalog, monkeypatch, data):
+    """`--feed sip` names what bars and trades already load; the parser lets it through to the client."""
+    monkeypatch.setattr(history_load, "utc_now", lambda: NOW)
+
+    def reached():
+        raise HistoryStopped("offline: the client is not built in this test")
+
+    monkeypatch.setattr(history_load, "history_client", reached)
+    argv = cli(catalog, "--symbols", "AAPL", "--feed", "sip", "--bars", "1-MINUTE")
+    argv[argv.index("quotes")] = data
+    assert history_load.main(argv) == 1
+
+
+def _route(tmp_path, **usage) -> tuple[subprocess.CompletedProcess, Path]:
+    """The task's run script with its process boundaries replaced: no keychain, no uv, no network."""
+    task = tomllib.loads((SOURCE_ROOT / "mise.toml").read_text())["tasks"]["paper:history"]
+    bin_ = tmp_path / "bin"
+    bin_.mkdir()
+    security = bin_ / "security"
+    security.write_text('#!/bin/sh\ntouch "$ROUTE_SECURITY"\necho offline-placeholder\n')
+    timeout = bin_ / "timeout"
+    timeout.write_text('#!/bin/sh\nif [ "$1" = -s ]; then shift 2; fi\nshift\nexec "$@"\n')
+    sent = tmp_path / "sent"
+    uv = bin_ / "uv"
+    uv.write_text('#!/bin/sh\nprintf "%s\\n" "$@" > "$ROUTE_SENT"\n')
+    for stub in (security, timeout, uv):
+        stub.chmod(0o700)
+    script = (
+        task["run"]
+        .replace("/usr/bin/security", str(security))
+        .replace("/usr/bin/timeout", str(timeout))
+    )
+    env = {
+        "PATH": f"{bin_}:{os.defpath}",
+        "ROUTE_SENT": str(sent),
+        "ROUTE_SECURITY": str(tmp_path / "security-called"),
+        "usage_account": "tests",
+        "usage_symbols": "AAPL",
+        "usage_start": START.isoformat(),
+        "usage_end": END.isoformat(),
+        **usage,
+    }
+    usage = {k: v for k, v in env.items() if v is not None}
+    completed = subprocess.run(
+        ["bash", "-c", script], env=usage, capture_output=True, text=True, check=False
+    )
+    return completed, sent
+
+
+@pytest.mark.parametrize("feed", ["sip", "iex"])
+def test_mise_load_mode_passes_the_quote_feed_to_the_module(tmp_path, feed):
+    completed, sent = _route(tmp_path, usage_data="quotes", usage_feed=feed)
+    assert completed.returncode == 0, completed.stderr
+    args = sent.read_text().splitlines()
+    assert args[args.index("--feed") + 1] == feed
+    assert args[args.index("--data") + 1] == "quotes"
+
+
+def test_mise_load_mode_without_feed_passes_none(tmp_path):
+    completed, sent = _route(tmp_path, usage_data="quotes")
+    assert completed.returncode == 0, completed.stderr
+    assert "--feed" not in sent.read_text().splitlines()
+
+
+def test_mise_help_names_the_sip_quote_bound():
+    task = tomllib.loads((SOURCE_ROOT / "mise.toml").read_text())["tasks"]["paper:history"]
+    assert 'choices "sip" "boats" "iex"' in task["usage"]
+    assert "60 minutes" in task["usage"] and "8 symbols" in task["usage"]
+    assert "SIP quotes" in task["description"]
+    assert f'"$count" -le {history_load.SIP_QUOTES_MAX_SYMBOLS} ]' in task["run"]
+
+
+# Round 1 (code review, high): a SIP quote root of its own, shell refusals before any pair, the bound's count.
+
+
+def _sip_bars_root(catalog: Path) -> None:
+    """A root that holds SIP bars, as `load_history` leaves one: one minute bar and the `sip` marker."""
+    bar_type = BarType.from_str("AAPL.ALPACA-1-MINUTE-LAST-EXTERNAL")
+    price = Price.from_str("10.00")
+    ts = dt_to_unix_nanos(START)
+    ParquetDataCatalog(str(catalog)).write_bars(
+        [Bar(bar_type, price, price, price, price, Quantity.from_int(5), ts, ts)], start=ts, end=ts
+    )
+    (catalog / FEED_FILE).write_text("sip\n")
+
+
+def test_a_sip_quote_load_into_a_root_with_sip_bars_is_refused_before_any_request(venue, catalog):
+    _sip_bars_root(catalog)
+    with pytest.raises(HistoryStopped, match=r"holds bars.*sip quotes.*root of their own"):
+        run(catalog, feed=DataFeed.SIP)
+    assert venue.sent == []
+    assert not (catalog / ".history-load.lock").exists()
+
+
+@pytest.mark.parametrize("feed", [DataFeed.SIP, DataFeed.IEX])
+@pytest.mark.parametrize("kind", ["bars", "trades"])
+def test_a_bars_or_trades_load_into_a_root_with_quotes_is_refused_whatever_the_feed(
+    venue, catalog, kind, feed
+):
+    assert run(catalog, symbols=["AAPL"], feed=feed) == 2
+    sent = len(venue.sent)
+    with pytest.raises(HistoryStopped, match=r"holds quotes.*no bars or trades"):
+        if kind == "bars":
+            history_load.load_history(
+                object(), ["AAPL"], ["1-MINUTE"], START, END, catalog, now=lambda: NOW
+            )
+        else:
+            history_load.load_trades(object(), ["AAPL"], START, END, catalog, now=lambda: NOW)
+    assert len(venue.sent) == sent
+
+
+def test_the_default_sip_quote_root_is_catalog_sip_quotes_and_iex_keeps_catalog(monkeypatch):
+    assert history_load.SIP_QUOTES_CATALOG == DEFAULT_CATALOG / "sip-quotes"
+    monkeypatch.setattr(history_load, "utc_now", lambda: NOW)
+    monkeypatch.setattr(history_load, "history_client", object)
+    roots = []
+
+    def load_quotes(client, symbols, start, end, catalog_path, **kwargs):
+        roots.append((kwargs["feed"], catalog_path))
+        return 0
+
+    monkeypatch.setattr(history_load, "load_quotes", load_quotes)
+    argv = ["--data", "quotes", "--symbols", "AAPL", "--start", START.isoformat()]
+    argv += ["--end", END.isoformat()]
+    assert history_load.main([*argv, "--feed", "sip"]) == 0
+    assert history_load.main(argv) == 0
+    assert roots == [
+        (DataFeed.SIP, DEFAULT_CATALOG / "sip-quotes"),
+        (DataFeed.IEX, DEFAULT_CATALOG),
+    ]
+
+
+@pytest.mark.parametrize("feed,root", [("sip", "catalog/sip-quotes"), ("iex", "catalog")])
+def test_mise_defaults_the_quote_root_by_feed(tmp_path, feed, root):
+    completed, sent = _route(tmp_path, usage_data="quotes", usage_feed=feed)
+    assert completed.returncode == 0, completed.stderr
+    args = sent.read_text().splitlines()
+    assert args[args.index("--catalog") + 1] == root
+
+
+@pytest.mark.parametrize(
+    "usage,message",
+    [
+        ({"usage_data": "trades", "usage_feed": "iex"}, "--feed iex is for --data quotes only"),
+        ({"usage_data": "bars", "usage_feed": "iex"}, "--feed iex is for --data quotes only"),
+        ({"usage_feed": "iex"}, "--feed iex is for --data quotes only"),
+        (
+            {"usage_data": "quotes", "usage_feed": "sip", "usage_symbols": None},
+            "sip quotes take --symbols",
+        ),
+        (
+            {
+                "usage_data": "quotes",
+                "usage_feed": "sip",
+                "usage_symbols": None,
+                "usage_symbols_file": "/symbols.txt",
+            },
+            "sip quotes take --symbols",
+        ),
+        (
+            {"usage_data": "quotes", "usage_feed": "sip", "usage_symbols": "A,B,C,D,E,F,G,H,I"},
+            "at most 8 symbols",
+        ),
+    ],
+    ids=["iex-trades", "iex-bars", "iex-default-bars", "sip-no-symbols", "sip-file", "sip-nine"],
+)
+def test_mise_load_mode_refuses_a_feed_misuse_before_any_pair_is_read(tmp_path, usage, message):
+    completed, sent = _route(tmp_path, **usage)
+    assert completed.returncode == 3
+    assert message in completed.stderr and "nothing was read" in completed.stderr
+    assert not (tmp_path / "security-called").exists()
+    assert not sent.exists()
+
+
+def test_mise_counts_sip_symbols_after_strip_and_upper_case(tmp_path):
+    nine_strings = "AAPL,aapl, MSFT,S0,S1,S2,S3,S4,S5"
+    completed, sent = _route(
+        tmp_path, usage_data="quotes", usage_feed="sip", usage_symbols=nine_strings
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert (tmp_path / "security-called").exists()
+    args = sent.read_text().splitlines()
+    assert args[args.index("--symbols") + 1] == nine_strings
+
+
+@pytest.mark.parametrize(
+    "usage",
+    [
+        {
+            "usage_mode": "baseline",
+            "usage_session": "2026-11-12",
+            "usage_start": None,
+            "usage_end": None,
+            "usage_symbols": None,
+        },
+        {"usage_mode": "conditions", "usage_start": None, "usage_end": None, "usage_symbols": None},
+    ],
+    ids=["baseline", "conditions"],
+)
+def test_feed_iex_is_refused_outside_load_mode_before_any_pair_is_read(tmp_path, usage):
+    completed, sent = _route(tmp_path, usage_feed="iex", **usage)
+    assert completed.returncode == 3
+    assert "iex" in completed.stderr and "nothing was read" in completed.stderr
+    assert not (tmp_path / "security-called").exists()
+    assert not sent.exists()
+
+
+def test_the_sip_bound_counts_distinct_symbols_after_strip_and_upper_case(venue, catalog):
+    """Nine strings that are eight symbols pass the bound; what stops them is the missing definitions."""
+    symbols = ["AAPL", "aapl", " MSFT", *(f"S{i}" for i in range(6))]
+    with pytest.raises(HistoryStopped, match="no instrument definition"):
+        run(catalog, symbols=symbols, feed=DataFeed.SIP)
+    assert venue.sent == []
+
+
+def test_a_blank_symbol_gets_the_empty_symbol_message_before_the_sip_bound(venue, catalog):
+    with pytest.raises(HistoryStopped, match="nonempty symbol"):
+        run(catalog, symbols=["", *(f"S{i}" for i in range(9))], feed=DataFeed.SIP)
+    assert venue.sent == []
+
+
+@pytest.mark.parametrize("data", ["bars", "trades"])
+def test_a_bars_or_trades_run_builds_no_feed_value(catalog, monkeypatch, data):
+    """The quote feed exists only on the quotes path: bars and trades load sip, never an iex value."""
+    monkeypatch.setattr(history_load, "utc_now", lambda: NOW)
+    built = []
+
+    class Guard:
+        SIP = DataFeed.SIP
+        IEX = DataFeed.IEX
+
+        def __new__(cls, value):
+            built.append(value)
+            return DataFeed(value)
+
+    def reached():
+        raise HistoryStopped("offline: the client is not built in this test")
+
+    monkeypatch.setattr(history_load, "DataFeed", Guard)
+    monkeypatch.setattr(history_load, "history_client", reached)
+    argv = cli(catalog, "--symbols", "AAPL", "--bars", "1-MINUTE")
+    argv[argv.index("quotes")] = data
+    assert history_load.main(argv) == 1
+    assert built == []
+
+
+@pytest.mark.parametrize(
+    "options",
+    [{"end": START + timedelta(hours=2)}, {"symbols": [f"S{i}" for i in range(9)]}],
+    ids=["span", "symbols"],
+)
+def test_a_sip_bound_refusal_cites_the_amended_record(venue, catalog, options):
+    with pytest.raises(HistoryStopped, match="ADR 0151"):
+        run(catalog, feed=DataFeed.SIP, **options)
