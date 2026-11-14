@@ -35,8 +35,11 @@ Upstream, at the pins (`nt:` nautilus-trader v2.0.0rc8, `ap:` alpaca-py v0.45.0)
 No upstream ships the ranking itself (ADR 0083, gap 1); the definitions below are the movers requirement's,
 and every threshold is a registered UNCALIBRATED row:
 
-* The move: the last bar's close over the latest split-adjusted official regular close of a session
-  before the trade date, less one; the caller supplies that close and its session (`Reference`). From
+* The move: the last bar's close over the latest official regular close of a session before the trade
+  date, less one, both raw (not split-adjusted: the live actor reads the close from Alpaca's snapshot,
+  `movers_rank_actor` module docstring); a name with a split since that session, or with no split read
+  covering it, is excluded (`split_since`, `corporate_action` in `rank`), so no raw close across a split
+  is ever ranked. The caller supplies that close and its session (`Reference`). From
   16:00 to 20:00 that is still the prior session's close, not today's (ADR 0087). The move
   from today's regular open is recorded beside it.
 * The dollar-volume ratio: today's dollar volume from `PART_START` New York the evening before (the
@@ -657,9 +660,10 @@ def read_baselines(path: Path, session: date) -> BaselineRead:
 
 @dataclass(frozen=True)
 class Reference:
-    """The latest completed official regular-session close, as the caller read it split-adjusted, and the
-    session it closed. Not every source adjusts a close for a split before its ex-date is processed, so
-    the split filter excludes any name with a split since that session rather than trust the close."""
+    """The latest completed official regular-session close, raw as the caller read it (not split-adjusted),
+    and the session it closed. `rank` excludes any name with a split since that session, or with no split
+    read covering it (`split_since`; `corporate_action` or `corporate_action:unknown`), so a raw close is
+    only ever compared with bars from the same share basis."""
 
     close: float
     session: date
