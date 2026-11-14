@@ -87,7 +87,8 @@ printed as it happens, so a run that is stopped has already named what it sent; 
 ends it as a failure by name (`custody._stop`). Exit 0 when each long is covered, 1 when a read or a send
 failed or the run was stopped, 2 when a long is left uncovered by name, 3 when the run was refused by name.
 With `--only` the 0 and the 2 speak of the NAMED symbols alone: a long that was not named is left as it
-was found, covered or not, and is no failure, and a named symbol that holds no long is a 2.
+was found, covered or not, and is no failure, and a named symbol that holds no long is a 2. A position
+that cannot be read is an ALERT and a 2 whether it was named or not: what it is, is not known.
 
 A stop that rests holds its shares: Alpaca refuses another sell of them until the stop is canceled, the
 holder's own included. `--cancel` (`cancel_stops`) cancels the open stops of the protect lineage, every one
@@ -785,7 +786,9 @@ class _Protect:
             at = now + timedelta(seconds=monotonic() - self.began)
             self._protect(symbol, whole, qty, ours, at, n)
         for symbol in selected or ():
-            if held.get(symbol, 0) <= 0:
+            # A named symbol that could not be read has its ALERT above: what it holds is not known,
+            # so it is not also said to hold no long.
+            if symbol not in unread and held.get(symbol, 0) <= 0:
                 # A name typed wrong would otherwise read as done (as `cancel_stops` holds for its
                 # symbol): it is said in a plan-only run too, and the run is not a success.
                 report.note(

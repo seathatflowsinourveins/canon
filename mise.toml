@@ -980,7 +980,8 @@ exec /usr/bin/timeout -s TERM -k 30 600 uv run --locked python -c 'from canon_tr
 # account's lock without waiting: a lock held refuses the run, so the go it was started on is not spent later. Exit
 # 0 each long covered (or planned), 1 a read or send failed, 2 a long left uncovered by name, 3 refused by name. With
 # --only the 0 and the 2 speak of the named symbols alone (a long not named is left as found and is no failure; a
-# named symbol with no long is a 2), and an --only given with no symbol is refused here, never read as no list. With
+# named symbol with no long is a 2; a position that cannot be read is an ALERT and a 2, named or not), and an
+# --only given with no symbol is refused here, never read as no list. With
 # --cancel: 0 each protect stop named ended canceled with nothing filled, or none was open; 1 a cancel or a read
 # failed, or a stop ended another way; 2 --symbol named a symbol the open listing showed no protect stop in; 3 refused.
 [tasks."paper:protect"]

@@ -2374,6 +2374,32 @@ def test_only_does_not_count_an_omitted_fraction_as_a_failure(capsys) -> None:
     assert "BBB: not named: no stop sent" in lines
 
 
+@pytest.mark.parametrize(
+    ("only", "sent", "plan_only"),
+    [
+        ("BBB", [], "false"),
+        ("AAA,BBB", ["AAA"], "false"),
+        ("AAA", ["AAA"], "false"),
+        ("BBB", [], "true"),
+    ],
+)
+def test_only_and_an_unreadable_position_say_one_true_thing(capsys, only, sent, plan_only) -> None:
+    """A position that cannot be read is an ALERT and a 2 whether it was named or not: what it is, is
+    not known, so the list does not make it "left as found". A named one is never also said to hold no
+    long, which would be false; the long beside it gets its stop only when it is named."""
+    paper = Paper(positions=[_position("AAA", "10"), _position("BBB", "NaN")])
+    data = Data({"AAA": AAA_BOOK, "BBB": BBB_BOOK})
+    code, lines = _only_run(
+        paper, data, capsys, only, plan_only=plan_only, row="" if plan_only == "true" else "OWN1"
+    )
+    assert code == 2, lines
+    assert [r.symbol for r in paper.submitted] == ([] if plan_only == "true" else sent), lines
+    assert len([x for x in lines if x.startswith("ALERT BBB:")]) == 1, lines
+    assert not any("BBB" in x and "no long held" in x for x in lines), lines
+    assert not any(x.startswith("BBB: not named") for x in lines), lines
+    assert not any(getattr(request, "symbol", None) == "BBB" for _, request in paper.calls)
+
+
 @pytest.mark.parametrize("plan_only", [False, True])
 def test_an_empty_include_list_is_refused_and_never_read_as_no_list(plan_only) -> None:
     """No list is None. A caller that built its list from no names must not get a send for every long."""
