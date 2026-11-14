@@ -681,3 +681,22 @@ def test_every_chase_leg_carries_the_protect_lineage_never_our_nodes() -> None:
     assert legs, "the chase must re-send the sale"
     for leg in [strategy.sent[0], *legs]:
         assert custody.lineage(str(leg.client_order_id)) == custody.PROTECT, leg.client_order_id
+
+
+@pytest.mark.parametrize("late", [10, 4], ids=["complete", "partial"])
+def test_a_late_fill_on_an_ended_leg_withdraws_the_working_leg_in_that_event(late: int) -> None:
+    """A custody fault (the lead, 2026-11-13 19:17): a late fill on a canceled leg (Canceled -> Filled,
+    nt@d53849b216e2 crates/model/src/orders/mod.rs:247) left the replacement working until the next
+    quote or step. The engine updates the position before it publishes the fill
+    (crates/execution/src/engine/mod.rs:3261, :3266), so the fill event itself re-evaluates."""
+    strategy, first = released()
+    at = RELEASE + CHASE + h.SECOND
+    strategy.observe("9.80", at)
+    terminal(first, at + 2 * h.SECOND)
+    strategy.observe("9.80", at + 3 * h.SECOND)
+    second = strategy.sent[-1]
+    assert second.quantity == Quantity.from_int(10)
+    accepted(second, at + 3 * h.SECOND)
+    filled(strategy, first, late, at + 4 * h.SECOND)
+    assert second.client_order_id in strategy.canceled, "withdrawn in the fill's own event"
+    assert len(strategy.sent) == 2, "nothing new is sent until the replacement's cancel is final"

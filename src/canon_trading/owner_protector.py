@@ -1305,7 +1305,14 @@ class OwnerProtector(Strategy):
         self._observe_sale(event.instrument_id, slot, self.cache.order(event.client_order_id))
 
     def on_order_filled(self, event: OrderFilled) -> None:
-        """Measure 1 for a sale the armed lock protected, then the sale's own record (U-d)."""
+        """Measure 1 for a sale the armed lock protected, then the holding re-evaluated at once.
+
+        A fill on any leg, a late one on a canceled leg included (Canceled -> Filled,
+        nt@d53849b216e2 crates/model/src/orders/mod.rs:247), changes the shares a working leg
+        must cover. The engine updates the position before it publishes the fill
+        (crates/execution/src/engine/mod.rs:3261, :3266), so `_manage` here withdraws a working
+        leg for size in this event, not at the next quote or step (the lead, 2026-11-13 19:17).
+        """
         slot = self.slots.get(event.instrument_id)
         if slot is None or not (
             event.client_order_id == slot.protect_id
@@ -1314,8 +1321,11 @@ class OwnerProtector(Strategy):
             return
         if slot.gain_armed_at is not None and slot.gain_entry is not None:
             self._gain_lock_sale(event, slot)
-        order = None if slot.protect_id is None else self.cache.order(slot.protect_id)
-        self._observe_sale(event.instrument_id, slot, order)
+        if self.stopping or event.instrument_id in self.stopped_instruments:
+            order = None if slot.protect_id is None else self.cache.order(slot.protect_id)
+            self._observe_sale(event.instrument_id, slot, order)
+            return
+        self._manage(event.instrument_id)  # Observes the sale's record first.
 
     def _gain_lock_sale(self, event: OrderFilled, slot: Holding) -> None:
         """Measure 1: each fill of a sale the armed lock protected, against the entry."""
