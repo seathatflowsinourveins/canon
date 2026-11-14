@@ -317,6 +317,125 @@ def test_seam_restarts_from_last_written_level_distance_offset_with_zero_guard(s
     assert any("identity" in limit for limit in report["limits"])
 
 
+SEAM = START + 6 * SECOND
+
+
+def two_segments(shape) -> dict[str, Any]:
+    shape["spec"]["segments"] = [[START, SEAM], [SEAM, START + 8 * SECOND]]
+    return shape["spec"]
+
+
+def saved_entry(report: dict[str, Any], symbol: str) -> dict[str, Any]:
+    return next(
+        entry
+        for entry in report["segments"][0]["book"]["entries"]
+        if entry["instrument_id"] == f"{symbol}.ALPACA"
+    )
+
+
+def test_a_scripted_sell_out_at_the_seam_is_a_new_holding_and_carries_no_level(shape) -> None:
+    # The venue shows LLL sold out and bought back at the seam, which the engine never did;
+    # MMM has no scripted fill. The verdict runs both ways in one replay.
+    spec = two_segments(shape)
+    spec["venue_fills"] = {
+        "LLL": [
+            {"side": "sell", "quantity": 10, "filled_at": SEAM},
+            {"side": "buy", "quantity": 10, "filled_at": SEAM + 1000},
+        ]
+    }
+    report = runner().replay(spec)
+    lll = holding(report, "LLL", segment=1)["arming"][0]
+    assert lll["level"] != saved_entry(report, "LLL")["last_level"]
+    lines = [line["text"] for line in report["segments"][1]["lines"] if line["symbol"] == "LLL"]
+    assert any("not carried" in text and "a new holding" in text for text in lines), lines
+    mmm = holding(report, "MMM", segment=1)["arming"][0]
+    saved = saved_entry(report, "MMM")
+    assert (mmm["level"], mmm["distance"], mmm["limit_offset"]) == (
+        saved["last_level"],
+        saved["distance"],
+        saved["limit_offset"],
+    )
+
+
+def test_the_venue_reader_answers_as_the_venue_would_for_a_persisted_holding(shape) -> None:
+    module = runner()
+    spec = two_segments(shape)
+    spec["venue_fills"] = {"LLL": [{"side": "sell", "quantity": 4, "filled_at": SEAM}]}
+    checked = module._checked(spec, Path.cwd())
+    reader = module._VenueReader(checked)
+    now = {"ns": START - SECOND}
+
+    class Clock:
+        def timestamp_ns(self) -> int:
+            return now["ns"]
+
+    reader.protector = type("Engine", (), {"clock": Clock()})()
+    assert reader.get("/clock") == {"timestamp": "2025-03-11T14:59:59+00:00"}
+    with pytest.raises(ValueError, match="no position in LLL"):
+        reader.get("/positions/LLL")
+    sells = {"symbols": "LLL", "side": "sell", "after": "2025-03-10T15:00:00+00:00"}
+    now["ns"] = SEAM - 1000
+    assert reader.get("/positions/LLL") == {"symbol": "LLL", "qty": "10"}
+    assert reader.get("/orders", sells) == []
+    now["ns"] = SEAM
+    assert reader.get("/positions/LLL") == {"symbol": "LLL", "qty": "6"}
+    (order,) = reader.get("/orders", sells)
+    assert (order["side"], order["filled_qty"], order["filled_at"]) == (
+        "sell",
+        "4",
+        "2025-03-11T15:00:06+00:00",
+    )
+    assert reader.get("/orders", {**sells, "side": "buy"}) == []
+    assert reader.get("/orders", {**sells, "until": "2025-03-11T15:00:05+00:00"}) == []
+    assert reader.get("/positions/MMM") == {"symbol": "MMM", "qty": "7"}
+    with pytest.raises(ValueError, match="cannot answer /account"):
+        reader.get("/account")
+
+
+def test_the_report_names_each_seam_crossing_and_each_entry_without_a_reading(shape) -> None:
+    report = runner().replay(two_segments(shape))
+    crossings = {row["symbol"]: row for row in report["seams"]}
+    assert set(crossings) == {"LLL", "MMM"}
+    for symbol, row in crossings.items():
+        first = holding(report, symbol)["owner_fills"][0]
+        again = holding(report, symbol, segment=1)["owner_fills"][0]
+        assert (row["segment"], row["opened_at"], row["opened_price"]) == (
+            2,
+            first["at"],
+            first["last_px"],
+        )
+        assert (row["rebought_at"], row["rebought_price"]) == (again["at"], again["last_px"])
+        assert "artefact" in row
+    unread = [
+        (segment["index"], entry["instrument_id"])
+        for segment in report["segments"]
+        for entry in segment["book"]["entries"]
+        if entry.get("horizon_ns") is None
+    ]
+    assert [(e["segment"], e["instrument_id"]) for e in report["entries_without_reading"]] == unread
+    rendered = runner().render_markdown(report)
+    assert "## Seams (the re-buy is an artefact of the replay)" in rendered
+    assert "## Book entries with no venue reading" in rendered
+
+
+@pytest.mark.parametrize(
+    ("fills", "message"),
+    [
+        ({"ZZZ": [{"side": "sell", "quantity": 1, "filled_at": SEAM}]}, "not a holding"),
+        ({"LLL": [{"side": "short", "quantity": 1, "filled_at": SEAM}]}, "buy or sell"),
+        ({"LLL": [{"side": "sell", "quantity": 0.5, "filled_at": SEAM}]}, "whole shares"),
+        ({"LLL": [{"side": "sell", "quantity": 1}]}, "side, quantity and filled_at"),
+    ],
+)
+def test_a_malformed_venue_fill_is_refused_before_any_engine(shape, fills, message) -> None:
+    spec = two_segments(shape)
+    spec["venue_fills"] = fills
+    report = runner().replay(spec)
+    assert report["status"] == "refused"
+    assert report["refusals"][0]["source"] == "spec"
+    assert message in report["refusals"][0]["reason"]
+
+
 def test_gain_lock_records_the_protectors_events_and_release_above_cost_floor(shape) -> None:
     row = holding(runner().replay(shape["spec"]))
     gain = row["gain_lock_events"][0]
