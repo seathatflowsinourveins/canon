@@ -723,7 +723,7 @@ flag "--symbols <symbols>" help="symbols, comma-separated (or --symbols-file)"
 flag "--symbols-file <file>" help="a file of symbols, one a line"
 flag "--start <start>" help="ISO 8601 with a time zone; required unless --spans-file (corporate-actions mode: a YYYY-MM-DD day)"
 flag "--date-map <file>" help="corporate-actions mode only, required: the sim lane's date map; every day of the span must be development or closed"
-flag "--end <end>" help="ISO 8601 with a time zone; required unless --spans-file, at least 15 minutes (trades, quotes or 1-MINUTE bars) or a day (1-DAY bars) before now"
+flag "--end <end>" help="ISO 8601 with a time zone; required unless --spans-file, at least 15 minutes (trades, quotes or 1-MINUTE bars) or a day (1-DAY bars) before now (corporate-actions mode: a YYYY-MM-DD day)"
 flag "--spans-file <file>" help="sip 1-MINUTE bars only (the default --bars then), in place of --start and --end: a file of spans, one a line as START END, in order and not overlapping, loaded in one process under one catalog lock and one pace"
 flag "--definitions <root>" help="bars only: read instrument definitions from this root, which holds equity definitions alone, not from --catalog; --catalog then gets none, and the baseline, replays and rank record, which read definitions from their bars root, find none there"
 flag "--bars <bars>" help="1-MINUTE, 1-DAY or both, comma-separated; default both, or 1-MINUTE (the only one) for --feed boats"
@@ -803,6 +803,7 @@ case "${usage_mode:-}" in
       # The module's refusals, held here too so a misuse reads no pair.
       [ -z "$(named start end)" ] || { echo "paper:history: --spans-file takes no --start or --end: the file gives every span; nothing was read" >&2; exit 3; }
       [ "${usage_data:-bars}" = bars ] && [ "${usage_feed:-sip}" = sip ] || { echo "paper:history: --spans-file is for sip bars only; nothing was read" >&2; exit 3; }
+      [ "${usage_bars:-1-MINUTE}" = 1-MINUTE ] || { echo "paper:history: --spans-file loads 1-MINUTE bars only, not --bars ${usage_bars}; nothing was read" >&2; exit 3; }
     fi
     [ -z "${usage_definitions:-}" ] || [ "${usage_data:-bars}" = bars ] || { echo "paper:history: --definitions is for bars only; nothing was read" >&2; exit 3; }
     [ -z "$wrong" ] || { echo "paper:history: load mode takes no baseline flag:$wrong; give the baseline mode for those; nothing was read" >&2; exit 3; }

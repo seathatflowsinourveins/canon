@@ -1170,6 +1170,8 @@ def test_the_task_passes_a_spans_file_and_definitions_and_no_empty_start_or_end(
         ),
         ({"spans_file": "/spans.txt", "data": "trades"}, "sip bars only"),
         ({"spans_file": "/spans.txt", "feed": "boats"}, "sip bars only"),
+        ({"spans_file": "/spans.txt", "bars": "1-MINUTE,1-DAY"}, "1-MINUTE bars only"),
+        ({"spans_file": "/spans.txt", "bars": "1-DAY"}, "1-MINUTE bars only"),
         ({"definitions": "/defs", "data": "quotes"}, "bars only"),
         ({"mode": "baseline", "spans_file": "/spans.txt"}, "--spans-file"),
         ({"mode": "conditions", "definitions": "/defs"}, "--definitions"),

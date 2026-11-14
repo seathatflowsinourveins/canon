@@ -731,6 +731,8 @@ def test_mise_corporate_actions_mode_refuses_a_foreign_flag_before_any_pair(
     )
     assert done.returncode == 3, done.stderr
     assert "corporate-actions mode takes" in done.stderr and "nothing was read" in done.stderr
+    named = "--" + flag.removeprefix("usage_").replace("_", "-")
+    assert done.stderr.rstrip().split("; nothing was read")[0].endswith(named), done.stderr
     assert not (tmp_path / "sent").exists() and not (tmp_path / "sent.security").exists()
 
 
