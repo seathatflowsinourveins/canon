@@ -98,7 +98,7 @@ class GainHarness(Harness):
 
 
 def holding(entry: Any = Decimal("10.00"), bid: str = "10.00") -> GainHarness:
-    strategy = GainHarness()
+    strategy = GainHarness(gain_lock=True)
     strategy.cached.held[0].avg_px_open = entry
     strategy.cached.latest = quote(bid)
     strategy.cached.history = minute_bars("0.20")
@@ -220,7 +220,7 @@ def test_f4_large_forward_skew_is_named_and_does_not_poison_later_quotes(stamp, 
 def test_f4_invalid_cached_future_quote_does_not_poison_startup() -> None:
     """Moved by C0's venue clock (the lead, 2026-11-13 17:36): with no maximum yet, the first sane
     quote establishes the clock and does not count, so the second newer quote arms."""
-    strategy = GainHarness()
+    strategy = GainHarness(gain_lock=True)
     strategy.cached.held[0].avg_px_open = Decimal("10.00")
     # Stamped 120 s ahead of its receipt; a receipt is the node's own clock, never ahead of it.
     ahead = quote("10.00", T0 + 120 * SECOND)
@@ -240,7 +240,7 @@ def test_f4_invalid_cached_future_quote_does_not_poison_startup() -> None:
 
 @pytest.mark.parametrize("event_at", [T0 - SECOND, T0], ids=["backlog", "start-boundary"])
 def test_f5_backlog_received_after_start_never_arms(event_at) -> None:
-    strategy = GainHarness()
+    strategy = GainHarness(gain_lock=True)
     strategy.cached.held[0].avg_px_open = Decimal("10.00")
     strategy.cached.latest = quote("10.00", T0 - 30 * SECOND)
     strategy.cached.history = minute_bars("0.20")
@@ -282,6 +282,7 @@ def native_gain_replay(owner=None):
     )
     engine.add_instrument(equity())
     protector = SimulatedProtector("9.80")
+    protector.settings.gain_lock = True  # the lock is opt-in (the lead, 2026-11-13 22:47)
     engine.add_strategy(Owner() if owner is None else owner)
     engine.add_strategy(protector)
     engine.add_data(sorted(minute_bars("0.20"), key=lambda bar: bar.ts_init))
@@ -543,6 +544,7 @@ def test_todays_shape_releases_at_cost_floor_and_below_threshold_keeps_plain_tra
     )
     engine.add_instrument(equity())
     protector = SimulatedProtector("9.80")
+    protector.settings.gain_lock = True  # the lock is opt-in (the lead, 2026-11-13 22:47)
     engine.add_strategy(Owner())
     engine.add_strategy(protector)
     # Entry ask is 10.00, and the warm ATR fixes the trail at 0.20.
@@ -600,7 +602,7 @@ def test_review4_arming_never_puts_the_trigger_at_or_over_the_bid(bid) -> None:
 
 
 def test_review5_a_redelivered_quote_from_before_the_arming_never_arms() -> None:
-    strategy = GainHarness()
+    strategy = GainHarness(gain_lock=True)
     strategy.cached.held[0].avg_px_open = Decimal("10.00")
     strategy.cached.history = minute_bars("0.20")
     # Received 10 ms before adoption, stamped 80 ms after it (the venue clock ahead).
@@ -629,8 +631,8 @@ def test_review5_a_redelivered_quote_from_before_the_arming_never_arms() -> None
 
 
 class CountingHarness(GainHarness):
-    def __init__(self) -> None:
-        super().__init__()
+    def __init__(self, **settings: Any) -> None:
+        super().__init__(**settings)
         self.modified: list[Any] = []
 
     def modify_order(self, client_order_id, *args, **kwargs) -> None:
@@ -639,7 +641,7 @@ class CountingHarness(GainHarness):
 
 
 def test_review6_no_modify_in_the_step_that_cancels_for_size() -> None:
-    strategy = CountingHarness()
+    strategy = CountingHarness(gain_lock=True)
     strategy.cached.held[0].avg_px_open = Decimal("10.00")
     strategy.cached.latest = quote("10.00")
     strategy.cached.history = minute_bars("0.20")
@@ -722,7 +724,7 @@ def test_the_lock_never_arms_before_the_plan_so_planning_cannot_lift_it_to_the_b
     """With the plan refused, the spacing is unknown, and a floor applied at a spacing of 0 is lifted
     by the later plan to floor plus spacing, at or over the bid: the next quote then sends a trail
     whose trigger is the bid, which the emulator releases at once. The lock alone must never sell."""
-    strategy = GainHarness()
+    strategy = GainHarness(gain_lock=True)
     strategy.cached.held[0].avg_px_open = Decimal("10.00")
     strategy.cached.latest = None
     strategy.cached.history = minute_bars("0.20")

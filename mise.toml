@@ -1074,6 +1074,7 @@ arg "<account>" help="tests: A; windows: B; protect: C, with the lead's account-
   choices "tests" "windows" "protect"
 }
 flag "--row <row>" required=#true help="OWN1 or OWN3; no default; F2 is refused by name"
+flag "--gain-lock" help="enable the gain lock (default off)"
 flag "--levels <levels>" help="optional starting levels, SYMBOL=PRICE,...; each belongs only to its starting holding"
 flag "--minutes <minutes>" help="1-960, default 30; shortened to the current feed span's end"
 flag "--feed <feed>" help="sip or boats; otherwise selected from Alpaca's clock/calendar; IEX refused"
@@ -1106,6 +1107,7 @@ ALPACA_SECRET_KEY="$(/usr/bin/timeout 30 /usr/bin/security find-generic-password
 [ -n "$ALPACA_API_KEY" ] && [ -n "$ALPACA_SECRET_KEY" ] || { echo "paper:protector: the named account's pair is not in the login keychain; nothing was sent" >&2; exit 1; }
 export ALPACA_API_KEY ALPACA_SECRET_KEY CANON_PAPER_ACCOUNT="$usage_account"
 args=("$usage_account" --row "$usage_row" --holds-dir "$usage_holds_dir" --inbox "$usage_inbox")
+[ "${usage_gain_lock:-false}" = true ] && args+=(--gain-lock)
 [ -z "${usage_symbol_holds_dir:-}" ] || args+=(--symbol-holds-dir "$usage_symbol_holds_dir")
 [ -z "${usage_levels:-}" ] || args+=(--levels "$usage_levels")
 [ -z "${usage_minutes:-}" ] || args+=(--minutes "$usage_minutes")

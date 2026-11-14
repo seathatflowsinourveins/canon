@@ -144,8 +144,10 @@ ERROR as without its working sell until one arrives. The two observations of the
 started fresh, as paper:protector starts each run. A protector that cannot act on its quotes says
 so at every step.
 
-Gain lock (ADR 0083:29; handbook/philosophy.md:29; owner, 2026-11-13; the arithmetic is
-canon_trading.gain_lock, shared with the Mover): a subsequent fresh quote with bid >= average
+Gain lock is off by default and enabled only by paper:protector's explicit --gain-lock flag
+(the lead's ruling, 2026-11-13): not a default until its replay proof. When enabled (ADR 0083:29;
+handbook/philosophy.md:29; owner, 2026-11-13; the arithmetic is canon_trading.gain_lock, shared
+with the Mover), a subsequent fresh quote with bid >= average
 entry + round-trip cost + noise floor latches a floor at up_on_step(entry + cost). The entry's
 fill paid the ask and the lock reads the bid, so the spread is not counted again: the cost is fees
 per share, zero on paper until ADR 0147 (the lead's cost ruling, 2026-11-13). Noise is
@@ -469,6 +471,7 @@ class OwnerProtectorConfig(StrategyConfig):
         symbol_holds: frozenset[str] | None = None,
         feed: str = "sip",
         extended_hours: bool = True,
+        gain_lock: bool = False,
         account_label: str | None = None,
         level_book_path: Path | str | None = None,
         run: str = "",
@@ -487,6 +490,7 @@ class OwnerProtectorConfig(StrategyConfig):
         self.feed = feed
         self.row = row
         self.extended_hours = extended_hours
+        self.gain_lock = gain_lock
         self.account_label = account_label
         self.level_book_path = level_book_path
         self.run = run
@@ -500,6 +504,9 @@ class OwnerProtectorConfig(StrategyConfig):
         self.validate_protection()
 
     def validate_protection(self) -> None:
+        if type(self.gain_lock) is not bool:
+            # A truthy non-bool would turn on a lock that is off unless asked for.
+            raise ValueError(f"gain_lock must be True or False, not {self.gain_lock!r}")
         if type(self.breach_count) is not int or self.breach_count < 1:
             raise ValueError("breach_count must be a whole number of at least one")
         if self._gap_given and (type(self.confirm_gap_ms) is not int or self.confirm_gap_ms < 0):
@@ -2226,6 +2233,8 @@ class OwnerProtector(Strategy):
         The arming quote fixes cost and noise; a changed average can only raise the cost floor.
         No unknown input removes either the retained level or the already-armed latch.
         """
+        if not self.settings.gain_lock:
+            return
         entry = _quantity(getattr(position, "avg_px_open", None))
         if entry is not None and entry <= 0:
             entry = None
