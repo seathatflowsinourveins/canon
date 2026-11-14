@@ -2797,7 +2797,39 @@ class OwnerProtector(Strategy):
             slot.sale_state = sale_table.State("G", 0)
         # Detach before doing any work. Submit/cancel echoes append to the next batch.
         queued = self._sale_events.pop(instrument_id, [])
-        events = list(events)
+        taken: set[int] = set()
+        try:
+            self._sale_batch(
+                instrument_id,
+                slot,
+                list(events),
+                queued,
+                taken,
+                reason=reason,
+                order_event_ns=order_event_ns,
+            )
+        finally:
+            # Whatever was raised, by the table or by anything else, the stored events not yet
+            # judged go back, in their order and ahead of this step's echoes, for the next step.
+            # A lost acknowledgement or fill would leave the holding with no leg and a false line.
+            # The event during whose judging something was raised is not judged again.
+            left = [item for item in queued if id(item) not in taken]
+            if left:
+                self._sale_events[instrument_id] = left + self._sale_events.get(instrument_id, [])
+
+    def _sale_batch(
+        self,
+        instrument_id: InstrumentId,
+        slot: Holding,
+        events: list[str],
+        queued: list[Any],
+        taken: set[int],
+        *,
+        reason: str,
+        order_event_ns: int | None,
+    ) -> None:
+        """One step's work on a detached batch; `taken` names each stored event once it is judged."""
+        assert slot.sale_state is not None
         snapshot = self._sale_snapshot(instrument_id, slot)
         position, held, uncovered, order, position_readable = snapshot
         net = held + self._sale_sold(instrument_id, self.sent_ids)
@@ -2860,6 +2892,7 @@ class OwnerProtector(Strategy):
                 current_reason, current_ns = reason, order_event_ns
                 wait_from_ns = order_event_ns
                 if item is not None:
+                    taken.add(id(item))
                     code = self._judge_sale_event(slot, item)
                     current_reason = str(getattr(item, "reason", None) or "")
                     current_ns = item.ts_event
