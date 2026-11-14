@@ -13,22 +13,37 @@ every record the actor kept on each tick (the Mover run's `ranking_records`), wi
 identity, input digests (the reference root's daily-bar files included), actor settings and
 code commit. The actor's settings are the regular replay's own, so a spec naming another
 part, feed, interval, data age or baseline rule is refused by name, in the full replay too.
-A recording and its replay need a clean commit (a 40-hex `running_commit`): code that is
-dirty or unknown is refused, never matched as text. Exit arms and fill presets are
+A recording and its replay need a 40-hex `running_commit`: a tree git reports dirty, or no
+commit at all, is refused, never matched as text. Exit arms and fill presets are
 deliberately not ranking configuration. Signal files live in or beside the snapshot, outside
 tracked repository content (ignored catalog snapshots inside a worktree are allowed). The
-destination folder is probed with a partial file before the ranking process starts, and the
-finished record is linked into place exclusively, so no unwritable folder costs a whole
-ranking and no failed run leaves a file. Existing files are read and validated, never
+destination folder is probed before the ranking process starts, by creating a partial file
+and hard-linking it to a second name, so a folder that takes no file or no link costs no
+ranking; the finished record is linked into place exclusively, and a run that fails leaves
+no file. Existing files are read and validated, never
 silently overwritten or recomputed. Each recording owns a process for the native logger,
 like window_replay. RecordedRankings follows FixedRank and the local p1_overnight
 RecordedRankings pattern, with one native alert per recorded tick, named after the actor's
 own timer so it keeps the actor's place among timers due at the same nanosecond (rc8
 crates/backtest/src/accumulator.rs:44-52 orders them by ts_event, then by name).
 
-Named limit: commit equality is conservative. Any later commit, including one that changes
-no ranking code (an exit arm in session_window.TRAIL_ARMS), voids every recording until it
-is recorded again.
+Named limits:
+- Commit equality is conservative. Any later commit, including one that changes no ranking
+  code (an exit arm in session_window.TRAIL_ARMS), voids every recording until it is
+  recorded again.
+- The commit is session_window.running_commit's: it returns CANON_COMMIT as-is when that
+  is set, and git's dirty test there is `status --porcelain -uno`, so an edit under an
+  exported CANON_COMMIT, or an untracked module the ranking imports, is not detected.
+- The reference root's digest covers every daily-bar file under it, so appending a session
+  to the root voids the recordings of earlier dates too. Published snapshots are never
+  appended to; a new day is a new version.
+- A recording killed outright (SIGKILL) leaves its `.partial` probe beside its target.
+- In recorded mode the roster's reference refusal reads the recording's `unreferenced`
+  list, which the digests above tie to the same inputs; and a roster with no defined name
+  and an empty recording is refused with the catalog's message, not the roster's.
+- In the default path the baseline and reference refusals come after the instrument load
+  (make_actor), not before it as at 8a51cacd: the same refusals, later and possibly behind
+  another one.
 """
 
 from __future__ import annotations
@@ -121,10 +136,15 @@ def _reference_root_sha256(root: Path) -> str:
     return digest.hexdigest()
 
 
-def configuration(spec: Mapping[str, Any]) -> dict[str, Any]:
+def check_settings(spec: Mapping[str, Any]) -> None:
+    """Refuse a spec naming an actor setting the regular replay does not run; reads no file."""
     for key, supported in ACTOR_SETTINGS.items():
         if key in spec and spec[key] != supported:
             raise ValueError(f"{key} must be {supported!r} for a regular replay")
+
+
+def configuration(spec: Mapping[str, Any]) -> dict[str, Any]:
+    check_settings(spec)
     baseline = Path(spec["baseline_path"])
     reference_root = Path(spec["reference_root"]) if "reference_root" in spec else None
     return {
@@ -167,7 +187,7 @@ def make_actor(
     from .window_replay import _ns
     from .window_replay import _references
 
-    configuration(spec)
+    check_settings(spec)
     day = date.fromisoformat(spec["trade_date"])
     baseline_path = _local(spec["baseline_path"], directory=False)
     baseline = movers_rank.read_baselines(baseline_path, day)
@@ -407,6 +427,10 @@ def record_rankings(spec: Mapping[str, Any], path: str | Path) -> dict[str, Any]
     ) as handle:
         partial = Path(handle.name)
     try:
+        # The record is linked into place, so the folder must take a hard link too.
+        linked = partial.with_name(partial.name + ".link")
+        os.link(partial, linked)
+        linked.unlink()
         result = subprocess.run(
             [sys.executable, "-c", _WORKER],
             input=json.dumps(dict(spec), allow_nan=False),
@@ -419,8 +443,12 @@ def record_rankings(spec: Mapping[str, Any], path: str | Path) -> dict[str, Any]
             raise RuntimeError(f"ranking process failed ({result.returncode}):\n{result.stderr}")
         record = json.loads(result.stdout)
         partial.write_text(json.dumps(record, indent=2, allow_nan=False) + "\n")
-        # Exclusive: a record another recorder published meanwhile is never overwritten.
-        os.link(partial, target)
+        # Exclusive: a record another recorder published meanwhile is never overwritten; it
+        # is read and validated instead, as an existing file is.
+        try:
+            os.link(partial, target)
+        except FileExistsError:
+            return read_record(target, spec)
     finally:
         partial.unlink(missing_ok=True)
     return record

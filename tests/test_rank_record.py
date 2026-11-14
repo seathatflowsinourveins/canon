@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 import subprocess
 from datetime import datetime
 from datetime import timedelta
@@ -215,6 +216,42 @@ def test_record_refuses_an_unwritable_destination_before_ranking(rank_spec, monk
     finally:
         root.chmod(0o755)
     assert not (root / "rank.json").exists()
+
+
+def test_record_refuses_a_folder_without_hard_links_before_ranking(rank_spec, monkeypatch):
+    from canon_trading import rank_record
+
+    monkeypatch.setattr(rank_record, "_WORKER", "raise AssertionError('ranking ran')")
+
+    def no_link(src, dst, *args, **kwargs):
+        raise OSError(45, "Operation not supported")
+
+    monkeypatch.setattr(rank_record.os, "link", no_link)
+    target = Path(rank_spec["bars_root"]) / "rank.json"
+    before = sorted(target.parent.iterdir())
+    with pytest.raises(OSError, match="not supported"):
+        rank_record.record_rankings(rank_spec, target)
+    assert sorted(target.parent.iterdir()) == before
+
+
+def test_a_record_published_meanwhile_is_read_not_overwritten(rank_spec, monkeypatch):
+    from canon_trading import rank_record
+
+    target = Path(rank_spec["bars_root"]) / "rank.json"
+    first = rank_record.record_rankings(rank_spec, target)
+    published = target.read_bytes()
+    target.unlink()
+    real_link = os.link
+
+    def racing_link(src, dst, *args, **kwargs):
+        # Another recorder publishes the same record just before this one links its own.
+        if Path(dst).name == target.name:
+            target.write_bytes(published)
+        return real_link(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(rank_record.os, "link", racing_link)
+    assert rank_record.record_rankings(rank_spec, target) == first
+    assert target.read_bytes() == published
 
 
 def test_a_failed_recording_leaves_no_file(rank_spec, monkeypatch):

@@ -38,8 +38,11 @@ and every threshold is a registered UNCALIBRATED row:
 * The move: the last bar's close over the latest official regular close of a session before the trade
   date, less one, both raw (not split-adjusted: the live actor reads the close from Alpaca's snapshot,
   `movers_rank_actor` module docstring); a name with a split since that session, or with no split read
-  covering it, is excluded (`split_since`, `corporate_action` in `rank`), so no raw close across a split
-  is ever ranked. The caller supplies that close and its session (`Reference`). From
+  covering it, is excluded (`split_since`, `corporate_action` in `rank`). That is only as good as the
+  caller's split read: the live actor reads Alpaca's corporate actions, while a replay without a
+  `splits` list hands in an empty read that covers every session, so there a name that split is ranked
+  on its raw close (`rank_record.make_actor`). The caller supplies that close and its session
+  (`Reference`). From
   16:00 to 20:00 that is still the prior session's close, not today's (ADR 0087). The move
   from today's regular open is recorded beside it.
 * The dollar-volume ratio: today's dollar volume from `PART_START` New York the evening before (the
@@ -663,7 +666,7 @@ class Reference:
     """The latest completed official regular-session close, raw as the caller read it (not split-adjusted),
     and the session it closed. `rank` excludes any name with a split since that session, or with no split
     read covering it (`split_since`; `corporate_action` or `corporate_action:unknown`), so a raw close is
-    only ever compared with bars from the same share basis."""
+    compared only with bars from the same share basis as far as the caller's split read is complete."""
 
     close: float
     session: date

@@ -1143,9 +1143,21 @@ movers_rank_actor.MoversRankActor.on_start = no_rank
     assert {"PRE.ALPACA", "WIN.ALPACA"} <= set(full["mover"]["run"]["opened_slots"])
     assert full["mover"]["run"]["ranking_records"]
     assert replay["rank_signals"] == full["rank_signals"]
-    # The Mover's own record, every key but the host's wall clock.
-    mover_full = {k: v for k, v in full["mover"]["run"].items() if k != "host_clock"}
-    mover_replay = {k: v for k, v in replay["mover"]["run"].items() if k != "host_clock"}
+
+    # The Mover's own record, every key but the host's wall clock and the random UUID4 of each
+    # history request (warm_up.slots[].request_id), which differs between any two runs.
+    def comparable(run: dict[str, Any]) -> dict[str, Any]:
+        out = {k: v for k, v in run.items() if k != "host_clock"}
+        warm = copy.deepcopy(out.get("warm_up"))
+        if isinstance(warm, dict):
+            for slot in warm.get("slots", []):
+                if isinstance(slot, dict):
+                    slot.pop("request_id", None)
+            out["warm_up"] = warm
+        return out
+
+    mover_full = comparable(full["mover"]["run"])
+    mover_replay = comparable(replay["mover"]["run"])
     assert [k for k in mover_full if mover_full[k] != mover_replay.get(k)] == []
     assert mover_replay == mover_full
     assert replay["generations"] == full["generations"]
