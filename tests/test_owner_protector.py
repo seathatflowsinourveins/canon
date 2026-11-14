@@ -2234,35 +2234,36 @@ def test_an_entry_without_a_distance_keeps_its_level_and_takes_the_rows_distance
     assert strategy.sent[0].trailing_offset == Decimal("0.0300")
 
 
-def test_an_entry_without_a_distance_never_takes_the_fixed_fallback(
+def test_an_entry_without_a_distance_is_covered_by_the_cold_rule_never_left_bare(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Ruling (a): with only the fixed fallback to plan from, the carried level is kept, nothing
-    is raised or sent, and that is named at each step until a distance can be planned."""
+    """Ruling (a) as the lead narrowed it (2026-11-13, 23:2x), superseding its first form here:
+    a carried long whose record has no distance and only the fixed fallback to plan from is
+    covered by that cold rule at the higher of its carried level and the rule's, named as such,
+    and never left bare; it never sends more than it holds."""
     path = tmp_path / "levels.json"
     strategy, _calls = carried_start(
         path, monkeypatch, level="0.7926", bid="0.7985", highest="0.8350", distance=None
     )
-    assert strategy.slots[AAA].level is None
-
-    def named(notes: list[str]) -> int:
-        return sum(
-            "the row gives only the fixed fallback" in note
-            and "carried level 0.7926 kept, raises nothing until a distance can be planned" in note
-            for note in notes
-        )
-
-    # U-h plans at the start on each answer (cache, seed, bars), each refusal named.
-    assert named(strategy.said) >= 1, strategy.said
+    slot = strategy.slots[AAA]
+    assert slot.level is not None, strategy.said
+    assert slot.level.as_decimal() == max(
+        Decimal("0.7926"), up_on_step(Decimal("0.7985") - FALLBACK)
+    )
+    assert slot.distance is not None and slot.distance.fallback
+    assert any("no carried distance" in note and "cold rule" in note for note in strategy.said), (
+        strategy.said
+    )
     for n in (181, 182, 183):
         strategy.test_clock.set_time(T0 + n * SECOND)
         strategy.cached.latest = quote("0.7985", T0 + n * SECOND)
         before = len(strategy.said)
         strategy._on_step(cast(Any, SimpleNamespace()))
-        assert named(strategy.said[before:]) == 1, strategy.said[before:]  # Each step, once.
-    assert not strategy.sent, "a carried long armed from the fixed fallback"
-    assert book_rows(path)["AAA.ALPACA"]["last_level"] == "0.7926"
-    assert "fallback" not in " ".join(n for n in strategy.said if "armed distance" in n)
+        step = strategy.said[before:]
+        assert not [n for n in step if "distance refused" in n or "fixed fallback (" in n], step
+        assert not [n for n in step if "replanned" in n], f"no replan on the same bars: {step}"
+    held = strategy.cached.held[0].quantity.as_decimal()
+    assert sum(order.quantity.as_decimal() for order in strategy.sent) <= held
 
 
 def test_an_entry_without_a_distance_and_no_quote_keeps_its_level_and_names_it(
