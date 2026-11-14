@@ -487,3 +487,26 @@ def test_bad_specs_are_refused_by_name_before_building_any_engine(
     assert report["status"] == "refused"
     assert report["segments"] == []
     assert problem in report["refusals"][0]["reason"].lower()
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "LLL.ALPACA: armed distance 0.1600",
+        "ALERT: LLL.ALPACA: our protective sell was refused by the venue",
+        "LLL.ALPACA: ALERT: the session day's bars read failed",
+    ],
+)
+def test_a_line_is_filed_under_the_instrument_it_names_wherever_it_names_it(text):
+    from types import SimpleNamespace
+
+    from nautilus_trader.model import InstrumentId
+
+    module = runner()
+    ids = [InstrumentId.from_str("LLL.ALPACA"), InstrumentId.from_str("LL.ALPACA")]
+    observer = SimpleNamespace(
+        trace=SimpleNamespace(ids=ids, lines=[]),
+        clock=SimpleNamespace(timestamp_ns=lambda: 7),
+    )
+    module._RecordedProtector._say(observer, text)
+    assert observer.trace.lines == [{"at": 7, "symbol": "LLL", "text": text}]

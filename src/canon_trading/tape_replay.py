@@ -54,6 +54,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from collections import Counter
 from datetime import UTC
 from datetime import datetime
@@ -501,9 +502,14 @@ class _RecordedProtector(OwnerProtector):
         return self._observed_clock
 
     def _say(self, text: str) -> None:
-        symbol = next(
-            (iid.symbol.value for iid in self.trace.ids if text.startswith(f"{iid}:")), None
-        )
+        # A line names its instrument at its start or after a prefix ("ALERT: <instrument>: ..."),
+        # so it is filed under the earliest instrument it names on a boundary, anywhere in it.
+        named = []
+        for iid in self.trace.ids:
+            found = re.search(rf"(?<![\w.]){re.escape(str(iid))}:", text)
+            if found is not None:
+                named.append((found.start(), iid.symbol.value))
+        symbol = min(named)[1] if named else None
         self.trace.lines.append({"at": self.clock.timestamp_ns(), "symbol": symbol, "text": text})
 
     def request_bars(
