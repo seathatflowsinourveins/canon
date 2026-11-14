@@ -399,42 +399,59 @@ class Protection:
             host.cancel_all_orders(instrument_id, order_side=OrderSide.SELL)
             return
         instrument = host.cache.instrument(instrument_id)
-        quote = host.cache.quote(instrument_id)
-        if instrument is None or quote is None or quote.bid_price.as_decimal() <= 0:
-            self._stop_note(instrument_id, held, sells, "no instrument or usable close quote")
+        if instrument is None:
+            self._stop_note(instrument_id, held, sells, "no instrument to price a sale")
             return
+        quote = host.cache.quote(instrument_id)
+        bid = None if quote is None else quote.bid_price.as_decimal()
+        quoted = bid is not None and bid > 0
 
         now = host.clock.timestamp_ns()
         slot = self._position_slot(instrument_id, now)
         slot.exiting = True
         self._ensure_exit(slot, held)
-        self._mark_exit(slot, now, quote.bid_price.as_decimal(), "strategy stop")
-        price = instrument.make_price(
-            exit_price(quote.bid_price.as_decimal(), self._context.settings.exit_ticks, None)
-        )
-        for order in sells:
-            if order.is_pending_cancel:
-                continue
-            if order.is_emulated and order.order_type == OrderType.TRAILING_STOP_LIMIT:
-                trigger = max(
-                    quote.bid_price.as_decimal(),
-                    Decimal(0) if order.trigger_price is None else order.trigger_price.as_decimal(),
-                )
-                host.modify_order(
-                    order.client_order_id,
-                    price=price,
-                    trigger_price=instrument.make_price(up_on_step(trigger)),
-                )
-            elif order.is_open and order.order_type == OrderType.LIMIT and order.price > price:
-                host.modify_order(order.client_order_id, price=price)
+        self._mark_exit(slot, now, bid if quoted else None, "strategy stop")
+        if quoted:
+            price = instrument.make_price(exit_price(bid, self._context.settings.exit_ticks, None))
+            for order in sells:
+                if order.is_pending_cancel:
+                    continue
+                if order.is_emulated and order.order_type == OrderType.TRAILING_STOP_LIMIT:
+                    trigger = max(
+                        bid,
+                        Decimal(0)
+                        if order.trigger_price is None
+                        else order.trigger_price.as_decimal(),
+                    )
+                    host.modify_order(
+                        order.client_order_id,
+                        price=price,
+                        trigger_price=instrument.make_price(up_on_step(trigger)),
+                    )
+                elif order.is_open and order.order_type == OrderType.LIMIT and order.price > price:
+                    host.modify_order(order.client_order_id, price=price)
 
         # A local release can fill synchronously. Re-read both the position and
-        # leaves quantities before sizing a second, disjoint sale (F3).
+        # leaves quantities before sizing a second, disjoint sale (F3). A sell still
+        # emulated here (no bid to release it at, or a trail the emulator did not
+        # release, emulator.rs:877-900) is local and ends with the node, so it reserves
+        # no venue shares and is no lasting cover: its shares are sold at the venue, and
+        # only once that sale is sent is it canceled, locally and at once (pin
+        # crates/execution/src/order_emulator/emulator.rs:936-966, :1202-1240). Nothing
+        # pending is sold twice: every other open sell keeps its shares reserved.
         held, sells = self._stop_holding(instrument_id)
-        reserved = sum((order.leaves_qty.as_decimal() for order in sells), Decimal(0))
+        local = [o for o in sells if o.is_emulated and not o.is_pending_cancel]
+        kept = {o.client_order_id for o in local}
+        reserved = sum(
+            (o.leaves_qty.as_decimal() for o in sells if o.client_order_id not in kept), Decimal(0)
+        )
         remainder = held - reserved
         if remainder > 0:
+            before = slot.protect_id
             self._limit_sell(slot, remainder, now, None)
+            if slot.protect_id != before:
+                for order in local:
+                    host.cancel_order(order.client_order_id)
         held, sells = self._stop_holding(instrument_id)
         if held > 0:
             self._stop_note(instrument_id, held, sells, "stop-time sell coverage")

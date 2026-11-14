@@ -15,6 +15,7 @@ from canon_alpaca.execution import SELL_TO_CLOSE_PROVEN
 from canon_alpaca.execution import AlpacaExecutionClient
 from nautilus_trader.core import UUID4
 from nautilus_trader.model import AccountId
+from nautilus_trader.model import AggressorSide
 from nautilus_trader.model import Bar
 from nautilus_trader.model import BarType
 from nautilus_trader.model import ClientOrderId
@@ -27,6 +28,8 @@ from nautilus_trader.model import Price
 from nautilus_trader.model import Quantity
 from nautilus_trader.model import StrategyId
 from nautilus_trader.model import TimeInForce
+from nautilus_trader.model import TradeId
+from nautilus_trader.model import TradeTick
 from nautilus_trader.model import TriggerType
 from nautilus_trader.model import VenueOrderId
 
@@ -725,26 +728,45 @@ def test_s2_stop_closes_through_adapter_or_preserves_cover(drive, pending_modify
         "stop canceled protection without a close accepted by the adapter",
         [denial for _, _, denial in submissions],
     )
-    if submissions:
-        assert all(denial is None for _, _, denial in submissions)
-        assert all(order.client_order_id == original.client_order_id for order, _, _ in submissions)
-    assert len(submissions) == (0 if pending_modify else 1)
+    assert len(submissions) == 1
+    ((sale, _, denial),) = submissions
+    assert denial is None
+    if pending_modify:
+        # A trail the emulator did not release ends with the node (delta review of 93a862f3,
+        # finding 2): a venue sale of its shares is sent first, and only then is it canceled.
+        assert sale.client_order_id != original.client_order_id
+        assert sale.order_type == OrderType.LIMIT and sale.is_reduce_only
+        assert original.client_order_id not in active
+    else:
+        assert sale.client_order_id == original.client_order_id
 
 
-def stop_host(drive, *, cover=10, emulated=False, pending=None, filled=0, fill_on_modify=False):
+def stop_host(
+    drive,
+    *,
+    cover=10,
+    emulated=False,
+    pending=None,
+    filled=0,
+    fill_on_modify=False,
+    release_on_modify=True,
+):
     """Real factory/adapter check, with venue acknowledgements and share reservations stood in.
 
     The pin's strategy/mod.rs:400-405 refuses a pending cancel's modification;
     :777-778 permits a pending update. emulator.rs:814-917 releases a locally
     modified trail synchronously. A pending venue cancel still reserves shares
     until its acknowledgement, as the adapter README's TC-E41/81 proof records.
+    `release_on_modify=False` stands in for a trail the emulator does not release
+    (emulator.rs:877-900); an emulated order's cancel is local and settles at once
+    (emulator.rs:1202-1240).
     """
     strategy = template()
     eng = drive(strategy, [quote(0, 9.99, 10.01), quote(1, 9.99, 10.01)])
     (original,) = working(eng.cache)
     held = [Decimal(10)]
     active = {}
-    messages, submissions, modifications, released = [], [], [], []
+    messages, submissions, modifications, released, canceled = [], [], [], [], []
     adapter: Any = SimpleNamespace(
         _provider=SimpleNamespace(find=eng.cache.instrument),
         cache=eng.cache,
@@ -782,8 +804,14 @@ def stop_host(drive, *, cover=10, emulated=False, pending=None, filled=0, fill_o
 
     def submit(order, position_id=None, client_id=None, params=None):
         denial = AlpacaExecutionClient._denial(adapter, order)
+        # Alpaca holds shares for a venue sell; an emulated one is local and holds none
         reserved = sum(
-            (o.leaves_qty.as_decimal() for o in active.values() if not o.is_closed), Decimal(0)
+            (
+                o.leaves_qty.as_decimal()
+                for o in active.values()
+                if not o.is_closed and not o.is_emulated
+            ),
+            Decimal(0),
         )
         if denial is None and reserved + order.quantity.as_decimal() > held[0]:
             denial = "insufficient qty available: existing sell still reserves shares"
@@ -795,6 +823,8 @@ def stop_host(drive, *, cover=10, emulated=False, pending=None, filled=0, fill_o
         order = active[cid]
         modifications.append(cid)
         if order.is_pending_cancel:  # native Strategy refuses before routing a command
+            return
+        if order.is_emulated and not release_on_modify:
             return
         if order.is_emulated:
             assert trigger_price is not None
@@ -819,6 +849,13 @@ def stop_host(drive, *, cover=10, emulated=False, pending=None, filled=0, fill_o
             held[0] -= order.leaves_qty.as_decimal()
             order.is_closed = True
 
+    def cancel(cid, *args, **kwargs):
+        order = active[cid]
+        canceled.append(cid)
+        assert order.is_emulated, "only a still-emulated sell is canceled at stop"
+        order.is_emulated, order.is_closed = False, True
+        order.emulation_trigger = None
+
     def cancel_all(instrument_id, order_side=None):
         assert instrument_id == AAA
         assert order_side == OrderSide.BUY or held[0] == 0
@@ -839,10 +876,12 @@ def stop_host(drive, *, cover=10, emulated=False, pending=None, filled=0, fill_o
             order=active.get,
             instrument=eng.cache.instrument,
             quote=eng.cache.quote,
+            trade=eng.cache.trade,
             bars=eng.cache.bars,
         ),
         cancel_all_orders=cancel_all,
         modify_order=modify,
+        cancel_order=cancel,
         submit_order=submit,
     )
     protection = importlib.import_module("canon_trading.protection")
@@ -854,6 +893,7 @@ def stop_host(drive, *, cover=10, emulated=False, pending=None, filled=0, fill_o
         submissions=submissions,
         modifications=modifications,
         released=released,
+        canceled=canceled,
     )
 
 
@@ -1003,27 +1043,21 @@ def test_stop_hook_covers_a_non_template_host_and_records_its_sale(drive):
     assert sale.client_order_id.value in host.protection._context.sale_rows
 
 
-@pytest.mark.parametrize("missing", ["quote", "instrument", "positive_bid"])
-@pytest.mark.parametrize(
-    "cover,emulated,pending,uncovered",
-    [
-        (0, False, None, 10),
-        (10, True, None, 10),
-        (4, False, None, 6),
-        (10, False, "cancel", 10),
-        (10, False, None, 0),
-    ],
-)
+STOP_COVER_CASES = [
+    (0, False, None, 10),
+    (10, True, None, 10),
+    (4, False, None, 6),
+    (10, False, "cancel", 10),
+    (10, False, None, 0),
+]
+
+
+@pytest.mark.parametrize("cover,emulated,pending,uncovered", STOP_COVER_CASES)
 def test_f6_stop_reports_only_durable_whole_holding_cover(
-    drive, missing, cover, emulated, pending, uncovered
+    drive, cover, emulated, pending, uncovered
 ):
     host, state = stop_host(drive, cover=cover, emulated=emulated, pending=pending)
-    if missing == "instrument":
-        host.cache.instrument = lambda _: None
-    elif missing == "quote":
-        host.cache.quote = lambda _: None
-    else:
-        host.cache.quote = lambda _: SimpleNamespace(bid_price=Price.from_str("0"))
+    host.cache.instrument = lambda _: None
     module().EMACrossProtected.on_stop(host)
     assert state.submissions == []
     if uncovered:
@@ -1038,6 +1072,60 @@ def test_f6_stop_reports_only_durable_whole_holding_cover(
     else:
         assert any("retains protection" in text for _, text in state.messages)
         assert not any(level in {"warning", "error"} for level, _ in state.messages)
+
+
+@pytest.mark.parametrize("missing", ["quote", "positive_bid"])
+@pytest.mark.parametrize("cover,emulated,pending,uncovered", STOP_COVER_CASES)
+def test_stop_with_no_usable_bid_still_sells_what_no_venue_sell_reserves(
+    drive, missing, cover, emulated, pending, uncovered
+):
+    """Delta review of 93a862f3, finding 1: with an instrument but no usable bid the stop still sends
+    the reduce-only DAY limit `_limit_sell` prices from its no-bid fallback, for the shares no venue
+    sell reserves; a still-emulated sell is canceled first, and a pending cancel's shares are not sold."""
+    host, state = stop_host(drive, cover=cover, emulated=emulated, pending=pending)
+    last = TradeTick(
+        AAA,
+        Price.from_str("10.00"),
+        Quantity.from_int(100),
+        AggressorSide.BUY,
+        TradeId("T-STOP"),
+        T0 + 2 * SECOND,
+        T0 + 2 * SECOND,
+    )
+    host.cache.trade = lambda _: last
+    if missing == "quote":
+        host.cache.quote = lambda _: None
+    else:
+        host.cache.quote = lambda _: SimpleNamespace(bid_price=Price.from_str("0"))
+    module().EMACrossProtected.on_stop(host)
+    sold = 0 if pending == "cancel" else uncovered
+    assert [s.quantity.as_decimal() for s, _, _ in state.submissions] == ([sold] if sold else [])
+    for sale, params, denial in state.submissions:
+        assert denial is None
+        assert sale.order_type == OrderType.LIMIT and sale.time_in_force == TimeInForce.DAY
+        assert sale.is_reduce_only and params == {"extended_hours": True}
+    assert bool(state.canceled) == emulated
+    live = sum(
+        (o.leaves_qty.as_decimal() for o in state.active.values() if not o.is_closed), Decimal(0)
+    )
+    assert live <= state.held[0], "more sent than held"
+    if pending != "cancel":
+        assert live == state.held[0], "a long left bare"
+
+
+def test_stop_cancels_a_trail_the_emulator_did_not_release_and_sells_its_shares(drive):
+    """Delta review of 93a862f3, finding 2: a trail still emulated after the modify ends with the node,
+    so it is canceled locally and its shares are sold at the venue, never sold beside it."""
+    host, state = stop_host(drive, cover=10, emulated=True, release_on_modify=False)
+    module().EMACrossProtected.on_stop(host)
+    assert state.canceled and not state.released
+    (submission,) = state.submissions
+    sale, params, denial = submission
+    assert denial is None and sale.quantity.as_decimal() == 10
+    assert sale.is_reduce_only and params == {"extended_hours": True}
+    live = [o for o in state.active.values() if not o.is_closed]
+    assert [o.client_order_id for o in live] == [sale.client_order_id]
+    assert any("retains protection" in text for _, text in state.messages)
 
 
 @pytest.mark.parametrize("context_floor,expected", [(1, "0.20"), (3, "0.60")])
