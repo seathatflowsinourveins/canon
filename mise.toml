@@ -964,7 +964,8 @@ exec /usr/bin/timeout -s TERM -k 30 600 uv run --locked python -c 'from canon_tr
 
 # One trailing stop Alpaca holds, GTC and marked sell_to_close, for each long no working sell covers, in the regular
 # session on one paper account, then exit (src/canon_trading/protect.py, ADR 0142, ADR 0129). Accounts A (tests) and C
-# (protect); windows is refused by name for now. --plan-only makes every read and names what each stop would be
+# (protect); windows (B) takes --cancel alone, to close a protect-lineage sell left there (the lead's ruling (d)3,
+# 2026-11-13), and a send on B is refused by name. --plan-only makes every read and names what each stop would be
 # under every registered row, and sends nothing: an account's first run. A run that sends names its row with
 # --row (the Mover's registered trail arms; there is no default). --cancel cancels the open stops of the protect
 # lineage and nothing else, asks for no session, and sends no order. It reads one account's pair and takes that
@@ -973,11 +974,11 @@ exec /usr/bin/timeout -s TERM -k 30 600 uv run --locked python -c 'from canon_tr
 # --cancel: 0 each protect stop named ended canceled with nothing filled, or none was open; 1 a cancel or a read
 # failed, or a stop ended another way; 2 --symbol named a symbol the open listing showed no protect stop in; 3 refused.
 [tasks."paper:protect"]
-description = "Send one GTC trailing stop Alpaca holds, marked sell_to_close, for each long no working sell covers, on paper account A or C, in the regular session, then exit; --plan-only sends nothing; --cancel cancels the open stops this task sent and sends nothing"
+description = "Send one GTC trailing stop Alpaca holds, marked sell_to_close, for each long no working sell covers, on paper account A or C, in the regular session, then exit; --plan-only sends nothing; --cancel cancels the open orders of the protect lineage and sends nothing, and is all B takes"
 shell = "bash -c"
 timeout = "10m"
 usage = '''
-arg "<account>" help="tests: account A; protect: account C (ADR 0142); windows (B) is refused by name for now" {
+arg "<account>" help="tests: account A; protect: account C (ADR 0142); windows: account B, --cancel only" {
   choices "tests" "windows" "protect"
 }
 flag "--plan-only" help="make every read, print what each stop would be under every registered row (the distance as a share of the price, the level it opens at, what bound it), and send nothing"
@@ -990,7 +991,10 @@ flag "--symbol <symbol>" help="with --cancel: only this symbol's protect stops; 
 run = '''
 case "${usage_account:-}" in
   tests) svc=canon-alpaca-paper; lock=canon-paper-test.lock ;;
-  windows) echo "paper:protect: account windows (B) is refused by name for now; nothing was read" >&2; exit 3 ;;
+  windows)
+    # B takes the cancel alone: a protect-lineage sell left on B is closed before proof 3 (ruling (d)3)
+    [ "${usage_cancel:-false}" = true ] || { echo "paper:protect: account windows (B) takes only --cancel (the protect lineage's cancel); a send on B is refused by name; nothing was read" >&2; exit 3; }
+    svc=canon-alpaca-paper-windows; lock=canon-paper-windows.lock ;;
   protect) svc=canon-alpaca-paper-protect; lock=canon-paper-protect.lock ;;
   *) echo "paper:protect: no paper account named '${usage_account:-}'; the names are tests and protect; nothing was read" >&2; exit 3 ;;
 esac
@@ -1009,6 +1013,69 @@ case "$held" in
 esac
 echo "account: $usage_account"
 exec /usr/bin/timeout -s TERM -k 30 300 uv run --locked python -c 'import sys; from canon_trading.protect import task_from_flags; raise SystemExit(task_from_flags(*sys.argv[1:5]))' "${usage_plan_only:-false}" "${usage_row:-}" "${usage_cancel:-false}" "${usage_symbol:-}"
+'''
+
+# Contract: ADR 0146's carrying node, ADR 0142's named row and C's lead go, ADR 0069's account/stream
+# locks, and OwnerProtector's unit-10 EXTERNAL custody seam. One strategy; no claim, entry or end sale.
+# --row is required; F2 and IEX are refused by name. --levels binds optional SYMBOL=PRICE levels only
+# to starting holdings. The holds folder and inbox are required explicit paths, read together at start;
+# unread or nonempty: refused. Held account/stream locks: refused without waiting. Account A is refused
+# on weekdays 04:00-20:00 New York by Alpaca's clock, the movers recorder's hours (it takes no stream
+# lock). Never from the main checkout: only from a checkout of its own at a commit (the module refuses a
+# checkout on main). On C, at a commit of main, carrying the lead's go naming protect and the row in this
+# start step (ADR 0142's procedure, not a login). Its sells are of the protect lineage (custody.PROTECT).
+# SIP spans regular and extended hours, BOATS overnight; at most one feed span, sixteen hours on SIP,
+# eight on BOATS. Stop cancels this instance's own working orders only and names each holding left
+# unprotected by this node. A new owner fill after start on B is SIMULATION ONLY today; paper later on A.
+[tasks."paper:protector"]
+description = "Run OwnerProtector alone on tests, windows or protect, with a required row and start controls; no end sale; a new fill of the owner after start on B is SIMULATION ONLY today, paper showing later on A"
+shell = "bash -c"
+timeout = "1000m"
+usage = '''
+arg "<account>" help="tests: A; windows: B; protect: C, with the lead's account-and-row go" {
+  choices "tests" "windows" "protect"
+}
+flag "--row <row>" required=#true help="OWN1 or OWN3; no default; F2 is refused by name"
+flag "--levels <levels>" help="optional starting levels, SYMBOL=PRICE,...; each belongs only to its starting holding"
+flag "--minutes <minutes>" help="1-960, default 30; shortened to the current feed span's end"
+flag "--feed <feed>" help="sip or boats; otherwise selected from Alpaca's clock/calendar; IEX refused"
+flag "--holds-dir <holds_dir>" required=#true help="absolute holds folder; any entry refuses the start"
+flag "--inbox <inbox>" required=#true help="absolute inbox file or folder; unread or nonempty refuses the start"
+flag "--lead-go <lead_go>" help="on C: carry the lead's start instruction exactly as 'protect OWN1' or 'protect OWN3'"
+flag "--lock-wait <lock_wait>" help="0-300, default 0: wait this long for the account's locks, then refuse (the protector runner's successor)"
+'''
+run = '''
+case "${usage_row:-}" in
+  OWN1|OWN3) ;;
+  F2) echo "paper:protector: F2 is refused by name: a holding's distance is per symbol; nothing was read" >&2; exit 3 ;;
+  *) echo "paper:protector: --row must explicitly name OWN1 or OWN3; nothing was read" >&2; exit 3 ;;
+esac
+case "${usage_account:-}" in
+  tests) svc=canon-alpaca-paper ;;
+  windows) svc=canon-alpaca-paper-windows ;;
+  protect)
+    [ "${usage_lead_go:-}" = "protect ${usage_row}" ] || { echo "paper:protector: C requires the lead's go naming protect and ${usage_row} in this start step; nothing was read" >&2; exit 3; }
+    svc=canon-alpaca-paper-protect ;;
+  *) echo "paper:protector: no such paper account; nothing was read" >&2; exit 3 ;;
+esac
+case "${usage_feed:-}" in
+  ''|sip|boats) ;;
+  *) echo "paper:protector: IEX and any feed other than sip or boats are refused; nothing was read" >&2; exit 3 ;;
+esac
+ALPACA_API_KEY="$(/usr/bin/timeout 30 /usr/bin/security find-generic-password -s "$svc" -a ALPACA_API_KEY -w)" || ALPACA_API_KEY=""
+ALPACA_SECRET_KEY="$(/usr/bin/timeout 30 /usr/bin/security find-generic-password -s "$svc" -a ALPACA_SECRET_KEY -w)" || ALPACA_SECRET_KEY=""
+[ -n "$ALPACA_API_KEY" ] && [ -n "$ALPACA_SECRET_KEY" ] || { echo "paper:protector: the named account's pair is not in the login keychain; nothing was sent" >&2; exit 1; }
+export ALPACA_API_KEY ALPACA_SECRET_KEY CANON_PAPER_ACCOUNT="$usage_account"
+args=("$usage_account" --row "$usage_row" --holds-dir "$usage_holds_dir" --inbox "$usage_inbox")
+[ -z "${usage_levels:-}" ] || args+=(--levels "$usage_levels")
+[ -z "${usage_minutes:-}" ] || args+=(--minutes "$usage_minutes")
+[ -z "${usage_feed:-}" ] || args+=(--feed "$usage_feed")
+[ -z "${usage_lead_go:-}" ] || args+=(--lead-go "$usage_lead_go")
+[ -z "${usage_lock_wait:-}" ] || args+=(--lock-wait "$usage_lock_wait")
+# 16 h plus 20 min startup; TERM gives session_window.STOP_GRACE_SECS (785) to stop, then KILL.
+# The module takes both canonical locks for its whole lifetime and uses session_window._run_node's
+# clock/stop bounds. Nothing invokes the session window's flattening step.
+exec /usr/bin/timeout -s TERM -k 785 58800 uv run --locked python -m canon_trading.protector_node "${args[@]}"
 '''
 
 # The nightly study (docs/adr/0089-the-nightly-study-loop.md): one firing of canon_trading.nightly_study in
