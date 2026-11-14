@@ -747,6 +747,31 @@ Each is stated in `execution.py`'s header, with its source.
   (2026-11-10: a limit sell while the account's market buy was still open, and buys while the strategy's
   market sell was open; ADR 0037). The adapter does not check for a wash trade before sending, and
   neither the error code nor the message is on a page read.
+
+  **OBSERVED 2026-11-13, 18:26-18:27 New York, post-market:** one share of a liquid index ETF
+  held on a long-only paper account, REST only. Each accepted order was canceled and read canceled
+  before the next. The owning lane keeps the run's log outside the repository.
+  The new sells were (a) a DAY limit sell marked for extended hours, 5% over the ask;
+  (b) the same with `position_intent=sell_to_close`; (c) a plain DAY market sell;
+  (d) a GTC trailing stop sell, 5%, `sell_to_close`. Every refusal was HTTP 403, code
+  **40310000**, message **"potential wash trade detected. use complex orders"**.
+
+  | Resting order | (a) | (b) | (c) | (d) |
+  |---|---|---|---|---|
+  | 0. None (baseline) | accepted | accepted | accepted (queued) | accepted |
+  | 1. Market buy, GTC, not marked for extended hours, resting as `accepted` (queued for the next open) | REFUSED | REFUSED | REFUSED | accepted |
+  | 2. DAY limit buy marked for extended hours, 5% under the bid (live) | accepted | accepted | accepted (queued) | accepted |
+  | 3. GTC limit buy not marked for extended hours (queued), 1.00 over the sell's limit | REFUSED | REFUSED | REFUSED | accepted |
+
+  Reversed: with sell (a) resting, a new market buy (GTC, not extended) was ACCEPTED (queued),
+  and a new DAY limit buy marked for extended hours, 5% under the bid, was ACCEPTED.
+
+  The one differing cell from the page's wording above is **row 2, cell (c)**: the market sell
+  was accepted beside a resting live limit buy priced under the market. This is recorded as
+  observed, without inferring a general venue rule.
+  **Not shown:** the overnight session (a second run is owed, to be appended by a later edit);
+  a stop or stop-limit sell; whether a trailing stop elects and sells beside a resting buy;
+  any size but one share; an account that allows shorting; the regular session.
 * **Fills** come from the trade updates stream, one per `fill` or `partial_fill` event, with the event's
   own `qty` and `price`, and from Alpaca's fill activities when an Alpaca read shows more filled than the
   node holds; every fill is known by Alpaca's trade ID alone and applied once per trade ID, whichever
@@ -943,7 +968,12 @@ Each is stated in `execution.py`'s header, with its source.
   upstream's Coinbase adapter keeps its reports to what it loaded), and a report asked for one instrument
   reads no other's. A value that is not a number skips a closed order and fails an open one, as any
   value this slice cannot map. Alpaca does not say whether a short
-  position's `qty` is negative, so the side comes from `side` and the size is its magnitude. Each loaded
+  position's `qty` is negative (UNVERIFIED), so a position is read by custody's one rule: its `qty` must
+  be a finite number, read before the sign is taken off, else the report fails naming it, and with it the node's
+  start-up, as for any position this slice cannot represent (below); it is a short
+  by its `side` or by a `qty` below zero, never reported long; the size is the magnitude. A position
+  labelled long with a `qty` below zero is reported a short and named in a warning with both fields, once per
+  symbol for the client's life and only for a report it makes; a refusal names the symbol. Each loaded
   instrument Alpaca lists no position in is reported flat: Alpaca's positions endpoint lists only open
   positions, and NautilusTrader takes only "An explicit flat report" as evidence of flat. Without it,
   fills inferred from part of the order history left an `EXTERNAL` position Alpaca did not hold. With

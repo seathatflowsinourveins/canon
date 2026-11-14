@@ -1,17 +1,17 @@
 #!/bin/bash
 # dsh-profiles — read-only: name every installed DeepSeek Harness profile package the record does not hold.
 #
-# Contract (AGENTS.md rule 3), read at the pinned source deepseek-harness@1f81c047fc48:
+# Contract (AGENTS.md rule 3), read at the pinned source deepseek-harness@ddac96760b6e (dsh-v0.2.2-rc.2):
 #   packages/boot/app-boot/README.md
-#     L50  "A profile lives at `$DSH_HOME/profiles/<name>`" — one folder under profiles/ is one profile.
-#     L56  `compatibility.json` maps exact `package-name@version` keys to lists of exact DSH runtime
+#     L52  "A profile lives at `$DSH_HOME/profiles/<name>`" — one folder under profiles/ is one profile.
+#     L58  `compatibility.json` maps exact `package-name@version` keys to lists of exact DSH runtime
 #          versions, and "A missing file means no exemptions."
-#     L138 runtime resolution entries live at `$DSH_HOME/profiles/node_modules`, which is not a profile.
+#     L142 runtime resolution entries live at `$DSH_HOME/profiles/node_modules`, which is not a profile.
 #   packages/boot/app-boot/src/profile.ts
-#     L169-176 resolveProfileDir refuses '', '.', '..', node_modules and a name with / or \ as a
+#     L165-172 resolveProfileDir refuses '', '.', '..', node_modules and a name with / or \ as a
 #          profile name, and accepts any other, one starting with a dot among them.
 #   packages/boot/plugin-manager/README.md
-#     L52  registry installs use `saveExact: true`, so a recorded spec is exact.
+#     L54  registry installs use `saveExact: true`, so a recorded spec is exact.
 #     L40  "Disabling retains the dependency" — this check reads what each profile's package.json
 #          declares installed, not the `dsh.profile.bundles` selection. A disabled bundle still holds
 #          its dependency, so its row is judged by what is installed. That is this check's limit: a
@@ -28,7 +28,7 @@
 #
 # Rows, one per profile in name order (the recorded profiles and every folder under
 # ${DSH_HOME:-$HOME/.dsh}/profiles/ that holds a package.json and whose name dsh accepts as a profile's:
-# a dot-folder is one, node_modules is not; profile.ts L169-176), in the format of scripts/bootstrap's row:
+# a dot-folder is one, node_modules is not; profile.ts L165-172), in the format of scripts/bootstrap's row:
 #   ok          N packages as recorded
 #   DIFFERS     the differences in package-name order, separated by '; ':
 #                 NOT RECORDED <name> <spec>       a dependency the record lacks
@@ -85,7 +85,7 @@ row() { printf '  %-24s %-9s %s\n' "$1" "$2" "$3"; }
 
 # The record is usable only as .profiles: an object of profiles, each an object of exact string specs.
 # A profile name must be one dsh accepts (deepseek-harness packages/boot/app-boot/src/profile.ts
-# L169-176 refuses '', '.', '..', node_modules and a name with / or \), so none reaches outside
+# L165-172 refuses '', '.', '..', node_modules and a name with / or \), so none reaches outside
 # profiles/; and it holds no control character, since names are handled one per line and printed.
 record=$(jq -c -e '
   def string_map: type == "object" and all(.[]; type == "string");
@@ -105,8 +105,8 @@ record=$(jq -c -e '
 recorded_names=$(printf '%s' "$record" | jq -r 'keys[]')
 
 # Every folder directly under profiles/ that holds a package.json and has a name dsh accepts as a
-# profile's (profile.ts L169-176): one starting with a dot is, node_modules is not, since dsh keeps
-# runtime resolution entries there (app-boot README L138). A folder whose name holds a control character
+# profile's (profile.ts L165-172): one starting with a dot is, node_modules is not, since dsh keeps
+# runtime resolution entries there (app-boot README L142). A folder whose name holds a control character
 # cannot be handled one per line or printed, so it is counted, and the count is a row of its own.
 found_names=""
 unprintable=0

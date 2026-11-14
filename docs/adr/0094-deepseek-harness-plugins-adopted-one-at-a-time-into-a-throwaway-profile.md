@@ -122,3 +122,10 @@ Read and run 2026-11-11.
 * A second reader checked this record on 2026-11-11: no claim failed; it asked for the repositories and
   commits above, the exemption's source and the per-change wording, now added.
 * Loading the plugin in a running agent, and both evals: **UNVERIFIED — not run.**
+* 2026-11-13, the engine pin moves to `dsh-v0.2.2-rc.2` (ADR 0045's Evidence). dsh-ci-context's peer range
+  `^0.1.0-rc.6` excludes 0.2.2-rc.2 as it excluded 0.2.1-rc.3, and the plugin-manager README at the new pin
+  still maps an exemption to exact runtime versions: "Neither plugin upgrades nor DSH upgrades inherit
+  permission" (resolved). Rule 4's grant for 0.2.1-rc.3 therefore does not cover 0.2.2-rc.2, and the trial
+  profile was not re-run on it. dsh-github-skills, which rule 5 declines, leaves the `dsh-tui` profile's
+  recorded set. A rehearsal (run 2026-11-13) installed the four worker profiles on 0.2.2-rc.2, each in a
+  throwaway `DSH_HOME` with the pinned pnpm 10.34.9 (exit 0); none of them carries dsh-ci-context.

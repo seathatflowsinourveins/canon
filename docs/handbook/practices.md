@@ -32,3 +32,8 @@ names sort. No unit's addition touches another unit's file.
 - [Custody and budgets](practices/custody-and-budgets/)
 - [Sessions](practices/sessions/)
 - [Evidence and learning](practices/evidence-and-learning/)
+
+## Pages
+
+- [The simulation practice](simulation.md): how a run on NautilusTrader's engine and simulated venue is
+  made, the venue's profile, and what a simulation shows and does not show.

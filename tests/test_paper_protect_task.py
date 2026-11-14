@@ -14,7 +14,7 @@ only when a paper key pair is in the environment, `CANON_PAPER_PROTECT_TASK=1` a
 runner's own marker is there, so a routine `mise run paper:test` skips it. Run it alone, in the regular
 session, on account A:
 
-    CANON_PAPER_PROTECT_TASK=1 mise run paper:test -- -s -k test_paper_protect_task tests/test_paper_protect_task.py
+    CANON_PAPER_PROTECT_TASK=1 mise run paper:test -- -s -k test_paper_protect_task_on_an_account_that_allows_shorting tests/test_paper_protect_task.py
 
 `CANON_PAPER_PROTECT_SYMBOL` names another stock to buy the one share of, so the plan-only lines show
 every row's distance for that name; it is read from the environment and written nowhere. Never write the
@@ -65,6 +65,9 @@ from canon_trading import session_window
 
 SYMBOL = os.environ.get("CANON_PAPER_PROTECT_SYMBOL", "SPY")
 """The stock the one share is of: SPY, or the name the run's environment gives."""
+ONLY_SYMBOLS = os.environ.get("CANON_PAPER_PROTECT_ONLY_SYMBOLS", "SPY,AAPL")
+"""The two stocks of the include list's run, one share each: the first is named to the task, the second
+is the long it must send nothing for. SPY and AAPL, or the pair the run's environment gives."""
 ONE = Decimal(1)
 PREFIX = "canon-check-protect-"
 """The test's own buy and closing sell; foreign to `custody.lineage`, as every paper test's orders are."""
@@ -158,12 +161,18 @@ def _until(read: Any, wanted: Any) -> Any:
     return value
 
 
-def _market(trading: Any, side: OrderSide, label: str, intent: PositionIntent | None) -> Any:
+def _market(
+    trading: Any,
+    side: OrderSide,
+    label: str,
+    intent: PositionIntent | None,
+    symbol: str | None = None,
+) -> Any:
     """One DAY market order of one share, sent once; a lost answer is looked up by its ID, never sent
     again. The order as Alpaca shows it once it has ended, or as last read."""
     client_order_id = f"{PREFIX}{uuid4().hex[:20]}-{label}"
     request = MarketOrderRequest(
-        symbol=SYMBOL,
+        symbol=SYMBOL if symbol is None else symbol,
         qty=1,
         side=side,
         time_in_force=TimeInForce.DAY,
@@ -209,7 +218,7 @@ def _cancel_and_wait(trading: Any, order: Any, problems: list[str]) -> None:
         print(f"cleanup: one {_status(ended)} order, filled {ended.filled_qty}")
 
 
-def _cancel_ours(trading: Any, problems: list[str]) -> None:
+def _cancel_ours(trading: Any, problems: list[str], symbols: tuple[str, ...] | None = None) -> None:
     """Cancel every open order in the symbol that the task or this test sent, and read each until it
     has ended, by its own read: the open-orders listing lags a cancel by seconds."""
     for order in _open_orders(trading):
@@ -217,7 +226,7 @@ def _cancel_ours(trading: Any, problems: list[str]) -> None:
         ours = client_order_id.startswith(PREFIX) or (
             custody.lineage(client_order_id) == custody.PROTECT
         )
-        if order.symbol != SYMBOL or not ours:
+        if order.symbol not in (symbols if symbols is not None else (SYMBOL,)) or not ours:
             problems.append(f"an order this run did not send is open: {custody.describe(order)}")
             continue
         _cancel_and_wait(trading, order, problems)
@@ -231,35 +240,33 @@ def _cancel_sent(trading: Any, problems: list[str]) -> None:
         try:
             order = _by_client_id(trading, client_order_id)
             if order is None:
-                problems.append(
-                    f"{client_order_id} ({SYMBOL}) does not show at Alpaca, and may yet"
-                )
+                problems.append(f"{client_order_id} does not show at Alpaca, and may yet")
             elif _status(order) not in ENDED:
                 _cancel_and_wait(trading, order, problems)
         except BaseException as e:  # noqa: BLE001 - the next kept ID is still tried; this one is named
             problems.append(
-                f"{client_order_id} ({SYMBOL}) could not be read or canceled "
+                f"{client_order_id} could not be read or canceled "
                 f"({type(e).__name__}); it may yet show working"
             )
 
 
-def _bought(trading: Any) -> Decimal:
+def _bought(trading: Any, symbol: str | None = None) -> Decimal:
     """The shares this run's own market orders bought less those they sold, by each order's own read."""
     net = Decimal(0)
     for client_order_id in SENT:
         order = _by_client_id(trading, client_order_id)
-        if order is not None:
+        if order is not None and (symbol is None or order.symbol == symbol):
             filled = Decimal(str(order.filled_qty or 0))
             net += filled if getattr(order.side, "value", order.side) == "buy" else -filled
     return net
 
 
-def _clean(trading: Any, problems: list[str]) -> None:
+def _clean(trading: Any, problems: list[str], symbols: tuple[str, ...] | None = None) -> None:
     """The module header's order: cancel, restore the setting, sell the share on a long-only account,
     read flat. Each step is tried whatever the one before it did."""
 
     def cancel() -> None:
-        _cancel_ours(trading, problems)
+        _cancel_ours(trading, problems, symbols)
 
     def cancel_sent() -> None:
         _cancel_sent(trading, problems)
@@ -271,29 +278,29 @@ def _clean(trading: Any, problems: list[str]) -> None:
             )
         print(f"no_shorting after the run: {str(_no_shorting(trading)).lower()}")
 
-    def close() -> None:
+    def close(symbol: str) -> None:
         if not _no_shorting(trading):
             problems.append("the share is not sold: the account is not long-only, see above")
             return
-        bought = _bought(trading)
+        bought = _bought(trading, symbol if symbols is not None else None)
         held = _until(
-            lambda: _held(trading).get(SYMBOL, Decimal(0)),
+            lambda: _held(trading).get(symbol, Decimal(0)),
             lambda found: found != 0 or bought <= 0,
         )
         if bought > 0 and held == 0:
             problems.append(
-                f"this run's orders filled {bought} {SYMBOL} and no position of it shows after "
+                f"this run's orders filled {bought} {symbol} and no position of it shows after "
                 f"{WAIT_SECS} reads (a stop that elected may have sold it): "
                 "mise run paper:account tests"
             )
         if held < 0:
-            problems.append(f"A SHORT of {-held} {SYMBOL} is open: close it by hand")
+            problems.append(f"A SHORT of {-held} {symbol} is open: close it by hand")
         elif held == ONE:
-            closed = _market(trading, OrderSide.SELL, "close", PositionIntent.SELL_TO_CLOSE)
+            closed = _market(trading, OrderSide.SELL, "close", PositionIntent.SELL_TO_CLOSE, symbol)
             if _status(closed) != "filled":
                 problems.append(f"the closing sell did not fill: {_status(closed)}")
         elif held != 0:
-            problems.append(f"{held} {SYMBOL} held, not the one share bought: left as found")
+            problems.append(f"{held} {symbol} held, not the one share bought: left as found")
 
     def final() -> None:
         held = _until(lambda: _held(trading), lambda found: not found)
@@ -307,7 +314,10 @@ def _clean(trading: Any, problems: list[str]) -> None:
         ("the cancel of what was sent", cancel),
         ("the cancel of this run's own orders by their kept IDs", cancel_sent),
         ("the long-only setting's restore", restore),
-        ("the close of the share", close),
+        *(
+            (f"the close of the share in {symbol}", lambda symbol=symbol: close(symbol))
+            for symbol in (symbols if symbols is not None else (SYMBOL,))
+        ),
         ("the final read", final),
     ):
         try:
@@ -438,3 +448,98 @@ def test_paper_protect_task_on_an_account_that_allows_shorting(capsys: Any) -> N
     with capsys.disabled():
         print(BY_HAND)
         _finish(body, lambda problems: _clean(trading, problems))
+
+
+def _only_round_trip(trading: Any, data: Any, symbols: tuple[str, str]) -> None:
+    """Buy two one-share longs, protect only the first, read and cancel that stop, then clear both.
+
+    Shared with the offline stand-in drive. `_finish` runs every cleanup step after any body failure,
+    including a lost buy answer or a failed assertion after the stop has been sent.
+    """
+    assert _no_shorting(trading), "the account is not long-only at the start; nothing sent"
+    assert not _held(trading), "the account holds a position at the start; nothing sent"
+    assert not _open_orders(trading), "the account holds an open order at the start; nothing sent"
+    SENT.clear()
+    named, omitted = symbols
+
+    def body() -> None:
+        for symbol in symbols:
+            bought = _market(trading, OrderSide.BUY, "buy", None, symbol)
+            assert _status(bought) == "filled" and Decimal(str(bought.filled_qty)) == ONE
+        expected = dict.fromkeys(symbols, ONE)
+        held = _until(lambda: _held(trading), lambda found: found == expected)
+        assert held == expected, "the two one-share longs were not shown"
+        code = protect.task_from_flags("false", ROW, "false", "", named, trading=trading, data=data)
+        assert code == 0, f"the named send exited {code}"
+        working = _until(lambda: _working(trading), lambda found: bool(found))
+        assert not any(order.symbol == omitted for order in working), (
+            "the omitted long has an order"
+        )
+        assert len(working) == 1, "the named long does not have exactly one working stop"
+        (stop,) = working
+        assert stop.symbol == named and _status(stop) in protect.RESTING
+        assert custody.lineage(str(stop.client_order_id)) == custody.PROTECT
+        assert (
+            stop.side == OrderSide.SELL
+            and stop.type.value == "trailing_stop"
+            and stop.time_in_force == TimeInForce.GTC
+            and stop.position_intent == PositionIntent.SELL_TO_CLOSE
+            and Decimal(str(stop.qty)) == ONE
+            and Decimal(str(stop.filled_qty)) == 0
+        ), "the named stop does not have the required terms"
+        code = protect.task_from_flags(
+            "false", "", "true", named, trading=trading, pause=time.sleep
+        )
+        assert code == 0, f"the named cancel exited {code}"
+        canceled = trading.get_order_by_id(stop.id)
+        assert _status(canceled) == "canceled" and Decimal(str(canceled.filled_qty)) == 0
+        # The cancel named one symbol, so a stop sent for the omitted long would still work here,
+        # and by now the listing has had the cancel's whole wait to show it.
+        left = _until(lambda: _working(trading), lambda found: not found)
+        assert not left, f"{len(left)} order(s) still work after the named stop's cancel"
+
+    _finish(body, lambda problems: _clean(trading, problems, symbols))
+
+
+def test_paper_protect_only_named_long(capsys: Any) -> None:
+    """Run alone, on the two liquid symbols `ONLY_SYMBOLS` names (the first is the one named to the task):
+
+    CANON_PAPER_PROTECT_TASK=1 mise run paper:test -- -s -k test_paper_protect_only_named_long
+
+    This offline collection check must select exactly one test:
+
+    uv run --locked pytest tests/test_paper_protect_task.py -k test_paper_protect_only_named_long --collect-only -q
+    """
+    if os.environ.get("CANON_PAPER_PROTECT_TASK") != "1":
+        pytest.skip("asked for only by CANON_PAPER_PROTECT_TASK=1")
+    marker = os.environ.get("CANON_ALPACA_STREAM_LOCK", "")
+    if not marker or Path(marker).name != "canon-alpaca-stream-tests.lock":
+        pytest.skip("not under the paper test runner's account lock")
+    if os.environ.get("CANON_PAPER_ACCOUNT", "tests") != "tests":
+        pytest.skip("this is only for the test account")
+    symbols = ONLY_SYMBOLS.split(",")
+    assert (
+        len(symbols) == 2
+        and len(set(symbols)) == 2
+        and all(
+            name.isascii() and name.isalpha() and name.isupper() and len(name) <= 5
+            for name in symbols
+        )
+    ), "CANON_PAPER_PROTECT_ONLY_SYMBOLS must name two distinct plain stock symbols; nothing sent"
+    deadline = os.environ.get("CANON_PAPER_TEST_DEADLINE", "")
+    # Two buys, two closes and the stop's cancel need twice the original single-long run's room.
+    if not deadline.isdigit() or int(deadline) - time.time() < 2 * DEADLINE_ROOM_SECS:
+        pytest.skip(f"needs {2 * DEADLINE_ROOM_SECS} s of the paper runner's deadline left")
+    trading: Any = session_window.paper_trading()
+    clock = trading.get_clock()
+    if (
+        not clock.is_open
+        or (clock.next_close - clock.timestamp).total_seconds() < 2 * CLOSE_MARGIN_SECS
+    ):
+        pytest.skip("needs the regular session with thirty minutes left")
+    with capsys.disabled():
+        print(
+            "if killed before cleanup: inspect the test account; cancel this run's protect stop "
+            "and close its two one-share longs in Alpaca's own screen"
+        )
+        _only_round_trip(trading, session_window.window_data, (symbols[0], symbols[1]))

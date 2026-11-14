@@ -657,6 +657,9 @@ def test_t7_count_one_carried_sale_floor_uses_its_plan_cap(tmp_path):
     order.apply(released)
     strategy.cached.working = [order]
     strategy.on_order_released(released)
+    # The release handler only stores the release; the sale starts where the holding is next
+    # managed, at the next quote or step.
+    strategy._manage(h.AAA)
     assert slot.sale is not None
     assert slot.sale.floor == chase_floor(first, cap)
 

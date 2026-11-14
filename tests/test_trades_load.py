@@ -622,3 +622,71 @@ def test_the_task_documents_the_implemented_prints_mode() -> None:
     task = tomllib.loads((SOURCE_ROOT / "mise.toml").read_text())["tasks"]["paper:history"]
     assert "trades is not built yet" not in task["usage"]
     assert "trades" in task["description"]
+
+
+BOATS_END = START + timedelta(hours=1)
+
+
+def test_boats_trades_are_asked_for_on_boats_and_claim_a_boats_root(venue, catalog) -> None:
+    """The overnight feed: Alpaca's historical trades take `feed=boats`, "Blue Ocean ATS, overnight US
+    trading data" (https://docs.alpaca.markets/us/reference/stocktrades-1.md, read 2026-11-13)."""
+    from alpaca.data.enums import DataFeed
+
+    assert run(catalog, end=BOATS_END, feed=DataFeed.BOATS) > 0
+    assert {q["feed"][0] for _, _, q in venue.sent} == {"boats"}
+    assert (catalog / FEED_FILE).read_text() == "boats\n"
+
+
+@pytest.mark.parametrize(
+    ("status", "exception", "message"),
+    [(429, RateLimited, "429"), (403, HistoryStopped, r"feed boats.*HTTP 403")],
+)
+def test_a_429_or_refused_boats_feed_stops_by_name_and_asks_no_other_feed(
+    venue, catalog, status, exception, message
+) -> None:
+    from alpaca.data.enums import DataFeed
+
+    venue.answers = [status]
+    with pytest.raises(exception, match=message):
+        run(catalog, end=BOATS_END, feed=DataFeed.BOATS)
+    assert [q["feed"] for _, _, q in venue.sent] == [["boats"]]
+    assert not (catalog / FEED_FILE).exists()
+
+
+def test_a_boats_trade_load_into_a_sip_root_is_refused_before_any_request(venue, catalog) -> None:
+    from alpaca.data.enums import DataFeed
+
+    assert run(catalog, end=BOATS_END) > 0
+    venue.sent.clear()
+    with pytest.raises(HistoryStopped, match="holds sip data and this load is boats"):
+        run(catalog, end=BOATS_END, feed=DataFeed.BOATS)
+    assert venue.sent == []
+
+
+@pytest.mark.parametrize(
+    ("options", "message"),
+    [
+        ({"symbols": [f"S{i}" for i in range(9)]}, "BOATS_MAX_SYMBOLS"),
+        ({"end": START + timedelta(hours=8, minutes=1)}, "BOATS_MAX_SPAN"),
+    ],
+    ids=["nine-symbols", "over-one-overnight-session"],
+)
+def test_a_boats_trade_load_over_its_bound_is_refused_before_any_request(
+    venue, catalog, options, message
+) -> None:
+    from alpaca.data.enums import DataFeed
+
+    with pytest.raises(HistoryStopped, match=message):
+        run(catalog, feed=DataFeed.BOATS, **({"end": BOATS_END} | options))
+    assert venue.sent == []
+
+
+def test_a_boats_bound_counts_every_distinct_symbol_as_given(venue, catalog) -> None:
+    """Code review, 2026-11-13: the bound counts the symbols as they reach the request, so nine
+    entries that differ only in case are nine, not eight."""
+    from alpaca.data.enums import DataFeed
+
+    symbols = ["aapl", "AAPL", *(f"S{i}" for i in range(7))]
+    with pytest.raises(HistoryStopped, match="BOATS_MAX_SYMBOLS"):
+        run(catalog, symbols=symbols, end=BOATS_END, feed=DataFeed.BOATS)
+    assert venue.sent == []

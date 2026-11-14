@@ -3,15 +3,15 @@
 # ${DSH_HOME:-~/.dsh}/profiles/dsh-tui/cordis.patch.yml, after any rows already there.
 # Restart dsh-tui after it changes; verify with: dsh-tui doctor, or dsh --profile dsh-tui --dump-config.
 #
-# Session-log upload off. dsh-TUI v0.17.0 docs/configuration.en.md, "Official request metadata and
+# Session-log upload off. dsh-TUI v0.20.0 docs/configuration.en.md, "Official request metadata and
 # feedback reporting": "To stop API request metadata, disable either field in the user profile patch".
-# DeepSeek Harness dsh-v0.2.1-rc.3 packages/session/session-log-deepseek/README.md: "`false` stops
+# DeepSeek Harness dsh-v0.2.2-rc.2 packages/session/session-log-deepseek/README.md: "`false` stops
 # Session-log upload"; "Re-enabling resumes the unaccepted suffix, including events recorded while
 # disabled", so this stays off.
 - id: session-log-deepseek
   config:
     enabled: false
-# Cross-session memory off. dsh-memento 0.5.28 README, Configuration: "Override under the `memento`
+# Cross-session memory off. dsh-memento 0.5.30 README, Configuration: "Override under the `memento`
 # row"; `enabled` is the "Master switch; `false` removes the service, tools, snapshot, command, panel,
 # and answerer". The patch layer replaces a row's config as a whole (dsh-TUI configuration.en.md), so
 # nothing else of the row is kept, which is what off means here.
@@ -20,9 +20,9 @@
     enabled: false
 # Approval requests refused, never asked (ADR 0136, docs/adr/0136-*.md): nobody answers a prompt in an Orca
 # worker.
-# DeepSeek Harness dsh-v0.2.1-rc.3 packages/interaction/user-approval/README.md: "`never` rejects every
+# DeepSeek Harness dsh-v0.2.2-rc.2 packages/interaction/user-approval/README.md: "`never` rejects every
 # request deterministically before interactive dispatch — the strict headless stance for CI and unattended
-# runs"; dsh-TUI v0.17.0 docs/cli.en.md: "it does not auto-approve". The sandbox stays as dsh-TUI sets it.
+# runs"; dsh-TUI v0.20.0 docs/cli.en.md: "it does not auto-approve". The sandbox stays as dsh-TUI sets it.
 - id: approval
   config:
     policy: never
@@ -43,4 +43,14 @@
       workspace-write:
         sandbox: workspace-write
         approval: never
+# Read-before-write on in the dsh-tui profile, the one profile this block reaches: a tool may overwrite or edit a
+# file only after reading it, and not once it has changed since that read. DeepSeek Harness dsh-v0.2.2-rc.2
+# packages/fs/fs-observation-policy/README.md: "The shipped compositions leave it off: `dsh-base` lists its
+# `fs-observation-policy` row `disabled: true`; set that row to `disabled: false` to restore the guard for every
+# mutating tool". dsh-v0.2.1-rc.3's dsh-base loaded the row, so this keeps the guard as it was once
+# scripts/bootstrap --install has written this block into the profile. Between the engine's move to
+# dsh-v0.2.2-rc.2 and that install, dsh-base's row holds and the guard is off (ADR 0045's 2026-11-13 window).
+# headless, review-acp and build-acp run without it at that pin (ADR 0136's 2026-11-13 line).
+- id: fs-observation-policy
+  disabled: false
 # end canon bootstrap: review settings
