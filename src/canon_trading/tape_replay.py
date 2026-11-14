@@ -49,6 +49,9 @@ defaults to foreign; own buys from the protector's hook as a bounded experiment,
 without changing its custody decisions. An own run is a measurement, never a counted proof.
 Optional latency ({"insert_ns", "update_ns", "delete_ns"}, whole nanoseconds) gives the venue
 send_latency.SendLatency, a named departure from v1's none; absent, the venue has no latency model.
+Optional gain_lock (a JSON boolean, default false) asks the protector's gain lock, which is off
+unless asked for; the JSON report carries the value. A report without the field was written before
+the key existed, and its lock state is not known from the report: on before #479, off after it.
 Timestamps are integer nanoseconds, decimal
 nanosecond strings, or timezone-aware ISO strings with at most microsecond precision. Paths
 are local; relative paths in a CLI spec are relative to that spec's directory. Segments use
@@ -198,16 +201,19 @@ def _checked(spec: Any, base: Path) -> dict[str, Any]:
         "level_book_path",
         "run_label",
     }
-    allowed = required | {"fill_arm", "booking", "venue_fills", "latency"}
+    allowed = required | {"fill_arm", "booking", "venue_fills", "latency", "gain_lock"}
     if not required <= spec.keys() or spec.keys() - allowed:
         raise ValueError(
             f"spec keys: missing {sorted(required - spec.keys())}; unknown {sorted(spec.keys() - allowed)}"
         )
-    spec = {"fill_arm": "tape", "booking": "foreign", **spec}
+    spec = {"fill_arm": "tape", "booking": "foreign", "gain_lock": False, **spec}
     if spec["fill_arm"] not in ("touch", "tape"):
         raise ValueError(f"unknown fill arm {spec['fill_arm']!r}; use touch or tape")
     if spec["booking"] not in ("foreign", "own"):
         raise ValueError(f"unknown booking {spec['booking']!r}; use foreign or own")
+    if type(spec["gain_lock"]) is not bool:
+        # A truthy non-bool would turn on a lock that is off unless asked for.
+        raise ValueError(f"gain_lock must be a JSON boolean, not {spec['gain_lock']!r}")
     send_latency.checked(spec.get("latency"))
     if not isinstance(spec["run_label"], str) or not spec["run_label"].strip():
         raise ValueError("run_label must be nonempty text")
@@ -424,6 +430,7 @@ def _config(
         strategy_id=StrategyId("OwnerProtector-001"),
         row=spec["row"],
         feed="sip",
+        gain_lock=spec["gain_lock"],
         account_label="tape-replay",
         level_book_path=spec["level_book_path"],
         run=f"{spec['run_label']}:{index + 1}",
@@ -907,6 +914,7 @@ def replay(spec: Any, *, base: Path | None = None) -> dict[str, Any]:
         return report
     report["run_label"] = checked["run_label"]
     report["row"] = checked["row"]
+    report["gain_lock"] = checked["gain_lock"]
     report["fill_arm"] = checked["fill_arm"]
     report["booking"] = checked["booking"]
     if checked["booking"] == "own":
