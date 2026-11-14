@@ -80,9 +80,12 @@ if [ -e "$w/alerts.jsonl" ] || [ -L "$w/alerts.jsonl" ]; then
     | group_by(.key) | map(last) | sort_by(.state != "uncovered")') \
     || fail "could not read $w/alerts.jsonl"
 fi
-notify=$(jq -cn --argjson alerts "$alerts" --argjson delivered "$delivered" '
-  $alerts | map(select(.key as $key | $delivered | index($key) == null))') \
-  || fail 'could not read pending keys'
+# Window-sized JSON never goes on argv (Linux caps one argument at 128 KiB, macOS
+# all of them at kern.argmax): one document on stdin, the other by --slurpfile from
+# a process substitution, and printf is the shell's builtin.
+notify=$(jq -c --slurpfile d <(printf '%s' "$delivered") '
+  (reduce $d[0][] as $k ({}; .[$k] = true)) as $seen | map(select($seen[.key] | not))' \
+  <<< "$alerts") || fail 'could not read pending keys'
 pending=$(jq 'length' <<< "$notify") || { pending=null; fail 'could not count pending keys'; }
 if [ "$pending" -gt 0 ]; then
   notified=false
@@ -97,16 +100,16 @@ if [ "$pending" -gt 0 ]; then
       -e 'end run' "$msg" "$lane" >/dev/null 2>&1; then
       notified=true
       sent_now=$pending
-      delivered=$(jq -cn --argjson prev "$delivered" --argjson sent "$notify" \
-        '($prev + ($sent | map(.key))) | unique') || fail 'could not read delivered keys'
+      delivered=$(jq -c --slurpfile sent <(printf '%s' "$notify") \
+        '(. + ($sent[0] | map(.key))) | unique' <<< "$delivered") || fail 'could not read delivered keys'
     fi
   fi
 fi
 pending=$((pending - sent_now))
 # keep only keys the window still holds: an older key can never be read again
-delivered=$(jq -cn --argjson d "$delivered" --argjson a "$alerts" \
-  '($a | map(.key)) as $k | $d | map(select(. as $x | $k | index($x) != null))') \
-  || fail 'could not read delivered keys'
+delivered=$(jq -c --slurpfile a <(printf '%s' "$alerts") \
+  '(reduce $a[0][] as $x ({}; .[$x.key] = true)) as $k | map(select($k[.] // false))' \
+  <<< "$delivered") || fail 'could not read delivered keys'
 put delivered.json "$delivered" || fail "could not write $w/delivered.json"
 status || { echo "exit-monitor-notify: could not write $w/notify-status.json" >&2; exit 1; }
 exit 0

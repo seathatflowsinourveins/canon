@@ -301,6 +301,33 @@ n7() {
     jqt "$BOX/notify-status.json" '.notified == true and .sent_now == 1 and .pending == 0 and (.error | test("delivered"))'
 }
 
+# Hosted check on #454 (2026-11-14): window-sized JSON on argv hit Linux's 128 KiB
+# per-argument limit, and a full window of long lines exceeds macOS's kern.argmax
+# (1 MiB) too. 2000 lines of about 590 bytes (1.18 MB) with keys of about 80 bytes
+# (a receipt of about 170 KB) must be sent, recorded, and read back by the next run.
+n8() {
+  fresh N8-window || return 1
+  jq -cn --arg pad "$(printf '%0400d' 0)" 'range(2000) as $n |
+    {at: "2026-11-14T05:00:00.000000+00:00",
+     key: ("exit-monitor:A:SYN:2026-11-14T05:00:00.000000+00:00:uncovered:" + ($n | tostring) + ":full-window-case"),
+     sid: "exit-monitor:A", lane: "exit monitor A",
+     flag: ("SYN quantity 100 uncovered " + ($n | tostring) + " " + $pad),
+     state: "uncovered", quiet_min: 0, fail: 0}' > "$BOX/alerts.jsonl" || return 1
+  need 'the window is over 1 MiB' test "$(wc -c < "$BOX/alerts.jsonl")" -gt 1048576 || return 1
+  run_notify
+  need 'a full window of long lines is sent and exits 0' eval 'test "$RC" = 0 && calls 1' || return 1
+  need 'the text names the count and the first flag' \
+    jq -se '.[0][6] | startswith("2000 new flag(s): SYN quantity 100 uncovered 0 ")' "$TEST/calls.jsonl" >/dev/null || return 1
+  need 'every key of the window is recorded' jqt "$BOX/delivered.json" 'length == 2000' || return 1
+  need 'the receipt is over 128 KiB' test "$(wc -c < "$BOX/delivered.json")" -gt 131072 || return 1
+  need 'the status says all were sent' \
+    jqt "$BOX/notify-status.json" '.pending == 0 and .sent_now == 2000 and .notified == true' || return 1
+  run_notify
+  need 'the next run reads the full receipt and sends nothing' eval 'test "$RC" = 0 && calls 1' || return 1
+  need 'the next run says nothing was due' \
+    jqt "$BOX/notify-status.json" '.pending == 0 and .sent_now == 0 and .notified == null'
+}
+
 check 'N1: argv, title, lane, batching and uncovered priority' n1
 check 'N2: receipt, retry, 30s timeout and send/record gap' n2
 check 'N3: read-only last 2000 lines, malformed rows and no ALPACA environment' n3
@@ -308,5 +335,6 @@ check 'N4: atomic status, no-notify and file errors' n4
 check 'N5: pass then carrier, exit preservation and credential-free invocation' n5
 check 'N6: frozen notice on first pass and once per repeat key' n6
 check 'N7: one run at a time, pruned receipt, latest line, honest status' n7
+check 'N8: a full window of long lines and a full receipt pass no argv limit' n8
 echo "exit-monitor-notify: $pass passed, $fail failed, 0 skipped"
 [ "$fail" -eq 0 ]
