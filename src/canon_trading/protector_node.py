@@ -354,7 +354,10 @@ def _book_settings(config: ProtectorRun) -> dict[str, Any]:
     here, under the locks; where it takes none, that is named."""
     path = os.environ.get(LEVEL_BOOK_ENV)
     if not path:
-        return {}
+        # A start by hand, with no book: the reader is still handed, since the overnight
+        # eligibility check reads through it whether or not a level persists (Codex's P1-a on
+        # 62941f39, 2026-11-13: with none, every overnight long was refused as unreadable).
+        return {"trading": _trading_reader()} if _protector_takes_reader() else {}
     levels = _book_levels(Path(path), config.account)
     if not _protector_takes_book():
         raise window.WindowRefused(

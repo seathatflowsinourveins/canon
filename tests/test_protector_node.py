@@ -413,6 +413,9 @@ def runtime(monkeypatch, controls, *, account="windows", lead_go=None):
 
     monkeypatch.setattr(module, "protector_node", build)
     monkeypatch.setattr(window, "_run_node", lambda node, ends: strategy.on_stop())
+    # Every start hands the protector its GET-only reader, book or none (Codex's P1-a); offline
+    # here it is a stand-in, and booked() replaces it where a case names its reader.
+    monkeypatch.setattr(module, "_trading_reader", lambda: "reader")
     settings = config(controls, account=account, lead_go=lead_go)
     return module, settings, strategy, foreign, reads, built
 
@@ -1484,3 +1487,18 @@ def test_two_builder_segments_carry_the_level_distance_and_offset(controls, tmp_
         "sell",
         "buy",
     ]
+
+
+def test_unbooked_overnight_start_can_select_an_eligible_long(controls, tmp_path, monkeypatch):
+    reader = VenueOrders(asset={"attributes": ["overnight_tradable"]})
+    module, settings, _, _, _, built = booked(
+        monkeypatch, controls, takes_reader=True, reader=reader
+    )
+    monkeypatch.delenv(module.LEVEL_BOOK_ENV, raising=False)
+    clock, calendar = market("2026-11-12T21:00:00")
+    monkeypatch.setattr(window, "session_now", lambda _: (clock, calendar, window.time.monotonic()))
+    module.run_protector(settings, trading=object(), lock_dir=tmp_path)
+    assert built[0][2] == "boats"
+    probe = Harness(feed="boats", session_part="overnight", **(built[0][3] or {}))
+    probe.on_start()
+    assert AAA in probe.slots, probe.said
