@@ -58,6 +58,10 @@ NautilusTrader d53849b216e2, v2.0.0rc8:
   string. A terminal failure can have no payload (:77-79,423-425). data/engine/mod.rs:1965-1972
   and dispatch.rs:387-390 cache response quotes first; common/cache/mod.rs:2379-2402 pushes
   them to the front regardless of venue stamp. Every fallback here reads venue_quotes instead.
+* Overnight cold start (the lead's amended ruling, 2026-11-13): use Mover's BOATS history
+  delay and protect.distance_for for the cold rule as well as the warm row. Its Distance.fallback
+  names the cold rule. trading/__init__.pyi:552-560 cannot modify a trailing offset;
+  warming therefore retains a working sell and never lowers its level.
 
 Coverage follows protect.py:514-570: sum remaining shares of simple working sells; unknown cover,
 contingencies and pending changes freeze; full cover needs no sell; partial foreign cover freezes;
@@ -77,14 +81,20 @@ acknowledgement is not a fill. Offsets use Mover's existing
 explicit-distance calculation with a dollar distance from protect.distance_for, sharing row_distance with
 protect.plan_distance (ADR 0142). The required row is OWN1 or OWN3 from protect.ROWS, without a default
 or fraction overrides; F2 is refused by name because the holding's distance must be per symbol.
-The distance and limit offset are fixed once per holding and logged with
-Distance.source(). At start and adoption, after subscribing, the protector requests the latest quote
-on its live feed and bars since the latest 04:00 New York. It waits for the bars request to complete,
-merges history and cache by event stamp, excludes an open minute, and passes the last 14 existing
-minutes to protect.distance_for. The adapter stamps bars at their open (data.py:1237-1257).
-One to thirteen bars use their own ATR period; with no spread the ATR stands alone. No history, or
-a flat day with no spread, takes the named fixed fallback, counted separately in END. Failed reads
-are named at each step and never retried. The adapter config helper enables
+The distance and limit offset are logged with Distance.source(). At start and adoption, after
+subscribing, the protector requests the latest quote on its live feed and bars since the latest
+04:00 New York; BOATS history ends the Mover's delay before now. It merges history and cache by
+event stamp, excludes an open minute, and passes the last 14 existing minutes to protect.distance_for.
+The adapter stamps bars at their open (data.py:1237-1257). Until complete bars exist, a usable quote
+arms through protect.distance_for(..., []), naming its fixed fallback as the cold rule. Bars then
+replan the distance without lowering the level or replacing a working sell. A carried distance
+stays whole; a carried level with no distance takes the higher of its level and the cold rule's
+level until bars allow a plan. One to thirteen bars use their own ATR period; with no spread the
+ATR stands alone. A flat day with no spread retains the named fixed fallback, counted separately
+in END; a carried long with no carried distance takes it as the cold rule, planned again on bars.
+Bars allow a plan only once the day's answer is in, or a full ATR's worth exists, judged on the
+slice the planner is given. Failed reads are named once and never retried.
+The adapter config helper enables
 external reports and reduce-only SELL_TO_CLOSE
 (canon_alpaca/execution.py:569,614-646,1578); it constructs no client or node.
 
@@ -125,8 +135,11 @@ guard, whether our cancel resized the holding (a growth, property (e)) or our se
 and then ended. Named limits: (1) a host clock more than the bound behind Alpaca's makes every quote
 on time insane, so nothing is placed and every step says why; (2) two different quotes with one
 stamp are one observation, and the second waits for the next greater stamp; (e4) after a DAY expiry
-the level is held and the sell is re-placed at once, the latest quote, however old, deciding only
-the limit's sign; the two observations of the next arming (U-c) cover the election that follows;
+the level is held and the sell is re-placed at once, the latest usable quote, however old, deciding
+only the limit's sign; our own size and re-price cancels use that same retained quote. A crossed
+quote or one with a zero size cannot erase it; without any usable quote the holding is named at
+ERROR as without its working sell until one arrives. The two observations of the next arming
+(U-c) cover the election that follows;
 (b) there is no on_resume or on_reset, so a node stopped and resumed protects nothing until it is
 started fresh, as paper:protector starts each run. A protector that cannot act on its quotes says
 so at every step.
@@ -165,13 +178,18 @@ reconciled EXTERNAL position opens at the reconciliation clock, never the venue'
 (crates/live/src/execution/manager.rs:4282-4330, live/src/execution/reconciliation.rs:955-1003,
 execution/src/reconciliation/orders.rs:1322,1348, model/src/position.rs:232), so ts_opened names
 no holding across runs; the entry keeps its own protection start. Whether the entry's holding is
-the one held now is read from the venue (U-e B, start_level.holding_verdict: GET /orders through
-the runner's reader, fills counted by fill time over a 92-day walk, review F1): fewer shares sold
-since the entry was written than it held, so never flat, and a quantity held now that those sells
-and the buys since explain (review F4: a split is not), carries its level. A sell-out is a new
-holding, and its entry may be replaced; a failed, incomplete or unexplained reading is unknown:
-the holding self-arms, guarded, at a level kept in memory, and the book keeps the entry as written
-unless this run's level is higher (review F2). A holding this run sees end has its entry retired:
+the one held now is read from the venue (U-e B, start_level.holding_reading: GET /orders through
+the runner's reader over a 92-day walk, review F1), on the venue's clock alone (DeepSeek P2-2,
+the lead's ruling of 2026-11-13 21:23): each entry keeps the venue's reading of its holding's
+fills, taken when the holding was found (Alpaca's clock, then both sides' orders, then the
+position, `_read_venue`) or carried from a same-holding reading, and every order the node had
+applied, by venue identity. The fills the entry does not hold are those the venue shows beyond
+it: fewer such shares sold than it held, so never flat, and a quantity held now that those sells
+and buys explain (review F4: a split is not), carries its level. A sell-out is a new holding,
+and its entry may be replaced; a failed, incomplete or unexplained reading, or an entry with no
+reading, is unknown: the holding self-arms, guarded, at a level kept in memory, and the book
+keeps the entry as written unless this run's level is higher (review F2), except an entry with
+no reading, which this run's own entry replaces (the lead, 21:32, property 2). A holding this run sees end has its entry retired:
 written with no level, state frozen, reason "holding ended", so no later run carries it (F3). A
 level supplied or kept while flat binds a holding found later only when no buy filled after it was
 kept (start_level.bought_since). Limit: each of those GETs runs on the event thread at the start of
@@ -202,8 +220,46 @@ written when it changes, and the file carries last_step_ns per account label, wr
 once per 1 s step, so a killed run shows as a step time that stops advancing. The default book is
 one file per account label, and each read, merge and replace holds LevelBook.locked (review F5).
 A write failure is named once per kind.
+An armed long, carried or armed this run, breached through its limit offset is named once at
+ERROR and keeps its level and distances. Once two new observations at or below its level confirm
+the breach (each breach counts its own two, cleared by a new two-sided quote above the level,
+whatever the step then does, or by a trailing order of ours placed; a quote with no usable
+two-sided prices and sizes neither counts nor clears, as main's guard skips it),
+it starts a DAY limit sale using the same exit_price and chase_floor rules as a released sale,
+including the lowest positive venue tick; it never submits a trailing order whose bid-derived
+limit would be nonpositive (F15 and its review).
 An omitted account label disables persistence by name; no guessed account shares a book key.
 There is no runner here to start nodes back to back or supply their history and session bounds.
+
+Review F1 of #443's max review (the lead's ruling, 2026-11-13 22:47 and 22:52): a holding first bought
+after the start, in a symbol the node did not load, is named at once and has its exit within a bound.
+The node loads the account's symbols once, at its start (protector_node.run_protector), and the
+adapter reports no fill or position in an instrument it did not load
+(packages/canon-alpaca/src/canon_alpaca/execution.py:369), so no such holding ever reaches the cache.
+Given its `roster` (the node's instruments), the protector reads the account's positions
+(Alpaca's GET /v2/positions, alpaca-py's get_all_positions, through session_window.position_reads)
+at its first step and every ROSTER_POLL_SECS after, in the step timer's handler, which no command of
+ours publishes, so the rule for order-event handlers (mover.py:231-238) does not bind it. A whole-share
+long outside the roster is named by one alert line with its symbol and quantity, and the run ends by name,
+ROSTER_ENDED, through the pinned Strategy.shutdown_system (nautilus-trader d53849b216e2
+python/nautilus_trader/trading/__init__.pyi:525, crates/common/src/actor/data_actor.rs:4568-4582): the
+live node shuts down on it (crates/live/src/node/mod.rs:1636-1641) as the backtest engine ends on it
+(crates/backtest/src/engine.rs:882-884), and the runner's successor reads the account fresh at its
+start, so the holding is on its roster. A long outside the roster that the start skips or refuses is
+named once and does not itself end the run, since a successor would not protect it. What the successor's
+start skips and refuses is one predicate, `session_window.start_account`, which the start and this read
+both call: an unreadable position, or one listed at zero, is skipped by name, and a fractional one,
+inside or outside the roster, refused, by the adapter's own whole-share rule. While the start would
+refuse the account read, a whole-share long outside the roster does not end the run: it is named once as
+unprotected with what blocks the restart, the run protects its roster to its planned end, and the first
+read the start would accept ends it. The order half of the start's refusal, an open order the adapter
+cannot map, runs inside reconciliation and is not called here, so a new holding beside such an order
+still ends the run into a refused start (the deputy's ruling, 2026-11-13 23:53). The bound: the buy is
+named, and the end asked for, at the first read after it, so within ROSTER_POLL_SECS and one step of the
+venue listing it, when the read answers within its own bound (the same reader and the same limit as the
+GETs above). The node's stop, the runner's seam and the successor's arming come after that and are not in
+the bound; how long they take live is not measured (UNVERIFIED). A failed read is an alert line, read
+again at the next interval. A holding outside the roster is never armed by this run.
 """
 
 from __future__ import annotations
@@ -250,27 +306,39 @@ from nautilus_trader.trading import Strategy
 from . import gain_lock
 from . import protect
 from . import session_window
+from . import symbol_hold
 from .custody import OURS
 from .custody import PROTECT
 from .custody import PROTECT_PREFIX
 from .custody import lineage
 from .ma_cross import refuse_unknown_keywords
 from .mover import FLOOR_WAIT_SECS
+from .mover import OVERNIGHT_HISTORY_DELAY
+from .mover import OVERNIGHT_HISTORY_FEED
 from .mover import SECOND_NS
 from .mover import chase_floor
 from .mover import offsets
 from .price_step import exit_price
 from .price_step import up_on_step
+from .start_level import APPLIED_MOST
 from .start_level import LABEL
+from .start_level import NEEDS_REASON
 from .start_level import NEW
 from .start_level import SAME
+from .start_level import UNKNOWN
+from .start_level import Applied
 from .start_level import Entry
+from .start_level import Horizon
 from .start_level import Key
 from .start_level import LevelBook
+from .start_level import Unread
+from .start_level import baseline
 from .start_level import book_path
 from .start_level import bought_since
-from .start_level import holding_verdict
+from .start_level import holding_reading
+from .start_level import leg_key
 from .start_level import overnight_answer
+from .start_level import raw_key
 from .start_level import start_level
 
 if TYPE_CHECKING:
@@ -285,6 +353,12 @@ REFUSED_KEPT = 64
 WAITING = "unprotected: waiting"
 STEP_NS = 1_000_000_000  # The step timer's interval (on_start), the floor between step writes.
 OVERNIGHT_RETRY_NS = 60 * STEP_NS  # Review F7: an unread eligibility is read again after a minute.
+ROSTER_POLL_SECS = 30
+"""Review F1: how often the account's positions are read for a holding outside the roster. With a read
+that answers in its bound, a new holding is named and the run's end asked for within this and one step
+of the venue listing it; the stop and the successor's arming after it are not bounded here."""
+ROSTER_ENDED = "new holding outside the roster"
+"""The run's end by name when a whole-share long outside the roster is found (review F1)."""
 
 GAIN_QUOTE_FORWARD_SKEW_NS = 100_000_000
 """100 ms forward event/receipt tolerance; UNCALIBRATED row GAIN_QUOTE_FORWARD_SKEW."""
@@ -317,6 +391,8 @@ class OwnerProtectorConfig(StrategyConfig):
         *,
         row: str,
         levels: dict[InstrumentId, Price] | None = None,
+        symbol_holds_dir: Path | str | None = None,
+        symbol_holds: frozenset[str] | None = None,
         feed: str = "sip",
         extended_hours: bool = True,
         account_label: str | None = None,
@@ -324,11 +400,14 @@ class OwnerProtectorConfig(StrategyConfig):
         run: str = "",
         session_part: str = "regular",
         trading: Any = None,
+        roster: Sequence[InstrumentId] | None = None,
         **_kwargs: Any,
     ) -> None:
         super().__init__()
         refuse_unknown_keywords(self, _kwargs)
         self.levels = dict(levels or {})
+        self.symbol_holds_dir = None if symbol_holds_dir is None else Path(symbol_holds_dir)
+        self.symbol_holds = None if symbol_holds is None else frozenset(symbol_holds)
         self.feed = feed
         self.row = row
         self.extended_hours = extended_hours
@@ -337,6 +416,8 @@ class OwnerProtectorConfig(StrategyConfig):
         self.run = run
         self.session_part = session_part
         self.trading = trading
+        # Review F1: the instruments the node loaded at its start; None reads no account.
+        self.roster = None if roster is None else tuple(roster)
         self.validate_protection()
 
     def validate_protection(self) -> None:
@@ -383,6 +464,10 @@ class OwnerProtectorConfig(StrategyConfig):
             if not isinstance(instrument_id, InstrumentId):
                 raise TypeError("levels must map InstrumentId to Price")
             _check_level(level)
+        if self.roster is not None and not all(
+            isinstance(instrument_id, InstrumentId) for instrument_id in self.roster
+        ):
+            raise TypeError("roster must name InstrumentIds")
 
 
 def owner_execution_config(**kwargs: Any) -> AlpacaExecutionClientConfig:
@@ -465,6 +550,16 @@ def _sane(tick: QuoteTick) -> bool:
     no observation and never a reference (as `canon_alpaca.data.trade_stamp` holds for prints,
     data.py:1044-1062). The local clock does this and nothing else."""
     return tick.ts_event - tick.ts_init <= STAMP_AHEAD_MOST_NS
+
+
+def _two_sided(tick: QuoteTick) -> bool:
+    """Prices and sizes on both sides, the quote the guard reads (bid > 0, ask >= bid)."""
+    return (
+        tick.bid_price.as_decimal() > 0
+        and tick.ask_price.as_decimal() >= tick.bid_price.as_decimal()
+        and tick.bid_size.as_decimal() > 0
+        and tick.ask_size.as_decimal() > 0
+    )
 
 
 def _usable(tick: QuoteTick, now: int) -> bool:
@@ -556,6 +651,12 @@ class Holding:
     last_observation: int | None = None
     distance: protect.Distance | None = None
     limit_offset: Decimal | None = None
+    offset_breach_named: bool = False
+    # F15's review, 1 (and land-f15's two): the first new sane observation at or below the level
+    # in the current breach; a second newer one starts the sale. Cleared by a new two-sided
+    # observation above the level, before any return, and by every trailing order of ours placed,
+    # so each breach counts its own two.
+    breach_observation: int | None = None
     fresh: bool = False
     ended: bool = False
     # The host clock when the level was fixed; it never orders venue observations.
@@ -585,6 +686,9 @@ class Holding:
     protection_start: int | None = None
     history_ready: bool = False
     history_error: str | None = None
+    history_error_said: bool = False
+    cold: bool = False
+    cold_seen: int | None = None
     seed_error: str | None = None
     first_quote: int | None = None
     last_quote: int | None = None
@@ -593,10 +697,17 @@ class Holding:
     # newer maximum held when it returned. A read requested before the holding opened sets neither.
     seed_requested_at: int | None = None
     current_from: int | None = None
+    # Set when the owner's word held this holding after its sell was placed: its release re-places
+    # the sell at the next step while the bid is above the level, with no new observation.
+    rearm_at_step: bool = False
 
 
 STREAM_LOGGER = "alpaca.data.live.websocket"
 STREAM_ERROR = "error during websocket communication"
+
+
+class BookUnreadable(Exception):
+    """The level book exists and cannot be read at a write: it is left as it is (F13)."""
 
 
 class _StreamErrors(logging.Handler):
@@ -642,8 +753,20 @@ class OwnerProtector(Strategy):
         self.levels = dict(config.levels)
         self.slots: dict[InstrumentId, Holding] = {}
         self.frozen: dict[InstrumentId, str] = {}
+        # The owner's word for one symbol (symbol_hold): held now, how many holds each symbol had
+        # this run, and the kind of the last read's failure while the last holds read stand.
+        self.held: set[InstrumentId] = set()
+        self.hold_counts: dict[InstrumentId, int] = {}
+        self.holds_unread: str | None = None
+        self.holds_made = False  # A folder read once: from then on its absence is a failed read.
         self.sent_ids: set[ClientOrderId] = set()
         self.cancel_requested: set[ClientOrderId] = set()
+        # An order event our own submit, cancel or modify publishes reaches its handler while the
+        # strategy is mutably borrowed (nt@d53849b216e2 crates/trading/src/python/strategy.rs:
+        # 2016-2037), where cache, clock and log raise. Such a handler only stores what the event
+        # carries, here, and the next quote or step reads the engine (main's form, mover.py:230-237).
+        self.released_at: dict[ClientOrderId, int] = {}
+        self.deferred_lines: list[str] = []
         self.sells_named = 0
         self.subscribed: set[InstrumentId] = set()
         # The holding (ts_opened, ts_init) whose supplied level was refused: it is named
@@ -656,6 +779,11 @@ class OwnerProtector(Strategy):
         self.refused_stamps: dict[InstrumentId, deque[int]] = {}
         # One quote at the running maximum per instrument, independent of levels and planning.
         self.venue_quotes: dict[InstrumentId, QuoteTick] = {}
+        # F8: replacing our ended sell needs the latest usable quote even after bad arrivals
+        # have displaced it from both the venue maximum and the bounded upstream cache.
+        self.replacement_quotes: dict[InstrumentId, QuoteTick] = {}
+        # F8's review, 2 and 3: a lost cover with no usable quote is ALERTed once per loss.
+        self.replace_alerted: set[InstrumentId] = set()
         self.gain_lock_events: list[dict[str, Any]] = []
         self.gain_lock_sales: list[dict[str, Any]] = []
         self.previous_levels: dict[Key, Entry] = {}
@@ -677,6 +805,8 @@ class OwnerProtector(Strategy):
         self.book_entries: dict[Key, Entry] = {}
         # Item 4: a write failure is named once per kind (exception type and text).
         self.write_failures: set[tuple[str, str]] = set()
+        # F13 (#443's max review): each note a read of the book gave, start or re-read, said once.
+        self.book_notes: set[str] = set()
         self.last_step_ns: int | None = None
         # P11: supplied levels and book entries that armed a holding this run.
         self.applied: set[InstrumentId] = set()
@@ -690,6 +820,10 @@ class OwnerProtector(Strategy):
         self.written_keys: set[Key] = set()
         self.kept_passed: set[InstrumentId] = set()
         self.carried: set[Key] = set()
+        # DeepSeek P2-2 (the lead, 2026-11-13 21:23): each holding's venue reading of its fills, by
+        # the opening it was read for, and the host clock of the last failed attempt with its reason.
+        self.readings: dict[InstrumentId, tuple[tuple[int, int], Horizon]] = {}
+        self.reading_tried: dict[InstrumentId, tuple[int, str]] = {}
         # Review F2: keys whose book entry this run may replace, lower level or not: the venue
         # showed a new holding, the entry had no level, or this run saw the holding end.
         self.replaceable: set[Key] = set()
@@ -708,6 +842,11 @@ class OwnerProtector(Strategy):
         self.fallbacks: dict[InstrumentId, int] = {}
         self.flat_fallbacks: dict[InstrumentId, int] = {}
         self.quote_refusals: dict[InstrumentId, str] = {}
+        # Review F1: the step that last read the account for the roster, the run's end by name once
+        # asked for, and the holdings outside the roster already named, by symbol and kind.
+        self.roster_read_ns: int | None = None
+        self.ended_for: str | None = None
+        self.roster_named: set[tuple[str, str]] = set()
 
     def _note(self, tick: QuoteTick | None) -> bool:
         """Record every quote; return whether it raises an already established venue clock.
@@ -772,6 +911,17 @@ class OwnerProtector(Strategy):
             and tick.ts_event == previous.ts_event
         ):
             self.venue_quotes[instrument_id] = tick
+        usable = self.replacement_quotes.get(instrument_id)
+        if (
+            not refused
+            and _sane(tick)
+            and tick.bid_price.as_decimal() > 0
+            and tick.ask_price.as_decimal() >= tick.bid_price.as_decimal()
+            and tick.bid_size.as_decimal() > 0
+            and tick.ask_size.as_decimal() > 0
+            and (usable is None or tick.ts_event >= usable.ts_event)
+        ):
+            self.replacement_quotes[instrument_id] = tick
         if self.venue_quotes.get(instrument_id) is tick and (
             previous is None or tick.ts_event > previous.ts_event
         ):
@@ -830,7 +980,7 @@ class OwnerProtector(Strategy):
 
     def _plan_from_maximum(self, instrument_id: InstrumentId, slot: Holding) -> None:
         tick = self.venue_quotes.get(instrument_id)
-        if slot.distance is None and tick is not None:
+        if (slot.distance is None or slot.cold) and tick is not None and slot.sale is None:
             self._plan_holding(instrument_id, slot, tick)
 
     def on_historical_quotes(self, quotes: Sequence[QuoteTick]) -> None:
@@ -878,16 +1028,27 @@ class OwnerProtector(Strategy):
             elif instrument_id not in self.venue_quotes:
                 slot.seed_error = "seed empty: no two-sided quote; wait"
 
-        try:
-            self.request_bars(
-                BarType.from_str(f"{instrument_id}-1-MINUTE-LAST-EXTERNAL"),
-                start=protect.session_start(now),
-                end=now,
-                params={"feed": self.settings.feed},
-                callback=bars_done,
+        end = now - OVERNIGHT_HISTORY_DELAY if self.settings.feed == OVERNIGHT_HISTORY_FEED else now
+        start = protect.session_start(now)
+        if start >= end:
+            # 04:00-04:15 New York on boats: no window ends 15 minutes ago inside the session day,
+            # so nothing is asked and the cold rule stands until a full ATR's worth of live bars
+            # exists (code-review-high/7, -high-2/2).
+            self._say(
+                f"{instrument_id}: no session day's bars to ask before {start + OVERNIGHT_HISTORY_DELAY:%H:%M} "
+                "UTC on boats; the cold rule stands until a full ATR's worth of bars exists"
             )
-        except (ValueError, RuntimeError) as exc:
-            slot.history_error = str(exc)
+        else:
+            try:
+                self.request_bars(
+                    BarType.from_str(f"{instrument_id}-1-MINUTE-LAST-EXTERNAL"),
+                    start=start,
+                    end=end,
+                    params={"feed": self.settings.feed},
+                    callback=bars_done,
+                )
+            except (ValueError, RuntimeError) as exc:
+                slot.history_error = str(exc)
         self.seeds_in_flight.setdefault(instrument_id, []).append(token)
         try:
             self.request_quotes(
@@ -1127,6 +1288,8 @@ class OwnerProtector(Strategy):
         for instrument_id in sorted(instruments, key=str):
             if instrument_id in self.slots or instrument_id in self.stopped_instruments:
                 continue
+            if self.settings.roster is not None and instrument_id not in self.settings.roster:
+                continue  # Review F1: named by the roster's read; this run never arms it.
             try:
                 self._discover_holding(instrument_id)
             except Exception as exc:  # noqa: BLE001 - one holding never costs another discovery.
@@ -1178,9 +1341,85 @@ class OwnerProtector(Strategy):
             return
         self.refused.pop(instrument_id, None)
         self.slots[instrument_id] = self._new_holding(instrument_id, position)
+        self._read_venue(instrument_id)
         self._subscribe_holding(instrument_id)
         self._request_seed(instrument_id)
         self._manage(instrument_id)
+
+    def _keep_reading(self, instrument_id: InstrumentId, position: Any, horizon: Horizon) -> None:
+        self.readings[instrument_id] = ((position.ts_opened, position.ts_init), horizon)
+        self.reading_tried.pop(instrument_id, None)
+
+    def _read_venue(self, instrument_id: InstrumentId) -> None:
+        """A found holding's venue reading of its fills (DeepSeek P2-2), once per opening, retried
+        once a minute after a failure that is named once per reason. With no level book there is
+        nothing to carry, so nothing is read."""
+        if self.level_book_path is None or instrument_id not in self.slots:
+            return
+        position = self._external_long(instrument_id)
+        if position is None:
+            return
+        found = self.readings.get(instrument_id)
+        if found is not None and found[0] == (position.ts_opened, position.ts_init):
+            return
+        key: Key = (self.settings.account_label or "", instrument_id)
+        previous = self.previous_levels.get(key)
+        if (
+            previous is not None
+            and previous.horizon is not None
+            and previous.last_level is not None
+            and not {key} & (self.carried | set(self.not_carried) | self.replaceable)
+        ):
+            return  # Its same-holding verdict, still to come, gives the reading on `same`.
+        now = self.clock.timestamp_ns()
+        tried = self.reading_tried.get(instrument_id)
+        if tried is not None and now - tried[0] < 60 * SECOND_NS:
+            return
+        held = _quantity(position.quantity)
+        try:
+            if held is None:
+                raise ValueError("the node's quantity is not a number")
+            horizon = baseline(self.settings.trading, instrument_id.symbol.value, held)
+        except Exception as exc:  # noqa: BLE001 - an unread venue is named, never guessed.
+            reason = f"{type(exc).__name__}: {exc}"
+            if tried is None or tried[1] != reason:
+                self._say(
+                    f"{instrument_id}: no venue reading of its fills yet ({reason}); a restart "
+                    "before one is read arms it with no carried level; tried again each minute"
+                )
+            self.reading_tried[instrument_id] = (now, reason)
+            return
+        self._keep_reading(instrument_id, position, horizon)
+        self._say(
+            f"{instrument_id}: venue reading of its fills at the venue's "
+            f"{datetime.fromtimestamp(horizon.at_ns / 1_000_000_000, UTC).isoformat()}, "
+            f"{len(horizon.applied)} recent orders kept by identity"
+        )
+
+    def _applied_orders(self, instrument_id: InstrumentId) -> tuple[Applied, ...]:
+        """Every order of the name the node holds with fills: its side, its venue legs and the
+        shares the node applied (`filled_qty`), matched to the venue's orders by identity."""
+        applied = []
+        for order in self.cache.orders(instrument_id=instrument_id):
+            filled = _quantity(order.filled_qty)
+            legs = tuple(sorted({leg_key(str(leg)) for leg in order.venue_order_ids}))
+            if filled and filled > 0 and legs:
+                side = "buy" if order.side == OrderSide.BUY else "sell"
+                applied.append(Applied(side, legs, filled))
+        return tuple(applied)
+
+    def _entry_horizon(self, instrument_id: InstrumentId, position: Any) -> Horizon | None:
+        """The reading an entry for this opening carries: the venue's reading, with every order
+        the node now holds in place of the venue's count of it. None until one is read."""
+        found = self.readings.get(instrument_id)
+        if found is None or found[0] != (position.ts_opened, position.ts_init):
+            return None
+        ours = self._applied_orders(instrument_id)
+        legs = {leg for applied in ours for leg in applied.legs}
+        kept = tuple(a for a in found[1].applied if not legs.intersection(a.legs))
+        if len(ours) + len(kept) > APPLIED_MOST:
+            return None
+        return Horizon(found[1].at_ns, (*ours, *kept))
 
     def on_start(self) -> None:
         if self.started_once:
@@ -1202,12 +1441,19 @@ class OwnerProtector(Strategy):
                 if self.settings.level_book_path is None
                 else Path(self.settings.level_book_path)
             )
-            self.previous_levels = LevelBook.read(self.level_book_path, report=self._say)
+            self.previous_levels = LevelBook.read(self.level_book_path, report=self._say_book_note)
             self.book_entries = dict(self.previous_levels)
             # 3d's cell 0c (the lead, 2026-11-13 19:12): the book's state is said at every start.
             self._say(f"level book enabled for account {self.settings.account_label}")
         else:
             self._say("level book disabled: no account label supplied; no level is carried")
+        if self.settings.symbol_holds_dir is None:
+            self._say("no symbol-holds folder supplied: no per-symbol hold is read this run")
+        for name in sorted(self.settings.symbol_holds or ()):
+            # The node's start read under the locks stands if this strategy's own read fails.
+            self.holds_made = True
+            self._hold_begins(InstrumentId.from_str(f"{name}.ALPACA"))
+        self._read_symbol_holds()
         for instrument_id, level in list(self.levels.items()):
             self.adopt_holding(instrument_id, level)
         self._discover_holdings()
@@ -1268,16 +1514,25 @@ class OwnerProtector(Strategy):
             if previous.last_level is None:
                 self.replaceable.add(key)
             else:
-                kind, reason = holding_verdict(
+                reading = holding_reading(
                     self.settings.trading, instrument_id.symbol.value, previous, held
                 )
-                if kind == SAME:
+                if reading.kind == SAME:
                     self.carried.add(key)
+                    position = self._external_long(instrument_id)
+                    if reading.horizon is not None and position is not None:
+                        self._keep_reading(instrument_id, position, reading.horizon)
                 else:
-                    assert reason is not None
-                    self.not_carried[key] = reason
-                    if kind == NEW:
+                    assert reading.reason is not None
+                    self.not_carried[key] = reading.reason
+                    # The lead, 2026-11-13 21:32, property 2: an entry with no venue reading (a
+                    # book the composed commit wrote) answers unknown once, by name, and this
+                    # run's own entry, with its reading, replaces it at the first save.
+                    if reading.kind == NEW or (
+                        reading.kind == UNKNOWN and previous.horizon is None
+                    ):
                         self.replaceable.add(key)
+                    self._read_venue(instrument_id)  # Its own reading, now the verdict is in.
         return key, previous
 
     def _name_start(
@@ -1300,8 +1555,13 @@ class OwnerProtector(Strategy):
             kept = (
                 f"distance {distance}"
                 if carried.distance is not None
-                else "no distance (written before distances were kept); the row's distance "
-                f"{distance} used for later raises only"
+                else (
+                    f"no carried distance; covered by the cold rule at {chosen} with distance "
+                    f"{distance}, to be planned again when bars exist"
+                    if slot.cold
+                    else "no distance (written before distances were kept); the row's distance "
+                    f"{distance} used for later raises only"
+                )
             )
             offset = (
                 f", limit offset {carried.limit_offset}"
@@ -1320,6 +1580,7 @@ class OwnerProtector(Strategy):
             self._say(
                 f"{instrument_id}: carried level {carried.last_level} and {kept} from run "
                 f"{carried.run}{offset}{both}"
+                + ("; cold rule: protect.distance_for fixed fallback" if slot.cold else "")
             )
             now = self.clock.timestamp_ns()
             since, until = (
@@ -1359,9 +1620,18 @@ class OwnerProtector(Strategy):
             if supplied is None
             else f"the supplied level {chosen} arms it"
         )
-        self._say(f"{instrument_id}: no carried level ({why}); {how}")
+        self._say(
+            f"{instrument_id}: no carried level ({why}); {how}"
+            + ("; cold rule: protect.distance_for fixed fallback" if slot.cold else "")
+        )
+
+    def _say_deferred(self) -> None:
+        lines, self.deferred_lines = self.deferred_lines, []
+        for line in lines:
+            self._say(line)
 
     def on_quote(self, quote: QuoteTick) -> None:
+        self._say_deferred()
         try:
             self._receive_quote(quote, "stream")
         except Exception as exc:  # noqa: BLE001 - named for its symbol, as a step's failure is.
@@ -1374,26 +1644,30 @@ class OwnerProtector(Strategy):
             self._save_levels()
 
     def on_order_cancel_rejected(self, event: OrderCancelRejected) -> None:
-        if event.strategy_id != self.strategy_id or event.client_order_id not in self.sent_ids:
+        """Stores only (`released_at`'s note): our own IDs are `sent_ids`; the line is said at the
+        next quote or step."""
+        if event.client_order_id not in self.sent_ids:
             return
         self.cancel_requested.discard(event.client_order_id)
-        self._say(
+        self.deferred_lines.append(
             f"{event.instrument_id}: our cancel rejected: {event.reason}; "
             "re-evaluate on the next quote or step"
         )
 
     def on_order_released(self, event: OrderReleased) -> None:
-        """The released trail starts the sale's chase (U-d); a sale the applied gain lock protected
-        also keeps the spread at its release (measure 1)."""
+        """The released trail's sale starts at the next quote or step (U-d), from `_manage`'s
+        `_observe_sale`, stamped at this release: a trail already through the bid is released
+        inside our own submit, where the engine cannot be read (`released_at`'s note). A sale the
+        applied gain lock protected also keeps the spread at its release (measure 1)."""
         slot = self.slots.get(event.instrument_id)
         if slot is None or event.client_order_id != slot.protect_id:
             return
+        self.released_at[event.client_order_id] = event.ts_event
         if slot.gain_applied_floor is not None:
             tick = self.venue_quotes.get(event.instrument_id)
             slot.gain_release_spread = (
                 None if tick is None else tick.ask_price.as_decimal() - tick.bid_price.as_decimal()
             )
-        self._observe_sale(event.instrument_id, slot, self.cache.order(event.client_order_id))
 
     def on_order_filled(self, event: OrderFilled) -> None:
         """Measure 1 for a sale the armed lock protected, then the holding re-evaluated at once.
@@ -1442,8 +1716,10 @@ class OwnerProtector(Strategy):
         )
 
     def _on_step(self, event: TimeEvent) -> None:
+        self._say_deferred()
         if self.stopping:
             return
+        self._read_symbol_holds()  # The owner's word, read at every step before any holding.
         lost = len(self.stream_errors.lines)
         if lost > self.stream_errors_said:
             # Said once per new stream error, for each holding: its quotes may be among those lost.
@@ -1468,11 +1744,95 @@ class OwnerProtector(Strategy):
                 # A protector that cannot act on its quotes says so at every step (the lead's
                 # ruling, 2026-11-13, 16:3x).
                 self._say(f"{instrument_id}: {waiting}; no sell yet")
+        stamp = getattr(event, "ts_event", None)
+        self._read_roster(stamp if type(stamp) is int else self.clock.timestamp_ns())
         self._discover_holdings()
+        for instrument_id in list(self.slots):
+            self._read_venue(instrument_id)
         # Item 4: the step's time reaches the book at most once per step, so a monitor sees a
         # killed run as a last_step_ns that stops advancing. A TimeEvent's ts_event is the step.
         at = getattr(event, "ts_event", None)
         self._save_levels(step_ns=at if type(at) is int else self.clock.timestamp_ns())
+
+    def _read_roster(self, now: int) -> None:
+        """Review F1: at the first step and every ROSTER_POLL_SECS, name each long the account holds
+        outside the roster, and end the run by name for a whole-share one, unless the start's own
+        predicate (`session_window.start_account`) would refuse the account read (module header)."""
+        roster = self.settings.roster
+        if roster is None or self.ended_for is not None:
+            return
+        if (
+            self.roster_read_ns is not None
+            and now - self.roster_read_ns < ROSTER_POLL_SECS * STEP_NS
+        ):
+            return
+        self.roster_read_ns = now
+        if self.settings.trading is None:
+            if ("", "no reader") not in self.roster_named:
+                self.roster_named.add(("", "no reader"))
+                self._say(
+                    "ALERT: no account reader: a holding bought after the start outside the roster "
+                    "cannot be named by this run"
+                )
+            return
+        try:
+            held, unread = session_window.position_reads(self.settings.trading)
+        except Exception as exc:  # noqa: BLE001 - an unread account is named, never taken as flat.
+            self._say(
+                f"ALERT: the account's positions could not be read ({type(exc).__name__}: {exc}): "
+                "a holding bought after the start outside the roster may be unnamed; read again in "
+                f"{ROSTER_POLL_SECS} s"
+            )
+            return
+        loaded = {instrument_id.symbol.value for instrument_id in roster}
+        # The start's own predicate, called, never copied (the lead's term (a), 2026-11-13 23:49): the
+        # successor reads this same account, skips what it skips and refuses what it refuses.
+        start = session_window.start_account(held, unread)
+        for symbol, why in sorted(start.skipped.items()):
+            if symbol not in loaded and (symbol, "skipped") not in self.roster_named:
+                self.roster_named.add((symbol, "skipped"))
+                self._say(
+                    f"{symbol}.ALPACA: ALERT: held outside the roster and unprotected, its quantity "
+                    f"unreadable or none ({why}): no exit in this run, and the next start skips it "
+                    "too, so it does not end this run"
+                )
+        for symbol, why in sorted(start.refused.items()):
+            if symbol not in loaded and (symbol, "refused") not in self.roster_named:
+                self.roster_named.add((symbol, "refused"))
+                self._say(
+                    f"{symbol}.ALPACA: ALERT: held outside the roster and unprotected: {held[symbol]} "
+                    f"held, which the next start refuses ({why}), so this run goes on; it has no exit "
+                    "here"
+                )
+        whole = [
+            (symbol, qty)
+            for symbol, qty in sorted(start.held.items())
+            if symbol not in loaded and qty > 0 and symbol not in start.refused
+        ]
+        if not whole:
+            return
+        if start.refused:
+            # An end into a start that refuses leaves every holding, the roster's too, with no stop of
+            # ours: the run goes on, protects its roster, and names each new holding once. Decided at
+            # every read, never latched (term (b)): the first read the start would accept ends it.
+            because = "; ".join(start.refused[symbol] for symbol in sorted(start.refused))
+            for symbol, qty in whole:
+                if (symbol, "blocked") not in self.roster_named:
+                    self.roster_named.add((symbol, "blocked"))
+                    self._say(
+                        f"{symbol}.ALPACA: ALERT: unprotected: {qty} held, bought after this run's "
+                        "start outside the roster; this run does not end, since the next start would "
+                        f"refuse the account ({because}); it protects its roster to its planned end "
+                        "and ends at the first read the start would accept"
+                    )
+            return
+        for symbol, qty in whole:
+            self._say(
+                f"{symbol}.ALPACA: ALERT: {ROSTER_ENDED}: {qty} held, bought after this run's "
+                "start; this run ends now, so the next start reads the account and protects it"
+            )
+        self.ended_for = f"{ROSTER_ENDED}: " + ", ".join(f"{s} {q}" for s, q in whole)
+        self.shutdown_system(self.ended_for)
 
     def _wait(self, instrument_id: InstrumentId, reason: str) -> None:
         """A holding with no sell of ours that waits on its quotes: a named record, said each step."""
@@ -1503,6 +1863,101 @@ class OwnerProtector(Strategy):
         reason = f"unprotected: supplied level refused: {reason}"
         self.frozen[instrument_id] = reason
         self._say(f"{instrument_id}: {reason}; no new sell")
+
+    def _read_symbol_holds(self) -> None:
+        """Read the owner's per-symbol holds (symbol_hold.read_holds) and name each change.
+
+        A new hold takes effect in this step's `_manage` (`_hold`); a removed one re-arms there.
+        A folder that cannot be read leaves the last holds read standing, named at every read;
+        a stray entry holds nothing and is named at every read too.
+        """
+        folder = self.settings.symbol_holds_dir
+        if folder is None:
+            return
+        try:
+            names, strays, made = symbol_hold.read_holds_if_made(folder)
+            if not made and self.holds_made:
+                raise FileNotFoundError(folder)
+        except (OSError, ValueError) as exc:
+            self.holds_unread = type(exc).__name__
+            standing = ", ".join(sorted(str(i) for i in self.held)) or "none"
+            self._say(
+                f"ALERT: symbol-holds folder {folder} unread ({type(exc).__name__}): the last "
+                f"holds read stand ({standing}); read again at the next step"
+            )
+            return
+        if not made:
+            if not self.holds_unread:
+                self.holds_unread = ""  # Said once: no folder was ever made, so none is held.
+                self._say(
+                    f"no {symbol_hold.FOLDER} folder made at {folder}: none held; read at every step"
+                )
+            return
+        self.holds_made = True
+        if self.holds_unread:
+            self._say(f"symbol-holds folder {folder} read again after {self.holds_unread}")
+        self.holds_unread = None
+        if strays:
+            self._say(f"ALERT: {symbol_hold.strays_named(strays)}; named at every step")
+        now = {InstrumentId.from_str(f"{name}.ALPACA") for name in names}
+        for instrument_id in sorted(now - self.held, key=str):
+            self._hold_begins(instrument_id)
+        for instrument_id in sorted(self.held - now, key=str):
+            self.held.discard(instrument_id)
+            slot = self.slots.get(instrument_id)
+            level = None if slot is None else slot.level
+            self._say(
+                f"{instrument_id}: hold removed: re-armed "
+                + (
+                    f"at {level}, never lowered"
+                    if level is not None
+                    else "as at a start, at its book level if it has one"
+                )
+                + (
+                    "; its sell was placed before the hold, so while the bid is above the level "
+                    "it is placed at this step, and otherwise"
+                    if slot is not None and slot.rearm_at_step
+                    else "; it is placed"
+                )
+                + " under the count rule (two new observations)"
+            )
+
+    def _hold_begins(self, instrument_id: InstrumentId) -> None:
+        if instrument_id in self.held:
+            return
+        self.held.add(instrument_id)
+        self.hold_counts[instrument_id] = self.hold_counts.get(instrument_id, 0) + 1
+        self._say(
+            f"{instrument_id}: {symbol_hold.HELD}: not armed; only our own sell of it is "
+            "canceled, nothing is sold, and every other holding stays protected"
+        )
+
+    def _hold(self, instrument_id: InstrumentId, slot: Holding, order: Any) -> None:
+        """The owner's word for this symbol: our own sell of it is canceled, nothing is sent,
+        modified or chased for it, and the slot keeps its level (raised to our sell's trigger in
+        `_manage` before this) and its venue clock, so the release re-arms from it, never lower.
+        A sale in progress ends with its cancel; the release re-arms the trail, not the chase."""
+        if slot.placed:
+            slot.rearm_at_step = True
+        # The guard is reset, a counting observation included (review F5), so a breach during the
+        # hold needs the count rule's two new observations after it.
+        slot.placed, slot.last_observation = False, None
+        if self.frozen.get(instrument_id, "").startswith(WAITING):
+            self.frozen.pop(instrument_id)
+        if order is not None:
+            self._cancel_own(
+                slot,
+                reason=f"{instrument_id}: {symbol_hold.HELD}: canceling our own sell only "
+                "(nothing is sold)",
+            )
+            return
+        if slot.sale is not None:
+            self._log_sale(instrument_id, slot.sale)
+            self._say(
+                f"{instrument_id}: {symbol_hold.HELD}: our sale ended with its cancel; the "
+                f"release re-arms the trail at {slot.level}"
+            )
+            slot.sale = None
 
     def _gain_lock(
         self,
@@ -1711,10 +2166,24 @@ class OwnerProtector(Strategy):
         if trigger != order.trigger_price or price != order.price:
             self.modify_order(order.client_order_id, trigger_price=trigger, price=price)
 
+    def _name_history_failure(self, instrument_id: InstrumentId, slot: Holding) -> None:
+        if slot.history_error is not None and not slot.history_error_said:
+            slot.history_error_said = True
+            self._say(
+                f"{instrument_id}: ALERT: the session day's bars read failed ({slot.history_error}); "
+                + (
+                    "cold rule (fixed fallback) protects until complete bars exist"
+                    if slot.cold
+                    else "the armed level and distance remain in force"
+                )
+            )
+
     def _plan_holding(self, instrument_id: InstrumentId, slot: Holding, tick: QuoteTick) -> bool:
-        """Fix a holding's level and distance once. A carried long (U-e B) arms at its carried
-        level and carried distance, and nothing re-derives either (the lead's ruling,
-        2026-11-13 17:43): no rebuilt level from closes, no row distance, no fallback. The trail
+        """Replan cold protection when complete bars arrive, never lowering its level.
+
+        A carried distance stays whole (U-e B). The lead's cold-start amendment allows a carried
+        level without a distance to take the shared cold rule at once, at the higher level, then
+        replan when bars exist. No level is rebuilt from closes. The trail
         is bid-triggered (crates/execution/src/trailing.rs:128-138), so after the start only bids
         raise it, through the emulator. rebuilt_level_from_bars (unit 4) is a last-price rule and
         is not called here; raising a carried level from the gap's bids is ADR 0151's SIP quotes
@@ -1778,6 +2247,20 @@ class OwnerProtector(Strategy):
             complete = [
                 b for at, b in sorted(bars.items()) if earliest <= at and at + 60 * SECOND_NS <= now
             ]
+            # Bars allow a plan only on the slice the planner is given (code-review-high/4), and
+            # only once the session day's answer is in, or a full ATR's worth has been seen: one
+            # live bar while the answer is pending never fixes the run's distance (-high/1).
+            # A failed read is no answer one live bar may warm (code-review-high-2/1).
+            answered = slot.history_ready
+            sound = [b for b in complete[-protect.ATR_BARS :] if protect._sound(b)]
+            has_bars = bool(sound) and (answered or len(sound) >= protect.ATR_BARS)
+            latest_bar_ns = sound[-1].ts_event if has_bars else None
+            replanning = slot.cold and slot.distance is not None
+            # A cold plan is planned again only on a newer sound bar than it last saw: no replan
+            # on every quote or step for the same bars (code-review-high/2, /8).
+            if replanning and (not has_bars or latest_bar_ns == slot.cold_seen):
+                self._name_history_failure(instrument_id, slot)
+                return True  # Keep the first cold plan until bars allow a new one.
             instrument = self.cache.instrument(instrument_id)
             if instrument is None:
                 raise ValueError("instrument is absent from cache")
@@ -1790,7 +2273,7 @@ class OwnerProtector(Strategy):
                 else None
             )
             bid = tick.bid_price.as_decimal()
-            bars_failed = None
+            cold = False
             if carried is not None and carried.distance is not None:
                 distance = carried.distance
                 share = distance / bid
@@ -1802,28 +2285,23 @@ class OwnerProtector(Strategy):
                 )
                 source = f"carried from run {carried.run}"
             else:
-                # A carried distance needs no bars; a planned one waits for the day's (U-h).
-                # A failed read is not a wait for the run: it plans on no bars, the fixed
-                # fallback that a day with none takes, named with an ALERT (the lead's ruling on
-                # land-composed's F1, 2026-11-13 20:45). Its retry is the follow-up's.
-                bars_failed = slot.history_error
-                if bars_failed is None and not slot.history_ready:
-                    raise ValueError("waiting for the session day's bars answer")
+                ask = tick.ask_price.as_decimal()
+                cold = not has_bars
                 distance, plan = protect.distance_for(
                     instrument_id.symbol.value,
                     self.settings.row,
                     bid,
-                    tick.ask_price.as_decimal(),
-                    [] if bars_failed is not None else complete[-protect.ATR_BARS :],
+                    ask,
+                    [] if cold else complete[-protect.ATR_BARS :],
                 )
                 plan = replace(plan, quote_age=age)
-                if carried is not None and plan.fallback:
-                    # Ruling (a), 2026-11-13 17:56: never the fixed fallback for a carried long.
-                    raise ValueError(
-                        f"the row gives only the fixed fallback ({plan.source()}), never used "
-                        "for a carried long"
-                    )
                 if plan.fallback:
+                    # The fixed fallback is the cold rule, carried or not, and is planned again
+                    # on bars (code-review-high-2/6). The lead's ruling (2026-11-13, 23:2x): a
+                    # carried long whose record has no distance takes it, never left bare; flat
+                    # bars give the same fallback as none (code-review-high/3).
+                    cold = True
+                if plan.fallback and not replanning:  # counted per holding (-high-2/4)
                     self.fallbacks[instrument_id] = self.fallbacks.get(instrument_id, 0) + 1
                     if plan.bars:
                         self.flat_fallbacks[instrument_id] = (
@@ -1836,7 +2314,7 @@ class OwnerProtector(Strategy):
                 _, limit = offsets(
                     plan.price, plan.plan.trail, plan.plan.exit_through, distance=distance
                 )
-            if bid - limit <= 0:
+            if bid - limit <= 0 and carried is None:
                 raise ValueError("no positive protective limit at this bid and distance")
             supplied = None if slot.level is None else slot.level.as_decimal()
             if carried is not None:
@@ -1846,16 +2324,37 @@ class OwnerProtector(Strategy):
                     if supplied is None
                     else start_level(carried.last_level, supplied)
                 )
+                if cold and carried.distance is None:
+                    chosen = max(chosen, up_on_step(bid - distance))
             else:
                 chosen = up_on_step(bid - distance) if supplied is None else supplied
+            if replanning:
+                order = None if slot.protect_id is None else self.cache.order(slot.protect_id)
+                retained = _own_level(slot, order)
+                assert retained is not None
+                if order is not None and not order.is_closed:
+                    # The pin cannot modify a trailing offset. Keep this working sell whole;
+                    # warming is never a cancel/re-place gap or a second sell of these shares.
+                    slot.level = instrument.make_price(retained)
+                    # still cold if the new plan is the fallback again (code-review-high-2/5)
+                    slot.cold, slot.cold_seen = cold, latest_bar_ns
+                    self._say(
+                        f"{instrument_id}: replanned distance {distance}; {source}; "
+                        f"working sell keeps distance {slot.distance.distance}, limit offset "
+                        f"{slot.limit_offset} and level {slot.level}"
+                    )
+                    return True
+                chosen = max(retained, up_on_step(bid - distance))
             level = instrument.make_price(chosen)
             if chosen <= 0 or level.as_decimal() != chosen:
                 raise ValueError(f"no exact positive level {chosen} at instrument precision")
             if slot.level is None and tick.ts_event in self.refused_stamps.get(instrument_id, ()):
                 raise ValueError("waiting for a newer quote: V1 refused this stamp")
-            self._name_start(
-                instrument_id, slot, previous, carried, chosen, distance, supplied, limit
-            )
+            if not replanning:
+                slot.cold = cold
+                self._name_start(
+                    instrument_id, slot, previous, carried, chosen, distance, supplied, limit
+                )
             if slot.level is None:
                 slot.armed_at, slot.armed_event = now, tick.ts_event
                 if tick.ts_event < slot.opened_at and (
@@ -1871,15 +2370,12 @@ class OwnerProtector(Strategy):
                     )
             slot.level = level
             slot.distance, slot.limit_offset = plan, limit
+            slot.cold, slot.cold_seen = cold, latest_bar_ns
             self._say(
-                f"{instrument_id}: armed distance {distance}; {source}; "
+                f"{instrument_id}: {'replanned' if replanning else 'armed'} distance {distance}; {source}; "
                 f"quote age {age.total_seconds():.0f} s"
             )
-            if bars_failed is not None:
-                self._say(
-                    f"{instrument_id}: ALERT: the session day's bars read failed ({bars_failed}); "
-                    f"armed on the fixed fallback distance {distance}, which stands for this run"
-                )
+            self._name_history_failure(instrument_id, slot)
         except ValueError as exc:
             self._record_unprotected(instrument_id, str(exc))
             return False
@@ -1966,7 +2462,23 @@ class OwnerProtector(Strategy):
                     self._say(f"{instrument_id}: our sale ended {order.status}; sending it again")
                 self.cancel_requested.discard(order.client_order_id)
                 slot.protect_id, order = None, None
+        if (
+            advanced
+            and tick is not None
+            and slot.level is not None
+            and _two_sided(tick)
+            and tick.bid_price.as_decimal() > slot.level.as_decimal()
+        ):
+            # Before every return below (land-f15's round 2, finding 2): a new two-sided
+            # observation above the level ends this breach, frozen or not. A quote main's guard
+            # skips (no usable two-sided prices and sizes) neither counts nor clears.
+            slot.breach_observation = None
+        if instrument_id in self.held:
+            self._hold(instrument_id, slot, order)
+            return
         if slot.sale is None:
+            if slot.cold:
+                self._plan_from_maximum(instrument_id, slot)
             # The lock moves the trigger of a trail not yet released; the exit beats the lock (R3).
             self._gain_lock(instrument_id, slot, position, quote, advanced=advanced)
         if order is not None and order.client_order_id in self.cancel_requested:
@@ -1980,6 +2492,7 @@ class OwnerProtector(Strategy):
             return
         self.frozen.pop(instrument_id, None)
         if order is not None:
+            self.replace_alerted.discard(instrument_id)
             if _remaining(order) != uncovered:
                 self._cancel_own(slot)  # Never modified in the step that cancels it for size.
             elif slot.sale is not None:
@@ -1989,8 +2502,23 @@ class OwnerProtector(Strategy):
             return
         if uncovered <= 0:
             return
+        usable = self.replacement_quotes.get(instrument_id)
+        sale_quote = quote
+        if slot.placed and usable is not None:
+            # A terminal acknowledgement has removed our cover. Re-place on the retained
+            # usable quote without an age or new-observation gate, never re-plan the level.
+            tick = sale_quote = usable
+            advanced = advanced and tick is quote
+        elif slot.placed and instrument_id not in self.replace_alerted:
+            # Our cover ended and no usable quote has ever arrived for it: named once at
+            # ERROR; the records below (a stalled sale, an unprotected row) say it each step.
+            self.replace_alerted.add(instrument_id)
+            self._say(
+                f"{instrument_id}: ALERT: holding without its working sell; no usable quote "
+                "to place its protective sale; waiting for one"
+            )
         if slot.sale is not None:
-            self._send_sale(instrument_id, slot, uncovered, quote)
+            self._send_sale(instrument_id, slot, uncovered, sale_quote)
             return
         if tick is None or (
             slot.level is None
@@ -2037,15 +2565,35 @@ class OwnerProtector(Strategy):
         assert (
             slot.level is not None and slot.distance is not None and slot.limit_offset is not None
         )
+        # F15's review, 4: any armed long, carried or armed this run, can gap through its offset.
+        offset_breached = bid <= slot.limit_offset
+        if offset_breached and not slot.offset_breach_named:
+            slot.offset_breach_named = True
+            carried = (self.settings.account_label or "", instrument_id) in self.carried
+            self._say(
+                f"{instrument_id}: ALERT: {'carried ' if carried else ''}long breached through "
+                f"its offset {slot.limit_offset} at bid {bid}; level {slot.level} kept; "
+                "sale follows the observation count and existing chase price rules"
+            )
         if not slot.placed and not advanced and instrument_id in self.quote_refusals:
             self._wait(instrument_id, self.quote_refusals[instrument_id])
             return
         if not slot.placed:
+            # Released from the owner's hold above its level: re-placed at this step on the venue
+            # maximum, with no new observation, since a sell resting under the bid elects nothing.
+            newest = self.venue_quotes.get(instrument_id)
+            rearm = (
+                slot.rearm_at_step
+                and newest is not None
+                and tick.ts_event == newest.ts_event
+                and bid > slot.level.as_decimal()
+                and _usable(tick, self.clock.timestamp_ns())
+            )
             if not _sane(tick):
                 self._note(tick)
                 self._wait(instrument_id, _ahead(tick))
                 return
-            if not advanced:
+            if not advanced and not rearm:
                 self._wait(
                     instrument_id,
                     "a quote stamped after the venue maximum"
@@ -2053,8 +2601,14 @@ class OwnerProtector(Strategy):
                     else "a second observation newer than the one guarded",
                 )
                 return
-            if slot.last_observation is None and (slot.fresh or bid <= slot.level.as_decimal()):
+            if (
+                slot.last_observation is None
+                and not rearm
+                and (slot.fresh or bid <= slot.level.as_decimal())
+            ):
                 slot.last_observation = tick.ts_event
+                if bid <= slot.level.as_decimal():
+                    slot.breach_observation = tick.ts_event
                 self._say(
                     f"{instrument_id}: holding level {slot.level}; one observation cannot elect"
                 )
@@ -2064,6 +2618,28 @@ class OwnerProtector(Strategy):
             slot.last_observation = tick.ts_event
         trailing, limit = slot.distance.distance, slot.limit_offset
         if bid - limit <= 0:
+            if offset_breached and bid <= slot.level.as_decimal():
+                # A fresh trailing order would derive a nonpositive limit from this bid; start
+                # the existing sale path instead, on two new sane observations at or below the
+                # level in this breach (ruling 6), whether or not a sell of ours was placed.
+                if not advanced:  # _note counts only a sane stamp that raises the maximum.
+                    self._wait(instrument_id, "a new observation to confirm the breach")
+                    return
+                if slot.breach_observation is None:
+                    slot.breach_observation = tick.ts_event
+                    self._say(
+                        f"{instrument_id}: holding level {slot.level}; one observation cannot elect"
+                    )
+                    self._wait(instrument_id, "a second observation to confirm")
+                    return
+                first = exit_price(bid, protect.PLANNER.exit_ticks, None)
+                now = self.clock.timestamp_ns()
+                slot.sale = Sale(
+                    now, first, chase_floor(first, protect.PLANNER.chase_cap), now, first
+                )
+                self._send_sale(instrument_id, slot, uncovered, tick)
+                slot.placed = slot.protect_id is not None
+                return
             self._freeze(instrument_id, "no positive protective limit at this bid and trail")
             return
         instrument = self.cache.instrument(instrument_id)
@@ -2095,6 +2671,8 @@ class OwnerProtector(Strategy):
             self._freeze(instrument_id, "generated client order ID already exists; left untouched")
             return
         slot.protect_id, slot.placed = order.client_order_id, True
+        slot.breach_observation = None  # A breach after this order counts its own two.
+        slot.rearm_at_step = False
         self.sent_ids.add(order.client_order_id)
         self.submit_order(order, params={"extended_hours": True})
 
@@ -2115,7 +2693,11 @@ class OwnerProtector(Strategy):
             if not owned_limit:
                 return
             released = [event for event in order.events() if isinstance(event, OrderReleased)]
-            at = released[0].ts_event if released else self.clock.timestamp_ns()
+            at = (
+                released[0].ts_event
+                if released
+                else self.released_at.get(order.client_order_id, self.clock.timestamp_ns())
+            )
             first = order.price.as_decimal()
             slot.sale = Sale(at, first, chase_floor(first, protect.PLANNER.chase_cap), at, first)
             self._log_sale(instrument_id, slot.sale)
@@ -2271,6 +2853,8 @@ class OwnerProtector(Strategy):
         one's entry or level. Review F3: its book entry is retired, written with no level, state
         frozen, reason "holding ended", so no later run can carry it."""
         key: Key = (self.settings.account_label or "", instrument_id)
+        self.readings.pop(instrument_id, None)
+        self.reading_tried.pop(instrument_id, None)
         self.carried.discard(key)
         self.written_keys.discard(key)
         self.replaceable.add(key)
@@ -2317,6 +2901,8 @@ class OwnerProtector(Strategy):
         self.stopped_instruments.add(instrument_id)
         self.refused_stamps.pop(instrument_id, None)
         self.venue_quotes.pop(instrument_id, None)
+        self.replacement_quotes.pop(instrument_id, None)
+        self.replace_alerted.discard(instrument_id)
         slot = self.slots.pop(instrument_id, None)
         self.levels.pop(instrument_id, None)
         if self.frozen.get(instrument_id, "").startswith(WAITING):
@@ -2329,13 +2915,16 @@ class OwnerProtector(Strategy):
             self._cancel_own(slot)
 
     def on_stop(self) -> None:
+        self._say_deferred()
         self.stopping = True
         logging.getLogger(STREAM_LOGGER).removeHandler(self.stream_errors)
         self._save_levels(final=True)
         self._name_unapplied()
         if STEP_TIMER in self.clock.timer_names():
             self.clock.cancel_timer(STEP_TIMER)
-        for instrument_id in sorted(self.stamp_counts.keys() | self.slots.keys(), key=str):
+        for instrument_id in sorted(
+            self.stamp_counts.keys() | self.slots.keys() | self.held, key=str
+        ):
             slot = self.slots.get(instrument_id)
             ahead, not_raised, redelivered = self.stamp_counts.get(instrument_id, [0, 0, 0])
             fallbacks = self.fallbacks.get(instrument_id, 0)
@@ -2348,7 +2937,13 @@ class OwnerProtector(Strategy):
                 f"fixed fallback={fallbacks}, "
                 f"no history={fallbacks - flat}, flat session day={flat}; "
                 f"first_quote={None if slot is None else slot.first_quote}, "
-                f"last_quote={None if slot is None else slot.last_quote}"
+                f"last_quote={None if slot is None else slot.last_quote}; "
+                f"owner holds={self.hold_counts.get(instrument_id, 0)}, "
+                + (
+                    f"{symbol_hold.HELD} at end"
+                    if instrument_id in self.held
+                    else "not held at end"
+                )
             )
             self.stop_instrument(instrument_id)
 
@@ -2382,7 +2977,7 @@ class OwnerProtector(Strategy):
                 self._say(
                     f"{key[1]}: book level {entry.last_level} (protection start "
                     f"{entry.protection_start_ns}) not applied this run: "
-                    f"{self.not_carried.get(key, 'its holding was not selectable')}; "
+                    f"{symbol_hold.HELD if key[1] in self.held else self.not_carried.get(key, 'its holding was not selectable')}; "
                     f"{fate}{memory}"
                 )
 
@@ -2403,6 +2998,13 @@ class OwnerProtector(Strategy):
         freeze) is `waiting` with its reason until a level and distance are planned, and after
         that maps as the planned slot does: `guarded` or `counting`.
         """
+        if instrument_id in self.held:
+            frozen = self.frozen.get(instrument_id)
+            if frozen is not None and not frozen.startswith(WAITING):
+                return "frozen", None, f"{frozen}; {symbol_hold.HELD}"  # Review F6: kept.
+            if slot is None or slot.protect_id is None:
+                return "held", None, f"{symbol_hold.HELD}: not armed; removing the hold re-arms it"
+            # Our sell still rests, its cancel asked: told as it is until the cancel ends it.
         reason = self.frozen.get(instrument_id)
         if reason is not None and reason.startswith(WAITING):
             if slot is None or slot.level is None or slot.distance is None:
@@ -2462,7 +3064,7 @@ class OwnerProtector(Strategy):
                 else:
                     # U-e B undecided: a previous run's entry is kept as written until the venue
                     # shows whose it is; only the state is new, and only where it fits its level.
-                    if prior.last_level is not None or state in ("waiting", "frozen"):
+                    if prior.last_level is not None or state in NEEDS_REASON:
                         entries[key] = replace(prior, state=state, count=count, reason=reason)
                     continue
             level = None if prior is None else prior.last_level
@@ -2474,7 +3076,7 @@ class OwnerProtector(Strategy):
             start = slot.protection_start if slot.protection_start is not None else slot.opened_at
             if own is not None:
                 level = start_level(level, own)
-            if level is None and state not in ("waiting", "frozen"):
+            if level is None and state not in NEEDS_REASON:
                 continue
             entries[key] = Entry(
                 level,
@@ -2487,6 +3089,7 @@ class OwnerProtector(Strategy):
                 reason,
                 None if level is None else distance,
                 None if level is None or distance is None else offset,
+                self._entry_horizon(instrument_id, position),
             )
         for instrument_id, reason in self.frozen.items():
             if instrument_id in self.slots:
@@ -2503,11 +3106,58 @@ class OwnerProtector(Strategy):
                 entries[key] = replace(prior, state=state, count=None, reason=reason)
                 continue
             entries[key] = Entry(
-                None, position.ts_opened, position.signed_qty, now, self.run, state, None, reason
+                None,
+                position.ts_opened,
+                position.signed_qty,
+                now,
+                self.run,
+                state,
+                None,
+                reason,
+                horizon=self._entry_horizon(instrument_id, position),
             )
         for key, retired in self.retired.items():
             entries.setdefault(key, retired)  # Review F3: unless a new holding's entry replaced it.
         return entries
+
+    def _say_book_note(self, note: str) -> None:
+        if note not in self.book_notes:
+            self.book_notes.add(note)
+            self._say(note)
+
+    def _merged_book(self, on_disk: dict[Key, Entry], unread: Unread, changed: dict[Key, Entry]):
+        """F13 (#443's max review; the lead, 2026-11-13 22:47): what the write holds. A row the
+        re-read rejected is carried unchanged, never replaced by this run's older copy of it,
+        unless this run changed that holding; and a higher level for the same holding (the same
+        protection start) that another run wrote since this run last read or wrote the book is never
+        lowered by this run's write. An entry this run read and judged not the holding held now
+        (the venue's clock, DeepSeek P2-2) is replaced as before."""
+        for key, entry in list(changed.items()):
+            disk = on_disk.get(key)
+            if (
+                disk is not None
+                and disk != self.book_entries.get(key)  # written by another run since
+                and disk.run != entry.run
+                and disk.protection_start_ns == entry.protection_start_ns
+                and disk.last_level is not None
+                and entry.last_level is not None
+                and disk.last_level > entry.last_level
+            ):
+                self._say_book_note(
+                    f"{key[1]}: level book keeps run {disk.run}'s level {disk.last_level} for "
+                    f"the same holding over this run's {entry.last_level}; a level is never "
+                    "lowered across a write"
+                )
+                changed[key] = disk
+        mine = {(account, str(instrument)) for account, instrument in changed}
+        skipped = {raw_key(row) for row in unread.rows}
+        kept = {
+            key: entry
+            for key, entry in self.book_entries.items()
+            if (key[0], str(key[1])) not in skipped
+        }
+        carried = [row for row in unread.rows if raw_key(row) not in mine]
+        return {**kept, **on_disk, **changed}, carried
 
     def _save_levels(self, *, final: bool = False, step_ns: int | None = None) -> None:
         """Write the book when a holding's level or state changed (P10, item 4), every holding's
@@ -2535,12 +3185,21 @@ class OwnerProtector(Strategy):
             # Review F5: the read, merge and replace hold the book's lock, so a writer sharing
             # the path can neither lose this run's entries nor have its own lost.
             with LevelBook.locked(self.level_book_path):
-                on_disk = LevelBook.read(self.level_book_path, report=lambda _note: None)
-                entries = {**self.book_entries, **on_disk, **changed}
+                unread = Unread()
+                on_disk = LevelBook.read(
+                    self.level_book_path, report=self._say_book_note, unread=unread
+                )
+                if unread.book is not None:
+                    raise BookUnreadable(
+                        f"ALERT: level book {self.level_book_path} unreadable ({unread.book}); "
+                        "not overwritten, so no other run's entry is lost; this run's levels "
+                        "are not saved until it reads"
+                    )
+                entries, carried = self._merged_book(on_disk, unread, changed)
                 steps = LevelBook.last_steps(self.level_book_path)
                 if self.last_step_ns is not None:
                     steps[self.settings.account_label] = self.last_step_ns
-                LevelBook.write(self.level_book_path, entries, last_step_ns=steps)
+                LevelBook.write(self.level_book_path, entries, last_step_ns=steps, carried=carried)
             self.written_keys.update(k for k, e in changed.items() if e.run == self.run)
         except Exception as exc:  # noqa: BLE001 - persistence must not replace the run's outcome.
             kind = (type(exc).__name__, str(exc))

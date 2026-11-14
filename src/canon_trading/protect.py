@@ -2,7 +2,10 @@
 covers, on one paper account, then exit (`mise run paper:protect tests`, or `protect` for account C,
 ADR 0142). A run that sends names the registered row its distance is planned on (`--row`, `ROWS`); there
 is no default. `--plan-only` makes every read, names what each stop would be under every row, and sends
-nothing. `--cancel` cancels the open stops of the protect lineage, every one or one symbol's, and nothing
+nothing. `--only` limits sends to distinct, comma-separated symbols in plain capital letters; omitted
+longs are named without counting as failures. Plan-only still reads and plans every long under every
+row, with an extra line for each omitted long. With no list the run is unchanged. `--cancel` cancels the
+open stops of the protect lineage, every one or one symbol's, and nothing
 else (`cancel_stops`): the way a stop that holds a long's shares is taken off before that long is sold.
 
 Contracts, read 2026-11-12:
@@ -54,11 +57,12 @@ Contracts, read 2026-11-12:
 
 The run. It reads Alpaca's clock first and nothing else unless the regular session is open (`is_open`, as
 `custody._part` reads it) with at least `CLOSE_MARGIN` left to its close: a stop Alpaca holds works only
-there, the session is read once, and the task's own time bound is that margin, so no stop goes out after
-the close. It reads the account's `no_shorting` and says it, the positions and the open orders, and
-refuses by name, with nothing sent, a listing of open orders at its maximum (`ORDERS_PAGE_LIMIT`), which
-may not hold every sell. A short is named and left: no order and no market data read for it. That a stop
-never opens or adds to a short rests on the holding and the free shares read in the send step, with the
+there, and the session is read once. The time left is counted from before the clock was asked, and
+each symbol checks it again before its reads and before its send, so no send starts with less than one
+send's bound (`SEND_MARGIN`) to the close. It reads the account's `no_shorting` and says it, the
+positions and the open orders, and refuses by name, with nothing sent, a listing of open orders at its
+maximum (`ORDERS_PAGE_LIMIT`), which may not hold every sell. A short is named and left: no order and no
+market data read for it. That a stop never opens or adds to a short rests on the holding and the free shares read in the send step, with the
 milliseconds between that read and the send as its window, and on Alpaca holding the shares for a stop
 that rests (read on paper, 2026-11-13: a second sell of them was refused with shorting allowed). Whether
 Alpaca refuses a marked stop for more shares than are held where shorting is allowed is not shown, so the
@@ -83,6 +87,9 @@ the run has taken since. Each line is
 printed as it happens, so a run that is stopped has already named what it sent; the task's stop signal
 ends it as a failure by name (`custody._stop`). Exit 0 when each long is covered, 1 when a read or a send
 failed or the run was stopped, 2 when a long is left uncovered by name, 3 when the run was refused by name.
+With `--only` the 0 and the 2 speak of the NAMED symbols alone: a long that was not named is left as it
+was found, covered or not, and is no failure, and a named symbol that holds no long is a 2. A position
+that cannot be read is an ALERT and a 2 whether it was named or not: what it is, is not known.
 
 A stop that rests holds its shares: Alpaca refuses another sell of them until the stop is canceled, the
 holder's own included. `--cancel` (`cancel_stops`) cancels the open stops of the protect lineage, every one
@@ -134,6 +141,8 @@ from alpaca.trading.requests import TrailingStopOrderRequest
 from canon_alpaca.execution import DEFINITIVE_SUBMIT_REFUSALS
 from canon_alpaca.execution import ORDERS_PAGE_LIMIT
 from canon_alpaca.execution import venue_trail
+from canon_alpaca.providers import CONNECT_TIMEOUT_SECS
+from canon_alpaca.providers import READ_TIMEOUT_SECS
 from canon_alpaca.providers import counted
 from canon_alpaca.providers import not_sent
 from nautilus_trader.indicators import AverageTrueRange
@@ -209,9 +218,26 @@ PLANNER = planner_config(session_window.DEFAULT_ARM)
 ATR_BARS = PLANNER.atr_n + 1
 """The most bars an ATR is warmed on: `atr_n` + 1, as `Mover._warm_atr` feeds, so each of the `atr_n`
 ranges has a previous close."""
-CLOSE_MARGIN = timedelta(seconds=300)
-"""The least time left to the close for a run to start: the task's own bound (`paper:protect`'s
-`timeout`), so a run that began in the regular session ends in it."""
+SEND_MARGIN = timedelta(seconds=math.ceil(CONNECT_TIMEOUT_SECS + READ_TIMEOUT_SECS))
+"""The least time left to the close for one stop to be sent: the most one submit may take, the paper
+client's own (connect, read) timeout (`session_window.paper_trading` mounts `providers.with_http_timeout`,
+ADR 0039) with alpaca-py's retries off for the send (`_sending_once`). It is checked again before each
+symbol's reads and just before its send. The bound is on each stall, not the whole exchange: the connect
+wait is per address tried and the read wait is between bytes, and name resolution has none, so a send that
+starts this near the close is most likely, not certainly, answered before it. What Alpaca does with a
+stop that arrives after the close is UNVERIFIED."""
+CLOSE_MARGIN = SEND_MARGIN
+"""The least time left to the close for a run to start: one send's bound, since each send checks the
+time again. It was 300 s, said to be the task's own bound, which is 10 minutes (`paper:protect`'s
+`timeout`), so it held for no reason that stood, and refused a long bought in the last minutes before
+the close (the lead's case of 2026-11-13); a run takes 2 to 4 s on paper (2026-11-13)."""
+
+
+def _whole(span: timedelta) -> int:
+    """Whole seconds, rounded down, so a time left is never said to be more than it is."""
+    return math.floor(span.total_seconds())
+
+
 QUOTE_MOST = timedelta(seconds=60)
 """The oldest latest quote a distance is planned on. An older one (a halt, a thin name) says nothing of
 the spread now, and the spread is the floor. UNCALIBRATED."""
@@ -233,6 +259,31 @@ not shown to protect the long, a failure by name, never sent again: `suspended`,
 `calculated` are not this stop working; and `held`, which alpaca-py's `OrderStatus` lists and Alpaca's
 page does not describe, is undecided until a paper answer shows it, so it fails rather than counts."""
 REFUSED = 3
+
+
+def _plain(symbol: str) -> bool:
+    """A symbol this task takes by name: plain capital letters (no class share with a dot)."""
+    return symbol.isascii() and symbol.isalpha() and symbol.isupper()
+
+
+def _only_symbols(only: str) -> tuple[str, ...] | None:
+    """The send's include list from the task's text, or None for an absent flag (the empty text the
+    task hands over when `--only` was not passed). An invalid list is never repaired."""
+    if not isinstance(only, str):
+        raise TypeError("--only is not text")
+    if only == "":
+        return None
+    symbols = only.split(",")
+    seen: set[str] = set()
+    for symbol in symbols:
+        if not symbol:
+            raise ValueError("--only has an empty symbol")
+        if not _plain(symbol):
+            raise ValueError(f"--only symbol {symbol!r} is not plain capital letters")
+        if symbol in seen:
+            raise ValueError(f"--only names {symbol!r} twice")
+        seen.add(symbol)
+    return tuple(symbols)
 
 
 @dataclass
@@ -642,21 +693,31 @@ class _Protect:
         say: Callable[[str], None] | None = None,
         plan_only: bool = False,
         row: str | None = None,
+        only: tuple[str, ...] | None = None,
     ) -> None:
         self.trading = trading
         self.data = data
         self.plan_only = plan_only
         self.row = row
+        self.only = only
         self.planners: dict[str, mover.Mover] = {}
         self.began = 0.0
-        """`monotonic()` at the clock's read: a later symbol is planned at the clock's time plus what
-        the run has taken since."""
+        """`monotonic()` just before the clock is asked: a later symbol is planned at the clock's time
+        plus what the run has taken since, the clock read's own wait counted."""
+        self.left = timedelta(0)
+        """The time to the close at the clock's read; what is left at a send is this less what the run
+        has taken since."""
         self.client: Any = None
         self.report = ProtectReport(say=say)
         self.stamp = ""
 
     def run(self) -> ProtectReport:
         report = self.report
+        selected = self.only
+        if selected is not None and not selected:
+            # No list is None. An empty list is a caller's mistake, never "every long".
+            report.refused = "the include list names no symbol; nothing was read or sent"
+            return report
         names = ", ".join(ROWS)
         if self.row is not None and self.row not in ROWS:
             report.refused = f"no registered row named {self.row!r}: the rows are {names}; nothing was read or sent"
@@ -667,8 +728,8 @@ class _Protect:
                 "plan-only to see each; nothing was read or sent"
             )
             return report
-        clock = _read("Alpaca's clock", self.trading.get_clock, Clock)
         self.began = monotonic()
+        clock = _read("Alpaca's clock", self.trading.get_clock, Clock)
         if not clock.is_open or clock.next_close <= clock.timestamp:
             report.refused = (
                 "outside the regular session: Alpaca's clock says the market is closed (next open "
@@ -676,11 +737,11 @@ class _Protect:
                 "only in the regular session; nothing else was read or sent"
             )
             return report
-        left = clock.next_close - clock.timestamp
-        if left < CLOSE_MARGIN:
+        self.left = clock.next_close - clock.timestamp
+        if (to_close := self._to_close()) < CLOSE_MARGIN:
             report.refused = (
-                f"too near the close: {left.total_seconds():.0f} s to the close, under the "
-                f"{CLOSE_MARGIN.total_seconds():.0f} s this run may take, and no stop is sent after "
+                f"too near the close: {_whole(to_close)} s to the close, under the "
+                f"{_whole(CLOSE_MARGIN)} s one send may take, and no stop is sent after "
                 "it; nothing else was read or sent"
             )
             return report
@@ -732,6 +793,14 @@ class _Protect:
                 )
             if qty <= 0:
                 continue
+            if selected is not None and symbol not in selected:
+                if self.plan_only:
+                    report.note(
+                        None, f"{symbol}: not named: a send with --only would send no stop for it"
+                    )
+                else:
+                    report.note(report.left_alone, f"{symbol}: not named: no stop sent")
+                    continue
             rest = self._uncovered(symbol, qty, orders)
             if rest is None:
                 continue
@@ -739,6 +808,15 @@ class _Protect:
             n += 1
             at = now + timedelta(seconds=monotonic() - self.began)
             self._protect(symbol, whole, qty, ours, at, n)
+        for symbol in selected or ():
+            # A named symbol that could not be read has its ALERT above: what it holds is not known,
+            # so it is not also said to hold no long.
+            if symbol not in unread and held.get(symbol, 0) <= 0:
+                # A name typed wrong would otherwise read as done (as `cancel_stops` holds for its
+                # symbol): it is said in a plan-only run too, and the run is not a success.
+                report.note(
+                    report.unprotected, f"{symbol}: named in --only, no long held: no stop sent"
+                )
         return report
 
     def _uncovered(
@@ -843,6 +921,22 @@ class _Protect:
             client_order_id=client_order_id,
         )
 
+    def _to_close(self) -> timedelta:
+        """What is left to the close now: the clock's figure less what the run has taken since it asked."""
+        return self.left - timedelta(seconds=monotonic() - self.began)
+
+    def _too_near(self, symbol: str, held: Decimal, when: str) -> bool:
+        """Name `symbol` unprotected, nothing sent, when less than one send's bound is left to the close."""
+        if (to_close := self._to_close()) >= SEND_MARGIN:
+            return False
+        self.report.note(
+            self.report.unprotected,
+            f"unprotected {symbol}: {held} held, no stop sent: {_whole(to_close)} s to the close "
+            f"{when}, under the {_whole(SEND_MARGIN)} s one send may take, and a stop Alpaca holds "
+            "works only in the regular session",
+        )
+        return True
+
     def _protect(
         self, symbol: str, whole: Decimal, held: Decimal, ours: Decimal, now: datetime, n: int
     ) -> None:
@@ -851,6 +945,8 @@ class _Protect:
         rows = tuple(ROWS) if self.plan_only else (self.row or "",)
         planned: dict[str, tuple[TrailingStopOrderRequest, Decimal, Distance]] = {}
         refused: dict[str, str] = {}
+        if self._too_near(symbol, held, "before its reads"):
+            return
         try:
             if self.client is None:
                 self.client = self.data() if callable(self.data) else self.data
@@ -889,6 +985,8 @@ class _Protect:
                 f"unprotected {symbol}: {held} held, no stop sent: {changed}; the holding or its "
                 "orders changed during the run; run again",
             )
+            return
+        if self._too_near(symbol, held, "by the send"):
             return
         if (aged := book.aged()) > QUOTE_MOST:
             report.note(
@@ -1015,12 +1113,15 @@ def protect_longs(
     say: Callable[[str], None] | None = None,
     plan_only: bool = False,
     row: str | None = None,
+    only: tuple[str, ...] | None = None,
 ) -> ProtectReport:
     """The run (module header). `data` is an alpaca-py `StockHistoricalDataClient`, or a callable that
     builds one; it is asked only once a long needs a stop. `say` is given each line as it happens.
     `plan_only` makes every read of a sending run and names what each stop would be under every
-    registered row, and sends none. A run that sends names its `row` (`ROWS`); there is no default."""
-    run = _Protect(trading, data, say, plan_only, row)
+    registered row, and sends none. A run that sends names its `row` (`ROWS`); there is no default.
+    `only`, when given, is the include list: it removes sends, never plan-only reads, and an empty one
+    is refused."""
+    run = _Protect(trading, data, say, plan_only, row, only)
     try:
         return run.run()
     except Exception as e:  # noqa: BLE001 - named, with what was sent before it, and exits 1
@@ -1277,6 +1378,7 @@ def task_from_flags(
     row: str,
     cancel: str = "false",
     symbol: str = "",
+    only: str = "",
     trading: TradingClient | None = None,
     data: Any = None,
     pause: Callable[[float], None] = sleep,
@@ -1285,11 +1387,21 @@ def task_from_flags(
     exactly `true` or `false` (mise gives a passed switch `true`, and the task gives `false` for one not
     passed), and anything else is refused by name with nothing read, so a value not known here never
     becomes a send or a cancel. The row is a registered name, or empty for none. A cancel takes no row,
-    and only a cancel takes a symbol, which is plain capital letters."""
+    and only a cancel takes `symbol`, which is plain capital letters. A send's optional `only` is a
+    comma-separated list of distinct symbols in plain capital letters; it cannot accompany a cancel
+    or its symbol flag."""
     for name, value in (("plan-only", plan_only), ("cancel", cancel)):
         if value not in ("true", "false"):
             return _refuse(f"{name} reads {value!r}, which is neither true nor false")
-    if symbol and not (symbol.isascii() and symbol.isalpha() and symbol.isupper()):
+    try:
+        selected = _only_symbols(only)
+    except (TypeError, ValueError) as e:
+        return _refuse(str(e))
+    if only and cancel == "true":
+        return _refuse("--only cannot be used with --cancel")
+    if only and symbol:
+        return _refuse("--only cannot be used with --symbol; that flag belongs to --cancel")
+    if symbol and not _plain(symbol):
         return _refuse(f"the symbol {symbol!r} is not plain capital letters")
     if cancel == "true":
         if row:
@@ -1297,7 +1409,7 @@ def task_from_flags(
         return cancel_task(trading, symbol or None, plan_only == "true", pause)
     if symbol:
         return _refuse("a symbol is named only with --cancel; a send covers every long it finds")
-    return protect_task(trading, data, plan_only == "true", row or None)
+    return protect_task(trading, data, plan_only == "true", row or None, selected)
 
 
 def protect_task(
@@ -1305,6 +1417,7 @@ def protect_task(
     data: Any = None,
     plan_only: bool = False,
     row: str | None = None,
+    only: tuple[str, ...] | None = None,
 ) -> int:
     """`mise run paper:protect tests`: run `protect_longs`, printing each line as it happens; the exit
     code is the report's (module header): a read that fails, or anything else part way, is named and
@@ -1320,7 +1433,9 @@ def protect_task(
                 f"paper:protect: no paper client: {_failure(e)}; nothing was sent", file=sys.stderr
             )
             return 1
-        report = protect_longs(trading, data or session_window.window_data, _say, plan_only, row)
+        report = protect_longs(
+            trading, data or session_window.window_data, _say, plan_only, row, only
+        )
     finally:
         signal.signal(signal.SIGTERM, before)
     if report.refused:

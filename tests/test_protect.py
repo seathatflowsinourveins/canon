@@ -1050,17 +1050,6 @@ def test_a_stop_for_part_of_a_long_is_checked_against_what_alpaca_says_is_free(c
     assert code == 0 and [r.qty for r in paper.submitted] == [4]
 
 
-def test_too_near_the_close_it_refuses_after_the_clock_read_alone(capsys) -> None:
-    """The session is read once, so the run must end inside it: with less than the task's own time
-    bound left to the close nothing else is read or sent."""
-    paper = Paper(positions=[_position("AAA", "10")], next_close="2026-11-12T15:04:59Z")
-    code, lines = _run(paper, Data({"AAA": AAA_BOOK}), capsys)
-    assert code == 3 and paper.calls == [("get_clock", None)]
-    assert "299 s to the close" in "\n".join(lines)
-    on_time = Paper(positions=[_position("AAA", "10")], next_close="2026-11-12T15:05:00Z")
-    assert _run(on_time, Data({"AAA": AAA_BOOK}), capsys)[0] == 0
-
-
 def test_a_clock_that_cannot_be_read_names_no_session(capsys) -> None:
     paper = Paper(positions=[_position("AAA", "10")])
     paper.clock_fails = requests.ReadTimeout("read timed out")
@@ -1278,7 +1267,9 @@ def _task() -> dict[str, str]:
     return tomllib.loads((ROOT / "mise.toml").read_text())["tasks"]["paper:protect"]
 
 
-def _run_task(tmp_path: Path, account: str) -> tuple[subprocess.CompletedProcess, str]:
+def _run_task(
+    tmp_path: Path, account: str, **flags: str
+) -> tuple[subprocess.CompletedProcess, str]:
     """The task's body with `/usr/bin/security` swapped for a stand-in that logs its arguments; it is
     run only for names refused before the keychain and the lock."""
     log = tmp_path / "security.log"
@@ -1288,7 +1279,7 @@ def _run_task(tmp_path: Path, account: str) -> tuple[subprocess.CompletedProcess
     body = _task()["run"].replace("/usr/bin/security", str(stub))
     done = subprocess.run(
         ["bash", "-c", body],
-        env={"PATH": f"{tmp_path}:/usr/bin:/bin", "usage_account": account},
+        env={"PATH": f"{tmp_path}:/usr/bin:/bin", "usage_account": account, **flags},
         capture_output=True,
         text=True,
         timeout=60,
@@ -1850,9 +1841,9 @@ def test_the_task_hands_the_cancel_and_the_symbol_over() -> None:
     task = _task()
     assert 'flag "--cancel"' in task["usage"] and 'flag "--symbol <symbol>"' in task["usage"]
     assert re.search(
-        r"task_from_flags\(\*sys\.argv\[1:5\]\)\)' "
+        r"task_from_flags\(\*sys\.argv\[1:6\]\)\)' "
         r'"\$\{usage_plan_only:-false\}" "\$\{usage_row:-\}" "\$\{usage_cancel:-false\}" '
-        r'"\$\{usage_symbol:-\}"$',
+        r'"\$\{usage_symbol:-\}" "\$\{usage_only:-\}"$',
         task["run"],
         re.MULTILINE,
     )
@@ -2187,3 +2178,474 @@ def test_exit_for_the_shares_the_owner_added_to_a_protected_long(capsys) -> None
     )
     code, lines = _run(paper, Data({"AAA": AAA_BOOK}), capsys)
     _covered(paper, "AAA", 5, code, lines)
+
+
+# The include list only removes sends; the planner and the send's quantity checks stay the same.
+
+
+def _only_run(paper: Paper, data: Data, capsys, only: str, **flags: Any) -> tuple[int, list[str]]:
+    code = protect.task_from_flags(
+        flags.get("plan_only", "false"),
+        flags.get("row", "OWN1"),
+        flags.get("cancel", "false"),
+        flags.get("symbol", ""),
+        only,
+        trading=cast(Any, paper),
+        data=data,
+        pause=lambda _seconds: None,
+    )
+    out = capsys.readouterr()
+    return code, (out.out + out.err).splitlines()
+
+
+def _data_calls(data: Data) -> list[tuple[str, dict[str, Any]]]:
+    """Compare request fields, including TimeFrame.value (alpaca/data/timeframe.py:76)."""
+    return [
+        (
+            method,
+            {
+                key: getattr(value, "value", value)
+                for key, value in request.to_request_fields().items()
+            },
+        )
+        for method, request in data.asked
+    ]
+
+
+@pytest.mark.parametrize("only", ["AAA", "AAA,BBB", "BBB,AAA", "CCC", "AAA,CCC"])
+def test_only_sends_for_named_longs_and_names_absent_symbols(capsys, only) -> None:
+    paper = Paper(positions=[_position("AAA", "10"), _position("BBB", "5")])
+    data = Data({"AAA": AAA_BOOK, "BBB": BBB_BOOK})
+    code, lines = _only_run(paper, data, capsys, only)
+    named = set(only.split(","))
+    # a named symbol with no long is not a success: a name typed wrong would otherwise read as done
+    assert code == (2 if "CCC" in named else 0), lines
+    assert [request.symbol for request in paper.submitted] == sorted(named & {"AAA", "BBB"})
+    _no_sale_open_or_cancel(paper)
+    for symbol in {"AAA", "BBB"} - named:
+        assert lines.count(f"{symbol}: not named: no stop sent") == 1
+        assert not any(getattr(request, "symbol", None) == symbol for _, request in paper.calls)
+        assert ("get_open_position", symbol) not in paper.calls
+        assert not any(request.symbol_or_symbols == symbol for _, request in data.asked)
+    if "CCC" in named:
+        (line,) = [line for line in lines if "CCC" in line]
+        assert line == "CCC: named in --only, no long held: no stop sent"
+
+
+def test_only_names_a_covered_long_without_sending_for_the_other_long(capsys) -> None:
+    paper = Paper(
+        positions=[_position("AAA", "10"), _position("BBB", "5")],
+        orders=[_order("AAA", "10", FOREIGN_SELL)],
+    )
+    data = Data({"AAA": AAA_BOOK, "BBB": BBB_BOOK})
+    code, lines = _only_run(paper, data, capsys, "AAA")
+    assert code == 0 and not paper.submitted and not data.asked, lines
+    (covered,) = [line for line in lines if "AAA" in line]
+    assert "fully covered by working sells" in covered
+    assert "BBB: not named: no stop sent" in lines
+
+
+@pytest.mark.parametrize("only", ["", "AAA,BBB", "BBB,AAA"])
+def test_only_preserves_the_unfiltered_requests_and_output(capsys, monkeypatch, only) -> None:
+    """Freeze only the clock and nonce so the request log and output can be compared byte for byte."""
+    monkeypatch.setattr(protect, "monotonic", lambda: 0.0)
+    monkeypatch.setattr(protect, "uuid4", lambda: SimpleNamespace(hex="0123456789abcdef"))
+    positions = [_position("AAA", "10"), _position("BBB", "5")]
+    baseline = Paper(positions=positions)
+    selected = Paper(positions=positions)
+    before = Data({"AAA": AAA_BOOK, "BBB": BBB_BOOK})
+    after = Data({"AAA": AAA_BOOK, "BBB": BBB_BOOK})
+    expected = _run(baseline, before, capsys)
+    assert _only_run(selected, after, capsys, only) == expected
+    assert selected.calls == baseline.calls
+    assert _data_calls(after) == _data_calls(before)
+
+
+@pytest.mark.parametrize("only", ["AAA", "AAA,CCC"])
+def test_only_plan_reads_and_plans_every_long_under_every_row(capsys, monkeypatch, only) -> None:
+    monkeypatch.setattr(protect, "monotonic", lambda: 0.0)
+    monkeypatch.setattr(protect, "uuid4", lambda: SimpleNamespace(hex="0123456789abcdef"))
+    positions = [_position("AAA", "10"), _position("BBB", "5")]
+    baseline, selected = Paper(positions=positions), Paper(positions=positions)
+    before = Data({"AAA": AAA_BOOK, "BBB": BBB_BOOK})
+    after = Data({"AAA": AAA_BOOK, "BBB": BBB_BOOK})
+    assert protect.protect_task(cast(Any, baseline), before, plan_only=True) == 0
+    expected = capsys.readouterr().out.splitlines()
+    code, lines = _only_run(selected, after, capsys, only, plan_only="true", row="")
+    # the account's first run already says a named symbol holds no long, and is not a success
+    absent = ["CCC: named in --only, no long held: no stop sent"] if "CCC" in only else []
+    assert code == (2 if absent else 0) and not selected.submitted, lines
+    (extra,) = [line for line in lines if "not named" in line]
+    assert extra == "BBB: not named: a send with --only would send no stop for it"
+    assert [line for line in lines if "no long held" in line] == absent
+    assert [line for line in lines if line != extra and line not in absent] == expected
+    assert selected.calls == baseline.calls and _data_calls(after) == _data_calls(before)
+    for symbol in ("AAA", "BBB"):
+        for row in protect.ROWS:
+            assert any(line.startswith(f"would send {symbol} under {row}:") for line in lines)
+
+
+@pytest.mark.parametrize(
+    ("only", "flags", "reason"),
+    [
+        (",AAA", {}, "empty"),
+        ("AAA,", {}, "empty"),
+        ("AAA,,BBB", {}, "empty"),
+        ("aaa", {}, "plain capital letters"),
+        ("AAA, BBB", {}, "plain capital letters"),
+        ("AAA1", {}, "plain capital letters"),
+        ("AAA.B", {}, "plain capital letters"),
+        ("ÄAA", {}, "plain capital letters"),
+        ("AAA\n", {}, "plain capital letters"),
+        ("AAA,AAA", {}, "twice"),
+        (None, {}, "not text"),
+        ("AAA", {"cancel": "true", "row": ""}, "--cancel"),
+        ("AAA", {"symbol": "BBB"}, "--symbol"),
+        ("AAA", {"cancel": "true", "row": "", "symbol": "BBB"}, "--cancel"),
+        ("AAA", {"plan_only": "perhaps"}, "plan-only"),
+        ("AAA", {"cancel": "perhaps"}, "cancel"),
+        ("AAA", {"row": "UNKNOWN"}, "row"),
+        ("AAA", {"row": ""}, "row"),
+    ],
+)
+def test_only_refuses_bad_flags_without_any_request(capsys, only, flags, reason) -> None:
+    paper = Paper(positions=[_position("AAA", "1")])
+    data = Data({"AAA": AAA_BOOK})
+    code, lines = _only_run(paper, data, capsys, only, **flags)
+    assert code == protect.REFUSED, lines
+    assert paper.calls == [] and data.asked == []
+    assert len(lines) == 1 and lines[0].startswith("refused:")
+    assert reason in lines[0] and "nothing was read or sent" in lines[0]
+
+
+def test_only_keeps_attempting_later_symbols_after_a_failed_send(capsys) -> None:
+    class RefuseFirst(Paper):
+        def submit_order(self, order_data):
+            self.submit_fails = (
+                APIError('{"code": 42210000, "message": "refused"}', _status(422))
+                if order_data.symbol == "AAA"
+                else None
+            )
+            return super().submit_order(order_data)
+
+    for only in ("", "BBB,AAA"):
+        paper = RefuseFirst(positions=[_position("BBB", "1"), _position("AAA", "1")])
+        code, lines = _only_run(paper, Data({"AAA": AAA_BOOK, "BBB": BBB_BOOK}), capsys, only)
+        assert code == 1, lines
+        assert [request.symbol for request in paper.submitted] == ["AAA", "BBB"]
+        assert any(line.startswith("failed AAA:") for line in lines)
+        assert any(line.startswith("sent BBB:") for line in lines)
+        assert not any(name == "get_order_by_client_id" for name, _ in paper.calls)
+
+
+@pytest.mark.parametrize("row", list(protect.ROWS))
+@pytest.mark.parametrize("available", ["2", "1", None])
+def test_only_keeps_the_whole_share_free_quantity_and_row_rules(capsys, row, available) -> None:
+    positions = [_position("AAA", "2.5", available=available), _position("BBB", "1")]
+    baseline, selected = Paper(positions=positions), Paper(positions=positions)
+    before = _run(baseline, Data({"AAA": AAA_BOOK, "BBB": BBB_BOOK}), capsys, row=row)
+    code, lines = _only_run(selected, Data({"AAA": AAA_BOOK}), capsys, "AAA", row=row)
+    assert code == before[0], lines
+    expected = [
+        r.model_dump(exclude={"client_order_id"}) for r in baseline.submitted if r.symbol == "AAA"
+    ]
+    assert [r.model_dump(exclude={"client_order_id"}) for r in selected.submitted] == expected
+    _no_sale_open_or_cancel(selected)
+    assert all(
+        request.qty == 2 and request.qty <= float(available) for request in selected.submitted
+    )
+
+
+def test_only_does_not_count_an_omitted_fraction_as_a_failure(capsys) -> None:
+    paper = Paper(positions=[_position("AAA", "1"), _position("BBB", "0.5")])
+    code, lines = _only_run(paper, Data({"AAA": AAA_BOOK}), capsys, "AAA")
+    assert code == 0 and [request.symbol for request in paper.submitted] == ["AAA"], lines
+    assert "BBB: not named: no stop sent" in lines
+
+
+@pytest.mark.parametrize(
+    ("only", "sent", "plan_only"),
+    [
+        ("BBB", [], "false"),
+        ("AAA,BBB", ["AAA"], "false"),
+        ("AAA", ["AAA"], "false"),
+        ("BBB", [], "true"),
+    ],
+)
+def test_only_and_an_unreadable_position_say_one_true_thing(capsys, only, sent, plan_only) -> None:
+    """A position that cannot be read is an ALERT and a 2 whether it was named or not: what it is, is
+    not known, so the list does not make it "left as found". A named one is never also said to hold no
+    long, which would be false; the long beside it gets its stop only when it is named."""
+    paper = Paper(positions=[_position("AAA", "10"), _position("BBB", "NaN")])
+    data = Data({"AAA": AAA_BOOK, "BBB": BBB_BOOK})
+    code, lines = _only_run(
+        paper, data, capsys, only, plan_only=plan_only, row="" if plan_only == "true" else "OWN1"
+    )
+    assert code == 2, lines
+    assert [r.symbol for r in paper.submitted] == ([] if plan_only == "true" else sent), lines
+    assert len([x for x in lines if x.startswith("ALERT BBB:")]) == 1, lines
+    assert not any("BBB" in x and "no long held" in x for x in lines), lines
+    assert not any(x.startswith("BBB: not named") for x in lines), lines
+    assert not any(getattr(request, "symbol", None) == "BBB" for _, request in paper.calls)
+
+
+@pytest.mark.parametrize("plan_only", [False, True])
+def test_an_empty_include_list_is_refused_and_never_read_as_no_list(plan_only) -> None:
+    """No list is None. A caller that built its list from no names must not get a send for every long."""
+    paper = Paper(positions=[_position("AAA", "10"), _position("BBB", "5")])
+    data = Data({"AAA": AAA_BOOK, "BBB": BBB_BOOK})
+    report = protect.protect_longs(
+        cast(Any, paper), data, plan_only=plan_only, row=None if plan_only else "OWN1", only=()
+    )
+    assert report.exit_code == protect.REFUSED and "names no symbol" in report.refused
+    assert paper.calls == [] and data.asked == [] and not paper.submitted
+
+
+@pytest.mark.parametrize("account", ["tests", "protect"])
+def test_the_task_refuses_an_only_passed_empty_before_any_pair_is_read(tmp_path, account) -> None:
+    """`--only "$NAMES"` with nothing in NAMES reaches the task as an empty value. The module cannot
+    tell that from an absent flag, so the task refuses it before the keychain and the lock."""
+    done, log = _run_task(tmp_path, account, usage_row="F2", usage_only="")
+    assert done.returncode == 3 and log == "", done.stderr
+    assert "--only was given with no symbol; nothing was read or sent" in done.stderr
+    assert done.stdout == ""
+    run = _task()["run"]
+    assert run.index("usage_only+passed") < run.index("/usr/bin/security")
+
+
+def test_the_task_hands_only_over_as_one_optional_text_argument() -> None:
+    task = _task()
+    assert 'flag "--only <symbols>"' in task["usage"]
+    assert "--exclude" not in task["usage"]
+    assert re.search(
+        r"task_from_flags\(\*sys\.argv\[1:6\]\)\)' "
+        r'"\$\{usage_plan_only:-false\}" "\$\{usage_row:-\}" "\$\{usage_cancel:-false\}" '
+        r'"\$\{usage_symbol:-\}" "\$\{usage_only:-\}"$',
+        task["run"],
+        re.MULTILINE,
+    )
+
+
+class OnlyRoundTripPaper(Cancelable):
+    """The paper test's two buys, stop, cancel and closes on the existing offline venue."""
+
+    def __init__(self, failure: str = "") -> None:
+        super().__init__()
+        self.positions: list[Position] = []
+        self.orders: list[Order] = []
+        self.failure = failure
+
+    def submit_order(self, order_data):
+        if isinstance(order_data, TrailingStopOrderRequest):
+            submitted = super().submit_order(order_data)
+            order = submitted.model_copy(
+                update={
+                    "position_intent": order_data.position_intent
+                    if self.failure != "after-stop"
+                    else None
+                }
+            )
+        else:
+            self.calls.append(("submit_order", order_data))
+            self.submitted.append(order_data)
+            if order_data.side.value == "buy":
+                if order_data.symbol == "BBB" and self.failure == "second-buy":
+                    raise APIError('{"code": 42210000, "message": "refused"}', _status(422))
+                self.positions.append(_position(order_data.symbol, "1"))
+            else:
+                assert (
+                    order_data.qty == 1
+                    and order_data.position_intent == PositionIntent.SELL_TO_CLOSE
+                )
+                assert any(p.symbol == order_data.symbol and p.qty == "1" for p in self.positions)
+                self.positions = [p for p in self.positions if p.symbol != order_data.symbol]
+            order = _order(
+                order_data.symbol,
+                "1",
+                order_data.client_order_id,
+                type="market",
+                order_type="market",
+                side=order_data.side,
+                limit_price=None,
+                status="filled",
+                filled_qty="1",
+                position_intent=order_data.position_intent,
+            )
+        self.orders.append(order)
+        self.found[order.client_order_id] = order
+        return order
+
+    def get_orders(self, filter: Any = None):
+        return [
+            order
+            for order in super().get_orders(filter)
+            if order.status.value not in protect.session_window.TERMINAL
+            and str(order.id) not in self.canceled
+        ]
+
+
+@pytest.mark.parametrize("failure", ["", "second-buy", "after-stop"])
+def test_only_paper_round_trip_and_cleanup_on_the_standin(monkeypatch, failure) -> None:
+    """The exact new paper body, including its cleanup, never its credential/session wrapper."""
+    paper_test = _paper_test()
+    monkeypatch.setattr(paper_test.time, "sleep", lambda _seconds: None)
+    paper = OnlyRoundTripPaper(failure)
+    data = Data({"AAA": AAA_BOOK, "BBB": BBB_BOOK})
+    if failure:
+        reason = "buy: refused" if failure == "second-buy" else "required terms"
+        with pytest.raises(AssertionError, match=reason):
+            paper_test._only_round_trip(paper, data, ("AAA", "BBB"))
+    else:
+        paper_test._only_round_trip(paper, data, ("AAA", "BBB"))
+    assert paper.positions == [] and paper.get_orders() == []
+    stops = [
+        request for request in paper.submitted if isinstance(request, TrailingStopOrderRequest)
+    ]
+    assert [request.symbol for request in stops] == ([] if failure == "second-buy" else ["AAA"])
+    assert len(paper.canceled) == len(stops)
+    closed = [
+        request.symbol
+        for request in paper.submitted
+        if request.type.value == "market" and request.side.value == "sell"
+    ]
+    assert closed == (["AAA"] if failure == "second-buy" else ["AAA", "BBB"])
+    assert paper.no_shorting is True
+
+
+def test_the_close_margin_is_one_sends_bound_not_the_tasks_timeout() -> None:
+    """The run checks the time to the close again before each send, so the margin it needs is what one
+    send may take: the paper client's own (connect, read) bound on the submit, retries off. The 300 s it
+    held before was said to be the task's timeout, which is 10 minutes, so it held for no reason that
+    stood (the lead's case of 2026-11-13: a long bought in the last minutes before the close got no stop)."""
+    from canon_alpaca import providers
+
+    one_send = providers.CONNECT_TIMEOUT_SECS + providers.READ_TIMEOUT_SECS
+    assert protect.SEND_MARGIN.total_seconds() >= one_send
+    assert protect.SEND_MARGIN.total_seconds() < one_send + 1
+    assert protect.CLOSE_MARGIN == protect.SEND_MARGIN
+
+
+@EXIT
+def test_a_long_bought_a_minute_before_the_close_gets_its_stop(capsys) -> None:
+    """A minute before the close is inside the old 300 s refusal: the stop now goes out."""
+    paper = Paper(positions=[_position("AAA", "10")], next_close="2026-11-12T15:01:00Z")
+    code, lines = _run(paper, Data({"AAA": AAA_BOOK}), capsys)
+    assert code == 0, lines
+    assert [r.symbol for r in paper.submitted] == ["AAA"]
+    _no_sale_open_or_cancel(paper)
+
+
+def test_under_one_sends_bound_to_the_close_the_run_reads_nothing_else(capsys, monkeypatch) -> None:
+    monkeypatch.setattr(protect, "monotonic", lambda: 0.0)  # no wall-clock time passes in the run
+    margin = int(protect.SEND_MARGIN.total_seconds())
+    close = NOW + timedelta(seconds=margin - 1)
+    paper = Paper(positions=[_position("AAA", "10")], next_close=close.isoformat())
+    code, lines = _run(paper, Data({"AAA": AAA_BOOK}), capsys)
+    assert code == 3 and paper.calls == [("get_clock", None)]
+    assert f"{margin - 1} s to the close" in "\n".join(lines)
+    at_margin = Paper(
+        positions=[_position("AAA", "10")],
+        next_close=(NOW + timedelta(seconds=margin)).isoformat(),
+    )
+    # exactly the margin is enough at the start and at the send: the stop goes out
+    assert _run(at_margin, Data({"AAA": AAA_BOOK}), capsys)[0] == 0
+    assert [r.symbol for r in at_margin.submitted] == ["AAA"]
+    on_time = Paper(
+        positions=[_position("AAA", "10")],
+        next_close=(NOW + timedelta(seconds=margin + 2)).isoformat(),
+    )
+    assert _run(on_time, Data({"AAA": AAA_BOOK}), capsys)[0] == 0
+    assert [r.symbol for r in on_time.submitted] == ["AAA"]
+
+
+def test_the_clock_reads_own_wait_counts_against_the_close(capsys, monkeypatch) -> None:
+    """The clock's time is the server's when it answered: a read that took 10 s to come back leaves 10 s
+    less to the close than its stamp says, so the run counts from before it asked."""
+    passed = [0.0]
+    monkeypatch.setattr(protect, "monotonic", lambda: passed[0])
+    margin = int(protect.SEND_MARGIN.total_seconds())
+    paper = Paper(
+        positions=[_position("AAA", "10")],
+        next_close=(NOW + timedelta(seconds=margin + 5)).isoformat(),
+    )
+    original = paper.get_clock
+
+    def slow():
+        passed[0] += 10.0
+        return original()
+
+    paper.get_clock = slow  # type: ignore[method-assign]
+    code, lines = _run(paper, Data({"AAA": AAA_BOOK}), capsys)
+    assert code == 3 and not paper.submitted and paper.calls == [("get_clock", None)], lines
+    assert f"too near the close: {margin - 5} s to the close" in "\n".join(lines)
+
+
+def test_a_symbol_reached_after_the_margin_has_nothing_read_for_it(capsys, monkeypatch) -> None:
+    """Once less than one send's bound is left, a later symbol is named unprotected before its quote,
+    bars or orders are read: nothing it could read would be sent."""
+    passed = [0.0]
+    monkeypatch.setattr(protect, "monotonic", lambda: passed[0])
+    paper = Paper(
+        positions=[_position("AAA", "10"), _position("BBB", "5")],
+        next_close="2026-11-12T15:01:00Z",
+    )
+    original = paper.submit_order
+
+    def slow(order_data):
+        passed[0] += 40.5  # the first send took 40.5 s, leaving 19.5 s to the close
+        return original(order_data)
+
+    paper.submit_order = slow  # type: ignore[method-assign]
+    data = Data({"AAA": AAA_BOOK, "BBB": BBB_BOOK})
+    code, lines = _run(paper, data, capsys)
+    assert code == 2 and [r.symbol for r in paper.submitted] == ["AAA"]
+    assert not [a for a in data.asked if getattr(a[1], "symbol_or_symbols", None) == "BBB"]
+    (line,) = [x for x in lines if x.startswith("unprotected BBB:")]
+    assert "19 s to the close" in line  # whole seconds left, never rounded up
+
+
+def test_a_send_the_close_would_overtake_is_refused_by_name_and_not_sent(
+    capsys, monkeypatch
+) -> None:
+    """The time to the close is checked again just before each send: a symbol reached with less than
+    one send's bound left is named unprotected and nothing is sent for it, the earlier one's stop kept."""
+    passed = [0.0]
+    monkeypatch.setattr(protect, "monotonic", lambda: passed[0])
+    paper = Paper(
+        positions=[_position("AAA", "10"), _position("BBB", "5")],
+        next_close="2026-11-12T15:01:00Z",
+    )
+    original = paper.submit_order
+
+    def slow(order_data):
+        passed[0] += 40.0  # the first send took 40 s, leaving 20 s to the close
+        return original(order_data)
+
+    paper.submit_order = slow  # type: ignore[method-assign]
+    code, lines = _run(paper, Data({"AAA": AAA_BOOK, "BBB": BBB_BOOK}), capsys)
+    assert code == 2 and [r.symbol for r in paper.submitted] == ["AAA"]
+    (line,) = [x for x in lines if x.startswith("unprotected BBB:")]
+    assert "20 s to the close" in line
+
+
+def test_a_read_in_the_send_step_that_eats_the_margin_stops_the_send(capsys, monkeypatch) -> None:
+    """The check just before the send is its own: a symbol that had the margin before its reads, and
+    lost it to a slow position read in the send step, is named unprotected by the send, nothing sent."""
+    passed = [0.0]
+    monkeypatch.setattr(protect, "monotonic", lambda: passed[0])
+    margin = int(protect.SEND_MARGIN.total_seconds())
+    paper = Paper(
+        positions=[_position("AAA", "10")],
+        next_close=(NOW + timedelta(seconds=margin + 5)).isoformat(),
+    )
+    original = paper.get_open_position
+
+    def slow(symbol):
+        passed[0] += 10.0  # the send step's position read took 10 s, leaving margin - 5 s
+        return original(symbol)
+
+    paper.get_open_position = slow  # type: ignore[method-assign]
+    code, lines = _run(paper, Data({"AAA": AAA_BOOK}), capsys)
+    assert code == 2 and not paper.submitted, lines
+    (line,) = [x for x in lines if x.startswith("unprotected AAA:")]
+    assert f"{margin - 5} s to the close by the send" in line
