@@ -65,6 +65,10 @@ class Leg:
     pending: bool = False
     silent_told: bool = False
     cancel_told: bool = False
+    # Our cancel of this leg was refused where it is asked again: its wait still runs (the table's
+    # `cancel_due` is then false; the "c~" step ends it), and its ALERT was written.
+    cancel_waits: bool = False
+    refusal_told: bool = False
 
     @property
     def remaining(self):
@@ -153,6 +157,8 @@ def facts(account, seen, row):
         "reprice_due": reprice_due,
         "ends_filled": seen.ends_filled,
         "refusal_told": account.told,
+        "cancel_due": not (leg and leg.cancel_waits),
+        "cancel_refusal_told": bool(leg and leg.refusal_told),
         "resend_due": not account.young,
         "flight_alert_due": bool(
             seen.overdue
@@ -379,8 +385,24 @@ def advance(world, seen, n, table):
     if event == "HE" and before.legs and before.legs[0].cancelable:
         # ONE property over ALL rows: at the holding's end, a sale of ours that can take a cancel
         # is asked canceled in that step, whatever the row. A holding reopened at least as large
-        # never shows a mismatch, so nothing else would ask.
-        assert sale.Action.CANCEL in result.actions, "an_ended_holdings_sale_is_asked_canceled"
+        # never shows a mismatch, so nothing else would ask. One exception: a cancel the venue
+        # refused is asked again only when its wait has passed.
+        if before.legs[0].cancel_waits:
+            assert sale.Action.CANCEL not in result.actions, "a_refused_cancel_waits_its_pace"
+        else:
+            assert sale.Action.CANCEL in result.actions, "an_ended_holdings_sale_is_asked_canceled"
+    if event == "ST" and origin == "TW" and before.legs:
+        due = before.legs[0].cancelable and not before.legs[0].cancel_waits
+        assert (sale.Action.CANCEL in result.actions) == due, (
+            "a_standing_stop_asks_again_when_due" if due else "a_refused_cancel_waits_its_pace"
+        )
+    if (origin, result.state.row) in {("PCX", "OX"), ("PCT", "TW")}:
+        # Our cancel refused where it is asked again: said once per leg, then its wait runs.
+        refused = account.legs[0]
+        assert (sale.Action.ALERT in result.actions) == (not refused.refusal_told), (
+            "a_refused_cancel_is_told_once_per_leg"
+        )
+        account = replace(account, legs=(replace(refused, cancel_waits=True, refusal_told=True),))
     if event == "HE" and origin == "T0":
         assert result.state.row == "X", "a_stopped_holding_that_ends_has_ended"
     if event == "oLF" and world.state.row in {"WK", "PF"} and account.long <= 0:
@@ -445,7 +467,10 @@ def advance(world, seen, n, table):
             legs=(replace(account.legs[0], pending=True, cancel_told=False),),
         )
     if event == "MO":
-        assert sale.Action.CANCEL in result.actions, "mismatch_cancels_in_same_step"
+        if before.legs[0].cancel_waits:
+            assert sale.Action.CANCEL not in result.actions, "a_refused_cancel_waits_its_pace"
+        else:
+            assert sale.Action.CANCEL in result.actions, "mismatch_cancels_in_same_step"
         assert sale.Action.SEND not in result.actions, "mismatch_never_sends"
     if event in {"QA", "NQ"}:
         assert sale.Action.CANCEL not in result.actions, "reprice_only_under_level"
@@ -508,6 +533,9 @@ def step(world, observations, n=2, table=sale.TABLE, *, sends=None):
     """Use the table's ordering; derive each event's facts from the evolving account."""
     if observations == (Seen("~"),):
         return replace(world, account=replace(world.account, young=False))
+    if observations == (Seen("c~"),):
+        waited = replace(world.account.legs[0], cancel_waits=False)
+        return replace(world, account=replace(world.account, legs=(waited,)))
     if len(observations) == 1 and observations[0].code == "p":
         # A usable quote that is not counted (inside the gap): it changes no row and it prices.
         return replace(
@@ -521,6 +549,15 @@ def step(world, observations, n=2, table=sale.TABLE, *, sends=None):
     ):
         # Another position sits under the instrument: the glue raises the end at every step.
         observations = (Seen("HE", reopened=True), *observations)
+    if world.state.row == "TW" and not any(seen.code == "ST" for seen in observations):
+        # The stop still stands with our sale open: the glue raises it at every step.
+        observations = (Seen("ST"), *observations)
+    asks_again = bool(
+        world.state.row in {"OX", "TW"}
+        and world.account.legs
+        and world.account.legs[0].cancelable
+        and not world.account.legs[0].cancel_waits
+    )
     indexed = {str(i): seen for i, seen in enumerate(observations)}
     tagged = [sale.Event(seen.code, {str(i): True}) for i, seen in enumerate(observations)]
     ordered = sale.order_step(tagged, table=table)
@@ -542,14 +579,19 @@ def step(world, observations, n=2, table=sale.TABLE, *, sends=None):
         actions.extend(asked)
     if any(seen.code in INVALIDATES for seen in observations):
         assert sale.Action.SEND not in actions, "invalidation_first"
-    if owed:
+    waits = bool(world.account.legs and world.account.legs[0].cancel_waits)
+    if owed and not waits:
         # After a holding ends, from any row and by any history, no sell of ours is left working
-        # without a cancel being asked for it: a step that begins with one asks, or the sale ends.
-        # A backstop over whole steps: the two per-event properties (the end asks; a mismatch
-        # asks) fail first under every one-cell mutation tried, so this one has no mutation of
-        # its own.
+        # without a cancel being asked for it: a step that begins with one asks, or the sale ends,
+        # or a cancel the venue refused waits its pace. A backstop over whole steps.
         assert sale.Action.CANCEL in actions or not world.account.legs, (
             "no_sale_of_an_ended_holding_works_unasked"
+        )
+    if asks_again:
+        # NEVER NEVER: a step that begins with an ended or stopped holding's sale open, able to
+        # take a cancel and with no refusal's wait running, asks its cancel, or the sale ends.
+        assert sale.Action.CANCEL in actions or not world.account.legs, (
+            "a_resting_sale_is_asked_canceled_when_due"
         )
     return world
 
@@ -559,6 +601,8 @@ def alternatives(world):
     account = world.account
     if account.young:
         yield (Seen("~"),)
+    if account.legs and account.legs[0].cancel_waits:
+        yield (Seen("c~"),)
     codes = ["QU", "QA", "NQ", "ST", "FRZ"]
     if world.state.row in {"T0", "TW", "PCT"}:
         # A stop that was the owner's hold may be removed at any step.
@@ -857,8 +901,17 @@ def test_stopped_mismatch_is_emitted_and_has_teeth():
     world = World(sale.State("TW"), Account(long=2, legs=(Leg(3, status="working"),), opening=3))
     after = step(world, (Seen("NQ"),))
     assert after.state.row == "PCT" and after.account.legs[0].pending
+    # The stop still stands at every step in TW, so the stop asks first; the mismatch's own cell
+    # is judged directly.
+    asked, actions = advance(world, Seen("MO"), 2, sale.TABLE)
+    assert asked.state.row == "PCT" and sale.Action.CANCEL in actions
     with pytest.raises(AssertionError, match="mismatch_cancels_in_same_step"):
-        step(world, (Seen("NQ"),), table=mutated("TW", "MO", next="TW", cancel=False))
+        advance(
+            world,
+            Seen("MO"),
+            2,
+            mutated_branch("TW", "MO", "cancel_due", next="TW", cancel=False),
+        )
 
 
 @pytest.mark.parametrize("event", ["oPF", "oFF"])
@@ -1304,14 +1357,6 @@ FROZEN_WORKING = WORKING + (Seen("oOTH"),)
             "echo_is_inert_one_step_late",
         ),
         (
-            "TW",
-            "HE",
-            "cancelable",
-            {"next": "TW", "cancel": False},
-            (Seen("QU"), Seen("QU"), Seen("ST"), Seen("oACC"), Seen("oCRJ"), Seen("HE")),
-            "an_ended_holdings_sale_is_asked_canceled",
-        ),
-        (
             "FZW",
             "HE",
             "cancelable",
@@ -1394,17 +1439,17 @@ HELD_WITH_A_FAULT = FROZEN_WORKING + (Seen("ST"), Seen("oCXL"))
         (
             "OX",
             "HE",
-            "cancelable",
+            "cancelable and cancel_due",
             {"next": "OX", "cancel": False},
-            WORKING + (Seen("HE", reopened=True), Seen("oCRJ"), Seen("NQ")),
+            WORKING + (Seen("HE", reopened=True), Seen("oCRJ"), Seen("c~"), Seen("NQ")),
             "an_ended_holdings_sale_is_asked_canceled",
         ),
         (
             "OX",
             "MO",
-            "always",
+            "cancel_due",
             {"next": "OX", "cancel": False},
-            WORKING + (Seen("HE"), Seen("oCRJ"), Seen("NQ")),
+            WORKING + (Seen("HE"), Seen("oCRJ"), Seen("c~"), Seen("NQ")),
             "mismatch_cancels_in_same_step",
         ),
     ],
@@ -1435,6 +1480,119 @@ def test_eleventh_form_mutations_have_teeth(row, event, history):
     assert walk(history).state.row == "X"
     with pytest.raises(AssertionError, match="an_ended_holding_keeps_no_row"):
         walk(history, table=mutated_branch(row, event, "not long_remains", next="T0"))
+
+
+def test_a_stopped_sales_end_asks_its_cancel_where_the_stop_did_not():
+    """TW x HE. In a step the standing stop asks first (ST precedes HE), so the end's own cell is
+    reached only where no stop is raised with it; it is judged directly, with its mutation."""
+    world = World(sale.State("TW"), Account(legs=(Leg(3, status="working"),), opening=3))
+    asked, actions = advance(world, Seen("HE", reopened=True), 2, sale.TABLE)
+    assert asked.state.row == "PCT" and sale.Action.CANCEL in actions
+    with pytest.raises(AssertionError, match="an_ended_holdings_sale_is_asked_canceled"):
+        advance(
+            world,
+            Seen("HE", reopened=True),
+            2,
+            mutated_branch("TW", "HE", "cancelable and cancel_due", next="TW", cancel=False),
+        )
+
+
+REFUSED_AT_END = WORKING + (Seen("HE", reopened=True), Seen("oCRJ"))
+REFUSED_FLAT = WORKING + (Seen("HE"), Seen("oCRJ"))
+REFUSED_UNDER_STOP = WORKING + (Seen("ST"), Seen("oCRJ"))
+
+
+def test_a_refused_cancel_is_asked_again_only_when_its_wait_has_passed():
+    """Never every step, never never: at a holding's end, flat or reopened, and under a stop."""
+    for history, resting, asking in (
+        (REFUSED_AT_END, "OX", "PCX"),
+        (REFUSED_FLAT, "OX", "PCX"),
+        (REFUSED_UNDER_STOP, "TW", "PCT"),
+    ):
+        refused = walk(history)
+        assert refused.state.row == resting and refused.account.legs[0].cancel_waits
+        waiting = walk((Seen("NQ"), Seen("QA"), Seen("NQ")), initial=refused)
+        assert waiting.state.row == resting and not waiting.account.legs[0].pending
+        again = walk((Seen("c~"), Seen("NQ")), initial=waiting)
+        assert again.state.row == asking and again.account.legs[0].pending
+
+
+@pytest.mark.parametrize(
+    "row,event,when,changes,history,property_name",
+    [
+        # Asked again at every step: the pace ignored.
+        (
+            "OX",
+            "HE",
+            "cancelable and not cancel_due",
+            {"next": "PCX", "cancel": True},
+            REFUSED_AT_END + (Seen("NQ"),),
+            "a_refused_cancel_waits_its_pace",
+        ),
+        (
+            "OX",
+            "MO",
+            "not cancel_due",
+            {"next": "PCX", "cancel": True},
+            REFUSED_FLAT + (Seen("NQ"),),
+            "a_refused_cancel_waits_its_pace",
+        ),
+        (
+            "TW",
+            "ST",
+            "cancelable and not cancel_due",
+            {"next": "PCT", "cancel": True},
+            REFUSED_UNDER_STOP + (Seen("NQ"),),
+            "a_refused_cancel_waits_its_pace",
+        ),
+        # Never asked again: the wait passes and nothing asks.
+        (
+            "OX",
+            "HE",
+            "cancelable and cancel_due",
+            {"next": "OX", "cancel": False},
+            REFUSED_AT_END + (Seen("c~"), Seen("NQ")),
+            "an_ended_holdings_sale_is_asked_canceled",
+        ),
+        (
+            "OX",
+            "MO",
+            "cancel_due",
+            {"next": "OX", "cancel": False},
+            REFUSED_FLAT + (Seen("c~"), Seen("NQ")),
+            "mismatch_cancels_in_same_step",
+        ),
+        (
+            "TW",
+            "ST",
+            "cancelable and cancel_due",
+            {"next": "TW", "cancel": False},
+            REFUSED_UNDER_STOP + (Seen("c~"), Seen("NQ")),
+            "a_standing_stop_asks_again_when_due",
+        ),
+        # Said at every refusal, or never said.
+        (
+            "PCX",
+            "oCRJ",
+            "cancel_refusal_told",
+            {"alert": True},
+            REFUSED_AT_END + (Seen("c~"), Seen("NQ"), Seen("oCRJ")),
+            "a_refused_cancel_is_told_once_per_leg",
+        ),
+        (
+            "PCT",
+            "oCRJ",
+            "not cancel_refusal_told",
+            {"alert": False},
+            REFUSED_UNDER_STOP,
+            "a_refused_cancel_is_told_once_per_leg",
+        ),
+    ],
+)
+def test_twelfth_form_mutations_have_teeth(row, event, when, changes, history, property_name):
+    walk(history)
+    with pytest.raises(AssertionError, match=property_name):
+        walk(history, table=mutated_branch(row, event, when, **changes))
 
 
 def test_a_hold_and_its_release_through_the_table():

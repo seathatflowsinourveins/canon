@@ -366,3 +366,34 @@ def test_the_status_under_a_hold_names_a_recorded_fault(tmp_path: Path) -> None:
     state, _, reason = strategy._holding_state(h.AAA, strategy.slots[h.AAA])
     assert "re-arms" not in (reason or ""), reason
     assert state == "frozen", (state, reason)
+
+
+def test_a_release_with_a_refused_cancel_still_gets_our_sell_canceled(tmp_path: Path) -> None:
+    """The hold is removed while our sell still rests, its cancel refused. The release waits for
+    the sale to end, so the cancel must still be asked again, at the pace, or the release waits
+    for ever and the holding is never counted again."""
+    strategy = two_quote(tmp_path)
+    under(strategy, 1, "9.89")
+    under(strategy, 2, "9.88")
+    (leg,) = strategy.sent
+    symbol_hold.write_hold(tmp_path, "AAA")
+    step(strategy, 3)
+    ours = strategy.cache.order(leg.client_order_id)
+    strategy.deliver("Submitted", leg=ours)
+    strategy.deliver("Accepted", leg=ours)
+    step(strategy, 4)
+    assert strategy.canceled == [leg.client_order_id] and c.row(strategy) == State("PCT")
+    strategy.deliver("CancelRejected", leg=ours, ts_event=h.T0 + 5 * h.SECOND)
+    step(strategy, 5)
+    assert c.row(strategy) == State("TW"), c.row(strategy)
+    symbol_hold.remove_hold(tmp_path, "AAA")
+    for seconds in range(6, 10):
+        step(strategy, seconds)
+    assert strategy.canceled == [leg.client_order_id], "not before the refusal's wait has passed"
+    step(strategy, 10)
+    assert strategy.canceled == [leg.client_order_id] * 2, "asked again though the hold is gone"
+    strategy.deliver("Canceled", leg=ours, ts_event=h.T0 + 11 * h.SECOND)
+    step(strategy, 11)
+    step(strategy, 12)
+    assert c.row(strategy) == State("G", 0), "the release is applied once our sell has ended"
+    assert strategy.sent == [leg]

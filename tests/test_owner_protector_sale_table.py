@@ -1950,6 +1950,11 @@ def test_timer_still_observes_a_stopped_sale_after_cancel_refusal():
     assert row(strategy).row == "TW" and len(strategy.canceled) == 1
     strategy.cached.held[0].signed_qty = Decimal(5)
     strategy.cached.held[0].quantity = h.Quantity.from_int(5)
+    # The venue refused the cancel a moment ago: even with our sale now larger than the long, it
+    # is asked again when the refusal's wait has passed, not at the next step.
+    strategy._on_step(SimpleNamespace(ts_event=strategy.clock.timestamp_ns()))
+    assert row(strategy).row == "TW" and len(strategy.canceled) == 1
+    strategy.test_clock.set_time(h.T0 + 60 * h.SECOND)
     strategy._on_step(SimpleNamespace(ts_event=h.T0 + 60 * h.SECOND))
     assert row(strategy).row == "PCT" and len(strategy.canceled) == 2
 
