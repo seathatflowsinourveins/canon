@@ -23,16 +23,21 @@ Each row keeps six fields: `type`, `symbol`, `ex_date`, `process_date`, `old_rat
 other field Alpaca sends (identifiers, CUSIPs, ISINs, currency, other dates and any text) is dropped
 before anything is written or printed. A unit split has no `symbol` or `ex_date`; its `old_symbol` and
 `effective_date` fill them, and the row says so in `mapped_from`. A row whose Alpaca record names a
-`new_symbol` other than its symbol is counted in `renamed_rows`, a named gap: the new ticker is not kept.
+`new_symbol` other than its symbol is counted in `renamed_rows`, by type in `renamed_by_type`, a named gap:
+the new ticker is not kept. At the pin only a unit split's model names one, and a unit split never enters
+the `SplitRead`.
 The reference page says the actions "are sorted by their `process_date`" and does not say which date the
 span bounds, so a split whose `ex_date` is in the span but whose `process_date` is not may be missing; that
 is named in `gaps`, and a row whose `ex_date` lies outside the span is marked. An `ex_date` or
-`process_date` on a day the map would refuse is withheld, with the reason. A symbol that is not a plain
-ticker is written masked and counted. Nothing of the account is read; the answer is market data.
+`process_date` on a day the map would refuse is withheld, with the reason; a withheld `ex_date` also
+withholds the row's symbol and rates, so nothing of a split on a refused day is kept but its type. A
+symbol Alpaca sends that is not a plain ticker is written masked and counted; a name asked that is not one
+is refused, unechoed, before anything is read. Nothing of the account is read; the answer is market data.
 
 The file is `splits-<start>_<end>-all.json` for every symbol, or a digest of the names asked in place of
-`all`. `split_read` turns it into the ranking's `movers_rank.SplitRead`, whose `split_since` is the
-exclusion's test.
+`all`. `split_read` turns the read of every symbol into the ranking's `movers_rank.SplitRead`, whose
+`split_since` is the exclusion's test; a read of named symbols is refused there, since it says nothing of
+the others.
 """
 
 from __future__ import annotations
@@ -159,6 +164,12 @@ def _map(path: Path) -> tuple[dict[str, str], str]:
         raise MapUnreadable(f"{path} has no dates")
     kinds = {}
     for day, entry in dates.items():
+        try:
+            iso = date.fromisoformat(day).isoformat() == day
+        except TypeError, ValueError:
+            iso = False
+        if not iso:
+            raise MapUnreadable(f"{path}: {day} is not a YYYY-MM-DD date")
         if not isinstance(entry, dict):
             raise MapUnreadable(f"{path}: the entry for {day} is not an object")
         kind = entry.get("kind")
@@ -237,6 +248,8 @@ def read_splits(
 
 
 MASKED = "<masked>"
+WITHHELD = "<withheld>"
+"""The symbol of a row whose ex-date is withheld: which name split on a day the map refuses is not kept."""
 
 
 def _symbol(value: object) -> str:
@@ -279,6 +292,9 @@ def masked_row(
         if why is not None:
             row[field] = None
             row[f"{field}_withheld"] = why
+    if row["ex_date"] is None:
+        # Which name split, and by how much, on a day the map refuses is withheld with the day.
+        row.update(symbol=WITHHELD, old_rate=None, new_rate=None)
     new = record.get("new_symbol")
     return row, bool(new) and new != record.get("old_symbol" if unit else "symbol")
 
@@ -296,6 +312,11 @@ def split_read(record: dict[str, Any]) -> tuple[SplitRead, dict[str, int]]:
     ex-date was withheld has none, so neither enters. The models are built without validation
     (`model_construct`) because the record keeps six fields and the models also require CUSIPs, which
     the split test does not read."""
+    if record.get("symbols") != "all":
+        raise ValueError(
+            "split_read takes the read of every symbol: a read of named symbols says nothing of the "
+            "others, so split_since would answer no split for a name it never asked"
+        )
     actions: list[ForwardSplit | ReverseSplit] = []
     left_out = {"unit_split": 0, "withheld": 0}
     for row in record["rows"]:
@@ -353,9 +374,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--end", type=_span_date, required=True, help="last day, YYYY-MM-DD, inclusive"
     )
     parser.add_argument("--date-map", type=Path, required=True, help="the sim lane's date map")
-    parser.add_argument(
-        "--catalog", type=_catalog, default=Path("catalog"), help="the catalog root"
-    )
+    parser.add_argument("--catalog", type=_catalog, default="catalog", help="the catalog root")
     names = parser.add_mutually_exclusive_group()
     names.add_argument("--symbols", help="comma-separated; default every symbol")
     names.add_argument("--symbols-file", type=Path, help="a file of symbols, one a line")
@@ -378,17 +397,30 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"paper:history corporate-actions: refused by the date map ({generated}): {', '.join(bad)}; nothing was read"
         )
         return 3
+    try:
+        text = (
+            args.symbols_file.read_text()
+            if args.symbols_file
+            else (args.symbols or "").replace(",", "\n")
+        )
+    except (OSError, ValueError) as e:
+        print(
+            f"paper:history corporate-actions: refused: the symbols file cannot be read ({type(e).__name__}); nothing was read"
+        )
+        return 3
+    lines = [s.strip().upper() for s in text.splitlines()]
+    bad_line = next((n for n, s in enumerate(lines, 1) if s and not SYMBOL.fullmatch(s)), None)
+    if bad_line is not None:
+        print(
+            f"paper:history corporate-actions: refused: the symbols' line {bad_line} is not a plain ticker; nothing was read"
+        )
+        return 3
+    symbols = sorted({s for s in lines if s})
     if args.check_only:
         print(
             f"paper:history corporate-actions: {args.start}..{args.end} allowed by the date map ({generated})"
         )
         return 0
-    text = (
-        args.symbols_file.read_text()
-        if args.symbols_file
-        else (args.symbols or "").replace(",", "\n")
-    )
-    symbols = sorted({s.strip().upper() for s in text.splitlines() if s.strip()})
     args.catalog.mkdir(parents=True, exist_ok=True)
     out = out_path(args.catalog, args.start, args.end, symbols)
     try:
@@ -399,6 +431,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             masked = [masked_row(k, r, start=args.start, end=args.end, kinds=kinds) for k, r in raw]
             rows = [row for row, _ in masked]
             renamed = sum(1 for _, new in masked if new)
+            renamed_by_type = {
+                t: sum(1 for r, new in masked if new and r["type"] == t) for t in TYPES
+            }
             hidden = sum(1 for row in rows if row["symbol"] == MASKED)
             outside = sum(1 for row in rows if not row["ex_date_in_read_span"])
             spread = sorted(
@@ -407,7 +442,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                 if r["ex_date"] is not None and r["process_date"] is not None
             )
             record = _record(
-                args, symbols, generated, pages, rows, renamed, hidden, outside, spread
+                args,
+                symbols,
+                generated,
+                pages,
+                rows,
+                renamed,
+                renamed_by_type,
+                hidden,
+                outside,
+                spread,
             )
             out.parent.mkdir(parents=True, exist_ok=True)
             partial = out.with_name(f"{out.name}.{os.getpid()}.partial")
@@ -432,6 +476,7 @@ def _record(
     pages: int,
     rows: list[dict[str, Any]],
     renamed: int,
+    renamed_by_type: dict[str, int],
     hidden: int,
     outside: int,
     spread: list[int],
@@ -449,6 +494,7 @@ def _record(
         "pages": pages,
         "rows": rows,
         "renamed_rows": renamed,
+        "renamed_by_type": renamed_by_type,
         "ex_date_outside_read_span": outside,
         "masked_symbols": hidden,
         "ex_minus_process_days": {"min": spread[0], "max": spread[-1]} if spread else None,
@@ -458,8 +504,9 @@ def _record(
                 "a split whose ex_date is in the span and whose process_date is not may be missing"
             ),
             (
-                f"{renamed} rows name a new_symbol, which is not kept: a name ranked under its new ticker is "
-                "not matched by symbol"
+                f"{renamed} rows name a new_symbol, which is not kept ({renamed_by_type['unit_split']} of them "
+                "unit splits, whose model always names one and which do not enter split_read's SplitRead): "
+                "a forward or reverse split's name ranked under a new ticker is not matched by symbol"
             ),
             (
                 f"{hidden} rows have a symbol that is not a plain ticker, written as {MASKED}: their "

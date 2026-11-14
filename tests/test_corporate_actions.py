@@ -310,7 +310,9 @@ def test_a_unit_split_maps_old_symbol_and_effective_date_and_says_so(
 def test_a_renamed_symbol_is_counted_as_a_named_gap(venue: Venue, tmp_path: Path) -> None:
     record = read(venue, tmp_path)
     assert record["renamed_rows"] == 2, "the reverse split with new_symbol and the unit split"
-    assert any("new_symbol" in g for g in record["gaps"])
+    assert record["renamed_by_type"] == {"reverse_split": 1, "forward_split": 0, "unit_split": 1}
+    gap = next(g for g in record["gaps"] if "new_symbol" in g)
+    assert "1 of them unit splits" in gap and "do not enter" in gap
     assert "AAB" not in json.dumps(record["rows"])
 
 
@@ -345,17 +347,22 @@ def test_an_ex_date_on_a_day_the_map_forbids_is_withheld(venue: Venue, tmp_path:
     record = json.loads(
         (out / "corporate-actions" / "splits-2026-09-05_2026-09-15-all.json").read_text()
     )
-    row = next(r for r in record["rows"] if r["symbol"] == "BBB")
+    row = next(r for r in record["rows"] if r["type"] == "forward_split")
     assert row["ex_date"] is None and row["ex_date_withheld"] == "held"
     assert "2026-09-17" not in json.dumps(record)
+    # Which name split, and by how much, on a day the map forbids is withheld with the date.
+    assert row["symbol"] == ca.WITHHELD and row["old_rate"] is None and row["new_rate"] is None
+    assert "BBB" not in json.dumps(record)
+    assert record["masked_symbols"] == 0
 
 
 def test_an_ex_date_on_a_weekday_the_map_omits_is_withheld(venue: Venue, tmp_path: Path) -> None:
     venue.pages[0]["corporate_actions"]["forward_splits"] = [dict(FORWARD, ex_date="2026-09-21")]
     record = read(venue, tmp_path)
-    row = next(r for r in record["rows"] if r["symbol"] == "BBB")
+    row = next(r for r in record["rows"] if r["type"] == "forward_split")
     assert row["ex_date"] is None and row["ex_date_withheld"] == "not in the map"
     assert "2026-09-21" not in json.dumps(record)
+    assert row["symbol"] == ca.WITHHELD and "BBB" not in json.dumps(record)
 
 
 def test_a_process_date_on_a_day_the_map_forbids_is_withheld(venue: Venue, tmp_path: Path) -> None:
@@ -370,6 +377,8 @@ def test_a_process_date_on_a_day_the_map_forbids_is_withheld(venue: Venue, tmp_p
     row = next(r for r in json.loads(text)["rows"] if r["symbol"] == "BBB")
     assert row["process_date"] is None and row["process_date_withheld"] == "judgment"
     assert "2026-09-17" not in text
+    # The ex-date is allowed, so the split stays whole for the exclusion: only the date is withheld.
+    assert row["ex_date"] == "2026-09-15" and (row["old_rate"], row["new_rate"]) == (1, 2)
 
 
 def test_a_named_read_does_not_overwrite_the_span_read_of_every_symbol(
@@ -421,6 +430,20 @@ def test_a_held_catalog_lock_stops_before_any_get(venue: Venue, tmp_path: Path, 
         ({"generated": "g"}, "no dates"),
         ({"generated": "g", "dates": {"2026-09-08": "development"}}, "2026-09-08"),
         ({"generated": "g", "dates": {"2026-09-08": {}}}, "2026-09-08 no kind"),
+        (
+            {
+                "generated": "g",
+                "dates": {"2026-09-08": {"kind": "development"}, "notes": {"kind": "x"}},
+            },
+            "notes is not a YYYY-MM-DD date",
+        ),
+        (
+            {
+                "generated": "g",
+                "dates": {"2026-09-08": {"kind": "development"}, "20260918": {"kind": "held"}},
+            },
+            "20260918 is not a YYYY-MM-DD date",
+        ),
     ],
 )
 def test_a_malformed_date_map_is_refused_by_name(
@@ -449,6 +472,50 @@ def test_split_read_feeds_the_rankings_split_test(venue: Venue, tmp_path: Path) 
     assert movers_rank.split_since(split_read, "BBB", date(2026, 9, 14), date(2026, 9, 15)) is True
     assert movers_rank.split_since(split_read, "AAA", date(2026, 9, 14), date(2026, 9, 15)) is False
     assert movers_rank.split_since(split_read, "AAA", date(2026, 9, 11), date(2026, 9, 14)) is True
+
+
+def test_split_read_refuses_a_record_of_named_symbols(venue: Venue, tmp_path: Path) -> None:
+    # A read of some names says nothing of the others, so it is never the universe's SplitRead.
+    record = read(venue, tmp_path, "--symbols", "AAA")
+    assert record["symbols"] == ["AAA"]
+    with pytest.raises(ValueError, match="every symbol"):
+        ca.split_read(record)
+
+
+def test_an_unreadable_symbols_file_is_refused_by_name_before_the_pair(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    monkeypatch.delenv(ENV_API_KEY, raising=False)
+    monkeypatch.delenv(ENV_SECRET_KEY, raising=False)
+    args = ["--start", "2026-09-05", "--end", "2026-09-15", "--date-map", str(date_map(tmp_path))]
+    missing = tmp_path / "missing.txt"
+    assert ca.main([*args, "--symbols-file", str(missing), "--check-only"]) == 3
+    assert "the symbols file cannot be read (FileNotFoundError)" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("check_only", [True, False])
+def test_a_symbol_that_is_not_a_plain_ticker_is_refused_unechoed(
+    venue: Venue, tmp_path: Path, capsys, check_only: bool
+) -> None:
+    names = tmp_path / "names.txt"
+    names.write_text("AAA\nan account note\n")
+    args = ["--start", "2026-09-05", "--end", "2026-09-15", "--date-map", str(date_map(tmp_path))]
+    extra = ["--check-only"] if check_only else ["--catalog", str(tmp_path / "out")]
+    assert ca.main([*args, "--symbols-file", str(names), *extra]) == 3
+    out = capsys.readouterr().out
+    assert "line 2 is not a plain ticker" in out
+    assert "account note" not in out.lower()
+    assert venue.sent == [] and not (tmp_path / "out").exists()
+
+
+def test_the_default_catalog_is_checked_against_the_ledger(tmp_path: Path, monkeypatch) -> None:
+    ledger = tmp_path / "ledger"
+    ledger.mkdir()
+    monkeypatch.setattr(ca, "LEDGER", ledger)
+    monkeypatch.chdir(ledger)
+    args = ["--start", "2026-09-05", "--end", "2026-09-15", "--date-map", str(date_map(tmp_path))]
+    with pytest.raises(SystemExit):
+        ca.main([*args, "--check-only"])
 
 
 def test_the_record_names_its_source_and_when_it_was_read(venue: Venue, tmp_path: Path) -> None:
