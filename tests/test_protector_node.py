@@ -1455,7 +1455,7 @@ def test_two_builder_segments_carry_the_level_distance_and_offset(controls, tmp_
         gc.collect()
         published = asyncio.Event()
         node, strategy = module.protector_node(
-            config(controls),
+            config(controls, gain_lock=True),
             (AAA,),
             feed="sip",
             book={"account_label": "windows"},

@@ -173,6 +173,8 @@ class Watched(SimulatedProtector):
 
     def __init__(self, level: str, *, venue_copy: bool = False) -> None:
         super().__init__(level)
+        # Both shapes prove the gain lock, which is opt-in (the lead, 2026-11-13 22:47).
+        self.settings.gain_lock = True
         self.asked: dict[str, Any] = {}
         self.venue_copy = venue_copy
         self.snapshots: list[tuple[int, Decimal | None, list[Any]]] = []

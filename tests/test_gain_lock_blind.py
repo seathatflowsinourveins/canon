@@ -313,7 +313,7 @@ def protector_type() -> tuple[Any, Any]:
 @contextmanager
 def protector_session(*, hide_cost_basis: bool = False):
     configure, observable = protector_type()
-    config = configure(feed="sip", levels={AAA: PROTECTOR_LEVEL})
+    config = configure(feed="sip", levels={AAA: PROTECTOR_LEVEL}, gain_lock=True)
     subject = observable(config)
     subject.hide_cost_basis = hide_cost_basis
     with replay(strategies=(subject,)) as harness:
