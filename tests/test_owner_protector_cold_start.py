@@ -631,6 +631,7 @@ def test_a_late_seed_does_not_change_the_spread_at_release() -> None:
             SimpleNamespace(
                 instrument_id=AAA,
                 client_order_id=slot.protect_id,
+                ts_event=AFTER_HOURS - 4 * SECOND,
             ),
         )
     )
