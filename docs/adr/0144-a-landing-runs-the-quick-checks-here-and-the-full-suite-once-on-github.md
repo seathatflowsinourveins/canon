@@ -64,7 +64,13 @@ landings started after it is on `main`; it changes no landing already in flight.
    because the full suite now runs only there and its two latest passing runs on `main` took 22 min 23 s
    and 22 min 31 s (read 2026-11-13 by the evidence-verifier from the workflow's run history), so a landing whose
    hosted run finishes ends with `main` updated; queueing beyond that still ends in an unconfirmed merge,
-   reported as before. The review gate,
+   reported as before. Amended 2026-11-14, on the lead's order: the `checks` job's timeout is 90 minutes
+   and the wait 95 (`LAND_WAIT_SECONDS`, default 5700), still above it. In a day of about 25 landings the
+   hosted suite grew from about 22 to about 36 minutes: passing runs on 2026-11-14 took 23-38 minutes
+   created to updated (on `main` 43617194822 33.9 and 43614583851 36.5, the `checks` job 33 min 48 s and
+   36 min 21 s; pull request run 43579294655 38.4, its job 38 min 19 s), and `main`'s push run 43621264808
+   and pull request run 43621201927 were cancelled at the 40-minute timeout while pytest ran. About 20 more
+   landings are expected, so the limit leaves room for further growth. The review gate,
    address check, branch rebase/merge rule, exact-head squash-merge arguments, subject and body stay as
    they are. Repository settings, rulesets and merge queues are untouched.
 5. **The lane's tests.** A lane still runs its unit's own tests before landing, and one full pytest when
@@ -152,6 +158,9 @@ Read 2026-11-13. Sources below distinguish direct reads from the lead's supplied
   and https://github.blog/changelog/2023-07-12-pull-request-merge-queue-is-now-generally-available/
   — "Pull request merge queues are available in any public repository owned by an organization", and the
   changelog says the same (fetched 2026-11-13).
+* `gh run list --workflow ci.yml` and `gh run view <id> --json jobs`, read 2026-11-14 — the run and
+  `checks` job times and the two cancelled runs in the amendment of 2026-11-14 to rule 4; each run is
+  this repository's `actions/runs/<id>` page on GitHub (fetched 2026-11-14 through GitHub's REST API by `gh`).
 * Lead's assignment, dated 2026-11-13 12:54, read 2026-11-13 — the chosen split, the timing/failure/load
   figures, retained local unit tests and full pytest for a new module, and the instruction to leave
   today's in-flight landings alone. The measurement logs were not supplied or independently read:
