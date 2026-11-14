@@ -368,7 +368,7 @@ WAITING = "unprotected: waiting"
 STEP_NS = 1_000_000_000  # The step timer's interval (on_start), the floor between step writes.
 OVERNIGHT_RETRY_NS = 60 * STEP_NS  # Review F7: an unread eligibility is read again after a minute.
 # A refused sale is sent again at a growing wait: the chase interval, doubled for each refusal in a
-# row, held at this cap, and started again by a leg the venue accepts or fills: 5, 10, 20, 40, then
+# row, held at this cap, and started again only by a fill of the open leg: 5, 10, 20, 40, then
 # 60 s. The form is NautilusTrader's ExponentialBackoff (nt@d53849b216e2
 # crates/network/src/backoff.rs:95-208: an initial delay, a factor, a maximum, a reset), which is
 # Rust and not reachable from a strategy, so this is glue in its form; no jitter, one client per
@@ -3199,9 +3199,13 @@ class OwnerProtector(Strategy):
                 slot.flight_answered = True
                 # A lag is the node's own, counted from its receipt of the answer.
                 slot.flight_answer_ns = getattr(event, "ts_init", event.ts_event)
-            if code in {"oPF", "oFF", "oLF", "oCXL", "oEXP"}:
-                slot.refusal_streak = 0  # a fill, or a leg that ended without a refusal
-            if code in {"oACC", "oPF", "oFF", "oLF"}:
+            open_leg = event.client_order_id == slot.protect_id
+            if open_leg and code in {"oPF", "oFF"}:
+                # Within a holding ONLY a fill of the open leg starts the pace again. A leg we
+                # cancel, a cancel by another hand, an expiry, an acceptance and a late fill of an
+                # earlier leg neither start it again nor add to it; a new holding starts at none.
+                slot.refusal_streak = 0
+            if open_leg and code in {"oACC", "oPF", "oFF"}:
                 if slot.refusals and code == "oACC":
                     self._say(
                         f"{event.instrument_id}: our sale was accepted after {slot.refusals} "

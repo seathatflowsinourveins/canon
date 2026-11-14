@@ -695,8 +695,8 @@ def test_refusals_in_a_row_wait_the_chase_interval_doubled_up_to_the_cap():
 
 
 def test_an_acceptance_alone_does_not_start_the_refusals_wait_again():
-    """A venue that accepts a leg and then rejects it keeps the pace: only a fill, or a leg that
-    ends without a refusal, starts the wait again. The acceptance still ends the ALERT's episode."""
+    """A venue that accepts a leg and then rejects it keeps the pace: only a fill of the open leg
+    starts the wait again. The acceptance still ends the ALERT's episode."""
     strategy = counted()
     sent(strategy)
     assert waits_after_refusals(strategy, 3) == [5, 10, 20]
@@ -717,8 +717,10 @@ def test_a_fill_starts_the_refusals_wait_again():
     assert waits_after_refusals(strategy, 2) == [5, 10]
 
 
-def test_a_leg_that_ends_without_a_refusal_starts_the_refusals_wait_again():
-    """Accepted, then replaced by our own re-price: the venue took that leg, so the pace starts again."""
+def test_our_own_reprice_cancel_keeps_the_refusals_pace():
+    """Accepted, then replaced by our own re-price: within a holding only a fill of the open leg
+    starts the pace again, so a venue that accepts, lets us re-price and refuses again is still
+    asked at the pace reached (about sixty refused orders an hour, never six a minute)."""
     strategy = counted()
     sent(strategy)
     assert waits_after_refusals(strategy, 3) == [5, 10, 20]
@@ -727,7 +729,69 @@ def test_a_leg_that_ends_without_a_refusal_starts_the_refusals_wait_again():
     assert c.row(strategy).row == "PCR", c.row(strategy)
     strategy.deliver_then_step("Canceled", ts_event=strategy.clock.timestamp_ns())
     assert c.row(strategy).row == "FL", c.row(strategy)
+    assert waits_after_refusals(strategy, 2) == [40, 60]
+
+
+@pytest.mark.parametrize("kind", ["Canceled", "Expired"])
+def test_a_leg_ended_by_another_hand_or_expired_keeps_the_refusals_pace(kind):
+    """Neither a cancel we did not ask nor an expiry starts the pace again or adds to it."""
+    strategy = counted()
+    sent(strategy)
+    assert waits_after_refusals(strategy, 3) == [5, 10, 20]
+    strategy.deliver_then_step("Accepted")
+    strategy.deliver_then_step(kind, ts_event=strategy.clock.timestamp_ns())
+    assert c.row(strategy).row == "G", c.row(strategy)
+    seconds_to_the_next_leg(strategy, strategy.clock.timestamp_ns())  # a new count, a new first leg
+    assert waits_after_refusals(strategy, 1) == [40]
+
+
+def test_a_late_fill_of_an_earlier_leg_restarts_neither_the_pace_nor_the_alert():
+    """A leg we canceled for a re-price fills late while its successors are being refused: that
+    fill is not of the open leg, so the pace goes on and no second ALERT is written."""
+    strategy = counted()
+    c.first_leg(strategy)
+    earlier = strategy.cached.working[-1]
+    strategy.observe("9.70", strategy.clock.timestamp_ns() + 6 * h.SECOND)
+    assert c.row(strategy).row == "PCR", c.row(strategy)
+    strategy.deliver_then_step("Canceled", ts_event=strategy.clock.timestamp_ns())
+    assert c.row(strategy).row == "FL", c.row(strategy)
     assert waits_after_refusals(strategy, 2) == [5, 10]
+    strategy.deliver_then_step("Filled", quantity=1, leg=earlier)
+    assert waits_after_refusals(strategy, 1) == [20]
+    refused = [line for line in alerts(strategy) if "venue refused our sale" in line]
+    assert len(refused) == 1, alerts(strategy)
+
+
+def test_a_later_episode_of_the_same_holding_carries_the_refusals_pace():
+    """After a run of refusals, a later episode's second try waits at the carried delay until a
+    fill: the price back over the level ends the episode, not the venue's refusing."""
+    strategy = counted()
+    sent(strategy)
+    assert waits_after_refusals(strategy, 2) == [5, 10]
+    refuse(strategy)
+    strategy.observe("10.00", strategy.clock.timestamp_ns() + h.SECOND)
+    assert c.row(strategy) == sale_table.State("G", 0), c.row(strategy)
+    seconds_to_the_next_leg(
+        strategy, strategy.clock.timestamp_ns()
+    )  # the later episode's first try
+    assert waits_after_refusals(strategy, 1) == [40]
+
+
+def test_a_new_holding_starts_the_refusals_pace_at_none():
+    strategy = counted()
+    sent(strategy)
+    assert waits_after_refusals(strategy, 3) == [5, 10, 20]
+    refuse(strategy)
+    old = strategy.slots[h.AAA]
+    assert old.refusal_streak == 4
+    held = strategy.cached.held[0]
+    held.ts_opened = held.ts_init = strategy.clock.timestamp_ns() + h.SECOND
+    for _ in range(3):
+        strategy.test_clock.set_time(strategy.clock.timestamp_ns() + h.SECOND)
+        strategy._on_step(SimpleNamespace(ts_event=strategy.clock.timestamp_ns()))
+    new = strategy.slots[h.AAA]
+    assert new is not old, "the holding bought later has a slot of its own"
+    assert new.refusal_streak == 0 and new.refusal_last_ns is None
 
 
 def test_a_chase_interval_of_zero_still_waits_a_second(monkeypatch):
