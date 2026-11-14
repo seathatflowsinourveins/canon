@@ -35,28 +35,34 @@ Contracts read at the pins on 2026-11-13:
   sessions.py:490-492: trust_env=False prevents implicit netrc authentication
   or proxy configuration, keeping the task's explicit pair as the sole source.
 
-Files default to CLAUDE_CONFIG_DIR/canon/exit-monitor/<A|B>/ (else ~/.claude).
+Files default to CLAUDE_CONFIG_DIR/canon/exit-monitor/<A|B|C>/ (else ~/.claude).
 memory.json carries episodes; status.json is for unit two to consume; records/
 has one JSONL file per New York trade date (20:00 rolls the date). alerts.jsonl
 is this monitor's OUTBOX, in the watchdog's form, not its shared alert file.
-Unit two owns delivery/retry, status display and installation of the 60s schedule.
+Unit two (ADR 0158): scripts/exit-monitor-notify delivers the outbox after each pass;
+scripts/automation install-exit-monitor <account>, the owner's command, installs the
+60 s agent for one account, never by plain install, and status shows its row. C is read only behind
+the lead's word, LEAD_GO, which the agent reads from exit-monitor/C/go at every
+firing and passes to the task and to monitor_task, each of which checks it again.
 
 Boundary ruling (lead, 2026-11-13): P20 and P21 are separate facts calling for
 different acts, so each has its own notice and status/record entry. Deduplication
 is per kind, account, holding and boundary, never by their joined message.
 
 Node-report contract (the lead's 2026-11-13 R7 level-book ruling), for its later
-writer: reports.json contains version=1, account=A|B, last_step_at (aware ISO),
+writer: reports.json contains version=1, account=A|B|C, last_step_at (aware ISO),
 step_seconds (positive), and holdings=[{symbol, quantity, state, level,
-armed_at, count, required_count, reason, sessions, client_order_id?, result?}].
-Each holding names armed at its level, guarded, counting n of N, waiting with
-its reason, or frozen with its reason and result=denied|rejected. Only armed
-and counting cover; freshness is at most three steps since last_step_at, not
-since armed_at. The monitor uses the state/quantity; the level, countdown and
+armed_at, count, required_count, reason, sessions, client_order_id?, result?,
+source?}]. The states and what each reads are REPORT_STATES below, the
+contract's one home; held reads held, never uncovered. Freshness is at most three steps since
+last_step_at, not since armed_at. The monitor uses the state/quantity; the level, countdown and
 free-text reason stay in the book (raw text could contain a venue identifier).
 Only our node's holdings belong there. The default session list is regular.
-An optional client_order_id identifies ONE stop whose quantity is its open
-remainder, never an aggregate. A venue stop with that identity stands alone;
+An optional client_order_id identifies ONE stop or sale of our lineage (ours or
+protect) whose quantity is its open remainder, never an aggregate. A working
+sale of ours the venue acknowledges, not of a stop kind, covers through that
+report alone, up to what the venue shows left; one not acknowledged adds
+nothing (ADR 0158's contract rows). A venue stop with that identity stands alone;
 an unidentified report adds nothing where another exit could be the same one.
 Repeated identities count once. No client order identifier is emitted.
 The injected assess/run_pass seam retains its original {symbol, quantity,
@@ -115,6 +121,34 @@ from . import symbol_hold
 
 NEW_YORK = ZoneInfo("America/New_York")
 DEFAULT_ACCOUNTS = ("A", "B")
+"""Accounts a pass reads with no further word."""
+GO_ACCOUNTS = ("C",)
+"""Accounts a pass reads only behind the lead's standing word, given in the same step (ADR 0158)."""
+LEAD_GO = "exit-monitor protect"
+"""The lead's word for C, exactly: the agent reads it from canon/exit-monitor/C/go at every firing."""
+REFUSED = "account refused; C needs the lead's named word; nothing read"
+COVER, NO_COVER, HELD, FROZEN = "cover", "no cover", "held", "frozen"
+REPORT_STATES: dict[str, str] = {
+    "armed": COVER,
+    "counting": COVER,
+    "cold": COVER,
+    "waiting": NO_COVER,
+    "guarded": NO_COVER,
+    "uncovered": NO_COVER,
+    "held": HELD,
+    "frozen": FROZEN,
+}
+"""The node-report contract's states and what each reads: its one home, which the parser and the
+tests read (ADR 0158; the deputy, 2026-11-14). `cold` covers on the node's fixed fallback distance;
+`uncovered` is the node's known no-cover state; `held` needs a source in HELD_SOURCES; `frozen` keeps
+any result, one outside FROZEN_RESULTS reading `other`. A state not here, missing or not text, costs
+its holding the report's cover, named without its text, and never the pass."""
+COVER_STATES = tuple(state for state, reads in REPORT_STATES.items() if reads == COVER)
+NO_COVER_STATES = tuple(state for state, reads in REPORT_STATES.items() if reads == NO_COVER)
+HELD_SOURCES = ("word", "order")
+"""A held report's source: the owner's word or the owner's order (ADR 0158)."""
+FROZEN_RESULTS = ("denied", "rejected", "voided", "fault", "other", "cover unread")
+"""A frozen report's results, the node's words (node_report.py); any other reads `other`."""
 INTERVAL_SECONDS = 60  # UNCALIBRATED: P19's schedule contract; installed by unit two.
 REPORT_FRESH_SECONDS = 150  # UNCALIBRATED: original injected armed-stop shorthand only.
 REPORT_FRESH_STEPS = 3  # UNCALIBRATED (P2/R7); the level book supplies the node's step duration.
@@ -195,10 +229,9 @@ def _local(value: datetime) -> datetime:
 def _fresh(report: Mapping[str, Any], now: datetime) -> bool:
     if not isinstance(report, Mapping):
         raise ReadFailed("node report is not an object")
-    sessions = report.get("sessions", ["regular"])
-    if not isinstance(sessions, list) or not all(isinstance(part, str) for part in sessions):
-        raise ReadFailed("node report names no valid session eligibility")
-    for field in ("symbol", "state", "client_order_id"):
+    # A state, quantity or sessions it cannot read is judged in _cover, for its holding alone (ADR 0158);
+    # a symbol or an identity that is not text names no holding, so it still fails the pass.
+    for field in ("symbol", "client_order_id"):
         if report.get(field) is not None and not isinstance(report[field], str):
             raise ReadFailed(f"node report {field} is not text")
     if "last_step_at" in report or "step_seconds" in report:
@@ -211,10 +244,20 @@ def _fresh(report: Mapping[str, Any], now: datetime) -> bool:
     return 0 <= age <= REPORT_FRESH_SECONDS
 
 
-def _cover(symbol: str, orders: Sequence[Any], reports: Sequence[Any], now: datetime, part: str):
+def _cover(
+    symbol: str,
+    orders: Sequence[Any],
+    reports: Sequence[Any],
+    now: datetime,
+    part: str,
+    ended_ids: frozenset[str] = frozenset(),
+):
     cover = active = foreign = Decimal(0)
     kinds: set[str] = set()
     venue_stops: set[str] = set()
+    working_sales: dict[str, Decimal] = {}
+    unacknowledged: set[str] = set()
+    ended: set[str] = set(ended_ids)
     report_notes: set[str] = set()
     frozen = ""
     for order in orders:
@@ -222,6 +265,10 @@ def _cover(symbol: str, orders: Sequence[Any], reports: Sequence[Any], now: date
             continue
         status = _value(_field(order, "status"))
         if status in custody.ENDED_AT:
+            # A sale of ours the venue rejected or ended this trade date is never cover, whatever a
+            # report says of it (the Codex read of 2026-11-14, P1-1).
+            if custody.lineage(_field(order, "client_order_id")) in (custody.OURS, custody.PROTECT):
+                ended.add(str(_field(order, "client_order_id")))
             continue
         qty = _decimal(_field(order, "qty"))
         filled = _decimal(_field(order, "filled_qty"))
@@ -234,9 +281,20 @@ def _cover(symbol: str, orders: Sequence[Any], reports: Sequence[Any], now: date
             continue
         # R7: any open sell of ours the venue shows, counted or not (being canceled, not yet
         # acknowledged, not a stop kind), is one a node report may not add as engine cover.
-        venue_stops.add(str(_field(order, "client_order_id")))
+        identity = str(_field(order, "client_order_id"))
+        if identity in ended:
+            # The trade date's ended orders, read after the open ones, show this sale ended: the
+            # later fact wins, and none of it is cover (the Codex re-read of 2026-11-14, R1).
+            continue
+        venue_stops.add(identity)
         kind = _value(_field(order, "type") or _field(order, "order_type"))
-        if kind not in STOP_KINDS or status not in ACKNOWLEDGED:
+        if status not in ACKNOWLEDGED:
+            unacknowledged.add(identity)
+            continue
+        if kind not in STOP_KINDS:
+            # Contract row 1 (ADR 0158): a sale of ours the venue acknowledges is cover only
+            # through the node report that names it; a bare limit sell of ours is not.
+            working_sales[identity] = left
             continue
         cover += left
         kinds.add(f"{owner} {kind}")
@@ -251,35 +309,74 @@ def _cover(symbol: str, orders: Sequence[Any], reports: Sequence[Any], now: date
     if not current_reports:
         report_notes.add("no protector running")
     armed_reports = []
+    held = ""
     for report in current_reports:
         state = report.get("state", "armed" if "last_step_at" not in report else None)
-        if state == "frozen":
+        reads = REPORT_STATES.get(state) if isinstance(state, str) else None
+        if reads == FROZEN:
+            # Contract row 3 (ADR 0158): frozen with any result reads frozen and keeps the pass;
+            # a result outside the node's words reads `other`, so no free text is carried.
             result = report.get("result")
-            if result not in ("denied", "rejected"):
-                raise ReadFailed("frozen node report names no denied or rejected sell")
-            frozen = result
+            frozen = result if result in FROZEN_RESULTS else "other"
             continue
-        if state in ("guarded", "waiting", "held"):
+        if reads == HELD:
+            # ADR 0158: a hold names its source, the owner's word or the owner's order.
+            source = report.get("source")
+            if source in HELD_SOURCES:
+                held = held or str(source)
+            else:
+                report_notes.add("a held report names no known source; it adds no cover")
             continue
-        if state not in ("armed", "counting"):
-            raise ReadFailed("node report state is not a level-book state")
+        if reads == NO_COVER:
+            # Contract row 2 (ADR 0158): `uncovered` is the node's known no-cover state.
+            continue
+        if reads != COVER:
+            # ADR 0158: a state this monitor does not know costs this holding the report's cover,
+            # by name, and never the pass: nodes and the monitor change at different times.
+            # Its text is not carried: it could name anything, and a note picks the reason kind.
+            report_notes.add("a node report state is not known to this monitor; it adds no cover")
+            continue
         armed_reports.append(report)
     seen_stops: set[str] = set()
+    cold = False
     for report in armed_reports:
-        qty = _decimal(report.get("quantity"))
+        # ADR 0158 (evidence-verifier/14): a bad row costs its holding the report's cover, named,
+        # never the pass.
+        try:
+            qty = _decimal(report.get("quantity"))
+        except ReadFailed:
+            report_notes.add("a report's quantity is not a number; it adds no cover")
+            continue
         sessions = report.get("sessions", ["regular"])
-        if not isinstance(sessions, list) or not set(sessions) <= PARTS:
-            raise ReadFailed("node report names no valid session eligibility")
+        if (
+            not isinstance(sessions, list)
+            or not all(isinstance(part, str) for part in sessions)
+            or not set(sessions) <= PARTS
+        ):
+            report_notes.add("a report names no valid session eligibility; it adds no cover")
+            continue
         identity = report.get("client_order_id")
         if identity:
-            if custody.lineage(identity) != custody.OURS:
-                raise ReadFailed("node report stop identity is not of our node lineage")
+            # Contract row 1 (ADR 0158): the sale a report names is ours, of our nodes' lineage
+            # or the protect lineage (the protector's sales are of the latter).
+            if custody.lineage(identity) not in (custody.OURS, custody.PROTECT):
+                raise ReadFailed("node report stop identity is not of our lineage")
             identity = str(identity)
-            if identity in venue_stops:
-                report_notes.add("report not added: the same stop is shown at the venue")
-                continue
             if identity in seen_stops:
                 report_notes.add("report not added: the same stop was already reported")
+                continue
+            if identity in ended:
+                report_notes.add("report not added: the sale it names has ended at the venue")
+                continue
+            if identity in working_sales:
+                # The venue acknowledges this sale and did not count it: the report counts it,
+                # once, for no more than the venue shows left of it.
+                qty = min(qty, working_sales[identity])
+            elif identity in unacknowledged:
+                report_notes.add("report not added: our sale is not shown as working at the venue")
+                continue
+            elif identity in venue_stops:
+                report_notes.add("report not added: the same stop is shown at the venue")
                 continue
             seen_stops.add(identity)
         elif venue_stops or len(armed_reports) > 1:
@@ -287,6 +384,9 @@ def _cover(symbol: str, orders: Sequence[Any], reports: Sequence[Any], now: date
             continue
         cover += qty
         kinds.add(NODE_STOP)
+        if report.get("state") == "cold":
+            cold = True
+            report_notes.add("cold: the node's stop is on its fixed fallback distance")
         if part in sessions:
             active += qty
     return (
@@ -296,7 +396,61 @@ def _cover(symbol: str, orders: Sequence[Any], reports: Sequence[Any], now: date
         ", ".join(sorted(kinds)) or "no armed exit",
         frozen,
         "; ".join(sorted(report_notes)),
+        held,
+        cold,
     )
+
+
+REASON_KINDS = (
+    "short",
+    "frozen",
+    "inactive in this session",
+    "partial cover",
+    "no protector running",
+    "node guarded",
+    "node waiting",
+    "node uncovered",
+    "report state not known",
+    "held with no known source",
+    "no armed exit",
+)
+"""Uncovered reason kinds the status counts (ADR 0158); never a report's free text."""
+
+
+def _reason_kind(
+    symbol: str,
+    short: bool,
+    frozen: str,
+    cover: Decimal,
+    quantity: Decimal,
+    note: str,
+    reports: Sequence[Any],
+    now: datetime,
+) -> str:
+    if short:
+        return "short"
+    if frozen:
+        return "frozen"
+    if cover >= quantity:
+        return "inactive in this session"
+    if cover:
+        return "partial cover"
+    if "no protector running" in note:
+        return "no protector running"
+    # A list: a report's state may be any JSON value, and only a word can match (ADR 0158).
+    states = [
+        report.get("state")
+        for report in reports
+        if isinstance(report, Mapping) and report.get("symbol") == symbol and _fresh(report, now)
+    ]
+    for state in NO_COVER_STATES:
+        if state in states:
+            return f"node {state}"
+    if "not known to this monitor" in note:
+        return "report state not known"
+    if "names no known source" in note:
+        return "held with no known source"
+    return "no armed exit"
 
 
 def assess(
@@ -316,6 +470,7 @@ def assess(
     read_error: str = "",
     held: frozenset[str] = frozenset(),
     holds_error: str = "",
+    ended_ids: frozenset[str] = frozenset(),
 ) -> list[dict[str, Any]]:
     """P1-P9/P22: pure; supplied clock/calendar facts override the wall-time test seam.
 
@@ -343,12 +498,13 @@ def assess(
         quantity = abs(quantity)
         cover = active = foreign = Decimal(0)
         exit_kind, frozen, frozen_source = "no armed exit", "", ""
-        report_note = ""
+        report_note = report_held = ""
+        cold = False
         reason = ""
         state = "uncovered"
         try:
-            cover, active, foreign, exit_kind, report_frozen, report_note = _cover(
-                symbol, orders, reports, now, part
+            cover, active, foreign, exit_kind, report_frozen, report_note, report_held, cold = (
+                _cover(symbol, orders, reports, now, part, ended_ids)
             )
             if short:
                 cover = active = Decimal(0)
@@ -369,7 +525,9 @@ def assess(
             else:
                 old = memory.get("episodes", {}).get(symbol, {})
                 frozen, frozen_source = old.get("frozen", ""), old.get("frozen_source", "")
-                if frozen_source == "venue" and rejected is not None:
+                if (frozen_source == "venue" and rejected is not None) or report_held:
+                    # A fresh report of a hold replaces a freeze carried from an earlier pass (the
+                    # Codex read of 2026-11-14, P2-3); a fresh freeze beside it still reads frozen.
                     frozen, frozen_source = "", ""
                 if not frozen and run_holds and not cover:
                     state = "unknown"
@@ -391,6 +549,13 @@ def assess(
             reason = (
                 f"{symbol_hold.HELD}: the protector sells none of it; removing the hold re-arms it"
                 + (f"; {reason}" if frozen or cover else "")
+            )
+        elif state == "uncovered" and report_held and not short and not frozen:
+            # ADR 0158: a node's report of a hold is a fact apart from coverage, as the owner's
+            # word read from the folder is. One notice when a hold by order begins: not built.
+            state = "held"
+            reason = f"held by the owner's {report_held} (node report)" + (
+                f"; {reason}" if cover else ""
             )
         elif state == "uncovered" and holds_error and not frozen:
             # A hold that cannot be read is unknown; a freeze still shows as one (review F8).
@@ -416,10 +581,14 @@ def assess(
                 source = "since the owner's hold was removed"
             elif symbol in (fills or {}):
                 since, source = _stamp((fills or {})[symbol]), "since fill"
+        kind = ""
+        if state == "uncovered":
+            kind = _reason_kind(symbol, short, frozen, cover, quantity, report_note, reports, now)
         findings.append(
             {
                 "account": account,
                 "symbol": symbol,
+                "reason_kind": kind,
                 "quantity": "not shown" if invalid and not quantity else str(quantity),
                 "side": "short" if short else "long",
                 "state": state,
@@ -444,6 +613,7 @@ def assess(
                 "frozen_source": frozen_source,
                 "invalid": bool(invalid),
                 "held_by_owner": symbol in held,
+                "cold": cold and state == "covered",
             }
         )
     return findings
@@ -492,8 +662,7 @@ def _load_memory(path: Path, account: str):
                 _stamp(episode["last_alert"])
             if episode["kind"] not in STATES or episode.get("frozen", "") not in (
                 "",
-                "denied",
-                "rejected",
+                *FROZEN_RESULTS,
             ):
                 raise ValueError
             if not isinstance(episode.get("memory_lost", False), bool):
@@ -1074,7 +1243,7 @@ def _boundary_warnings(account, now, clock, days, positions, orders, reports, me
             gain_key = f"P20:{key}"
             gain = _field(position, "unrealized_pl")
             if gain_key not in cache and gain is not None and _decimal(gain, signed=True) > 0:
-                _, active, _, kind, _, _ = _cover(symbol, orders, reports, now, edge["part"])
+                _, active, _, kind, *_ = _cover(symbol, orders, reports, now, edge["part"])
                 if active < quantity:
                     next_act = edge["next_open"] or clock.next_open
                     text = f"exit cannot act next: {symbol} quantity {quantity}, unrealized result {gain}, {kind}; next act {next_act.isoformat() if kind != 'no armed exit' else 'no armed exit'}"
@@ -1188,8 +1357,9 @@ def _reports(path: Path, account: str) -> list[dict[str, Any]]:
             raise ValueError
         holdings = []
         for holding in report["holdings"]:
-            if not isinstance(holding, dict) or "state" not in holding:
-                raise ValueError
+            # A holding with no state costs its own cover in _cover, never the pass (ADR 0158).
+            if not isinstance(holding, dict):
+                raise TypeError
             holdings.append(
                 {
                     **holding,
@@ -1317,6 +1487,12 @@ def _finish(
             "longs": sum(f["side"] == "long" for f in findings),
             **counts,
             "oldest_uncovered_age": oldest,
+            "cold": sum(bool(f.get("cold")) for f in findings),
+            "uncovered_by_reason": {
+                kind: n
+                for kind in REASON_KINDS
+                if (n := sum(f.get("reason_kind") == kind for f in findings))
+            },
             "boundary_warnings": boundary_warnings,
             "exit_blocked": None if error else _blocks_kept(memory),
             "exit_blocks_observed": not bool(error),
@@ -1390,14 +1566,11 @@ def run_pass(
     *,
     tape_reader: Callable | None = None,
     data: Any = None,
+    lead_go: str | None = None,
 ) -> dict[str, Any]:
     """P10-P22: one bounded read pass; all effects are monitor-owned local files."""
-    if account not in DEFAULT_ACCOUNTS:
-        return {
-            "ok": False,
-            "findings": [],
-            "summary": "account refused; C needs the lead's named word; nothing read",
-        }
+    if not admitted(account, lead_go):
+        return {"ok": False, "findings": [], "summary": REFUSED}
     root = _root(account)
     path = memory_path or root / "memory.json"
     findings: list[dict[str, Any]] = []
@@ -1412,6 +1585,7 @@ def run_pass(
             budget = ReadBudget()
             notes = []
             fills, rejected = {}, None
+            ended_ids: frozenset[str] = frozenset()
             boundary_events, boundary_warnings = [], []
             try:
                 if trading is None:
@@ -1483,8 +1657,25 @@ def run_pass(
                     )
                     for f in preliminary
                 )
+                # A sale a fresh report names that the venue does not show open may have ended this
+                # trade date: the ended orders say so, and an ended sale is never cover (the Codex
+                # read of 2026-11-14, P1-1).
+                open_ids = {str(_field(o, "client_order_id")) for o in orders}
+                history_needed = history_needed or any(
+                    isinstance(r, Mapping)
+                    and r.get("client_order_id")
+                    and str(r["client_order_id"]) not in open_ids
+                    for r in fresh_reports
+                )
                 if history_needed:
-                    fills, rejected = _history_facts(ended_orders(trading, now, budget), positions)
+                    history = ended_orders(trading, now, budget)
+                    fills, rejected = _history_facts(history, positions)
+                    ended_ids = frozenset(
+                        str(o.client_order_id)
+                        for o in history
+                        if _value(o.side) == "sell"
+                        and custody.lineage(o.client_order_id) in (custody.OURS, custody.PROTECT)
+                    )
                 reader = tape_reader or (
                     (
                         lambda symbol, start, end: read_tape(
@@ -1523,6 +1714,7 @@ def run_pass(
                 fills=fills,
                 rejected=rejected,
                 read_error=error,
+                ended_ids=ended_ids,
                 held=held,
                 holds_error=holds_error,
             )
@@ -1569,19 +1761,24 @@ def run_pass(
         return {"ok": False, "findings": unknown, "summary": reason}
 
 
+def admitted(account: str, lead_go: str | None = None) -> bool:
+    """A and B by default; C only with the lead's word, exactly LEAD_GO, given in this step."""
+    return account in DEFAULT_ACCOUNTS or (account in GO_ACCOUNTS and lead_go == LEAD_GO)
+
+
 def monitor_task(
-    account: str, trading_for: Callable | None = None, *, accounts: Sequence[str] | None = None
+    account: str,
+    trading_for: Callable | None = None,
+    *,
+    accounts: Sequence[str] | None = None,
+    lead_go: str | None = None,
 ) -> dict[str, Any]:
-    """One account per invocation. A/B default; no standing C authorization."""
-    configured = tuple(accounts) if accounts is not None else DEFAULT_ACCOUNTS
-    if account not in configured or account not in DEFAULT_ACCOUNTS:
-        return {
-            "ok": False,
-            "findings": [],
-            "summary": "account refused; C needs the lead's named word; nothing read",
-        }
+    """One account per invocation. A/B default; C only behind the lead's word (ADR 0158)."""
+    configured = tuple(accounts) if accounts is not None else DEFAULT_ACCOUNTS + GO_ACCOUNTS
+    if account not in configured or not admitted(account, lead_go):
+        return {"ok": False, "findings": [], "summary": REFUSED}
     if trading_for is not None:
-        return run_pass(account, trading_for(account))
+        return run_pass(account, trading_for(account), lead_go=lead_go)
     os.environ[DATA_ONLY_ENV] = "1"
     # The task loads exactly one account's pair into its own environment using
     # paper:account's keychain pattern. Nothing reads a second account's pair.
@@ -1589,19 +1786,39 @@ def monitor_task(
         trading = session_window.paper_trading()
         data = session_window.window_data()
     except KeyError:
-        return run_pass(account, None)
-    return run_pass(account, trading, data=data)
+        return run_pass(account, None, lead_go=lead_go)
+    return run_pass(account, trading, data=data, lead_go=lead_go)
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Display-only paper exit monitor; one pass, GET only"
     )
-    parser.add_argument("account", choices=DEFAULT_ACCOUNTS)
+    parser.add_argument("account", choices=DEFAULT_ACCOUNTS + GO_ACCOUNTS)
+    parser.add_argument("--lead-go", help=f"on C: the lead's word, exactly {LEAD_GO!r}")
     args = parser.parse_args()
-    result = monitor_task(args.account)
-    print(json.dumps(result, sort_keys=True))
+    result = monitor_task(args.account, lead_go=args.lead_go)
+    print(json.dumps(_said(args.account, result), sort_keys=True))
     return 0 if result["ok"] else 1
+
+
+def _said(account: str, result: Mapping[str, Any]) -> dict[str, Any]:
+    """What the entry point prints: the agent logs it to watch/, outside the account's folder, so
+    no symbol, quantity or reason (ADR 0158). What the folder keeps: records/ every finding but a
+    covered one, status.json the counts, memory.json each holding's state by symbol; a covered
+    finding's detail is not kept anywhere (a whole-pass file is a named follow-up)."""
+    findings = result.get("findings") or []
+    said: dict[str, Any] = {
+        "account": account,
+        "ok": bool(result.get("ok")),
+        "counts": {
+            state: n for state in STATES if (n := sum(f.get("state") == state for f in findings))
+        },
+        "holdings": [{"state": f.get("state")} for f in findings],
+    }
+    if not result.get("ok") and not findings:
+        said["summary"] = result.get("summary", "")
+    return said
 
 
 if __name__ == "__main__":

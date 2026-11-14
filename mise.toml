@@ -915,18 +915,23 @@ exec /usr/bin/timeout -s KILL 300 uv run --locked python -c 'from canon_trading.
 # The keychain reads are paper:account's pattern. Missing pairs reach the module
 # so it records an unknown pass. Unit two owns the all-hours 60-second schedule.
 [tasks."paper:exit-monitor"]
-description = "Write one paper account's exit status, record and alert outbox (GET only; no orders)"
+description = "Write one paper account's exit status, record and alert outbox (GET only; no orders; C only on the lead's word)"
 shell = "bash -c"
 timeout = "3m"  # keychain 2 x 10 s, the pass 50 s, the carrier 30 + 5 s, with room; its lock goes stale at 3 min
 usage = '''
-arg "<account>" help="tests: account A; windows: account B; C has no standing authorization" {
-  choices "tests" "windows"
+arg "<account>" help="tests: account A; windows: account B; protect: account C, only with the lead's word (ADR 0158)" {
+  choices "tests" "windows" "protect"
 }
+flag "--lead-go <lead_go>" help="on C: the lead's standing word exactly as 'exit-monitor protect', which the agent reads from canon/exit-monitor/C/go"
 '''
 run = '''
+go=()
 case "${usage_account:-}" in
   tests) svc=canon-alpaca-paper; label=A ;;
   windows) svc=canon-alpaca-paper-windows; label=B ;;
+  protect)
+    [ "${usage_lead_go:-}" = "exit-monitor protect" ] || { echo "paper:exit-monitor: C requires the lead's word 'exit-monitor protect' in this step; nothing read" >&2; exit 3; }
+    svc=canon-alpaca-paper-protect; label=C; go=(--lead-go "exit-monitor protect") ;;
   *) echo "paper:exit-monitor: account refused; C needs the lead's named word; nothing read" >&2; exit 3 ;;
 esac
 ALPACA_API_KEY="$(/usr/bin/timeout 10 /usr/bin/security find-generic-password -s "$svc" -a ALPACA_API_KEY -w 2>/dev/null)" || ALPACA_API_KEY=""
@@ -936,7 +941,7 @@ if [ -z "$ALPACA_API_KEY" ] || [ -z "$ALPACA_SECRET_KEY" ]; then
 fi
 export ALPACA_API_KEY ALPACA_SECRET_KEY CANON_PAPER_ACCOUNT="$usage_account" CANON_ALPACA_DATA_ONLY=1
 pass_rc=0
-/usr/bin/timeout -s KILL 50 uv run --locked python -m canon_trading.exit_monitor "$label" || pass_rc=$?
+/usr/bin/timeout -s KILL 50 uv run --locked python -m canon_trading.exit_monitor "$label" ${go[@]+"${go[@]}"} || pass_rc=$?
 unset ALPACA_API_KEY ALPACA_SECRET_KEY
 if ! "$MISE_PROJECT_ROOT/scripts/exit-monitor-notify" "$label"; then
   echo "paper:exit-monitor: carrier failed for account $label" >&2

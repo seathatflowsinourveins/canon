@@ -25,9 +25,14 @@
 #   nightly study          every 30 minutes, Mac awake       launchd user agent running mise.toml's study:nightly
 #                                                            in this clone: the latest recorded night studied
 #                                                            once, nothing when there is none (ADR 0089)
+#   exit monitor           every 60 s, Mac awake, per account  launchd user agent per account, installed only by
+#                          once installed                    install-exit-monitor: one GET-only pass and the
+#                                                            carrier's notification; C only on the lead's
+#                                                            word in canon/exit-monitor/C/go (ADR 0158)
 #
 # Usage: scripts/automation status | install [--defer-paper] | uninstall | differs | mark-user-config
 #        scripts/automation install-protector <tests|windows|protect> <OWN1|OWN3> | uninstall-protector <account>
+#        scripts/automation install-exit-monitor <tests|windows|protect> | uninstall-exit-monitor <account>
 # `install --defer-paper` installs everything but the paper session's runner, plist and clone, and leaves its
 # agent loaded as it is: the maintenance agent's round while a window runs from them, which defers that part
 # to the session boundary (home/.claude/canon/maintenance.sh, ADR 0065).
@@ -1412,6 +1417,238 @@ show_protector_status() {
   done
 }
 
+# The exit monitor's agent, one per account (unit two, ADR 0158; launchd.plist(5) StartInterval, as the
+# protector runner's): local.canon.exit-monitor-<account>, running this script's run-exit-monitor from its
+# own installed copy. Each firing runs `mise run paper:exit-monitor <account>` once, in a clone of origin's
+# main of its own, ~/.claude/canon/exit-monitor-<account>-checkout, never a checkout a person uses (ADR 0050):
+# one GET-only pass, then the carrier's delivery of the outbox. The clone is brought to origin's main by the
+# installed copy of paper-session.sh --recorder-checkout (the recorder's reused, marked clone) when it is
+# missing or its last refresh is EXITMON_REFRESH_SECS old; a failed fetch keeps the last good main, which the
+# helper says. At every firing HEAD must be the clone's origin/main with no tracked file changed, or nothing
+# runs (`refused`, not_main): a run is from main at every firing. Nothing installs it but
+# `scripts/automation install-exit-monitor <tests|windows|protect>`, the owner's command (no session runs it):
+# plain `install`, which the maintenance agent runs, never does, so it is off by default. On C (protect) a
+# firing reads the lead's standing word in canon/exit-monitor/C/go, exactly EXITMON_GO, at every firing, and
+# passes it to the task, which checks it again, as monitor_task does; only the lead writes that file, never
+# this script. A firing holds canon/exit-monitor/<A|B|C>/runner.lock, so one firing per account runs at a
+# time, and records watch/exit-monitor-<account>.json, which status reads with the monitor's own status.json
+# and the carrier's notify-status.json. The agent's own log is watch/exit-monitor-<account>.log.
+EXITMON_RUNNER="$CANON_HOME/exit-monitor-runner.sh"
+EXITMON_INTERVAL=60                                   # exit_monitor.INTERVAL_SECONDS
+EXITMON_GO="exit-monitor protect"                     # exit_monitor.LEAD_GO
+EXITMON_RUN_SECS=${CANON_EXITMON_RUN_SECS:-240}       # the task's 3m bound, mise's start and a margin
+EXITMON_REFRESH_SECS=${CANON_EXITMON_REFRESH_SECS:-1800}  # fetch origin's main at most every 30 minutes
+EXITMON_HELPER="$CANON_HOME/exit-monitor-checkout.sh"  # the runner's copy of paper-session.sh (--recorder-checkout)
+EXITMON_SILENT=$((EXITMON_INTERVAL + EXITMON_RUN_SECS + 300))
+# the monitor's own staleness, STALE_INTERVALS x INTERVAL_SECONDS in exit_monitor.py: a status older than
+# this is not trusted, whatever its stored healthy flag says (the Codex read of 2026-11-14, P2-5)
+EXITMON_PASS_STALE=180
+exitmon_label() { printf 'local.canon.exit-monitor-%s\n' "$1"; }
+exitmon_letter() { case "$1" in tests) echo A ;; windows) echo B ;; protect) echo C ;; *) return 1 ;; esac; }
+write_exitmon_plist() { # <account> <mise> <origin> <file>
+  cat > "$4" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$(exitmon_label "$1")</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>$(xml "$EXITMON_RUNNER")</string>
+    <string>run-exit-monitor</string>
+    <string>$(xml "$2")</string>
+    <string>$(xml "$CANON_HOME/exit-monitor-$1-checkout")</string>
+    <string>$(xml "$3")</string>
+    <string>$1</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>CLAUDE_CONFIG_DIR</key><string>$(xml "$CLAUDE_HOME")</string>
+    <key>MISE_TASK_RUN_AUTO_INSTALL</key><string>false</string>
+  </dict>
+  <key>WorkingDirectory</key><string>$(xml "$CANON_HOME")</string>
+  <key>StartInterval</key><integer>$EXITMON_INTERVAL</integer>
+  <key>RunAtLoad</key><false/>
+  <key>ProcessType</key><string>Background</string>
+  <key>StandardOutPath</key><string>$(xml "$CANON_HOME/watch/exit-monitor-$1.log")</string>
+  <key>StandardErrorPath</key><string>$(xml "$CANON_HOME/watch/exit-monitor-$1.log")</string>
+</dict>
+</plist>
+PLIST
+}
+# run-exit-monitor <mise> <clone> <origin> <tests|windows|protect>: one firing
+do_run_exit_monitor() {
+  [ "$#" = 4 ] || { echo "usage: automation run-exit-monitor <mise> <clone> <origin> <tests|windows|protect>" >&2; return 2; }
+  local m=$1 dir=$2 url=$3 account=$4 letter folder status go="" word rc=0 commit outcome note out stamp age ceiling last
+  local name
+  for name in "${!ALPACA_@}"; do unset "$name"; done
+  export PATH=/usr/bin:/bin:/usr/sbin:/sbin
+  letter=$(exitmon_letter "$account") || { echo "exit-monitor-runner: no such paper account: $account" >&2; return 2; }
+  folder="$CANON_HOME/exit-monitor/$letter"; status="$CANON_HOME/watch/exit-monitor-$account.json"
+  em_say() { echo "exit-monitor-runner[$account]: $(/bin/date -u +%Y-%m-%dT%H:%M:%SZ) $*"; }
+  em_record() { # <outcome> <exit code> <note>
+    local t rec
+    rec=$(jq -nc --argjson e "$(/bin/date +%s)" --arg a "$account" --arg o "$1" --argjson r "$2" --arg n "$3" --arg c "${commit:-none}" \
+          '{at_epoch: $e, account: $a, outcome: $o, exit_code: $r, note: $n, commit: $c}') || return 1
+    mkdir -p "${status%/*}" && t=$(mktemp "$status.XXXXXX") || return 1
+    if printf '%s\n' "$rec" > "$t" && mv -f "$t" "$status"; then return 0; fi
+    rm -f "$t"; return 1
+  }
+  mkdir -p "$folder" || { em_say "could not create $folder"; return 1; }
+  exec 6>>"$folder/runner.lock" || { em_say "could not open $folder/runner.lock"; return 1; }
+  "$LOCKF" -t 0 6 2>/dev/null || rc=$?
+  if [ "$rc" = 75 ]; then em_say "the previous firing is still running; nothing started"; exec 6>&-; return 0; fi
+  [ "$rc" = 0 ] || { em_say "could not take $folder/runner.lock (exit $rc)"; exec 6>&-; return 1; }
+  if [ "$account" = protect ]; then
+    if [ ! -f "$folder/go" ]; then
+      note="no_go: C runs nothing without the lead's standing word in $folder/go"
+      em_say "$note"; em_record refused 0 "$note"; exec 6>&-; return 0
+    fi
+    if ! word=$(cat "$folder/go" 2>/dev/null); then
+      note="go_unreadable: $folder/go"; em_say "$note"; em_record refused 0 "$note"; exec 6>&-; return 0
+    fi
+    if [ "$word" != "$EXITMON_GO" ]; then
+      note="go_mismatch: $folder/go does not read '$EXITMON_GO'; nothing run"
+      em_say "$note"; em_record refused 0 "$note"; exec 6>&-; return 0
+    fi
+    go=1
+  fi
+  stamp="$folder/clone-refreshed"
+  age=$EXITMON_REFRESH_SECS
+  if [ -d "$dir/.git" ] && [ -f "$stamp" ]; then
+    # a stamp that is empty or not a number (a firing killed while writing it) refreshes now
+    last=$(cat "$stamp" 2>/dev/null) || last=""
+    case "$last" in ''|*[!0-9]*) ;; *) age=$(( $(/bin/date +%s) - last )) ;; esac
+  fi
+  if [ "$age" -ge "$EXITMON_REFRESH_SECS" ]; then
+    if ! out=$(/bin/bash "$EXITMON_HELPER" --recorder-checkout "$m" "$dir" "$url" 6>&- 2>&1); then
+      note="checkout_failed: ${out//$'\n'/; }"; em_say "$note"; em_record failed 1 "$note"; exec 6>&-; return 1
+    fi
+    em_say "${out//$'\n'/; }"
+    /bin/date +%s > "$stamp" || em_say "could not write $stamp"
+  fi
+  # from main at every firing: HEAD is the clone's origin/main and no file differs or was added
+  # (untracked included, as protector_node._clean_on_main has it: a mise.local.toml would redefine the task)
+  commit=$(git -C "$dir" -c core.hooksPath=/dev/null rev-parse --verify -q HEAD 2>/dev/null) || commit="unknown"
+  word=$(git -C "$dir" -c core.hooksPath=/dev/null rev-parse --verify -q refs/remotes/origin/main 2>/dev/null) || word=""
+  out=$(git -C "$dir" -c core.hooksPath=/dev/null status --porcelain --untracked-files=normal 2>&1) || out="status failed"
+  if [ -z "$word" ] || [ "$commit" != "$word" ] || [ -n "$out" ]; then
+    note="not_main: $dir is not at its origin/main with no change or added file; nothing run; the next refresh restores it"
+    rm -f "$stamp"; em_say "$note"; em_record refused 0 "$note"; exec 6>&-; return 0
+  fi
+  # the clone's parent bounds mise's config search, as the recorder's does; unresolved or split: nothing runs
+  if ! ceiling=$(cd "$(dirname "$dir")" && pwd -P); then
+    note="ceiling_failed: could not resolve the clone's parent; nothing run"; em_say "$note"; em_record failed 1 "$note"; exec 6>&-; return 1
+  fi
+  case "$ceiling" in *:*|*,*)
+    note="ceiling_failed: the clone's parent holds a mise ceiling list separator; nothing run"; em_say "$note"; em_record failed 1 "$note"; exec 6>&-; return 1 ;;
+  esac
+  rc=0
+  if [ -n "$go" ]; then
+    (cd "$dir" && MISE_CEILING_PATHS="$ceiling" CANON_COMMIT="$commit" /usr/bin/timeout -k 10 "$EXITMON_RUN_SECS" "$m" run paper:exit-monitor "$account" --lead-go "$EXITMON_GO" < /dev/null 6>&-) || rc=$?
+  else
+    (cd "$dir" && MISE_CEILING_PATHS="$ceiling" CANON_COMMIT="$commit" /usr/bin/timeout -k 10 "$EXITMON_RUN_SECS" "$m" run paper:exit-monitor "$account" < /dev/null 6>&-) || rc=$?
+  fi
+  case "$rc" in
+    0) outcome=ok; note="pass exit 0" ;;
+    3) outcome=refused; note="the task refused (exit 3); nothing read" ;;
+    *) outcome=failed; note="pass exit $rc" ;;
+  esac
+  em_say "$outcome: $note"
+  em_record "$outcome" "$rc" "$note" || em_say "could not write $status"
+  exec 6>&-
+  [ "$outcome" != failed ] || return "$rc"
+}
+do_install_exit_monitor() {
+  [ "$#" = 1 ] || { note "usage: scripts/automation install-exit-monitor <tests|windows|protect>"; return 2; }
+  local account=$1 letter m dir branch t plist rc=0 folder url
+  letter=$(exitmon_letter "$account") || { note "  FAILED: no such paper account: $account"; return 2; }
+  # the runner's installed copy comes from this tree, so only a tree on main installs it
+  dir=${CANON_EXITMON_CHECKOUT:-$ROOT}   # override only for tests
+  branch=$(git -C "$dir" symbolic-ref --short -q HEAD 2>/dev/null) || branch=""
+  [ "$branch" = main ] || { note "  FAILED: $dir is not on main (${branch:-detached}); the agent runs only what main has passed"; return 1; }
+  m=$(find_mise 2>&1) || { note "  FAILED: $m"; return 1; }
+  url=$(git -C "$ROOT" remote get-url origin 2>/dev/null) && [ -n "$url" ] || { note "  FAILED: no origin remote for the exit monitor's clone"; return 1; }
+  case "$url" in https://*|/*) ;; *) note "  FAILED: the exit monitor's origin must be https"; return 1 ;; esac
+  if [[ "$url" =~ ^https://[^/?#]*@ ]]; then note "  FAILED: the exit monitor's origin carries credentials"; return 1; fi
+  case "$url" in *[?#]*) note "  FAILED: the exit monitor's origin has a query or fragment"; return 1 ;; esac
+  folder="$CANON_HOME/exit-monitor/$letter"; plist="$AGENTS_DIR/$(exitmon_label "$account").plist"
+  mkdir -p "$folder" "$AGENTS_DIR" "$CANON_HOME/watch" || { note "  FAILED: could not create $folder"; return 1; }
+  exec 6>>"$folder/runner.lock" || { note "  FAILED: could not open $folder/runner.lock"; return 1; }
+  "$LOCKF" -t 0 6 2>/dev/null || rc=$?
+  if [ "$rc" = 75 ]; then exec 6>&-; note "  deferred   exit monitor for $account: a firing is running; retry when it has ended"; return 0; fi
+  [ "$rc" = 0 ] || { exec 6>&-; note "  FAILED: could not take $folder/runner.lock (exit $rc)"; return 1; }
+  t=$(mktemp "$AGENTS_DIR/.exit-monitor.XXXXXX") || { exec 6>&-; note "  FAILED: could not write $plist"; return 1; }
+  if ! write_exitmon_plist "$account" "$m" "$url" "$t" || ! plutil -lint "$t" >/dev/null; then
+    rm -f "$t"; exec 6>&-; note "  FAILED: could not write $plist"; return 1
+  fi
+  if [ "${AUTOMATION_SKIP_LAUNCHD:-0}" != 1 ]; then unload "$(exitmon_label "$account")" || { rc=$?; rm -f "$t"; exec 6>&-; unload_note "$(exitmon_label "$account")" "$rc"; return 1; }; fi
+  if ! { /usr/bin/install -m 755 "$ROOT/home/.claude/canon/paper-session.sh" "$EXITMON_HELPER" \
+         && /usr/bin/install -m 755 "$ROOT/scripts/automation" "$EXITMON_RUNNER" && mv -f "$t" "$plist"; }; then
+    rm -f "$t"; exec 6>&-; note "  FAILED: could not install the exit monitor for $account"; return 1
+  fi
+  exec 6>&-
+  t="account $account ($letter), every $EXITMON_INTERVAL s from its own clone of origin's main, $CANON_HOME/exit-monitor-$account-checkout"
+  [ "$account" != protect ] || t="$t; it runs nothing until the lead writes '$EXITMON_GO' in $folder/go"
+  note "  wrote      $plist ($t)"
+  if [ "${AUTOMATION_SKIP_LAUNCHD:-0}" = 1 ]; then note "  not loaded (AUTOMATION_SKIP_LAUNCHD=1)"; return 0; fi
+  boot "$(exitmon_label "$account")" "$plist" "(first firing in $EXITMON_INTERVAL s)"
+}
+do_uninstall_exit_monitor() {
+  [ "$#" = 1 ] || { note "usage: scripts/automation uninstall-exit-monitor <tests|windows|protect>"; return 2; }
+  local plist rc=0
+  exitmon_letter "$1" >/dev/null || { note "  FAILED: no such paper account: $1"; return 2; }
+  plist="$AGENTS_DIR/$(exitmon_label "$1").plist"
+  if [ "${AUTOMATION_SKIP_LAUNCHD:-0}" != 1 ]; then unload "$(exitmon_label "$1")" || rc=$?; fi
+  [ "$rc" = 0 ] || { unload_note "$(exitmon_label "$1")" "$rc"; return 1; }
+  rm -f "$plist" || { note "  FAILED: could not remove $plist"; return 1; }
+  note "  removed    $plist; left: $CANON_HOME/exit-monitor/$(exitmon_letter "$1") (its records and any word file), its clone and the runner's copy"
+}
+# One row per installed exit monitor agent, none when there is none (so status does not fail for it).
+show_exit_monitor_status() {
+  local plist account letter v label sf nf
+  for plist in "$AGENTS_DIR"/local.canon.exit-monitor-*.plist; do
+    [ -f "$plist" ] || continue
+    account=${plist##*/local.canon.exit-monitor-}; account=${account%.plist}
+    letter=$(exitmon_letter "$account") || letter="?"
+    # before the first pass the monitor and the carrier have written nothing: read as empty, not as unreadable
+    sf="$CANON_HOME/exit-monitor/$letter/status.json"; [ -f "$sf" ] || sf=/dev/null
+    nf="$CANON_HOME/exit-monitor/$letter/notify-status.json"; [ -f "$nf" ] || nf=/dev/null
+    # shellcheck disable=SC2016  # jq program, not shell
+    v=$(jq -ner --argjson now "$(date +%s)" --argjson silent "$EXITMON_SILENT" --argjson passstale "$EXITMON_PASS_STALE" \
+          --slurpfile r "$CANON_HOME/watch/exit-monitor-$account.json" --slurpfile s "$sf" --slurpfile n "$nf" '
+        # an ISO time with an offset, fractional seconds allowed, as the monitor writes checked_at
+        def epoch: capture("^(?<d>[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})(\\.[0-9]+)?(?<z>Z|[+-][0-9]{2}:[0-9]{2})$")
+          | (.d + "Z" | fromdateiso8601)
+            - (if .z == "Z" then 0 else (.z[0:1] + "1" | tonumber) * ((.z[1:3] | tonumber) * 3600 + (.z[4:6] | tonumber) * 60) end);
+        ($r[0] | select(type == "object" and (.at_epoch | type) == "number")) as $run
+        | ($s[0] // {}) as $s | ($n[0] // {}) as $n
+        | (if $s.longs == null then null else ($now - ($s.checked_at | epoch)) end) as $passage
+        | (if $run.outcome == "failed" then "FAILED" elif $run.outcome == "refused" then "REFUSED"
+           elif $now - $run.at_epoch > $silent then "STALE"
+           elif $passage != null and $passage > $passstale then "STALE"
+           elif ($s.unhealthy_reasons // []) | index("uncovered at or over alert age") then "UNCOVERED"
+           elif $s.healthy == false then "FAILED"
+           elif ($n.error // "") != "" then "FAILED" else "ok" end)
+          + "\t" + $run.outcome + "; " + ($run.note // "")
+          + (if $passage != null and $passage > $passstale then "; the monitor'"'"'s last pass " + ($passage | floor | tostring) + " s old" else "" end)
+          + (if $s.longs == null then "; no pass status yet"
+             else "; " + ($s.longs | tostring) + " longs, " + (($s.covered // 0) | tostring) + " covered, "
+               + (($s.uncovered // 0) | tostring) + " uncovered"
+               + (if ($s.unhealthy_reasons // []) | length > 0 then " (" + ($s.unhealthy_reasons | join("; ")) + ")" else "" end) end)
+          + (if $n.pending == null then "" else "; carrier " + ($n.pending | tostring) + " pending" end)
+          + (if ($n.error // "") != "" then "; carrier failed: " + ($n.error | tostring) else "" end)' 2>/dev/null) || v=""
+    if [ -n "$v" ]; then label=${v%%$'\t'*}; v=${v#*$'\t'}
+    else label=UNKNOWN; v="no readable status at $CANON_HOME/watch/exit-monitor-$account.json (first firing $EXITMON_INTERVAL s after install)"; fi
+    if ! cmp -s "$ROOT/scripts/automation" "$EXITMON_RUNNER" || ! cmp -s "$ROOT/home/.claude/canon/paper-session.sh" "$EXITMON_HELPER"; then
+      [ "$(paper_rank OUTDATED)" -le "$(paper_rank "$label")" ] || label=OUTDATED
+      v="$v; installed runner differs from this tree: the owner reruns scripts/automation install-exit-monitor $account"
+    fi
+    check_row "exit monitor $account" "$label" "$v | log $CANON_HOME/watch/exit-monitor-$account.log"
+  done
+}
+
 # The collector agent runs otelcol with the config from home/.claude/canon/otel/, kept alive by launchd
 # (launchd.plist(5) KeepAlive, RunAtLoad; KeepAlive true, so a SIGKILL or a clean exit is restarted too);
 # CANON_OTEL_DIR tells the config where to write logs.jsonl. Its own log, at service.telemetry.logs.level
@@ -2258,6 +2495,7 @@ do_status() {
 
   show_recorder_status
   show_protector_status
+  show_exit_monitor_status
   show_baseline_status
 
   # The collector: launchd must show it running (KeepAlive restarts it); the file's age is shown, not judged,
@@ -2536,6 +2774,9 @@ case "${1:-}" in
   run-protector) shift; do_run_protector "$@" ;;
   install-protector) shift; do_install_protector "$@"; exit $? ;;
   uninstall-protector) shift; do_uninstall_protector "$@"; exit $? ;;
+  run-exit-monitor) shift; do_run_exit_monitor "$@" ;;
+  install-exit-monitor) shift; do_install_exit_monitor "$@"; exit $? ;;
+  uninstall-exit-monitor) shift; do_uninstall_exit_monitor "$@"; exit $? ;;
   build-movers-baseline) shift; do_baseline_movers "$@" ;;
   status)    do_status ;;
   # the failures again after the status table, the last lines the owner sees, and the exit code with them
