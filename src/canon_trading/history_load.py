@@ -870,6 +870,15 @@ def _load_trade_part(
     ticks = []
     rounded = 0
     first_rounding = ""
+    # A print of size 0 (an after-hours print seen 2026-11-13) cannot be a TradeTick at the pin:
+    # Quantity refuses a size that is not positive. It is skipped and counted, never fatal.
+    unsized = [row for row in answered if not row[0].size > 0]
+    if unsized:
+        answered = [row for row in answered if row[0].size > 0]
+        out(
+            f"paper:history: Skipped {len(unsized)} size-0 {what}; "
+            f"the first at {unsized[0][0].timestamp}"
+        )
     try:
         for trade, ts_event in answered:
             tick = parse_trade(trade, instrument, ts_event, ts_event=ts_event)
