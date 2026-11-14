@@ -1613,3 +1613,48 @@ def test_a_position_unreadable_at_the_end_is_named_with_its_count_last_seen_at_t
     (alert,) = [line for line in said.splitlines() if line.startswith("ALERT BBB:")]
     assert "2 held, last seen at start" in alert and "left unprotected" in alert, alert
     assert strategy.sent == before
+
+
+def test_a_position_unreadable_at_the_start_is_named_at_the_end_when_the_end_read_fails(
+    controls, tmp_path, monkeypatch, capsys
+):
+    """A symbol skipped as unreadable at the start is named in the end report when the end read itself
+    fails: what the start could not read is not forgotten by the stop."""
+    module, settings, strategy, _foreign, _reads, built = real_reader(monkeypatch, controls)
+    trading = Listing(listed("AAA", "10"), listed("BBB", "NaN"))
+
+    def failing() -> list:
+        raise ConnectionError("positions offline")
+
+    def stop(_node, _ends):
+        strategy.on_stop()
+        trading.get_all_positions = failing
+
+    monkeypatch.setattr(window, "_run_node", stop)
+    with pytest.raises(RuntimeError, match="end positions read failed"):
+        module.run_protector(settings, trading=trading, lock_dir=tmp_path)
+    assert set(built[0][1]) == {AAA}
+    said = capsys.readouterr().out
+    alerts = [line for line in said.splitlines() if line.startswith("ALERT BBB:")]
+    assert len(alerts) == 2, said
+    assert "left unprotected by this node" in alerts[1], alerts[1]
+
+
+@pytest.mark.parametrize(("qty", "side"), [("0", "long"), ("0", "short"), ("-0", "short")])
+def test_a_holding_with_a_zero_quantity_is_skipped_by_name_and_every_other_long_is_covered(
+    controls, tmp_path, monkeypatch, capsys, qty, side
+):
+    """A position listed with a zero quantity is no holding the node can protect: it is named with an
+    ALERT and left out, a level for it with it, and every other long is covered, never a refusal of the
+    whole node (the lead, 2026-11-13 21:27)."""
+    module, _settings, _strategy, _foreign, _reads, built = real_reader(monkeypatch, controls)
+    settings = config(controls, levels={AAA: Price.from_str("9.50"), BBB: Price.from_str("1.50")})
+    trading = Listing(listed("AAA", "10"), listed("BBB", qty, side))
+    module.run_protector(settings, trading=trading, lock_dir=tmp_path)
+    assert len(built) == 1
+    assert set(built[0][1]) == {AAA}
+    assert set(built[0][0].levels) == {AAA}
+    start = next(
+        line for line in capsys.readouterr().out.splitlines() if line.startswith("ALERT BBB:")
+    )
+    assert "skipped, nothing sent" in start, start

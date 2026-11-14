@@ -475,6 +475,12 @@ def run_protector(
         # is named with an ALERT and skipped, its symbol and any level for it left out of the node, so
         # every other long is still covered (the lead, 2026-11-13 21:27 and 21:35).
         held, unread = window.position_reads(trading)
+        # A zero quantity (a short read as -0 among them) is no holding this node can protect: it is
+        # named and skipped like an unreadable one, never a refusal of every other long.
+        for symbol, qty in sorted(held.items()):
+            if qty == 0:
+                unread[symbol] = f"position in {symbol} is listed with quantity {qty}, no holding"
+                del held[symbol]
         for symbol, why in sorted(unread.items()):
             print(
                 f"ALERT {symbol}: {why}, so this node does not protect it; skipped, nothing sent for it",
@@ -487,8 +493,6 @@ def run_protector(
             )
         if not held:
             raise window.WindowRefused("no starting holding; no protector node started")
-        if any(not qty.is_finite() or qty == 0 for qty in held.values()):
-            raise window.WindowRefused("a starting holding has an invalid quantity")
         for instrument in config.levels:
             if held.get(instrument.symbol.value, 0) <= 0:
                 raise window.WindowRefused(
@@ -532,9 +536,10 @@ def run_protector(
                 last_seen = ""
             except Exception as e:  # noqa: BLE001 - last seen is explicitly not a current account read
                 errors.append(f"end positions read failed: {type(e).__name__}")
+                # What the start could not read is named again, as the start read it.
                 remaining, unread_now, last_seen = (
                     held,
-                    {},
+                    unread,
                     "last seen at start; current quantity UNVERIFIED; ",
                 )
             for symbol, qty in sorted(remaining.items()):
