@@ -118,11 +118,10 @@ def test_two_slow_unread_names_leave_armed_quotes_and_steps_time_to_run(monkeypa
         quote_stamps.append(at)
         step(strategy, at)
     elapsed = (strategy.clock.timestamp_ns() - start) // SECOND
-    assert (len(reader.reads), elapsed) == (2, 72), (
-        "F7 on the base: 20 failed reads consume 620 of 630 seconds across ten callbacks",
-        len(reader.reads),
-        elapsed,
-    )
+    # On the base, 20 failed reads took 620 of 630 s. Property: within the minute's rest,
+    # each unread name is read once, and the ten callbacks lose only those reads' time.
+    assert len(reader.reads) == 2, reader.reads
+    assert elapsed <= 10 + 2 * 31, elapsed
     assert managed == [AAA] * 20, "every quote and timer step must still manage the armed long"
     assert strategy.venue_quotes[AAA].ts_event == quote_stamps[-1]
     assert len(strategy.sent) == 1 and not strategy.canceled
@@ -150,3 +149,59 @@ def test_slow_answer_in_retry_batch_also_starts_the_shared_minute(eligible: bool
     hold(strategy, (BBB,))
     step(strategy, reader.reads[-1][2] + 120 * SECOND)
     assert len(reader.reads) == 5
+
+
+def test_new_names_read_while_a_retry_waits_never_postpone_it() -> None:
+    """F7's review, 3: a new name's first read moved the shared rest, so a new answered name
+    every 50 s kept an unread holding from ever being read again."""
+    strategy = Harness(session_part="overnight")
+    reader = SlowAssets(strategy)
+    strategy.settings.trading = reader
+    hold(strategy, (AAA,))
+    strategy.on_start()
+    retry_due = reader.reads[-1][2] + 60 * SECOND
+    names = [AAA]
+    steps = []
+    for n in range(4):
+        new = InstrumentId.from_str(f"N{n}X.ALPACA")
+        reader.answers[f"/assets/N{n}X"] = {"overnight_tradable": True}
+        names.append(new)
+        hold(strategy, tuple(names))
+        steps.append(strategy.clock.timestamp_ns() + 50 * SECOND)
+        step(strategy, steps[-1])
+        assert new in strategy.slots
+    retried = [start for route, start, _ in reader.reads[1:] if route == "/assets/AAA"]
+    assert retried, ("the unread name was never read again", reader.reads)
+    # Read at the first step at or after its minute, before that step's new name.
+    assert retried[0] == min(at for at in steps if at >= retry_due), (retried, steps, retry_due)
+
+
+def test_a_supplied_level_arms_its_holding_once_a_retried_read_answers() -> None:
+    """F7's review, 1: a supplied level whose first eligibility read failed was dropped at the
+    retry, and the holding self-armed on today's plan below the owner's level."""
+    strategy = Harness(session_part="overnight")
+    reader = SlowAssets(strategy)
+    strategy.settings.trading = reader
+    strategy.levels[AAA] = Price.from_str("9.90")
+    strategy.on_start()
+    assert AAA in strategy.frozen and not strategy.slots
+    reader.answers["/assets/AAA"] = {"overnight_tradable": True}
+    step(strategy, reader.reads[-1][2] + 60 * SECOND)
+    assert strategy.slots[AAA].level == Price.from_str("9.90"), strategy.said
+    assert AAA in strategy.applied
+
+
+def test_a_supplied_level_never_binds_the_next_holding_after_an_unread_read() -> None:
+    strategy = Harness(session_part="overnight")
+    reader = SlowAssets(strategy)
+    strategy.settings.trading = reader
+    strategy.levels[AAA] = Price.from_str("9.90")
+    strategy.on_start()
+    # The holding the level was supplied for ends and another is bought before the retry.
+    later = position()
+    later.ts_opened = later.ts_init = strategy.clock.timestamp_ns()
+    strategy.cached.held = [later]
+    reader.answers["/assets/AAA"] = {"overnight_tradable": True}
+    step(strategy, reader.reads[-1][2] + 60 * SECOND)
+    assert strategy.slots[AAA].level != Price.from_str("9.90")
+    assert any("supplied level 9.90 not applied" in note for note in strategy.said), strategy.said
