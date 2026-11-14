@@ -955,6 +955,7 @@ flag "--feed <feed>" help="sip or boats; otherwise selected from Alpaca's clock/
 flag "--holds-dir <holds_dir>" required=#true help="absolute holds folder; any entry refuses the start"
 flag "--inbox <inbox>" required=#true help="absolute inbox file or folder; unread or nonempty refuses the start"
 flag "--lead-go <lead_go>" help="on C: carry the lead's start instruction exactly as 'protect OWN1' or 'protect OWN3'"
+flag "--lock-wait <lock_wait>" help="0-300, default 0: wait this long for the account's locks, then refuse (the protector runner's successor)"
 '''
 run = '''
 case "${usage_row:-}" in
@@ -983,6 +984,7 @@ args=("$usage_account" --row "$usage_row" --holds-dir "$usage_holds_dir" --inbox
 [ -z "${usage_minutes:-}" ] || args+=(--minutes "$usage_minutes")
 [ -z "${usage_feed:-}" ] || args+=(--feed "$usage_feed")
 [ -z "${usage_lead_go:-}" ] || args+=(--lead-go "$usage_lead_go")
+[ -z "${usage_lock_wait:-}" ] || args+=(--lock-wait "$usage_lock_wait")
 # 16 h plus 20 min startup; TERM gives session_window.STOP_GRACE_SECS (785) to stop, then KILL.
 # The module takes both canonical locks for its whole lifetime and uses session_window._run_node's
 # clock/stop bounds. Nothing invokes the session window's flattening step.

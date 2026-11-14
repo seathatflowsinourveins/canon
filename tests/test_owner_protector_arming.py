@@ -5,10 +5,10 @@ The lead's ruling on unit 10's composed review (2026-11-13, 15:55):
   cache, is dropped at the refusal and named EVERY time. The holding it was supplied for is named
   unprotected at every step. A later long on that symbol self-arms or is named unprotected; no
   symbol is skipped in silence.
-- P2 (ruling 6, "no election on one observation"): (a) the first-step guard is not spent until a
-  quote RECEIVED after the arming has been seen; (b) a self-armed level is planned from a quote no
-  older than `protect.QUOTE_MOST`, the bound paper:protect plans on. Given only an older one, the
-  protector waits for a fresh quote and says so.
+- P2 (ruling 6, "no election on one observation"): the first-step guard requires a newer venue
+  stamp after arming. U-h Q1/Q4 replaces the old QUOTE_MOST planning limit: the current maximum
+  may plan at any age within the open session part, with its age named; an earlier-part quote
+  waits for this part's first quote and says so.
 """
 
 from __future__ import annotations
@@ -139,24 +139,23 @@ def test_a_supplied_level_guard_is_not_spent_on_a_quote_cached_before_its_adopti
     assert len(strategy.sent) == 1
 
 
-def test_a_stale_cached_quote_makes_the_protector_wait_and_say_so_then_arm_from_a_fresh_one() -> (
-    None
-):
+def test_a_prior_part_quote_waits_named_then_arms_from_this_parts_first_quote() -> None:
     strategy = Harness()
     strategy.cached.latest = quote("12.00", T0)
-    strategy.test_clock.set_time(T0 + 61 * SECOND)
+    now = T0 + 6 * 3600 * SECOND  # 17:00 New York; the cached 11:00 quote is before this part.
+    strategy.test_clock.set_time(now)
     strategy.on_start()
-    assert strategy.slots[AAA].level is None, "a level was planned from a stale quote"
-    assert any("waiting for a fresh quote" in line for line in unprotected_lines(strategy))
-    strategy.observe("10.00", T0 + 62 * SECOND)
+    assert strategy.slots[AAA].level is None, "a level was planned from the previous part"
+    assert any("before the open session part" in line for line in unprotected_lines(strategy))
+    strategy.observe("10.00", now + SECOND)
     distance, _ = task_distance(strategy, "OWN1")
     level = strategy.slots[AAA].level
     assert level is not None
     assert level.as_decimal() == up_on_step(Decimal("10.00") - distance)
     assert not strategy.sent, "the quote the level was armed from is not an observation"
-    strategy.observe("10.00", T0 + 63 * SECOND)
+    strategy.observe("10.00", now + 2 * SECOND)
     assert not strategy.sent, "the first quote after the arming is the guarded one"
-    strategy.observe("10.00", T0 + 64 * SECOND)
+    strategy.observe("10.00", now + 3 * SECOND)
     assert len(strategy.sent) == 1
     assert protect.QUOTE_MOST.total_seconds() == 60
 

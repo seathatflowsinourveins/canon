@@ -77,7 +77,9 @@ def test_r1b_a_quote_older_than_a_seen_spread_refusal_never_spends_the_guard() -
 
 
 @pytest.mark.parametrize("old_clock", ["stamp", "receipt"])
-def test_r2_staleness_uses_the_earlier_of_stamp_and_receipt(old_clock: str) -> None:
+def test_r2_age_is_named_from_the_earlier_clock_and_an_ahead_stamp_stays_refused(
+    old_clock: str,
+) -> None:
     strategy = Harness()
     stamp, receipt = T0 - 90 * SECOND, T0 - SECOND
     if old_clock == "receipt":
@@ -86,8 +88,14 @@ def test_r2_staleness_uses_the_earlier_of_stamp_and_receipt(old_clock: str) -> N
     strategy.adopt_holding(AAA, Price.from_str("10.00"))
     slot = strategy.slots[AAA]
     assert slot.armed_event is None, "a stale quote became the arming reference"
-    assert slot.distance is None, "a distance was planned on a stale quote"
-    assert "fresh quote" in strategy.frozen[AAA]
+    if old_clock == "stamp":
+        assert slot.distance is not None, "age alone within this part no longer refuses the plan"
+        assert slot.distance.quote_age.total_seconds() == 90
+        assert any("quote 90 s old" in line for line in strategy.said)
+    else:
+        assert slot.distance is None, "a stamp 89 s ahead of receipt is still refused"
+        assert "ahead of its receipt" in strategy.frozen[AAA]
+    assert not strategy.sent
 
 
 @pytest.mark.parametrize("self_armed", [False, True], ids=["supplied", "self-armed"])

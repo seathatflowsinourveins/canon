@@ -7,10 +7,14 @@ the real OwnerProtector with unit 10's synthetic cache/transport and stand-in ac
 from __future__ import annotations
 
 import fcntl
+import fnmatch
 import importlib
 import importlib.util
+import json
+import re
 import signal
 import subprocess
+import threading
 import tomllib
 from datetime import datetime
 from decimal import Decimal
@@ -62,6 +66,44 @@ def controls(tmp_path):
 def config(controls, **changes):
     values = {"account": "windows", "row": "OWN1", "holds_dir": controls[0], "inbox": controls[1]}
     return subject().ProtectorRun(**(values | changes))
+
+
+def test_the_protector_has_only_the_alpaca_data_client(controls, monkeypatch):
+    """No other quote source can bypass the Alpaca one-sided-quote drop."""
+    added = []
+    original = paper_node.LiveNode.builder
+
+    class Builder:
+        def __init__(self, native):
+            self.native = native
+
+        def add_data_client(self, name, factory, settings):
+            added.append((name, factory))
+            self.native = self.native.add_data_client(name, factory, settings)
+            return self
+
+        def __getattr__(self, name):
+            def call(*args, **kwargs):
+                result = getattr(self.native, name)(*args, **kwargs)
+                if name == "build":
+                    return result
+                self.native = result
+                return self
+
+            return call
+
+    monkeypatch.setattr(
+        paper_node,
+        "LiveNode",
+        SimpleNamespace(
+            builder=lambda *args, **kwargs: Builder(original(*args, **kwargs)),
+        ),
+    )
+    node, _ = subject().protector_node(config(controls), (AAA,), feed="sip")
+    try:
+        assert added == [("ALPACA", paper_node.AlpacaDataClientFactory)]
+    finally:
+        node.dispose()
 
 
 def market(at: str):
@@ -346,7 +388,7 @@ def runtime(monkeypatch, controls, *, account="windows", lead_go=None):
         window, "session_now", lambda _trading: (clock, calendar, window.time.monotonic())
     )
 
-    def build(settings, instruments, *, feed):
+    def build(settings, instruments, *, feed, book=None, **_kwargs):
         built.append((settings, instruments, feed))
         return node, strategy
 
@@ -690,9 +732,10 @@ def test_a_run_from_a_checkout_of_its_own_starts(controls, tmp_path, monkeypatch
 
 def test_a_checkout_that_cannot_be_read_is_refused(controls, tmp_path, monkeypatch):
     module = subject()
+    # --basetemp may be inside our worktree; the plain folder must not discover that parent.
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
     monkeypatch.setattr(module, "parse_args", lambda _argv: config(controls))
     monkeypatch.setattr(module, "run_protector", lambda _config: pytest.fail("started unchecked"))
-    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
     (tmp_path / "plain").mkdir()
     assert module.main([], checkout=tmp_path / "plain") == 3
 
@@ -782,3 +825,395 @@ def test_off_c_a_dirty_tree_is_a_named_limit_and_starts(controls, tmp_path, monk
     (own / "tracked.txt").write_text("changed\n")
     assert module.main([], checkout=own) == 0
     assert started
+
+
+# U-g: the successor's bounded wait on the account's locks (the lead's ruling (d)4, 2026-11-13).
+
+
+def held_lock(tmp_path: Path, name: str = "canon-paper-windows.lock"):
+    """A second open file description of the lock: flock(2) conflicts with it in this process too."""
+    held = (tmp_path / name).open("a")
+    fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    return held
+
+
+def test_lock_wait_takes_the_lock_once_released_and_reads_nothing_before(
+    controls, tmp_path, monkeypatch
+):
+    module, _settings, _strategy, _foreign, reads, _built = runtime(monkeypatch, controls)
+    settings = config(controls, lock_wait=5)
+    held = held_lock(tmp_path)
+    released: list[float] = []
+
+    def release() -> None:
+        released.append(window.time.monotonic())
+        held.close()
+
+    first_read: list[float] = []
+    positions = window.positions
+
+    def stamped(trading):
+        first_read.append(window.time.monotonic())
+        return positions(trading)
+
+    monkeypatch.setattr(window, "positions", stamped)
+    timer = threading.Timer(0.6, release)
+    timer.start()
+    try:
+        module.run_protector(settings, trading=object(), lock_dir=tmp_path)
+    finally:
+        timer.cancel()
+        held.close()
+    assert released and first_read and first_read[0] >= released[0]
+    assert reads[0] == "positions"
+
+
+def test_lock_wait_refuses_by_name_past_its_bound_with_no_read(controls, tmp_path, monkeypatch):
+    module, _settings, _strategy, _foreign, reads, built = runtime(monkeypatch, controls)
+    held = held_lock(tmp_path)
+    started = window.time.monotonic()
+    try:
+        with pytest.raises(window.WindowRefused, match=r"lock is held after waiting 1 s"):
+            module.run_protector(config(controls, lock_wait=1), trading=object(), lock_dir=tmp_path)
+    finally:
+        held.close()
+    assert 1 <= window.time.monotonic() - started < 3
+    assert reads == [] and built == []
+
+
+def test_lock_wait_never_retries_around_a_hold(controls, tmp_path, monkeypatch):
+    module, _settings, _strategy, _foreign, reads, built = runtime(monkeypatch, controls)
+    (controls[0] / "owner-hold").write_text("stop")
+    started = window.time.monotonic()
+    with pytest.raises(window.WindowRefused, match="holds folder is not empty"):
+        module.run_protector(config(controls, lock_wait=5), trading=object(), lock_dir=tmp_path)
+    assert window.time.monotonic() - started < 1
+    assert reads == [] and built == []
+
+
+def test_no_lock_wait_still_refuses_at_once(controls, tmp_path, monkeypatch):
+    module, settings, _strategy, _foreign, reads, _built = runtime(monkeypatch, controls)
+    held = held_lock(tmp_path)
+    started = window.time.monotonic()
+    try:
+        with pytest.raises(window.WindowRefused, match="lock is held; nothing started"):
+            module.run_protector(settings, trading=object(), lock_dir=tmp_path)
+    finally:
+        held.close()
+    assert window.time.monotonic() - started < 1 and reads == []
+
+
+@pytest.mark.parametrize("value", ["-1", "301", "x"])
+def test_lock_wait_is_bounded(controls, value):
+    with pytest.raises(SystemExit):
+        subject().parse_args(
+            ["windows", "--row", "OWN1", "--holds-dir", str(controls[0]), "--inbox"]
+            + [str(controls[1]), "--lock-wait", value]
+        )
+
+
+def test_lock_wait_defaults_to_none_and_parses(controls):
+    base = [
+        "windows",
+        "--row",
+        "OWN1",
+        "--holds-dir",
+        str(controls[0]),
+        "--inbox",
+        str(controls[1]),
+    ]
+    assert subject().parse_args(base).lock_wait == 0
+    assert subject().parse_args([*base, "--lock-wait", "90"]).lock_wait == 90
+
+
+def test_start_line_names_its_end_as_an_epoch_for_the_runner(
+    controls, tmp_path, monkeypatch, capsys
+):
+    module, settings, *_rest = runtime(monkeypatch, controls)
+    module.run_protector(settings, trading=object(), lock_dir=tmp_path)
+    line = next(x for x in capsys.readouterr().out.splitlines() if "; ends " in x)
+    found = re.search(r"; ends (\S+) \(epoch (\d+)\)$", line)
+    assert found is not None, line
+    assert int(datetime.fromisoformat(found.group(1)).timestamp()) == int(found.group(2))
+
+
+def test_task_passes_the_bounded_lock_wait():
+    task = tomllib.loads((ROOT / "mise.toml").read_text())["tasks"]["paper:protector"]
+    assert 'flag "--lock-wait <lock_wait>"' in task["usage"]
+    assert 'args+=(--lock-wait "$usage_lock_wait")' in task["run"]
+
+
+def test_runner_retry_bound_is_the_stop_grace_and_a_minute():
+    text = (ROOT / "scripts" / "automation").read_text()
+    grace = re.search(r"^PROTECTOR_STOP_GRACE=(\d+)", text, re.MULTILINE)
+    assert grace is not None, "scripts/automation has no PROTECTOR_STOP_GRACE"
+    assert int(grace.group(1)) == window.STOP_GRACE_SECS
+    assert (
+        "PROTECTOR_RETRY_BOUND=${CANON_PROTECTOR_RETRY_BOUND:-$((PROTECTOR_STOP_GRACE + 60))}"
+        in text
+    )
+
+
+def runner_arm(message: str) -> str:
+    """The first arm of the runner's refusal `case` (scripts/automation, do_run_protector) that the
+    node's printed refusal matches, read from the script itself, with bash's glob read as fnmatch's."""
+    text = (Path(__file__).parents[1] / "scripts" / "automation").read_text()
+    block = text.split("    err=$(grep -E 'paper:protector: (refused|failed)'", 1)[1]
+    block = block.split('    case "$err" in\n', 1)[1].split("    esac", 1)[0]
+    line = f"paper:protector: refused: {message}"
+    for arm in re.findall(r"^      (\*[^)]*|'')\)", block, flags=re.MULTILINE):
+        for pattern in arm.split("|"):
+            if pattern != "''" and fnmatch.fnmatchcase(line, pattern.replace('"', "")):
+                return arm
+    return "*"
+
+
+def test_the_runner_classes_each_node_refusal_by_its_own_words(controls, tmp_path, monkeypatch):
+    """The runner reads only the node's printed words: each refusal it handles apart must match its arm."""
+    module, settings, *_ = runtime(monkeypatch, controls)
+    held = held_lock(tmp_path)
+    try:
+        with pytest.raises(window.WindowRefused) as now:
+            module.run_protector(settings, trading=object(), lock_dir=tmp_path)
+        with pytest.raises(window.WindowRefused) as waited:
+            module.run_protector(config(controls, lock_wait=1), trading=object(), lock_dir=tmp_path)
+    finally:
+        held.close()
+    assert runner_arm(str(waited.value)) == '*"lock is held after waiting"*'
+    assert runner_arm(str(now.value)) == '*"lock is held"*'
+    (controls[0] / "owner-hold").write_text("stop")
+    with pytest.raises(window.WindowRefused) as hold:
+        module.run_protector(settings, trading=object(), lock_dir=tmp_path)
+    assert runner_arm(str(hold.value)) == '*"holds folder"*|*"inbox"*'
+    (controls[0] / "owner-hold").unlink()
+    controls[1].write_text("unread")
+    with pytest.raises(window.WindowRefused) as inbox:
+        module.run_protector(settings, trading=object(), lock_dir=tmp_path)
+    assert runner_arm(str(inbox.value)) == '*"holds folder"*|*"inbox"*'
+
+
+# The lead's ruling (2026-11-13, 17:10): the level book is read only once the account's locks are held.
+
+
+def write_book(path: Path, *rows: tuple[str, str, str, int]) -> None:
+    entries = [
+        {
+            "account_label": account,
+            "instrument_id": instrument,
+            "protection_start_ns": 1,
+            "last_level": level,
+            "quantity": "10",
+            "written_ns": written,
+            "run": "r",
+        }
+        for account, instrument, level, written in rows
+    ]
+    path.write_text(json.dumps({"schema": 1, "entries": entries}))
+
+
+def booked(monkeypatch, controls, *, takes_book=True, takes_reader=False, reader=None):
+    """runtime(), with the node builder recording the book settings it is handed."""
+    parts = runtime(monkeypatch, controls)
+    module, _settings, strategy, _foreign, _reads, built = parts
+    node = SimpleNamespace(dispose=lambda: None)
+
+    def build(settings, instruments, *, feed, book=None, **_kwargs):
+        built.append((settings, instruments, feed, book))
+        return node, strategy
+
+    monkeypatch.setattr(module, "protector_node", build)
+    monkeypatch.setattr(module, "_protector_takes_book", lambda: takes_book)
+    monkeypatch.setattr(module, "_protector_takes_reader", lambda: takes_reader)
+    monkeypatch.setattr(module, "_trading_reader", lambda: reader)
+    return parts
+
+
+def test_book_is_read_only_once_the_lock_is_held(controls, tmp_path, monkeypatch):
+    module, _settings, _strategy, _foreign, _reads, built = booked(monkeypatch, controls)
+    book = tmp_path / "owner-levels.json"
+    write_book(book, ("windows", "AAA.ALPACA", "9.5", 5))
+    monkeypatch.setenv("CANON_PROTECTOR_LEVEL_BOOK", str(book))
+    held = held_lock(tmp_path)
+    released: list[float] = []
+
+    def release() -> None:
+        # The predecessor's stop writes the book while it still holds the lock, then exits.
+        write_book(book, ("windows", "AAA.ALPACA", "9.75", 6))
+        released.append(window.time.monotonic())
+        held.close()
+
+    read: list[tuple[float, dict]] = []
+    book_levels = module._book_levels
+
+    def stamped(path, account):
+        found = book_levels(path, account)
+        read.append((window.time.monotonic(), found))
+        return found
+
+    monkeypatch.setattr(module, "_book_levels", stamped)
+    timer = threading.Timer(0.6, release)
+    timer.start()
+    try:
+        module.run_protector(config(controls, lock_wait=5), trading=object(), lock_dir=tmp_path)
+    finally:
+        timer.cancel()
+        held.close()
+    assert released and read and read[0][0] >= released[0]
+    assert read[0][1] == {AAA: Price.from_str("9.75")}
+    assert built[0][3] == {"account_label": "windows", "level_book_path": str(book)}
+
+
+def test_every_book_level_of_this_account_reaches_the_protector_unfiltered(
+    controls, tmp_path, monkeypatch
+):
+    """The lead's P11 ruling (16:55, narrowed 17:08): a level for a symbol not held at the start is
+    kept and handed on; the protector, not this node, decides whether it binds."""
+    module, settings, _strategy, _foreign, _reads, built = booked(monkeypatch, controls)
+    book = tmp_path / "owner-levels.json"
+    write_book(
+        book,
+        ("windows", "AAA.ALPACA", "9.5", 5),
+        ("windows", "AAA.ALPACA", "9.6", 7),
+        ("protect", "BBB.ALPACA", "1.5", 9),
+        ("windows", "ZZZ.ALPACA", "3", 9),
+    )
+    assert module._book_levels(book, "windows") == {
+        AAA: Price.from_str("9.6"),
+        InstrumentId.from_str("ZZZ.ALPACA"): Price.from_str("3"),
+    }
+    monkeypatch.setenv("CANON_PROTECTOR_LEVEL_BOOK", str(book))
+    module.run_protector(settings, trading=object(), lock_dir=tmp_path)
+    assert built[0][0].levels == {}
+    assert built[0][3] == {"account_label": "windows", "level_book_path": str(book)}
+
+
+def test_a_book_with_a_protector_that_reads_none_refuses_by_name(controls, tmp_path, monkeypatch):
+    module, settings, _strategy, _foreign, _reads, built = booked(
+        monkeypatch, controls, takes_book=False
+    )
+    book = tmp_path / "owner-levels.json"
+    write_book(book, ("windows", "AAA.ALPACA", "9.5", 5))
+    monkeypatch.setenv("CANON_PROTECTOR_LEVEL_BOOK", str(book))
+    with pytest.raises(window.WindowRefused, match="reads no level book"):
+        module.run_protector(settings, trading=object(), lock_dir=tmp_path)
+    assert built == []
+
+
+def test_the_protector_gets_the_accounts_own_get_only_reader_under_the_lock(
+    controls, tmp_path, monkeypatch, capsys
+):
+    """U-e's fix round (the deputy, 17:26): the protector decides carry from the venue's fills, read
+    through a trading reader the runner supplies; this node hands it, built only under the locks."""
+    reader = object()
+    module, settings, _strategy, _foreign, _reads, built = booked(
+        monkeypatch, controls, takes_reader=True, reader=reader
+    )
+    book = tmp_path / "owner-levels.json"
+    write_book(book, ("windows", "AAA.ALPACA", "9.5", 5))
+    monkeypatch.setenv("CANON_PROTECTOR_LEVEL_BOOK", str(book))
+    module.run_protector(settings, trading=object(), lock_dir=tmp_path)
+    assert built[0][3] == {
+        "account_label": "windows",
+        "level_book_path": str(book),
+        "trading": reader,
+    }
+    assert "no trading reader" not in capsys.readouterr().out
+
+
+def test_a_protector_with_no_reader_slot_is_named(controls, tmp_path, monkeypatch, capsys):
+    module, settings, _strategy, _foreign, _reads, built = booked(monkeypatch, controls)
+    book = tmp_path / "owner-levels.json"
+    write_book(book, ("windows", "AAA.ALPACA", "9.5", 5))
+    monkeypatch.setenv("CANON_PROTECTOR_LEVEL_BOOK", str(book))
+    module.run_protector(settings, trading=object(), lock_dir=tmp_path)
+    assert "trading" not in built[0][3]
+    assert "takes no trading reader" in capsys.readouterr().out
+
+
+def test_the_trading_reader_refuses_every_method_but_get_before_sending(monkeypatch):
+    """Stand-in key values only (no credential is read): the reader's session has only GET-only
+    adapters, so a POST is refused before anything is sent."""
+    from canon_alpaca.providers import MethodRefused
+    from canon_alpaca.providers import TimeoutAdapter
+    from canon_alpaca.providers import session_of
+
+    monkeypatch.setenv(window.ENV_API_KEY, "stand-in")
+    monkeypatch.setenv(window.ENV_SECRET_KEY, "stand-in")
+    reader = subject()._trading_reader()
+    session = session_of(reader)
+    assert session is not None
+    adapters = list(session.adapters.values())
+    assert adapters and all(isinstance(a, TimeoutAdapter) and a.get_only for a in adapters)
+    with pytest.raises(MethodRefused):
+        session.post("https://paper-api.alpaca.markets/v2/orders", json={})
+    with pytest.raises(MethodRefused):
+        session.delete("https://paper-api.alpaca.markets/v2/orders")
+
+
+def test_this_trees_protector_takes_the_reader():
+    """U-e is composed (L6, 2026-11-13): its OwnerProtector takes the GET-only `trading` reader."""
+    assert subject()._protector_takes_reader() is True
+
+
+def test_this_trees_protector_reads_the_book():
+    """U-e is composed: its OwnerProtector takes `account_label` and `level_book_path`."""
+    assert subject()._protector_takes_book() is True
+
+
+@pytest.mark.parametrize("text", [None, "not json", '{"schema": 2, "entries": []}'])
+def test_an_unreadable_book_refuses_the_start_by_name(controls, tmp_path, monkeypatch, text):
+    module, settings, _strategy, _foreign, _reads, built = booked(monkeypatch, controls)
+    book = tmp_path / "owner-levels.json"
+    if text is not None:
+        book.write_text(text)
+    monkeypatch.setenv("CANON_PROTECTOR_LEVEL_BOOK", str(book))
+    with pytest.raises(window.WindowRefused, match="level book unreadable"):
+        module.run_protector(settings, trading=object(), lock_dir=tmp_path)
+    assert built == []
+
+
+# Composition (L6, 2026-11-13): U-e's protector checks overnight eligibility only when told the run is
+# overnight (OwnerProtectorConfig.session_part, default "regular"); the node knows the part from
+# window.protection_span and must hand it over, or an overnight run skips that check.
+def test_run_protector_hands_the_span_part_to_the_node_builder(controls, tmp_path, monkeypatch):
+    module, settings, strategy, _foreign, _reads, _built = runtime(monkeypatch, controls)
+    seen: list[dict[str, Any]] = []
+
+    def build(settings, instruments, *, feed, book=None, **kwargs):
+        seen.append({"feed": feed, **kwargs})
+        return SimpleNamespace(dispose=lambda: None), strategy
+
+    monkeypatch.setattr(module, "protector_node", build)
+    span = window.protection_span
+
+    def overnight(clock, calendar, *, minutes, feed):
+        ends, _part, _feed = span(clock, calendar, minutes=minutes, feed=None)
+        return ends, "overnight", "boats"
+
+    monkeypatch.setattr(window, "protection_span", overnight)
+    module.run_protector(settings, trading=object(), lock_dir=tmp_path)
+    assert seen == [{"feed": "boats", "session_part": "overnight"}]
+
+
+def test_the_node_builder_puts_the_part_in_the_protectors_settings(controls, monkeypatch):
+    run = config(controls)  # subject() reloads the module: patch only after it
+    module = subject()
+    made: list[Any] = []
+
+    class Stop(Exception):
+        pass
+
+    def builder(*_args, **_kwargs):
+        raise Stop
+
+    real = module.OwnerProtectorConfig
+
+    def recorded(**kwargs):
+        made.append(real(**kwargs))
+        return made[-1]
+
+    monkeypatch.setattr(module, "OwnerProtectorConfig", recorded)
+    monkeypatch.setattr(module.paper_node, "alpaca_paper_builder", builder)
+    with pytest.raises(Stop):
+        module.protector_node(run, (AAA,), feed="boats", session_part="overnight")
+    assert made[0].session_part == "overnight"

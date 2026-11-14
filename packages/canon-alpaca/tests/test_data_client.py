@@ -111,6 +111,23 @@ PLACEHOLDER = "offline-placeholder"
 LOG_PROBE_LINES = 20_000
 
 
+@pytest.fixture(autouse=True)
+def alpaca_stream_lock() -> None:
+    """All clients here are synthetic; never inspect a real credential or paper lock."""
+
+
+def test_a_zero_bid_on_sip_is_dropped_counted_and_the_next_quote_arrives(venue, alpaca, capfd):
+    venue.stream.quotes = [lambda: alpaca.quote(bp=0.0, bs=100), alpaca.quote]
+    strategy = consumer(want_trades=False, bar_type=None, subscribe_params={"feed": "sip"})
+    run(build_node(strategy), "hosted")
+    assert venue.built["stream"]["feed"] == DataFeed.SIP
+    (tick,) = strategy.seen_quotes
+    assert tick.bid_price == Price.from_str("87.6600")
+    log = logged(capfd)
+    assert "has bid price 0.0" in log
+    assert "Dropped 1 one-sided Alpaca quotes for AAPL since subscribing" in log
+
+
 @pytest.fixture
 def venue(monkeypatch, alpaca) -> SimpleNamespace:
     """Replace alpaca-py's client constructors with recorders that return the stand-ins."""

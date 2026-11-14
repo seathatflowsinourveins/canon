@@ -66,6 +66,7 @@ def test_p1_2_level_supplied_with_no_long_does_not_arm_a_much_later_holding() ->
     later = position("10")
     later.ts_opened = T0 + 3600 * SECOND  # Bought an hour later, at about 8.00.
     strategy.cached.held = [later]
+    strategy.cached.latest = None  # U-h permits an old quote in this part; this case starts empty.
     strategy.test_clock.set_time(T0 + 3600 * SECOND)
     strategy._on_step(cast(Any, SimpleNamespace()))  # The one-second timer adopts it.
     strategy.observe("8.00", T0 + 3601 * SECOND)

@@ -204,17 +204,17 @@ def test_a_self_arming_quote_redelivered_does_not_spend_the_guard() -> None:
     assert len(strategy.sent) == 1
 
 
-def test_a_level_is_never_planned_on_a_quote_received_long_ago() -> None:
-    """The (e) review's P2-2 (e2): a quote stamped ahead of its receipt is aged from its receipt, so
-    a quote received 30 minutes ago never sets a level."""
+def test_a_level_is_never_planned_on_a_quote_stamped_an_hour_ahead_of_receipt() -> None:
+    """U-h permits old quotes inside the part; this quote still violates V1's stamp bound."""
     strategy = Harness()
     strategy.cached.latest = None
     strategy.on_start()
     old = tick("12.00", T0 + 3600 * SECOND, T0)
     strategy.cached.latest = old
+    strategy.on_quote(old)
     step(strategy, T0 + 1800 * SECOND)
     assert strategy.slots[AAA].level is None, "a level was planned on a 30-minute-old quote"
-    assert any("waiting for a fresh quote" in line for line in strategy.said)
+    assert any("ahead of its receipt" in line for line in strategy.said)
 
 
 def test_a_stopped_instrument_keeps_no_wait_record() -> None:

@@ -178,6 +178,13 @@ def owner_type():
     assert issubclass(module.OwnerProtector, Strategy)
 
     class Recording(module.OwnerProtector):
+        # Backtest has no latest endpoint. Answer only the added data requests synthetically;
+        # its real emulator, positions, order transitions and all blind assertions are retained.
+        from tests.test_owner_protector import Harness
+
+        request_bars = Harness.request_bars
+        request_quotes = Harness.request_quotes
+
         def __init__(self, config):
             self.sent: list[dict[str, Any]] = []
             self.claims: list = []
@@ -500,3 +507,34 @@ def test_iex_configuration_refuses_to_run():
     else:
         assert not strategy.is_running(), "IEX must be refused at start, before the tape"
     assert strategy.sent == []
+
+
+def test_a_zero_bid_injected_past_the_adapter_elects_the_resting_sell():
+    """The zero bid: the guarantee rests on the adapter. The pin's emulator copies a quote's bid
+    with no zero or size check (crates/execution/src/order_emulator/emulator.rs:1076-1090 at
+    d53849b216e2, L8's read). So a zero bid reaching a resting bid-triggered sell elects it.
+    The adapter refuses such a quote before a `QuoteTick` exists (canon_alpaca/data.py:1276-1292,
+    packages/canon-alpaca/tests/test_data_client.py's one-sided cases), and the protector node
+    has no other quote source. This passes while the pin does not filter; it fails loudly if the
+    emulator starts to."""
+    config, recording = owner_type()
+    strategy = recording(config(feed="sip"))
+    with replay(strategies=(strategy,)) as harness:
+        harness.drive(*(["10.00"] * 10))
+        assert protective_orders(harness, strategy), "a resting protective sell"
+        assert not elected(harness, strategy)
+        harness.second += 1
+        at = T0 + harness.second * SECOND
+        zero = QuoteTick(
+            AAA,
+            Price.from_str("0.0000"),
+            Price.from_str("10.0100"),
+            Quantity.from_int(10_000),
+            Quantity.from_int(10_000),
+            at,
+            at,
+        )
+        harness.engine.clear_data()
+        harness.engine.add_data([zero])
+        harness.engine.run(streaming=True)
+        assert elected(harness, strategy), "the emulator elects on a zero bid past the adapter"

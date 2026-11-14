@@ -29,15 +29,12 @@ from __future__ import annotations
 
 import inspect
 from contextlib import contextmanager
-from datetime import timedelta
 from decimal import Decimal
 from importlib import import_module
-from time import monotonic
 from typing import Any
 
 import pytest
 from nautilus_trader.config import StrategyConfig
-from nautilus_trader.indicators import AverageTrueRange
 from nautilus_trader.model import Bar
 from nautilus_trader.model import OrderSide
 from nautilus_trader.model import Price
@@ -48,13 +45,13 @@ from nautilus_trader.model import TimeInForce
 from nautilus_trader.trading import Strategy
 
 from canon_trading import protect
-from canon_trading.mover import Mover
 from canon_trading.price_step import entry_price
 from tests.test_mover import AAA
 from tests.test_mover import MINUTE
 from tests.test_mover import T0
 from tests.test_mover import engine
 from tests.test_mover import tape
+from tests.test_owner_protector import alpaca_stream_lock  # noqa: F401 -- offline autouse fixture
 
 EXTERNAL = StrategyId("EXTERNAL")
 POSITION = 10
@@ -195,6 +192,13 @@ def owner_type() -> tuple[Any, Any]:
     assert issubclass(module.OwnerProtector, Strategy)
 
     class Recording(module.OwnerProtector):
+        # Answer the added history requests from this replay's existing cache; native
+        # orders/emulation and the blind distance oracle are unchanged.
+        from tests.test_owner_protector import Harness
+
+        request_bars = Harness.request_bars
+        request_quotes = Harness.request_quotes
+
         def __init__(self, config: Any) -> None:
             self.sent: list[Any] = []
             self.lines: list[str] = []
@@ -269,13 +273,12 @@ def matched(candidates: list[Decimal], expected: Decimal, what: str) -> Decimal:
 def expected_distance(
     row: str, *, warm: bool = True, bid: Decimal = BID, ask: Decimal = ASK
 ) -> Decimal:
-    """The distance `protect.row_distance` plans for `row` on the same bid, ask and one-minute ATR."""
-    atr = AverageTrueRange(protect.PLANNER.atr_n)
-    if warm:
-        for bar in bar_ticks():
-            atr.update_raw(float(bar.high), float(bar.low), float(bar.close))
-    book = protect.Book(bid, ask, atr, timedelta(0), monotonic())
-    distance, _ = protect.row_distance(book, "AAA", row, Mover(protect.planner_config(row)))
+    """The distance protect plans for `row` on the same bid and ask and the window U-h warms its ATR
+    on: the session day's last `protect.ATR_BARS` complete one-minute bars (L3's rule, as
+    `Mover._warm_atr` feeds), through `protect.distance_for`, the one function the task and the node
+    share. Every bar here is complete when the protector arms."""
+    bars = bar_ticks()[-protect.ATR_BARS :] if warm else []
+    distance, _ = protect.distance_for("AAA", row, bid, ask, bars)
     return distance
 
 

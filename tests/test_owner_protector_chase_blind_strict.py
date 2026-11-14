@@ -49,6 +49,7 @@ from tests.test_owner_protector import AAA
 from tests.test_owner_protector import PROTECTOR
 from tests.test_owner_protector import SECOND
 from tests.test_owner_protector import Harness
+from tests.test_owner_protector import alpaca_stream_lock  # noqa: F401 -- offline autouse fixture
 from tests.test_owner_protector import position
 from tests.test_owner_protector import working_sell
 

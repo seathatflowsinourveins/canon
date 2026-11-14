@@ -6,8 +6,9 @@ second P1). Every cell's expected result is derived from it in `expect`, and fro
   ahead of its own receipt is not an observation and is never a reference. It is named.
 - V2 (replaced by the lead at 17:36): the venue clock is the running maximum of all sane stamps
   received for the instrument, whether a level exists or the planner accepts the spread. A level
-  can be planned only on the current maximum, no older than `protect.QUOTE_MOST` when aged from
-  the earlier of stamp and receipt. With none planable, it waits named.
+  can be planned only on the current maximum. U-h Q1/Q4: age is named from the earlier of stamp
+  and receipt and does not refuse that maximum inside the open part. With none planable, it waits
+  named; equal stamps keep the last arrival without counting it.
 - V3: counting requires raising that maximum. The first sane quote when no maximum existed at
   arming establishes the clock and does not count. Equal/older stamps never count, regardless of
   receipt order; a stamp V1 refused remains refused while kept in the bounded record.
@@ -20,7 +21,7 @@ Axes:
   limit (1), and those cells assert the naming at every step (e1).
 - The reference: stamped at its receipt, ahead inside the bound, ahead beyond it (each relative to
   the stream), absent (no cached quote at a supplied adoption), or stale (received 120 s before
-  the arming, over `QUOTE_MOST`; e2 for a self-armed level).
+  the arming, over `QUOTE_MOST` but within the same session part; e2 for a self-armed level).
 - The delivery after the reference: the same stamp again, an older stamp (a second before the
   reference's venue time), or a newer stamp (three seconds after it). Each arrives promptly (just
   after the reference), late inside the bound (4 s after its venue time) or late beyond it (7 s).
@@ -247,7 +248,6 @@ def history_expect(
     nonempty earlier prefix, after arming and with a plan. The first planable current maximum
     fixes a self-armed level; supplied levels are armed after the initial cache snapshot.
     """
-    most = int(protect.QUOTE_MOST.total_seconds()) * SECOND
     valid = [
         sane(stamp, receipt) and stamp not in {s for s, r, _ in history[:i] if not sane(s, r)}
         for i, (stamp, receipt, _) in enumerate(history)
@@ -258,12 +258,14 @@ def history_expect(
     ]
     plans = [
         i
-        for i, (stamp, receipt, accepted) in enumerate(history)
+        for i in range(len(history))
         if i >= cached_count - 1
-        and valid[i]
-        and accepted
-        and stamp == maxima[i]
-        and max(T0, receipt) - min(stamp, receipt) <= most
+        and maxima[i] is not None
+        and next(
+            accepted
+            for j, (stamp, _, accepted) in reversed(list(enumerate(history[: i + 1])))
+            if valid[j] and stamp == maxima[i]
+        )
     ]
     plan = min(plans, default=None)
     arming = plan if phase == "self-armed" else cached_count - 1

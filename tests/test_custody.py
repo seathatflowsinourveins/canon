@@ -37,6 +37,7 @@ from canon_alpaca.execution import replacement_client_order_id
 from canon_trading import custody
 from canon_trading import paper_node
 from canon_trading import session_window
+from tests.test_owner_protector import alpaca_stream_lock  # noqa: F401 -- offline autouse fixture
 
 ROOT = Path(__file__).resolve().parents[1]
 ACCOUNT_NUMBER = "PA3MADEUP0001"

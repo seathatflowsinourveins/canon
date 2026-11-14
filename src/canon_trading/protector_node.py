@@ -30,11 +30,15 @@ A new owner fill after start on B is SIMULATION ONLY today; its paper showing co
 from __future__ import annotations
 
 import argparse
+import contextlib
+import inspect
+import json
 import os
 import re
 import signal
 import subprocess
 import sys
+from collections.abc import Generator
 from collections.abc import Sequence
 from dataclasses import dataclass
 from dataclasses import field
@@ -42,7 +46,11 @@ from datetime import datetime
 from datetime import time
 from pathlib import Path
 from typing import TYPE_CHECKING
+from typing import Any
 
+from canon_alpaca.providers import TimeoutAdapter
+from canon_alpaca.providers import session_of
+from canon_alpaca.providers import timeout_adapter
 from nautilus_trader.model import InstrumentId
 from nautilus_trader.model import Price
 from nautilus_trader.model import StrategyId
@@ -59,6 +67,14 @@ if TYPE_CHECKING:
     from nautilus_trader.live import LiveNode
 
 
+LOCK_WAIT_MAX_SECS = 300
+"""The longest a successor waits for its account's locks (U-g, the lead's ruling (d)4, 2026-11-13):
+the protector runner launches it about 60 s before its predecessor's planned end and bounds the wait
+at that end plus a stop budget of about 30 s. Five minutes keeps a go read at launch fresh."""
+LOCK_POLL_SECS = 0.5
+"""How often a waiting successor tries the locks again (UNCALIBRATED; flock(2) has no timed wait)."""
+
+
 @dataclass(frozen=True)
 class ProtectorRun:
     account: str
@@ -69,6 +85,7 @@ class ProtectorRun:
     levels: dict[InstrumentId, Price] = field(default_factory=dict)
     feed: str | None = None
     lead_go: str | None = None
+    lock_wait: int = 0
 
     def __post_init__(self) -> None:
         if self.account not in window.PAPER_ACCOUNT_LOCKS:
@@ -87,6 +104,12 @@ class ProtectorRun:
             raise ValueError("IEX is refused by name: protection requires sip or boats")
         if not self.holds_dir.is_absolute() or not self.inbox.is_absolute():
             raise ValueError("holds-dir and inbox must be absolute paths")
+        if (
+            not isinstance(self.lock_wait, int)
+            or isinstance(self.lock_wait, bool)
+            or not 0 <= self.lock_wait <= LOCK_WAIT_MAX_SECS
+        ):
+            raise ValueError(f"lock-wait must be between 0 and {LOCK_WAIT_MAX_SECS} seconds")
         # Keep the module's validation, including Price types and positive levels, at the seam.
         OwnerProtectorConfig(row=self.row, levels=self.levels, feed=self.feed or "sip")
 
@@ -114,7 +137,12 @@ def parse_levels(text: str) -> dict[InstrumentId, Price]:
 
 
 def protector_node(
-    config: ProtectorRun, instruments: Sequence[InstrumentId], *, feed: str
+    config: ProtectorRun,
+    instruments: Sequence[InstrumentId],
+    *,
+    feed: str,
+    book: dict[str, str] | None = None,
+    session_part: str = "regular",
 ) -> tuple[LiveNode, OwnerProtector]:
     """Build, but do not connect: one strategy, no claims and no automatic market exit.
 
@@ -125,6 +153,8 @@ def protector_node(
     if missing:
         names = ", ".join(sorted(str(instrument) for instrument in missing))
         raise ValueError(f"{names}: supplied level has no starting holding")
+    # U-e's keywords; pnode's copy refuses unknown ones (_book_settings refuses before it gets here).
+    book_settings: dict[str, Any] = dict(book or {})
     settings = OwnerProtectorConfig(
         row=config.row,
         levels=config.levels,
@@ -132,6 +162,10 @@ def protector_node(
         strategy_id=StrategyId("OwnerProtector-001"),
         order_id_tag="001",
         manage_stop=False,
+        # The span's part (window.protection_span), so U-e's overnight eligibility check runs on an
+        # overnight run (OwnerProtectorConfig.session_part; composition, L6 2026-11-13).
+        session_part=session_part,
+        **book_settings,
     )
     node = paper_node.alpaca_paper_builder(
         "CANON-OWNER-PROTECTOR-PAPER",
@@ -205,6 +239,160 @@ def _own_checkout(checkout: Path) -> None:
         )
 
 
+LEVEL_BOOK_ENV = "CANON_PROTECTOR_LEVEL_BOOK"
+"""The level book's path, which the protector runner (scripts/automation run-protector) sets to
+start_level.book_path()'s file. Read only once both locks are held (the lead's ruling, 2026-11-13,
+17:10), so a predecessor's stop write, made while it still held the lock, is always seen."""
+
+
+def _book_levels(path: Path, account: str) -> dict[InstrumentId, Price]:
+    """The one read of U-e's level book, to be replaced by `start_level.LevelBook.read` once it lands.
+
+    Its contract as built in ue-build (start_level.py, sha256 81cb6749..., 2026-11-13 16:48; UNVERIFIED
+    until it lands): JSON schema 1, `entries` rows keyed by account label, instrument id and protection
+    start, each with `last_level` as decimal text and `written_ns`. The account label is this task's
+    account name (UNVERIFIED: unit 10's caller sets it). The latest written row per instrument is taken.
+    A missing or unreadable book refuses the start; a malformed row is skipped by name, as LevelBook.read
+    skips it.
+    """
+    try:
+        data = json.loads(path.read_text())
+        entries = data["entries"] if isinstance(data, dict) else None
+        if (
+            type(data.get("schema")) is not int
+            or data["schema"] != 1
+            or not isinstance(entries, list)
+        ):
+            raise ValueError("expected schema 1 and an entries array")
+    except (OSError, ValueError, KeyError, AttributeError) as e:
+        raise window.WindowRefused(
+            f"level book unreadable at {path}: {type(e).__name__}; nothing started"
+        ) from e
+    latest: dict[InstrumentId, tuple[int, Price]] = {}
+    for index, row in enumerate(entries):
+        if not isinstance(row, dict) or row.get("account_label") != account:
+            continue
+        try:
+            instrument = InstrumentId.from_str(str(row["instrument_id"]))
+            level = Price.from_str(str(row["last_level"]))
+            written = row["written_ns"]
+            if type(written) is not int or level.as_decimal() <= 0:
+                raise ValueError("needs a positive level and integer written_ns")
+        except (KeyError, ValueError, TypeError, OverflowError) as e:
+            print(
+                f"paper:protector: level book entry {index} skipped: {type(e).__name__}", flush=True
+            )
+            continue
+        if instrument not in latest or written > latest[instrument][0]:
+            latest[instrument] = (written, level)
+    return {instrument: level for instrument, (_written, level) in latest.items()}
+
+
+def _protector_takes_book() -> bool:
+    """Whether this OwnerProtector build reads the level book itself (U-e's account_label and
+    level_book_path settings, ue-build 2026-11-13); pnode's copy (sha256 b8f83b71...) does not."""
+    parameters = inspect.signature(OwnerProtectorConfig.__init__).parameters
+    return "account_label" in parameters and "level_book_path" in parameters
+
+
+def _protector_takes_reader() -> bool:
+    """Whether this OwnerProtector build takes U-e's `trading` slot, the GET-only reader through which
+    it reads the venue's fills to decide carry (U-e's fix round, the deputy's message 17:26)."""
+    return "trading" in inspect.signature(OwnerProtectorConfig.__init__).parameters
+
+
+def _trading_reader() -> TradingClient:
+    """The account's own paper client, a second one apart from the node's start reads, with every
+    adapter on its session replaced by the adapter package's `TimeoutAdapter` at the same timeout and
+    `get_only` set: every method but GET is refused with `MethodRefused` before anything is sent (the
+    contract `require_get_only` checks in data-only mode, ADR 0070). The node's own execution client is
+    untouched, since data-only mode is not set for the process."""
+    reader = window.paper_trading()
+    session = session_of(reader)
+    mounted = timeout_adapter(reader)
+    if session is None or mounted is None:
+        raise window.WindowRefused(
+            "the trading reader has no session with the adapter's timeout, so it cannot be made "
+            "GET only; nothing started"
+        )
+    for old in {id(a): a for a in session.adapters.values()}.values():
+        old.close()
+    adapter = TimeoutAdapter(mounted.timeout, get_only=True)
+    for prefix in list(session.adapters) or ["https://", "http://"]:
+        session.mount(prefix, adapter)
+    return reader
+
+
+def _book_settings(config: ProtectorRun) -> dict[str, Any]:
+    """The composition with U-e in one call: with the runner's book path set, check the book reads
+    (`_book_levels`, refusing by name) and hand the protector its account label and the book's path.
+    Every level of this account goes to the protector, held at the start or not; the protector binds
+    a level only to its own holding and keeps the entry when that holding never appears (the lead's
+    P11 ruling, 16:55, narrowed at 17:08). This node filters none and drops none. Where the protector
+    takes U-e's `trading` slot it is handed the account's own GET-only reader (`_trading_reader`), built
+    here, under the locks; where it takes none, that is named."""
+    path = os.environ.get(LEVEL_BOOK_ENV)
+    if not path:
+        return {}
+    levels = _book_levels(Path(path), config.account)
+    if not _protector_takes_book():
+        raise window.WindowRefused(
+            "the level book is set, but this protector build reads no level book (U-e is not "
+            "composed); nothing started"
+        )
+    print(
+        f"paper:protector: level book {path}: {len(levels)} level(s) of {config.account} handed to "
+        "the protector",
+        flush=True,
+    )
+    settings: dict[str, Any] = {"account_label": config.account, "level_book_path": path}
+    if _protector_takes_reader():
+        settings["trading"] = _trading_reader()
+    else:
+        print(
+            "paper:protector: this protector build takes no trading reader, so it reads no fills "
+            "and carries no level by the venue's fills",
+            flush=True,
+        )
+    return settings
+
+
+@contextlib.contextmanager
+def _locked_start(config: ProtectorRun, lock_dir: Path) -> Generator[None]:
+    """`window.paper_start`, retried while a lock is held, for at most `config.lock_wait` seconds.
+
+    flock(2) locks belong to an open file description, so the wait cannot pre-take the lock and
+    then enter paper_start (a second open conflicts with the first in this process). It retries
+    the whole entry instead, only when the refusal's cause is flock's EWOULDBLOCK; paper_start's
+    `finally` closes a lock taken part way. Nothing is read, placed or subscribed before both
+    locks are held; a hold or unread inbox found after them is never retried (the owner's word).
+    """
+    deadline = window.time.monotonic() + config.lock_wait
+    with contextlib.ExitStack() as stack:
+        while True:
+            try:
+                stack.enter_context(
+                    window.paper_start(
+                        config.account,
+                        holds_dir=config.holds_dir,
+                        inbox=config.inbox,
+                        lock_dir=lock_dir,
+                    )
+                )
+                break
+            except window.WindowRefused as e:
+                if not isinstance(e.__cause__, BlockingIOError) or config.lock_wait == 0:
+                    raise
+                left = deadline - window.time.monotonic()
+                if left <= 0:
+                    raise window.WindowRefused(
+                        f"{e}".removesuffix("; nothing started")
+                        + f" after waiting {config.lock_wait} s; nothing started"
+                    ) from e
+                window.time.sleep(min(LOCK_POLL_SECS, left))
+        yield
+
+
 def _clean_on_main(checkout: Path) -> None:
     """On account C only: refuse a tree that is not clean at a commit on main (the lead's ruling
     (d)2, 2026-11-13, before proof 4). Clean is `git status --porcelain` empty, untracked files
@@ -248,12 +436,7 @@ def run_protector(
         trading = trading if trading is not None else window.paper_trading()
         _recorder_hours(config, window.session_now(trading)[0].timestamp)
     with (
-        window.paper_start(
-            config.account,
-            holds_dir=config.holds_dir,
-            inbox=config.inbox,
-            lock_dir=window.default_log_dir().parent if lock_dir is None else lock_dir,
-        ),
+        _locked_start(config, window.default_log_dir().parent if lock_dir is None else lock_dir),
         window.window_signals(),
     ):
         trading = trading if trading is not None else window.paper_trading()
@@ -281,9 +464,16 @@ def run_protector(
         # Re-read together immediately before building: a hold arriving in a broker read stops us.
         window.read_start_controls(config.holds_dir, config.inbox)
         _lead_go(config)
-        node, strategy = protector_node(config, instruments, feed=feed)
+        # The level book, under both locks only (the lead's ruling, 2026-11-13, 17:10).
+        book = _book_settings(config)
+        node, strategy = protector_node(
+            config, instruments, feed=feed, book=book, session_part=part
+        )
+        # The runner (scripts/automation run-protector) reads the epoch to launch the successor.
         print(
-            f"paper:protector: {config.account}, {config.row}, {part}, {feed}; ends {ends.isoformat()}"
+            f"paper:protector: {config.account}, {config.row}, {part}, {feed}; "
+            f"ends {ends.isoformat()} (epoch {int(ends.timestamp())})",
+            flush=True,
         )
         failure: BaseException | None = None
         errors: list[str] = []
@@ -341,6 +531,12 @@ def parse_args(argv: Sequence[str] | None = None) -> ProtectorRun:
     parser.add_argument("--holds-dir", type=Path, required=True)
     parser.add_argument("--inbox", type=Path, required=True)
     parser.add_argument("--lead-go", help="C only: the lead's start instruction, 'protect <row>'")
+    parser.add_argument(
+        "--lock-wait",
+        type=int,
+        default=0,
+        help=f"0-{LOCK_WAIT_MAX_SECS}: wait this long for the account's locks, else refuse",
+    )
     args = parser.parse_args(argv)
     try:
         args.levels = parse_levels(args.levels)
