@@ -448,7 +448,8 @@ def test_expired_sale_with_no_quote_names_the_stall_on_every_step() -> None:
         before = len(strategy.said)
         strategy._on_step(cast(Any, None))
         assert len(strategy.sent) == 1
-        assert any("sale" in line and "quote" in line for line in strategy.said[before:])
+        assert any("sale stalled" in line and "quote" in line for line in strategy.said[before:])
+        assert strategy._holding_state(h.AAA, strategy.slots[h.AAA])[0] == "frozen"
 
 
 def test_real_core_chases_a_gapped_release_then_fills_the_external_long() -> None:

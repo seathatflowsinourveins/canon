@@ -23,6 +23,7 @@ from nautilus_trader.model import TimeInForce
 
 from canon_trading.owner_protector import OwnerProtector
 from tests import test_owner_protector as h
+from tests.test_owner_protector import alpaca_stream_lock  # noqa: F401 -- offline autouse
 from tests.test_owner_protector_chase import CHASE
 from tests.test_owner_protector_chase import RELEASE
 from tests.test_owner_protector_chase import released
@@ -32,11 +33,6 @@ from tests.test_owner_protector_growth import acknowledge_cancel
 from tests.test_owner_protector_growth import armed_one_share
 from tests.test_owner_protector_growth import grows_to
 from tests.test_owner_protector_growth import step
-
-
-@pytest.fixture(autouse=True)
-def alpaca_stream_lock() -> None:
-    """No credential-environment fixture for these offline cases."""
 
 
 def unusable(at: int, kind: str) -> QuoteTick:
@@ -153,28 +149,66 @@ class LoggedHarness(h.Harness):
 
 
 @pytest.mark.parametrize("kind", ["absent", "crossed", "zero-bid-size", "zero-ask-size"])
-def test_no_usable_quote_ever_names_the_unprotected_holding_at_error_until_quotes_arrive(
+def test_a_start_with_no_usable_quote_names_the_holding_each_step_and_raises_no_alert(
     kind: str,
 ) -> None:
+    """F8's review, 2: a holding that never had a sell of ours is not a lost cover; before its
+    first usable quote it is named unprotected at each step, and no ALERT is raised."""
     strategy = LoggedHarness()
     strategy.cached.latest = None if kind == "absent" else unusable(h.T0, kind)
     strategy.adopt_holding(h.AAA, Price.from_str("9.90"))
     for second in (1, 2):
-        before = len(strategy.logged)
+        before = len(strategy.said)
         step(strategy, h.T0 + second * h.SECOND)
         assert not strategy.sent
+        assert h.AAA in strategy.frozen
         assert any(
-            severity == "ERROR"
-            and "AAA.ALPACA" in line
-            and "quote" in line
-            and ("unprotected" in line or "without" in line)
-            for severity, line in strategy.logged[before:]
-        ), "F8: a holding without any usable quote must be named at ERROR on each step"
+            "AAA.ALPACA" in line and "unprotected" in line for line in strategy.said[before:]
+        )
+    assert not [line for _, line in strategy.logged if "ALERT:" in line], strategy.logged
     strategy.observe("10.00", h.T0 + 3 * h.SECOND)
     strategy.observe("10.00", h.T0 + 4 * h.SECOND)
     strategy.observe("10.00", h.T0 + 5 * h.SECOND)
     assert len(working(strategy)) == 1
     assert h.AAA not in strategy.frozen
+
+
+def lost_sale_cover_with_no_usable_quote() -> h.Harness:
+    strategy, first = released()
+    terminal(first, RELEASE + h.SECOND, expired=True)
+    strategy.cached.latest = None
+    strategy.venue_quotes.clear()
+    strategy.replacement_quotes.clear()
+    return strategy
+
+
+def test_a_lost_cover_with_no_usable_quote_is_alerted_once_and_named_at_each_step() -> None:
+    """F8's review, 3: the ALERT was said on every step and every bad quote."""
+    strategy = lost_sale_cover_with_no_usable_quote()
+    for n in range(3):
+        before = len(strategy.said)
+        strategy._on_step(cast(Any, None))
+        assert any("sale stalled" in line for line in strategy.said[before:]), strategy.said
+    alerts = [line for line in strategy.said if "ALERT: holding without its working sell" in line]
+    assert len(alerts) == 1, strategy.said
+
+
+def test_a_lost_cover_with_no_usable_quote_is_reported_uncovered() -> None:
+    """F8's review, 1: the holding's report read `counting`, as if it were healthy."""
+    strategy = lost_sale_cover_with_no_usable_quote()
+    strategy._on_step(cast(Any, None))
+    state, _, reason = strategy._holding_state(h.AAA, strategy.slots[h.AAA])
+    assert state == "frozen" and reason is not None and "quote" in reason, (state, reason)
+
+
+def test_a_new_working_sell_rearms_the_lost_cover_alert() -> None:
+    strategy = lost_sale_cover_with_no_usable_quote()
+    strategy._on_step(cast(Any, None))
+    assert h.AAA in strategy.replace_alerted
+    strategy.observe("9.80", RELEASE + 2 * h.SECOND)
+    assert len(strategy.sent) == 2 and len(working(strategy)) == 1
+    strategy._on_step(cast(Any, None))
+    assert h.AAA not in strategy.replace_alerted, "a working sell ends the lost cover"
 
 
 def test_engine_replaces_size_canceled_trail_while_crossed_quotes_continue(capfd) -> None:

@@ -58,11 +58,10 @@ def test_a_refused_protective_sell_freezes_its_holding_with_the_venues_reason(
 
 def test_a_refused_protective_sell_raises_one_alert_line(tmp_path: Path) -> None:
     strategy = armed_and_sent(tmp_path / "levels.json")
-    before_refusal = len(strategy.said)  # F8 also alerts while startup has no usable quote.
     refuse(strategy)
     for n in range(184, 187):
         strategy.observe("1.21", T0 + n * SECOND)
-    alerts = [n for n in strategy.said[before_refusal:] if n.startswith(f"{AAA}: ALERT:")]
+    alerts = [n for n in strategy.said if n.startswith(f"{AAA}: ALERT:")]
     assert len(alerts) == 1, strategy.said
     assert "refused by the venue" in alerts[0] and "unprotected" in alerts[0], alerts
 
