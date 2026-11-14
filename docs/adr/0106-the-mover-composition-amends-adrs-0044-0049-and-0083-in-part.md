@@ -304,6 +304,13 @@ account C's construction are unchanged.
   converge (1.0, 2 and 3.5), and none ties a stop's distance to the quoted spread. The multiple and the
   floor are ours.
 
+The follow-up keeps a resolved arm on terminal heartbeats. A configuration error, bridged or not, is
+now `refused` where it was `failed`, and a refused run writes a record naming the arm, unless it had not
+yet read the account flat and the newest record is neither `ok` nor `refused`; that record then stays,
+since it may be the only one that says the account may not be flat. A run skipped, with nothing to
+run, refused by its parser or failed before its window writes no record. A signal before the window
+writes a failed record naming the arm: it is itself unsettled, so the next start must still read flat.
+
 ### Consequences
 
 * Bad: seven slots in every part (2026-11-11) rest on single-name windows, the measured fixture and
@@ -366,8 +373,16 @@ archived documentation, `nautilus-trader` and `alpaca-py`) were read 2026-11-11.
   `test_an_auto_part_names_a_trail_flag_given_at_its_fixed_row_as_not_run` to
   `test_only_the_default_arm_is_marked_as_the_default`, and in `tests/test_mover_sizing.py` the trail flags'
   namespace and refusal cases, and the profile flags' cases in `tests/test_mover_profile.py`. Run
-  2026-11-12/13. The paper window this change rests on (ADR 0074) is one 15-minute extended Mover window
-  on account B from the landing commit with no trail flag; its result is in the landing's pull request.
+  2026-11-12/13. Two 15-minute extended Mover paper windows on account B ran with no trail flag on
+  2026-11-13, in the overnight part on the `boats` feed: the first from the default commit before the
+  review's fixes, the second from the review-fix commit before its ADR-only amend. Neither tree is the
+  landed tree, which also carries main's later work. Both ended `ok`, flat (no position, no open order),
+  with `arm: "OWN1"`, `arm_default: true`. The first made no entry; the second made three, each noted
+  as "ATR has fewer than 14 complete one-minute bars: fixed trail fallback", so each stop took the
+  fixed plan's distance; no sale came inside 60 s, and the wind-down closed what was open. No OWN1 ATR
+  distance was exercised on a fill in either window; the landing's pull request gave the second
+  window's start only. Both windows' logs are kept outside the repository, as every session window's
+  are (ADR 0044).
 * The margin probe's run, 2026-11-12 14:26 New York on paper account A: one run, one name each, flat before
   and after (`paper:account`); its relations are above. Alpaca, https://docs.alpaca.markets/us/docs/orders-at-alpaca.md
   ("Buying Power", read 2026-11-12), https://docs.alpaca.markets/us/docs/margin-and-short-selling.md

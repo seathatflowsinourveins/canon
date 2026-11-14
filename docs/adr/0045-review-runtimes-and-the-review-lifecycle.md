@@ -49,7 +49,12 @@ owner's delegation of 2026-11-10.
      preview, hook-input fields, models, fixes; none changes a reader's terms; a brief starts no swarm).
      Its docs set `AGY_CLI_DISABLE_AUTO_UPDATE=true` in the shell profile, so `scripts/bootstrap
      --install` writes it to `~/.zshrc`. (Reversed 2026-11-10 by ADR 0065 rule 3: the updater is on
-     again, and `--install` removes that line.)
+     again, and `--install` removes that line.) (2026-11-13: it ran 1.5.6 from 2026-11-12 and 1.5.8 from
+     2026-11-13, by agy's own logs, and the pin followed once the notes of 1.5.6 to 1.5.8 were read.
+     1.5.6 loosens Auto mode's review of commands that leave the terminal sandbox. 1.5.7 makes Auto the
+     default Agent Mode where no mode is saved and Auto is available, headless `-p` included, unless a
+     `strict` Tool Permission is set. Whether that reaches a launch carrying the bypass flag above is
+     UNVERIFIED.)
    * *DeepSeek Harness* (MIT, pre-release only; agent id `dsh`, no entry in the map): API key in its own
      file (not read). Orca launches `dsh-tui .`, whose `/update` moves past the pin. Open Orca issues: a
      first prompt lost past 30 s (#38131), `git` failing in its terminals (#26594). Session logs go to
@@ -83,7 +88,7 @@ owner's delegation of 2026-11-10.
    at `tag:dsh-v0.2.1-rc.3`, `dsh-tui` at `tag:v0.17.0`, and `pnpm` at `tag:v10.34.9` for `dsh-tui`'s
    profile, the installed versions; each already has newer releases, which `outdated` reports.
    `antigravity-cli` was adopted at `tag:1.5.3` and moved to `tag:1.5.5`, the version its updater had
-   installed. All are
+   installed, then on 2026-11-13 to `tag:1.5.8`, the version installed by then. All are
    machine-level, not in `mise.toml`, as ADR 0043 did for Codex. `canon/models.json`
    and ADR 0005 are unchanged: these are readers, not lanes.
 6. **DeepSeek Harness after its trial** (decided by the coordinator under the owner's delegation of
@@ -209,7 +214,10 @@ Read 2026-11-10. `fetched`: downloaded and searched. "Lane": a model summarised 
   (resolved, the 1.5.3 pin). https://antigravity.google/docs/cli/troubleshooting/ — a "self-updater that
   runs in the background"; `AGY_CLI_DISABLE_AUTO_UPDATE` to `true` "inside your shell profile (`~/.bashrc`
   or `~/.zshrc`)" (lane); the name is in the binary (`strings`). Releases 1.5.4 and 1.5.5, notes read (`gh
-  release view`); `tag:1.5.5` → `3e9fbcc9773e` (resolved).
+  release view`); `tag:1.5.5` → `3e9fbcc9773e` (resolved). Releases 1.5.6 (2026-11-11), 1.5.7
+  (2026-11-12) and 1.5.8 (2026-11-13), notes read 2026-11-13 (`gh api`); `tag:1.5.8` → `1554cf9fc71d`
+  (resolved). The versions this machine ran, from the version strings in agy's own CLI logs, read
+  2026-11-13: 1.5.6 from 2026-11-12 and 1.5.8 from 2026-11-13, with no log naming 1.5.7.
 * https://github.com/deepseek-ai/deepseek-harness — MIT; every release a pre-release (`gh`).
   `tag:dsh-v0.2.1-rc.3` → `1f81c047fc48` (resolved).
 * https://raw.githubusercontent.com/ccch1mneyyy/dsh-TUI/v0.17.0/README.md — MIT; `dsh-tui update` "update

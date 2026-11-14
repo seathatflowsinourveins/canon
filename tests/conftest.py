@@ -396,6 +396,25 @@ def no_holdout_opened_in_the_main_checkout(
     )
 
 
+PAPER_DIR_ENV = "CANON_PAPER_SESSION_DIR"
+"""`session_window.PAPER_DIR_ENV`, written out so the suite's setup imports no trading code;
+`test_no_test_resolves_the_real_paper_records_folder` fails if the two part."""
+
+
+@pytest.fixture(autouse=True)
+def no_test_reaches_the_real_paper_records(
+    tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every test's session-window records folder is one of its own, never the per-user folder the
+    scheduled runner writes and `scripts/automation status` reads. It is set for the whole suite here,
+    so a test that names no `--log-dir` still cannot write the real heartbeat or record; a test of the
+    real folder's own lookup removes the variable itself."""
+    # a name under the run's base folder, made only by a test that writes there (os.urandom: unique
+    # per test, so one test's gap markers never reach the next)
+    folder = tmp_path_factory.getbasetemp() / "paper-records" / os.urandom(8).hex()
+    monkeypatch.setenv(PAPER_DIR_ENV, str(folder))
+
+
 @pytest.fixture
 def references_in(monkeypatch: pytest.MonkeyPatch) -> None:
     """A Mover window's references are in before its node (the lead's hold of 2026-11-12, item (i)); window

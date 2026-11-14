@@ -34,6 +34,11 @@ check's sources, ADR 0060), and the long-only sources 2026-11-11:
   task and then raises KeyboardInterrupt, which `Lib/asyncio/runners.py:112-113` does only on the main
   thread and only when SIGINT's handler is `signal.default_int_handler`; Python's default for SIGTERM
   ends the process with no `finally` run. `window_signals` therefore handles both for the whole window.
+* Python's argparse, https://docs.python.org/3/library/argparse.html#type and #argument-groups,
+  read 2026-11-13: a type converter's ValueError becomes a usage error, and add_argument_group groups
+  help without changing parsing (`Lib/argparse.py:1565-1568`, `:2649-2671` at `b703b2c5e704`).
+  At that pin, `Lib/dataclasses.py:1802-1813` carries unchanged fields through replace and calls
+  __post_init__, so a bridge resets Mover's rows with its strategy in one replacement.
 * macOS `timeout(1)` (`man timeout`): "For any other signals delivered to timeout, it will propagate them
   to command", to its whole process group; uv at its pin, `crates/uv-command-support/src/child.rs:117-122`,
   forwards SIGTERM to its child, and SIGINT when stdin is not a terminal. So one TERM to the task reaches
@@ -208,6 +213,7 @@ from decimal import InvalidOperation
 from pathlib import Path
 from typing import TYPE_CHECKING
 from typing import Any
+from typing import NoReturn
 from typing import cast
 from uuid import uuid4
 from zoneinfo import ZoneInfo
@@ -683,12 +689,22 @@ timed on a host clock up to `SKEW_SECS` behind Alpaca's, and its bounded end (`A
 after the clock read are inside the window, whose end is absolute."""
 
 
+PAPER_DIR_ENV = "CANON_PAPER_SESSION_DIR"
+"""The records folder's own name, read first by `default_log_dir` and by `scripts/automation status`."""
+
+
 def default_log_dir() -> Path:
     """The per-user temporary folder `mise run paper:session` passes, whatever `$TMPDIR` a session sets,
     so the gap marker is found by every caller: on macOS `getconf DARWIN_USER_TEMP_DIR` (getconf(1),
     `confstr(3)`'s `_CS_DARWIN_USER_TEMP_DIR`), and `RuntimeError` if it does not give one, since `$TMPDIR`'s
     folder is not where the gap marker and `scripts/automation status` look; elsewhere, Python's
-    `tempfile.gettempdir()`."""
+    `tempfile.gettempdir()`. `CANON_PAPER_SESSION_DIR`, when set, names the folder itself, as it does for
+    `scripts/automation status`, which reads the records there; the test suite sets it for every test,
+    so no test reaches the real folder. A relative one is refused by name."""
+    if named := os.environ.get(PAPER_DIR_ENV):
+        if not Path(named).is_absolute():
+            raise RuntimeError(f"{PAPER_DIR_ENV} must be an absolute folder, got {named!r}")
+        return Path(named)
     if sys.platform != "darwin":
         return Path(tempfile.gettempdir()) / "canon-paper-session"
     try:
@@ -2016,6 +2032,10 @@ class WindowReport:
     arm_default: bool = False
     """True when `arm` is `DEFAULT_ARM`, taken because the window named no arm and no trail flag; false
     when the arm was named, or there is none."""
+    entries_no_usable_spread: int = 0
+    """Mover entries whose notes name the fixed fallback for an unusable quoted spread."""
+    entries_cold_fallback: int = 0
+    """Mover entries with the ordinary cold-ATR fallback note, excluding the opening's fixed plan."""
     feed: str = ""
     """The feed the strategy streamed and warmed up on (ADR 0055)."""
     overnight: str = ""
@@ -2106,6 +2126,10 @@ class StopTimedOut(RuntimeError):
 class WindowSignalled(KeyboardInterrupt):
     """The window's node was stopped by a signal, SIGINT or SIGTERM, which the message names; raised as
     an interrupt, so the window's `finally` checks the account and writes the record as for Ctrl-C."""
+
+    heard = False
+    """Set once `_main` has written the heartbeat naming the stop (with the window's arm), so `main`
+    writes it only for a stop raised outside `_main`."""
 
 
 _ABANDONED: list = []
@@ -3156,13 +3180,15 @@ def run_window(
     trading: TradingClient | None = None,
     market: tuple[AlpacaClock, AlpacaCalendar | Sequence[AlpacaCalendar] | None] | None = None,
     market_read_at: float | None = None,
+    firing: _WindowFiring | None = None,
 ) -> WindowReport:
     """Run one window as the module header describes; raise if it cannot start or is not left flat.
     The Mover record carries the process's requests by endpoint at the node's start and at the window's
     end (`canon_alpaca.providers.endpoint_counts`).
     `trading` and `market` (the clock and calendar) are read here unless the caller already has them, in
     which case `market_read_at` is the `time.monotonic()` at which the clock's answer arrived
-    (`session_now`)."""
+    (`session_now`). `firing`, when supplied by the CLI, captures the bridge's identity and whether
+    this runner wrote a record; a later CLI refusal must preserve that record."""
     config.log_dir.mkdir(parents=True, exist_ok=True)
     marker = config.log_dir / "last-window-end"
     # Dated by when it was written, so a marker cut short by a kill still counts.
@@ -3191,7 +3217,47 @@ def run_window(
                     f"the {part} part runs the bridge in Mover's place ({row.bridge_reason}), "
                     f"which has no trailing sell for trigger {config.trigger}"
                 )
-            config = replace(config, strategy=DEFAULT_STRATEGY if row.bridge_reason else MOVER)
+            if row.bridge_reason:
+                # dataclasses.replace runs __post_init__: clear every Mover-only field together
+                # with the strategy, at SessionMaCross's own defaults. No current row bridges.
+                fields = (
+                    *TRAIL_SETTINGS,
+                    "trail_cap",
+                    "slots",
+                    "spares",
+                    "baseline_path",
+                    "baseline_dir",
+                    "trail_profile_path",
+                    "arm",
+                    "arm_default",
+                )
+                unrun = (
+                    firing.mover_flags
+                    if firing is not None
+                    else [
+                        f"--{name.replace('_', '-')} {getattr(config, name)}"
+                        for name in fields
+                        if name != "arm_default"
+                        and getattr(config, name) != getattr(WindowConfig, name)
+                    ]
+                )
+                try:  # a configuration error is a refusal, bridged or not
+                    config = replace(
+                        config,
+                        strategy=DEFAULT_STRATEGY,
+                        **{name: getattr(WindowConfig, name) for name in fields},
+                    )
+                except ValueError as e:
+                    raise WindowRefused(str(e)) from e
+                _say_unrun(config, unrun)
+                if firing is not None:
+                    firing.identify(config, unrun=unrun)
+                    _heard(
+                        config.log_dir,
+                        f"a {config.session} window of {config.strategy}{firing.trail_notice}",
+                    )
+            else:
+                config = replace(config, strategy=MOVER)
         if config.strategy == MOVER:
             if config.trigger in PRINT_TRIGGERS and feed != DataFeed.SIP.value:
                 raise WindowRefused(
@@ -3223,6 +3289,8 @@ def run_window(
         raise WindowRefused(str(e)) from e
     if left := leftovers(trading):
         raise WindowRefused(f"the paper account is not flat; not starting: {left}")
+    if firing is not None:
+        firing.flat_checked = True  # an older record's "may not be flat" is out of date from here
     no_shorting = venue_no_shorting(trading)
     if VENUE_LONG_ONLY and not no_shorting:
         raise WindowRefused(
@@ -3493,6 +3561,8 @@ def run_window(
     # from here a signal marks the record stopping at once, whether or not run_window's `finally` runs
     _SIGNALS.record = (config.log_dir, report)
     initial_snapshot_error = write_record(config.log_dir, report)
+    if firing is not None:
+        firing.record_written = True
     if initial_snapshot_error is not None:
         raise initial_snapshot_error  # the failed record is already on disk; no node was started
     started = time.monotonic()
@@ -3574,6 +3644,10 @@ def run_window(
                 if isinstance(strategy, Mover):
                     report.mover["run"] = run = strategy.record()
                     report.mover.update(clock_notes(run))
+                    (
+                        report.entries_no_usable_spread,
+                        report.entries_cold_fallback,
+                    ) = _entry_fallback_counts(run.get("entries", ()))
                     try:  # the lead's order of 2026-11-11; one that cannot be read is named
                         result_inputs = (
                             strategy_fills(cache, strategy_id),
@@ -3750,6 +3824,23 @@ def run_window(
     if over_budget:
         raise RuntimeError(f"the window went over its request budget: {over_budget}")
     return report
+
+
+def _entry_fallback_counts(entries: Sequence[Mapping[str, Any]]) -> tuple[int, int]:
+    """Count Mover._trail_plan's two fallback notes once per entry. Its structured source/bound
+    pair is shared by the opening's different cold plan, and fixed also names an ordinary plan."""
+    no_spread = (
+        "no usable quoted spread (missing/zero bid, crossed or locked): fixed trail fallback"
+    )
+    cold = (
+        r"ATR has fewer than \d+ complete one-minute bars: fixed trail fallback"
+        r"(?:, raised to the spread floor)?(?:; baseline dollar volume per minute is unknown: "
+        r"tier uses ATR, a stand-in for size)?"
+    )
+    return (
+        sum(no_spread in entry.get("notes", ()) for entry in entries),
+        sum(any(re.fullmatch(cold, note) for note in entry.get("notes", ())) for entry in entries),
+    )
 
 
 def overrun(started_wall: datetime, ran: float, ends: datetime) -> str:
@@ -5328,18 +5419,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"paper:session: {e}", file=sys.stderr)
         named = re.search(r"stopped by (SIG[A-Z]+)", str(e))
         code = 128 + signal.Signals[named.group(1)].value if named else 1
-        try:  # abandoned or not: the schedule's status reads a failed firing from it
-            write_heartbeat(args.log_dir, f"failed: {type(e).__name__}: {e}")
-        except OSError:
-            pass
-    except BaseException as e:
+        if not e.heard:  # raised before `_main`'s own handler, which says it with the arm
+            try:  # abandoned or not: the schedule's status reads a failed firing from it
+                write_heartbeat(args.log_dir, f"failed: {type(e).__name__}: {e}")
+            except OSError:
+                pass
+    except BaseException:
         if not _ABANDONED:
             raise
         traceback.print_exc()  # `os._exit` below would discard it
-        try:
-            write_heartbeat(args.log_dir, f"failed: {type(e).__name__}: {e}")
-        except OSError:
-            pass
     finally:
         if _ABANDONED:
             sys.stdout.flush()
@@ -5372,28 +5460,30 @@ def _parser() -> argparse.ArgumentParser:
         help=f"{MOVER}'s slots; default: seven in every part",
     )
     parser.add_argument("--spares", type=int, default=MOVER_SPARES, help="extra Mover roster names")
+    # argparse's add_argument_group changes help grouping, not parsing or defaults.
+    trail = parser.add_argument_group("Mover's trail")
     # the trail flags default to None, so `_args` tells a flag given at its fixed value from one left
     # out; a Mover window that names none of them and no --arm runs DEFAULT_ARM (`_mover_trail`)
-    parser.add_argument(
+    trail.add_argument(
         "--trail-mode",
         choices=TRAIL_SETTINGS["trail_mode"]["arms"],
         help=f"{MOVER}'s trail: fixed, atr over the spread floor, tier, ratchet or profile; fixed "
         f"when another trail flag or --arm is given, and arm {DEFAULT_ARM}'s rows when none is",
     )
-    parser.add_argument(
+    trail.add_argument(
         "--trail-cap",
         choices=TRAIL_CAPS,
         help=f"{MOVER}'s arm for a trail over the 0.02 cap: clamp, refuse, or own (the name's "
         f"distance, sized down); clamp when another trail flag or --arm is given",
     )
-    parser.add_argument(
+    trail.add_argument(
         "--atr-k",
-        type=Decimal,
+        type=_decimal_argument,
         choices=(TRAIL_SETTINGS["atr_k"]["default"], *TRAIL_SETTINGS["atr_k"]["alternates"]),
         help=f"{MOVER}'s ATR multiple under --trail-mode atr: a registered row, 1, 2 or 3; 1 when "
         "another trail flag or --arm is given",
     )
-    parser.add_argument(
+    trail.add_argument(
         "--arm",
         choices=tuple(TRAIL_ARMS),
         help=f"{MOVER}'s trail arm, named in the record and the heartbeat; refused unless the trail "
@@ -5424,7 +5514,7 @@ def _parser() -> argparse.ArgumentParser:
         help="read the trade date's <date>/<feed>.json in this directory, and refuse the window "
         "when it is missing (overnight ranks on dollars without one)",
     )
-    parser.add_argument(
+    trail.add_argument(
         "--trail-profile-path",
         type=Path,
         help="default: catalog/movers-baseline/trail-profile-v1.json",
@@ -5432,17 +5522,17 @@ def _parser() -> argparse.ArgumentParser:
     profile_k = PROFILE_SETTINGS["profile_k"]
     # the profile flags default to None, as the trail flags do, so a flag given at its row is told
     # from one left out; `window_config` fills the rows (`_profile_rows`)
-    parser.add_argument(
+    trail.add_argument(
         "--profile-k",
         type=_decimal_argument,
         choices=sorted((profile_k["default"], *profile_k["alternates"])),
     )
     for name in ("profile_pctl", "profile_floor"):
-        parser.add_argument(
+        trail.add_argument(
             "--" + name.replace("_", "-"),
             choices=PROFILE_SETTINGS[name]["arms"],
         )
-    parser.add_argument(
+    trail.add_argument(
         "--profile-multipliers",
         type=_decimal_argument,
         nargs=3,
@@ -5485,6 +5575,16 @@ def window_config(args: argparse.Namespace, session: str) -> WindowConfig:
             trigger=args.trigger,
             validate_trade_sequence=args.validate_trade_sequence,
         )
+        if rows["trail_mode"] != "profile":
+            unused = [
+                "--" + name.replace("_", "-")
+                for name in (*PROFILE_SETTINGS, "trail_profile_path")
+                if getattr(args, name) is not None
+            ]
+            if unused:
+                raise ValueError(f"{', '.join(unused)} requires --trail-mode profile")
+        if rows["trail_mode"] == "fixed" and rows["atr_k"] != TRAIL_FLAGS["atr_k"]:
+            raise ValueError("--atr-k away from its default is not used by --trail-mode fixed")
         for name in ARM_FLAGS:
             if (arm := getattr(args, name)) is None:
                 continue
@@ -5496,14 +5596,6 @@ def window_config(args: argparse.Namespace, session: str) -> WindowConfig:
                 )
                 continue
             rows[name] = arm
-    elif args.trail_mode not in (None, WindowConfig.trail_mode) or any(
-        value != getattr(WindowConfig, name) for name, value in profile.items()
-    ):
-        print(
-            f"paper:session: the trail rows are {MOVER}'s; this {args.strategy} window keeps "
-            "the fixed trail",
-            file=sys.stderr,
-        )
     return WindowConfig(
         symbol=args.symbol,
         session=session,
@@ -5521,7 +5613,7 @@ def window_config(args: argparse.Namespace, session: str) -> WindowConfig:
 
 def _decimal_argument(text: str) -> Decimal:
     """A finite decimal from the command line; argparse reports a ValueError as a usage error, and
-    `Decimal` raises `InvalidOperation`, which is not one."""
+    `Decimal` raises `InvalidOperation`, which is not one (Python's argparse.html#type)."""
     try:
         value = Decimal(text)
     except InvalidOperation:
@@ -5537,6 +5629,12 @@ def _args(argv: Sequence[str] | None) -> argparse.Namespace:
     (an empty `getconf` in the caller's shell leaves only the folder's name)."""
     parser = _parser()
     args = parser.parse_args(argv)
+
+    def refuse(reason: str) -> NoReturn:
+        # argparse's usage error, exit 2, and nothing written: a run refused while its command line
+        # is read never became a window, so it leaves the heartbeat and the record as they are
+        parser.error(reason)
+
     if args.profile_multipliers is not None:
         args.profile_multipliers = tuple(args.profile_multipliers)
     multipliers = PROFILE_SETTINGS["profile_multipliers"]
@@ -5545,22 +5643,22 @@ def _args(argv: Sequence[str] | None) -> argparse.Namespace:
             " ".join(str(value) for value in row)
             for row in (multipliers["default"], *multipliers["alternates"])
         )
-        parser.error(f"--profile-multipliers takes a registered row: {registered}")
+        refuse(f"--profile-multipliers takes a registered row: {registered}")
     if args.regular_strategy is not None and args.session != "auto":
-        parser.error("--regular-strategy names a part's strategy, so it needs --session auto")
+        refuse("--regular-strategy names a part's strategy, so it needs --session auto")
     if args.regular_strategy == MOVER and not args.mover:
-        parser.error(f"--regular-strategy {MOVER} trades the day's mover, so it needs --mover")
+        refuse(f"--regular-strategy {MOVER} trades the day's mover, so it needs --mover")
     runs_mover = MOVER in (args.strategy, args.regular_strategy) or (
         args.mover and args.session in ("extended", "auto")  # an extended part runs Mover with it
     )
     if args.slots is not None and not runs_mover:
-        parser.error(
+        refuse(
             f"--slots are {MOVER}'s, so they need --strategy or --regular-strategy {MOVER}, or "
             "--mover outside the regular session"
         )
     for flag in _trail_flags_given(args):
         if not runs_mover:
-            parser.error(
+            refuse(
                 f"{flag} is {MOVER}'s, so it needs --strategy or --regular-strategy {MOVER}, or "
                 "--mover outside the regular session"
             )
@@ -5587,9 +5685,9 @@ def _args(argv: Sequence[str] | None) -> argparse.Namespace:
     )
     extended = args.session != "regular" and (args.mover or args.strategy == MOVER)
     if args.reentry_arm is not None and not (regular or extended):
-        parser.error(f"--reentry-arm is {MOVER}'s, so it needs a part that runs {MOVER}")
+        refuse(f"--reentry-arm is {MOVER}'s, so it needs a part that runs {MOVER}")
     if args.opening_arm is not None and not regular:
-        parser.error(f"--opening-arm is the regular session's, so it needs {MOVER} to run there")
+        refuse(f"--opening-arm is the regular session's, so it needs {MOVER} to run there")
     if args.log_dir is None:
         args.log_dir = default_log_dir()
     elif not args.log_dir.is_absolute():
@@ -5606,15 +5704,19 @@ def _heard(log_dir: Path, outcome: str) -> None:
         print(f"paper:session: the heartbeat could not be written: {e}", file=sys.stderr)
 
 
-def _heard_failed(log_dir: Path, error: BaseException) -> None:
-    """The heartbeat for a failed run (`_heard`)."""
-    _heard(log_dir, f"failed: {type(error).__name__}: {error}")
+def _heard_failed(log_dir: Path, error: BaseException, trail_notice: str = "") -> None:
+    """The heartbeat for a failed run (`_heard`), naming any signal received during the run, before or
+    after the failure (the order is not known here), after the window's own notice."""
+    signalled = (
+        f"; {_SIGNALS.first} received during the run"
+        if _SIGNALS.first is not None and not isinstance(error, WindowSignalled)
+        else ""
+    )
+    _heard(log_dir, f"failed: {type(error).__name__}: {error}{trail_notice}{signalled}")
 
 
 TRAIL_FLAGS: dict[str, Any] = {
-    "trail_mode": TRAIL_SETTINGS["trail_mode"]["default"],
-    "trail_cap": TRAIL_CAP_DEFAULT,
-    "atr_k": TRAIL_SETTINGS["atr_k"]["default"],
+    name: TRAIL_ARMS["F2"][name] for name in ("trail_mode", "trail_cap", "atr_k")
 }
 """Mover's trail flags, by their `argparse` names, with the fixed rows each takes when it is left out
 and another trail flag or `--arm` is given (main's rows before `DEFAULT_ARM`)."""
@@ -5653,17 +5755,147 @@ def _trail_flags_given(args: argparse.Namespace) -> list[str]:
     return given
 
 
-def _refused_arm(args: argparse.Namespace) -> dict[str, Any]:
-    """The arm a refused window would have run, for its record, as an `ok` record names it: Mover's
-    from the command line (`_mover_trail`), none for another strategy."""
-    if args.strategy != MOVER:
-        return {"arm": None, "arm_default": False}
-    trail = _mover_trail(args)
-    return {"arm": trail["arm"], "arm_default": trail["arm_default"]}
+@dataclass
+class _WindowFiring:
+    """One CLI firing's identity, whether run_window has read the account flat, and explicit receipt of
+    run_window's first record write."""
+
+    identity: dict[str, Any] = field(default_factory=dict)
+    trail_notice: str = ""
+    mover_flags: list[str] = field(default_factory=list)
+    flat_checked: bool = False
+    record_written: bool = False
+
+    def identify(
+        self,
+        choice: argparse.Namespace | WindowConfig,
+        *,
+        session: str | None = None,
+        unresolved: bool = False,
+        unrun: Sequence[str] = (),
+    ) -> None:
+        """One shape for intended and built identities; no arm before an auto part is known."""
+        session = choice.session if session is None else session
+        strategy = choice.strategy
+        if isinstance(choice, WindowConfig):
+            arm, default = choice.arm, choice.arm_default
+        elif unresolved:
+            strategy, arm, default = None, None, False
+        else:
+            if choice.mover and session == "extended":
+                strategy = MOVER
+            trail = _mover_trail(choice) if strategy == MOVER else {}
+            arm, default = trail.get("arm"), trail.get("arm_default", False)
+        self.identity = {
+            "session": session,
+            "strategy": strategy,
+            "arm": arm,
+            "arm_default": default,
+        }
+        self.trail_notice = (
+            ("; session part unresolved" if unresolved else "")
+            + ("" if arm is None else f", arm {arm}")
+            + (" (the default)" if default else "")
+            + ("" if not unrun else f"; {', '.join(unrun)} not run")
+        )
+
+
+def _say_unrun(config: WindowConfig, unrun: Sequence[str]) -> None:
+    """Name unused Mover flags once, for an auto part or a bridge to another strategy."""
+    if unrun:
+        print(
+            f"paper:session: {', '.join(unrun)} not run: this {config.session} window "
+            f"runs {config.strategy}"
+        )
+
+
+def _unsettled_record(log_dir: Path) -> str | None:
+    """The result of a `latest.json` that does not show the account flat: anything but a window that
+    ended `ok` with nothing `left`, or a refusal (which placed nothing). That is `running` or `stopping`
+    (DIED once stale or overtaken), and `failed`, whose account check after the stop may not have read
+    the account at all; None for an ok or refused record, no record, or one it cannot read."""
+    try:
+        record = json.loads((records_dir(log_dir) / "latest.json").read_text())
+        result, left = record.get("result"), record.get("left")
+    except OSError, ValueError, AttributeError:
+        return None
+    if not isinstance(result, str):
+        return None
+    if (result == "ok" and not left) or result.startswith("refused"):
+        return None
+    return result
+
+
+def _startup_identity(firing: _WindowFiring, config: WindowConfig | None) -> dict[str, Any]:
+    """The firing's identity for a record written before run_window's, with the trigger and the
+    trade-sequence check once the window's configuration is known."""
+    return {
+        **firing.identity,
+        **(
+            {}
+            if config is None
+            else {
+                "trigger": config.trigger,
+                "validate_trade_sequence": config.validate_trade_sequence,
+            }
+        ),
+    }
+
+
+def _record_startup(
+    log_dir: Path, identity: Mapping[str, Any], outcome: str, *, keep_unsettled: bool
+) -> None:
+    """Record a run that ended before run_window registered its own record: refused, or stopped by a
+    signal. With `keep_unsettled` (a refusal before the firing read the account flat), a record that
+    says the account may not be flat (`_unsettled_record`) is left as it is: the refusal did not
+    establish otherwise, so it does not replace that warning (the heartbeat still names the refusal).
+    A signal's failed record is itself unsettled, so it is always written."""
+    if keep_unsettled and (kept := _unsettled_record(log_dir)) is not None:
+        print(
+            f"paper:session: the last window's record ({kept!r}) is left as it is: it may not be flat",
+            file=sys.stderr,
+        )
+        return
+    try:
+        unrecorded = write_record(
+            log_dir,
+            {
+                **identity,
+                "result": outcome,
+                "started_epoch": time.time(),
+                "started": datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ"),
+                "stale_after": STALE_RUNNING_SECS,
+                "commit": running_commit(),
+                "account": paper_account(),
+                "request_budget": request_record(()),
+                "entries_no_usable_spread": 0,
+                "entries_cold_fallback": 0,
+            },
+        )
+        if unrecorded is not None:
+            print(
+                f"paper:session: the startup record's request snapshot failed: {unrecorded}",
+                file=sys.stderr,
+            )
+    except OSError as written:
+        print(f"paper:session: the record could not be written: {written}", file=sys.stderr)
 
 
 def _main(args: argparse.Namespace) -> int:
     session = args.session
+    firing = _WindowFiring()
+    firing.identify(args, unresolved=session == "auto")
+    firing.mover_flags = _trail_flags_given(args) + [
+        f"--{name.replace('_', '-')} {getattr(args, name)}"
+        for name in (*ARM_FLAGS, "slots", "baseline_path", "baseline_dir")
+        if getattr(args, name) is not None
+    ]
+    if args.trigger != WindowConfig.trigger:
+        firing.mover_flags.append(f"--trigger {args.trigger}")
+    if args.validate_trade_sequence:
+        firing.mover_flags.append("--validate-trade-sequence")
+    if args.spares != WindowConfig.spares:
+        firing.mover_flags.append(f"--spares {args.spares}")
     config: WindowConfig | None = None
     try:
         trading = market = None
@@ -5675,19 +5907,24 @@ def _main(args: argparse.Namespace) -> int:
             if args.regular_strategy is not None and clock.is_open:
                 args.strategy = args.regular_strategy  # the schedule names the strategy a part runs
             resolved, why = resolve_session(clock, calendar, args.strategy, mover=args.mover)
+            session = resolved or ("regular" if clock.is_open else "extended")
+            firing.identify(args, session=session)
             if resolved is None:
                 print(f"paper:session: nothing to run: {why}")
-                _heard(args.log_dir, f"nothing to run: {why}")
+                _heard(args.log_dir, f"nothing to run: {why}{firing.trail_notice}")
                 return 0
-            session = resolved
         if args.mover and session == "extended":
             args.strategy = MOVER
-        config = window_config(args, session)
+        try:
+            config = window_config(args, session)
+        except ValueError as e:
+            firing.identify(args, session=session)
+            raise WindowRefused(str(e)) from e
         # an auto schedule's part that runs another strategy runs none of Mover's trail flags, entry
         # arms or trigger; it says so, rather than drop them unseen (AGENTS.md rule 5)
         unrun = (
             []
-            if args.strategy == MOVER
+            if config.strategy == MOVER
             else _trail_flags_given(args)
             + [
                 f"--{name.replace('_', '-')} {getattr(args, name)}"
@@ -5697,26 +5934,29 @@ def _main(args: argparse.Namespace) -> int:
             + ([] if args.trigger == WindowConfig.trigger else [f"--trigger {args.trigger}"])
             + (["--validate-trade-sequence"] if args.validate_trade_sequence else [])
         )
-        if unrun:
-            print(
-                f"paper:session: {', '.join(unrun)} not run: this {session} window runs {args.strategy}"
-            )
+        _say_unrun(config, unrun)
+        firing.identify(config, unrun=unrun)
         write_heartbeat(
             args.log_dir,
-            f"a {session} window of {args.strategy}"
-            + ("" if config.arm is None else f", arm {config.arm}")
-            + (" (the default)" if config.arm_default else "")
-            + ("" if not unrun else f"; {', '.join(unrun)} not run"),
+            f"a {session} window of {config.strategy}{firing.trail_notice}",
         )
-        report = run_window(config, trading=trading, market=market, market_read_at=market_read_at)
+        report = run_window(
+            config, trading=trading, market=market, market_read_at=market_read_at, firing=firing
+        )
     except WindowSkipped as e:
         print(f"paper:session: skipped: {e}")
-        _heard(args.log_dir, f"skipped: {e}")
+        _heard(args.log_dir, f"skipped: {e}{firing.trail_notice}")
         return 0
     except WindowRefused as e:
         print(f"paper:session: {e}", file=sys.stderr)
-        _heard(args.log_dir, f"refused: {e}")  # the refusal stands, said above
-        _record_unrun(args, session, f"refused: {e}", config)
+        _heard(args.log_dir, f"refused: {e}{firing.trail_notice}")
+        if not firing.record_written:
+            _record_startup(
+                args.log_dir,
+                _startup_identity(firing, config),
+                f"refused: {e}",
+                keep_unsettled=not firing.flat_checked,
+            )
         return 1
     except WindowSignalled as e:
         # a window stopped before its node ends failed (ADR 0050). Before run_window registered its record
@@ -5726,7 +5966,11 @@ def _main(args: argparse.Namespace) -> int:
         # run_window ended holds. `main` says the stop and writes the heartbeat.
         failed = f"failed: {type(e).__name__}: {e}"
         if _SIGNALS.record is None:
-            _record_unrun(args, session, failed, config)
+            # a failed record is itself unsettled, so it replaces any earlier warning: the next start
+            # must read the account flat either way
+            _record_startup(
+                args.log_dir, _startup_identity(firing, config), failed, keep_unsettled=False
+            )
         elif _SIGNALS.record[1].result == "running":
             log_dir, report = _SIGNALS.record
             report.result = failed
@@ -5735,61 +5979,24 @@ def _main(args: argparse.Namespace) -> int:
                 write_record(log_dir, report, refresh_requests=False)
             except OSError as written:
                 print(f"paper:session: the record could not be written: {written}", file=sys.stderr)
+        _heard_failed(args.log_dir, e, firing.trail_notice)
+        e.heard = True
         raise
     # KeyError: no key pair in the env; OSError: the HTTP layer's errors, the adapter's timeouts among them
     except (RuntimeError, ValueError, KeyError, APIError, OSError) as e:
         print(f"paper:session: {e}", file=sys.stderr)
-        _heard_failed(args.log_dir, e)
+        _heard_failed(args.log_dir, e, firing.trail_notice)
         return 1
-    except Exception as e:  # anything else: heard as failed, then raised with its traceback
-        _heard_failed(args.log_dir, e)
+    except BaseException as e:  # signals and other failures are recorded, then raised
+        _heard_failed(args.log_dir, e, firing.trail_notice)
         raise
     print(json.dumps(asdict(report), indent=2))
     if report.result.startswith("failed:"):  # a signal after the node: the heartbeat says it too
-        _heard(args.log_dir, report.result)
+        _heard(args.log_dir, f"{report.result}{firing.trail_notice}")
     elif _SIGNALS.first is not None:
         # one after the result was chosen: `main` exits for it, so the heartbeat says so
         _heard(args.log_dir, f"{report.result}; {_SIGNALS.first} received; the wind-down finished")
     return 0
-
-
-def _record_unrun(
-    args: argparse.Namespace, session: str, result: str, config: WindowConfig | None
-) -> None:
-    """The record of a window that ended before `run_window` registered one (refused, or stopped by a
-    signal), with `result`; one that cannot be written is said on stderr, so the run's own outcome and
-    exit code stand."""
-    try:
-        unrecorded = write_record(
-            args.log_dir,
-            {
-                "session": session,
-                "strategy": args.strategy,
-                "result": result,
-                **(
-                    {}
-                    if config is None
-                    else {
-                        "trigger": config.trigger,
-                        "validate_trade_sequence": config.validate_trade_sequence,
-                    }
-                ),
-                "started_epoch": time.time(),
-                "started": datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ"),
-                "stale_after": STALE_RUNNING_SECS,
-                "commit": running_commit(),
-                "account": paper_account(),
-                "request_budget": request_record(()),
-                **_refused_arm(args),
-            },
-        )
-        if unrecorded is not None:
-            print(
-                f"paper:session: the record's request snapshot failed: {unrecorded}",
-                file=sys.stderr,
-            )
-    except OSError as written:
-        print(f"paper:session: the record could not be written: {written}", file=sys.stderr)
 
 
 if __name__ == "__main__":

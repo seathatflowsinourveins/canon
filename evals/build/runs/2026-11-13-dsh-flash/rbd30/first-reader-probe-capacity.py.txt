@@ -1,0 +1,119 @@
+"""Probe: record one trial over a sample of one-minute AAPL bars, 390 per weekday session.
+
+Usage: python -I probe_capacity.py <new work dir> <sessions>
+
+Builds the bars the way tests/conftest.py does (an Alpaca asset through `parse_equity`, Alpaca bar
+payloads through `parse_bar`), writes them with the window they cover recorded (as a load by
+`bars_to_catalog` does), creates a ledger study over exactly that window and calls `record_trial` once.
+Prints which `canon_trading` was imported, the bar count, and what the trial was told.
+"""
+
+from __future__ import annotations
+
+import math
+import sys
+import traceback
+from datetime import UTC
+from datetime import datetime
+from datetime import timedelta
+from pathlib import Path
+
+from alpaca.data.models import Bar as AlpacaBar
+from alpaca.trading.models import Asset
+from canon_alpaca.data import parse_bar
+from canon_alpaca.providers import parse_equity
+from nautilus_trader.common import LogLevel
+from nautilus_trader.config import LoggerConfig
+from nautilus_trader.model import BarType
+from nautilus_trader.model import Quantity
+from nautilus_trader.persistence import ParquetDataCatalog
+
+import canon_trading
+from canon_trading.ledger import create_ledger_study
+from canon_trading.ledger import record_trial
+from canon_trading.ma_cross import MaCrossConfig
+
+ASSET = {
+    "borrow_status": "easy_to_borrow",
+    "class": "us_equity",
+    "easy_to_borrow": True,
+    "exchange": "NASDAQ",
+    "fractionable": True,
+    "id": "b0b6dd9d-8b9b-48a9-ba46-b9d54906e415",
+    "marginable": True,
+    "name": "Apple Inc. Common Stock",
+    "shortable": True,
+    "status": "active",
+    "symbol": "AAPL",
+    "tradable": True,
+}
+DAY = 86_400 * 1_000_000_000
+
+
+def main() -> None:
+    work, sessions = Path(sys.argv[1]), int(sys.argv[2])
+    work.mkdir(parents=True, exist_ok=False)
+    print("canon_trading:", canon_trading.__file__)
+    equity = parse_equity(Asset.model_validate(ASSET), 0)
+    bar_type = BarType.from_str(f"{equity.id}-1-MINUTE-LAST-EXTERNAL")
+    bars, previous, done = [], 100.0, 0
+    day = datetime(2025, 3, 10, tzinfo=UTC)  # a Monday
+    while done < sessions:
+        if day.weekday() < 5:
+            for minute in range(390):  # 13:30 to 19:59 UTC opens, the regular session in EDT
+                at = day + timedelta(hours=13, minutes=30 + minute)
+                close = round(100 + 5 * math.sin(len(bars) / 37), 2)
+                payload = {
+                    "t": at.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "o": previous,
+                    "h": max(previous, close),
+                    "l": min(previous, close),
+                    "c": close,
+                    "v": 1_000,
+                    "n": 10,
+                    "vw": close,
+                }
+                bars.append(parse_bar(AlpacaBar("AAPL", payload), bar_type, equity))
+                previous = close
+            done += 1
+        day += timedelta(days=1)
+    start = bars[0].ts_init // DAY * DAY
+    end = bars[-1].ts_init // DAY * DAY + DAY
+    catalog_path = work / "catalog"
+    catalog_path.mkdir()
+    catalog = ParquetDataCatalog(str(catalog_path))
+    catalog.write_instruments([equity])
+    catalog.write_bars(bars, start=start, end=end)
+    print(f"bars written: {len(bars)} of {bar_type}, sessions {sessions}, window {start} to {end}")
+
+    config = MaCrossConfig(
+        bar_type=bar_type, trade_size=Quantity.from_int(10), fast_period=10, slow_period=20
+    )
+    with create_ledger_study("probe", start=start, end=end, path=work / "trials.db") as study:
+        try:
+            recorded = record_trial(
+                study,
+                catalog_path,
+                [config],
+                starting_balances=["100_000 USD"],
+                logging=LoggerConfig(stdout_level=LogLevel.ERROR),
+            )
+            print(
+                "record_trial returned: outcome",
+                recorded.outcome,
+                "iterations",
+                recorded.run.result.iterations,
+            )
+        except Exception as error:  # noqa: BLE001, the probe reports what was raised
+            print("record_trial raised:", "".join(traceback.format_exception_only(error)).strip())
+        [trial] = study.get_trials(deepcopy=False)
+        attrs = trial.user_attrs
+        print(
+            f"trial #{trial.number}: state {trial.state.name}, outcome {attrs.get('outcome')!r}, "
+            f"session days {len(attrs.get('session_days', []))}, "
+            f"digest written {'data_digest' in attrs}, error {attrs.get('error')!r}"
+        )
+
+
+if __name__ == "__main__":
+    main()
