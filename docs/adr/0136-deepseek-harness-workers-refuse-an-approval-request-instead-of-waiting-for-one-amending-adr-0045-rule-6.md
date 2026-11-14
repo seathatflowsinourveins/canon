@@ -66,6 +66,10 @@ refuses to load. This record's first draft took option 4, until the code review 
 5. **Reach.** The rows bind every dsh-tui launch, Orca workers and the owner's own tabs alike; a running session
    keeps the rows it started with. No other profile changes: the shipped `headless` profile asks (rehearsed), and
    whether ADR 0086's build configuration on it waits or fails on a request is `UNVERIFIED`.
+   2026-11-13: at `dsh-v0.2.2-rc.2`, `dsh-base` composes `fs-observation-policy` with `disabled: true` (its
+   `cordis.patch.yml` L292-294), so `headless`, `review-acp` and `build-acp` run without read-before-write while
+   `tool-fs` stays on (each profile's `--dump-config` as `home/dsh/profiles.json` records it, rehearsed
+   2026-11-13). None is dispatched, and a row restores the guard before any lane dispatches one.
 6. **Briefs.** A brief to a dsh worker that runs `uv` sets `UV_CACHE_DIR` under the temp area, since uv's default
    cache is outside the sandbox, unless the smoke test below shows uv runs without it.
 7. **AGENTS.md is unchanged.** Its condition, `--check` showing the review patch ok, covers these rows; between a
@@ -284,3 +288,23 @@ dsh-TUI v0.17.0 (registry `dsh-tui`) and DeepSeek Harness `dsh-v0.2.1-rc.3` (reg
   hazard `docs/architecture.md` names, and asked for a literal path on every form, a working folder, a form for a
   project kept apart and the coordinator's step in the Confirmation. The text above carries each.
 * The smoke test: **UNVERIFIED — not yet run.**
+* 2026-11-13, the pins move to dsh-TUI `v0.20.0` → `8958f08e3ba0` and DeepSeek Harness `dsh-v0.2.2-rc.2` →
+  `ddac96760b6e` (resolved; ADR 0045's Evidence). Each citation above was re-read at the new commits. The cited
+  dsh-TUI lines are unchanged and where they were. In the engine, the base bundle's rows, `profile-boot.ts`
+  L212-217, the presets' `derive` and `bash-sandbox`'s README hold in place; the rest hold at moved lines:
+  `user-approval`'s README L78 and L165 and its `src/index.ts` L74 and L301, `permission-presets/src/index.ts`
+  L218-222 and L429-444, `sandbox-local`'s README L81 and its `src/index.ts` L357 and L369, `profiles.ts` L53-60,
+  the `headless` README L56, `tool-bash/src/index.ts` L506-508, `escalation.ts` L121-122, L235-242 (the prompt's
+  text now in `locales.ts` L5) and L249, and the hook `ask` path in `packages/core/tools/src/pipeline.ts`
+  L440-465. Two texts changed: the presets README now says agent creation applies the default preset to the
+  session, and `fs-sandbox`'s README L48 and `roots.ts` L87-106 add explicit additional writable roots to
+  `workspace-write`. That is the counter-evidence above, now at the pin: `additionalWritableRoots` is a
+  `sandbox-policy` setting (`src/index.ts` L142, README L49), empty by default, so the writable set stays as
+  recorded until a row sets it. Two more paths widen it without a user row: a plugin may call `sandbox-policy`'s
+  `registerWritableRoot(session, directory)` for a live session (README L55-57, `src/index.ts` L244), which no
+  package in the four recorded worker profiles calls (a grep of their rehearsed installs; in the engine, outside
+  `sandbox-policy` itself, it appears only as an API catalog string in `dsh-tool-cordis`, which no worker
+  composes), and the shipped `headless` row fills `additionalWritableRoots` from `--add-dir` (the `headless`
+  README L90), which no lane passes. The rehearsal (run 2026-11-13) composed this block in the `dsh-tui` profile on
+  the new pins with `approval` `never` and both presets `never`, and with the new `fs-observation-policy` row,
+  which `scripts/bootstrap` now counts among the block's ids. The smoke test stays `UNVERIFIED`.
