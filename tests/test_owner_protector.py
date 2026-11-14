@@ -3026,6 +3026,7 @@ def test_real_node_reduces_external_inventory_without_claim_or_ownership_transfe
         node.dispose()
 
 
+@pytest.mark.usefixtures("new_york_regular_hours")
 @pytest.mark.parametrize("at_start", [True, False], ids=["reconciled-long", "later-owner-fill"])
 def test_engine_starts_protector_and_self_arms_external_inventory(at_start) -> None:
     """Real startup reconciliation / new fill, real cache, emulator and reduce-only execution.
@@ -3166,6 +3167,7 @@ def test_engine_starts_protector_and_self_arms_external_inventory(at_start) -> N
         node.dispose()
 
 
+@pytest.mark.usefixtures("new_york_regular_hours")
 @pytest.mark.parametrize("late", [False, True], ids=["startup-reconciliation", "after-start-check"])
 def test_reconciled_external_long_opens_at_reconciliation_time_not_the_venue_open(
     late, tmp_path: Path

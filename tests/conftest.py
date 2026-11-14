@@ -445,3 +445,33 @@ def references_in(monkeypatch: pytest.MonkeyPatch) -> None:
         return (lambda symbols, cutoff, session: read.result()), read
 
     monkeypatch.setattr(session_window, "start_reference_read", start)
+
+
+@pytest.fixture
+def new_york_regular_hours(monkeypatch: pytest.MonkeyPatch) -> datetime:
+    """The real clock read as the nearest 11:00 New York, inside the regular session, for one test.
+
+    A LiveNode keeps the realtime clock at the pin (`crates/common/src/live/clock.rs:55-57`), so a test
+    that drives one runs at the hour it is started. `OwnerProtector._plan_holding` judges a quote's open
+    session part from that clock's hour and minute in `session_window.NEW_YORK`
+    (`src/canon_trading/owner_protector.py:1750-1765`); on sip from 00:00 to 04:00 New York no quote can
+    pass, and the test fails by the hour. This puts a fixed UTC offset in `session_window.NEW_YORK` for
+    the test, the one at which the real clock reads the nearest 11:00 New York: every stamp stays the
+    real clock's and time runs on, and only the reading of New York wall time moves, by under 24 hours
+    (`datetime.timezone`'s bound). The judge reads no weekday. A module that holds a zone of its own
+    (`mover.NEW_YORK`, `canon_alpaca.data.NEW_YORK`) is not moved. Returns the instant pinned.
+    """
+    from datetime import timezone
+
+    from canon_trading import session_window
+
+    now = datetime.now(UTC)
+    here = now.astimezone(NEW_YORK)
+    pinned = here.replace(hour=11, minute=0, second=0, microsecond=0)
+    if pinned - here > timedelta(hours=12):
+        pinned -= timedelta(days=1)
+    elif here - pinned > timedelta(hours=12):
+        pinned += timedelta(days=1)
+    offset = pinned.replace(tzinfo=None) - now.replace(tzinfo=None)
+    monkeypatch.setattr(session_window, "NEW_YORK", timezone(offset, "New York, pinned"))
+    return pinned
