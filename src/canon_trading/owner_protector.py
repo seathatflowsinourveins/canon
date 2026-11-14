@@ -615,7 +615,10 @@ def _remaining(order: Any) -> Decimal | None:
 
 
 def _reported(entry: Entry) -> tuple[Any, ...]:
-    """What the node report shows of a holding; a change in any of these is written at once."""
+    """What the node report shows of a holding, and the venue's reading a restart reads; a change
+    in any of these is written at once. A retry that recovers only the horizon is written in its
+    own step, so a run lost before another change leaves the next start its reading
+    (rd-owner-protector F3)."""
     return (
         entry.last_level,
         entry.quantity,
@@ -624,6 +627,7 @@ def _reported(entry: Entry) -> tuple[Any, ...]:
         entry.reason,
         entry.distance,
         entry.limit_offset,
+        entry.horizon,
     )
 
 
