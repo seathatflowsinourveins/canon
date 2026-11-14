@@ -47,7 +47,9 @@ included, or a quantity or sessions it cannot read, costs that holding the repor
 its text, and never the pass; only a row that is not an object fails the file.
 An optional `client_order_id` names one stop or sale
 of our lineage: not added where the venue shows the same stop, counted once if repeated; a report without
-one adds nothing where another exit could be the same. A missing or stale report reads "no protector running". The nodes report; the monitor judges.
+one adds nothing where another exit could be the same. A sale it names that the venue shows rejected or
+ended this trade date adds nothing. A missing or stale report reads "no protector running". The nodes
+report; the monitor judges.
 **Not built:** a writer of `reports.json`; the warming bound (the node reports `full_window_at`; a holding
 still `cold` after it raises one notice per holding and node run; one with too few bars, overnight say,
 stays cold and quiet); one notice when a hold by the owner's order begins with shares uncovered.
@@ -58,7 +60,9 @@ tree on `main` it writes `local.canon.exit-monitor-<account>`: `StartInterval` 6
 runs `mise run paper:exit-monitor` once in `exit-monitor-<account>-checkout`, a clone of origin's main of
 its own (ADR 0050), refreshed by the recorder's `paper-session.sh --recorder-checkout` at most every 30
 minutes; HEAD must be the clone's `origin/main` with no change or added file, or nothing runs (`not_main`). One
-firing per account at a time; one `scripts/automation status` row per agent; the uninstall keeps records.
+firing per account at a time; one `scripts/automation status` row per agent, which never shows a failed
+or unhealthy monitor as `ok`: it ages the last pass against the monitor's own 180 s and names a carrier
+failure; the uninstall keeps records.
 
 **C: ADR 0114 amended in part.** One more task gains C's pair: `paper:exit-monitor protect`, GET only, no
 order and no account or stream lock, behind the lead's standing word read at every firing, from main at every firing. "No

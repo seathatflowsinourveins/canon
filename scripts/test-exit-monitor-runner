@@ -169,7 +169,8 @@ now=$(date +%s)
 jq -n --argjson e "$now" '{at_epoch: $e, account: "protect", outcome: "ok", exit_code: 0, note: "pass exit 0", commit: "abc"}' > "$C/watch/exit-monitor-protect.json"
 auto status
 check "ok, saying so, before the monitor has written its first status" eval 'grep -Eq "^  exit monitor protect +ok .*no pass status yet" "$TMP/auto.out"'
-jq -n '{account: "C", ok: true, longs: 2, covered: 2, uncovered: 0, oldest_uncovered_age: 0, healthy: true, unhealthy_reasons: []}' > "$C/exit-monitor/C/status.json"
+iso() { printf '%s.123456%s' "$(TZ=America/New_York date -r "$1" +%Y-%m-%dT%H:%M:%S)" "$(TZ=America/New_York date -r "$1" +%z | sed 's/\(..\)$/:\1/')"; }
+jq -n --arg at "$(iso "$now")" '{account: "C", checked_at: $at, ok: true, longs: 2, covered: 2, uncovered: 0, oldest_uncovered_age: 0, healthy: true, unhealthy_reasons: []}' > "$C/exit-monitor/C/status.json"
 jq -n '{pending: 0, sent_now: 0, notified: null}' > "$C/exit-monitor/C/notify-status.json"
 auto status
 check "ok with the longs and their cover counted" eval 'grep -Eq "^  exit monitor protect +ok .*2 longs, 2 covered, 0 uncovered" "$TMP/auto.out"'
@@ -177,6 +178,14 @@ jq '.healthy = false | .unhealthy_reasons = ["stale pass"]' "$C/exit-monitor/C/s
 auto status
 check "FAILED when the monitor's own status is unhealthy though the firing ran" eval 'grep -Eq "^  exit monitor protect +FAILED .*stale pass" "$TMP/auto.out"'
 jq '.healthy = true | .unhealthy_reasons = []' "$C/exit-monitor/C/status.json" > "$TMP/s" && mv "$TMP/s" "$C/exit-monitor/C/status.json"
+jq --arg at "$(iso $((now - 240)))" '.checked_at = $at' "$C/exit-monitor/C/status.json" > "$TMP/s" && mv "$TMP/s" "$C/exit-monitor/C/status.json"
+auto status
+check "STALE when the monitor's last pass is older than its own 180 s bound, though the firing ran" eval 'grep -Eq "^  exit monitor protect +STALE .*last pass 2[34][0-9] s old" "$TMP/auto.out"'
+jq --arg at "$(iso "$now")" '.checked_at = $at' "$C/exit-monitor/C/status.json" > "$TMP/s" && mv "$TMP/s" "$C/exit-monitor/C/status.json"
+jq -n '{checked_at: "2026-11-14T16:46:11Z", pending: null, sent_now: 0, notified: false, error: "could not read delivered.json"}' > "$C/exit-monitor/C/notify-status.json"
+auto status
+check "FAILED when the carrier failed, naming its error, though the pass was healthy" eval 'grep -Eq "^  exit monitor protect +FAILED .*carrier failed: could not read delivered.json" "$TMP/auto.out"'
+rm -f "$C/exit-monitor/C/notify-status.json"
 jq '.uncovered = 1 | .covered = 1 | .oldest_uncovered_age = 300 | .healthy = false | .unhealthy_reasons = ["uncovered at or over alert age"]' "$C/exit-monitor/C/status.json" > "$TMP/s" && mv "$TMP/s" "$C/exit-monitor/C/status.json"
 jq -n '{pending: 1, sent_now: 0, notified: false}' > "$C/exit-monitor/C/notify-status.json"
 auto status

@@ -244,12 +244,20 @@ def _fresh(report: Mapping[str, Any], now: datetime) -> bool:
     return 0 <= age <= REPORT_FRESH_SECONDS
 
 
-def _cover(symbol: str, orders: Sequence[Any], reports: Sequence[Any], now: datetime, part: str):
+def _cover(
+    symbol: str,
+    orders: Sequence[Any],
+    reports: Sequence[Any],
+    now: datetime,
+    part: str,
+    ended_ids: frozenset[str] = frozenset(),
+):
     cover = active = foreign = Decimal(0)
     kinds: set[str] = set()
     venue_stops: set[str] = set()
     working_sales: dict[str, Decimal] = {}
     unacknowledged: set[str] = set()
+    ended: set[str] = set(ended_ids)
     report_notes: set[str] = set()
     frozen = ""
     for order in orders:
@@ -257,6 +265,10 @@ def _cover(symbol: str, orders: Sequence[Any], reports: Sequence[Any], now: date
             continue
         status = _value(_field(order, "status"))
         if status in custody.ENDED_AT:
+            # A sale of ours the venue rejected or ended this trade date is never cover, whatever a
+            # report says of it (the Codex read of 2026-11-14, P1-1).
+            if custody.lineage(_field(order, "client_order_id")) in (custody.OURS, custody.PROTECT):
+                ended.add(str(_field(order, "client_order_id")))
             continue
         qty = _decimal(_field(order, "qty"))
         filled = _decimal(_field(order, "filled_qty"))
@@ -348,6 +360,9 @@ def _cover(symbol: str, orders: Sequence[Any], reports: Sequence[Any], now: date
             identity = str(identity)
             if identity in seen_stops:
                 report_notes.add("report not added: the same stop was already reported")
+                continue
+            if identity in ended:
+                report_notes.add("report not added: the sale it names has ended at the venue")
                 continue
             if identity in working_sales:
                 # The venue acknowledges this sale and did not count it: the report counts it,
@@ -451,6 +466,7 @@ def assess(
     read_error: str = "",
     held: frozenset[str] = frozenset(),
     holds_error: str = "",
+    ended_ids: frozenset[str] = frozenset(),
 ) -> list[dict[str, Any]]:
     """P1-P9/P22: pure; supplied clock/calendar facts override the wall-time test seam.
 
@@ -484,7 +500,7 @@ def assess(
         state = "uncovered"
         try:
             cover, active, foreign, exit_kind, report_frozen, report_note, report_held, cold = (
-                _cover(symbol, orders, reports, now, part)
+                _cover(symbol, orders, reports, now, part, ended_ids)
             )
             if short:
                 cover = active = Decimal(0)
@@ -505,7 +521,9 @@ def assess(
             else:
                 old = memory.get("episodes", {}).get(symbol, {})
                 frozen, frozen_source = old.get("frozen", ""), old.get("frozen_source", "")
-                if frozen_source == "venue" and rejected is not None:
+                if (frozen_source == "venue" and rejected is not None) or report_held:
+                    # A fresh report of a hold replaces a freeze carried from an earlier pass (the
+                    # Codex read of 2026-11-14, P2-3); a fresh freeze beside it still reads frozen.
                     frozen, frozen_source = "", ""
                 if not frozen and run_holds and not cover:
                     state = "unknown"
@@ -1563,6 +1581,7 @@ def run_pass(
             budget = ReadBudget()
             notes = []
             fills, rejected = {}, None
+            ended_ids: frozenset[str] = frozenset()
             boundary_events, boundary_warnings = [], []
             try:
                 if trading is None:
@@ -1634,8 +1653,25 @@ def run_pass(
                     )
                     for f in preliminary
                 )
+                # A sale a fresh report names that the venue does not show open may have ended this
+                # trade date: the ended orders say so, and an ended sale is never cover (the Codex
+                # read of 2026-11-14, P1-1).
+                open_ids = {str(_field(o, "client_order_id")) for o in orders}
+                history_needed = history_needed or any(
+                    isinstance(r, Mapping)
+                    and r.get("client_order_id")
+                    and str(r["client_order_id"]) not in open_ids
+                    for r in fresh_reports
+                )
                 if history_needed:
-                    fills, rejected = _history_facts(ended_orders(trading, now, budget), positions)
+                    history = ended_orders(trading, now, budget)
+                    fills, rejected = _history_facts(history, positions)
+                    ended_ids = frozenset(
+                        str(o.client_order_id)
+                        for o in history
+                        if _value(o.side) == "sell"
+                        and custody.lineage(o.client_order_id) in (custody.OURS, custody.PROTECT)
+                    )
                 reader = tape_reader or (
                     (
                         lambda symbol, start, end: read_tape(
@@ -1674,6 +1710,7 @@ def run_pass(
                 fills=fills,
                 rejected=rejected,
                 read_error=error,
+                ended_ids=ended_ids,
                 held=held,
                 holds_error=holds_error,
             )

@@ -1750,3 +1750,40 @@ def test_the_staging_case_reads_what_a_real_pass_writes(em, tmp_path):
     assert event["key"].startswith("exit-monitor:A:SYN:") and event["state"] == "uncovered"
     assert observe(root, "SYN", NOW + timedelta(seconds=181)) == ([], {})
     assert observe(root, "OTH", NOW)[1] == {}
+
+
+# The Codex pre-landing read of 85a6316c (xr-carrier, 2026-11-14), from its probes.
+def test_a_report_naming_a_sale_the_venue_rejected_adds_no_cover(em, tmp_path):
+    # Codex P1-1: a rejected or ended sale is never cover, whatever a report says of it.
+    rejected = order(
+        type="limit", order_type="limit", limit_price="99", status="rejected", failed_at=NOW
+    )
+    paper = Paper(positions=[position()], orders=[rejected])
+    result = run(
+        em, tmp_path, paper, reports=[level_report(quantity="100", client_order_id=PROTECT)]
+    )
+    found = result["findings"][0]
+    assert found["state"] != "covered", found
+    assert found["cover"] == "0"
+    assert "has ended at the venue" in found["reason"]
+
+
+def test_a_fresh_held_report_replaces_a_freeze_carried_from_an_earlier_pass(em, tmp_path):
+    # Codex P2-3: a carried freeze does not outrank the node's fresh word that the owner holds it.
+    paper = Paper(positions=[position()])
+    first = run(
+        em,
+        tmp_path,
+        paper,
+        reports=[level_report(quantity="100", state="frozen", result="denied")],
+    )
+    assert first["findings"][0]["frozen"] == "denied"
+    paper.now += timedelta(seconds=1)
+    held = level_report(quantity="100", state="held", source="order", last_step_at=paper.now)
+    second = run(em, tmp_path, paper, reports=[held])
+    assert second["findings"][0]["state"] == "held", second["findings"][0]
+    paper.now += timedelta(seconds=900)
+    held = level_report(quantity="100", state="held", source="order", last_step_at=paper.now)
+    third = run(em, tmp_path, paper, reports=[held])
+    assert third["findings"][0]["state"] == "held"
+    assert third["alerts"] == []
