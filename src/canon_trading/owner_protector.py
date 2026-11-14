@@ -291,13 +291,15 @@ live node shuts down on it (crates/live/src/node/mod.rs:1636-1641) as the backte
 start, so the holding is on its roster. A long outside the roster that the start skips or refuses is
 named once and does not itself end the run, since a successor would not protect it. What the successor's
 start skips and refuses is one predicate, `session_window.start_account`, which the start and this read
-both call: an unreadable position, or one listed at zero, is skipped by name, and a fractional one,
-inside or outside the roster, refused, by the adapter's own whole-share rule. While the start would
+both call: an unreadable position, one listed at zero, or a fractional one is skipped by name, by the
+adapter's own whole-share rule. Before asking for a restart, the roster also reads every open order
+through session_window.open_orders (alpaca-py c42add7c0a70 trading/client.py:107-130, GET /orders),
+and calls that predicate with the orders. It uses the adapter's order_status_report mapper, including
+the successor's enabled trailing reports, to name any order the successor cannot map. While that would
 refuse the account read, a whole-share long outside the roster does not end the run: it is named once as
 unprotected with what blocks the restart, the run protects its roster to its planned end, and the first
-read the start would accept ends it. The order half of the start's refusal, an open order the adapter
-cannot map, runs inside reconciliation and is not called here, so a new holding beside such an order
-still ends the run into a refused start (the deputy's ruling, 2026-11-13 23:53). The bound: the buy is
+read the start would accept ends it (the lead's F2/F3 ruling, 2026-11-14 12:08). An unread order list
+also retains this run, naming the reason and trying again at the next roster read. The bound: the buy is
 named, and the end asked for, at the first read after it, so within ROSTER_POLL_SECS and one step of the
 venue listing it, when the read answers within its own bound (the same reader and the same limit as the
 GETs above). The node's stop, the runner's seam and the successor's arming come after that and are not in
@@ -2049,16 +2051,8 @@ class OwnerProtector(Strategy):
                 self.roster_named.add((symbol, "skipped"))
                 self._say(
                     f"{symbol}.ALPACA: ALERT: held outside the roster and unprotected, its quantity "
-                    f"unreadable or none ({why}): no exit in this run, and the next start skips it "
+                    f"unreadable, none or fractional ({why}): no exit in this run, and the next start skips it "
                     "too, so it does not end this run"
-                )
-        for symbol, why in sorted(start.refused.items()):
-            if symbol not in loaded and (symbol, "refused") not in self.roster_named:
-                self.roster_named.add((symbol, "refused"))
-                self._say(
-                    f"{symbol}.ALPACA: ALERT: held outside the roster and unprotected: {held[symbol]} "
-                    f"held, which the next start refuses ({why}), so this run goes on; it has no exit "
-                    "here"
                 )
         whole = [
             (symbol, qty)
@@ -2067,19 +2061,39 @@ class OwnerProtector(Strategy):
         ]
         if not whole:
             return
-        if start.refused:
-            # An end into a start that refuses leaves every holding, the roster's too, with no stop of
-            # ours: the run goes on, protects its roster, and names each new holding once. Decided at
-            # every read, never latched (term (b)): the first read the start would accept ends it.
-            because = "; ".join(start.refused[symbol] for symbol in sorted(start.refused))
+        try:
+            orders = session_window.open_orders(self.settings.trading)
+            start = session_window.start_account(held, unread, orders)
+        except Exception as exc:  # noqa: BLE001 - an unread order list cannot justify a restart.
             for symbol, qty in whole:
-                if (symbol, "blocked") not in self.roster_named:
-                    self.roster_named.add((symbol, "blocked"))
+                self._say(
+                    f"{symbol}.ALPACA: ALERT: unprotected: {qty} held outside the roster; open orders "
+                    f"could not be checked ({type(exc).__name__}: {exc}); this run keeps protecting "
+                    f"its roster; read again in {ROSTER_POLL_SECS} s"
+                )
+            return
+        # A roster long the start would now skip (read, not zero: fractional) keeps this run, which
+        # protects it, as the start's refusal of it did before F3: an end would drop its stop (review
+        # finding 1, 2026-11-14).
+        blocked = dict(start.refused) | {
+            symbol: f"roster holding {start.skipped[symbol]}, which the next start skips"
+            for symbol in sorted(loaded)
+            if symbol in start.skipped and symbol not in unread and held.get(symbol, 0) != 0
+        }
+        if blocked:
+            # An end into a start that refuses leaves every holding, the roster's too, with no stop of
+            # ours: the run goes on, protects its roster, and names each new holding once per reason.
+            # Decided at every read, never latched (term (b)): the first read the start would accept
+            # ends it.
+            because = "; ".join(blocked[symbol] for symbol in sorted(blocked))
+            for symbol, qty in whole:
+                if (symbol, f"blocked: {because}") not in self.roster_named:
+                    self.roster_named.add((symbol, f"blocked: {because}"))
                     self._say(
                         f"{symbol}.ALPACA: ALERT: unprotected: {qty} held, bought after this run's "
                         "start outside the roster; this run does not end, since the next start would "
-                        f"refuse the account ({because}); it protects its roster to its planned end "
-                        "and ends at the first read the start would accept"
+                        f"refuse the account or drop a roster holding ({because}); it protects its "
+                        "roster to its planned end and ends at the first read the start would accept"
                     )
             return
         for symbol, qty in whole:
