@@ -21,8 +21,9 @@ live account is written in this repository, and none is guessed:
   any name but that key at its top level (a table, a misspelt key, the key in other case) or sets the key
   to anything but a positive whole number: an error by name. It is never read as absent, and what it held
   is never repeated, a name it set included: a wrong value or name may be a slip of the real figure;
-* a path inside this checkout or any other git checkout is refused, there or not and however its folders
-  are spelt, so the figure cannot be kept where it could be committed.
+* a path that resolves to a place in this checkout, or under a folder holding a `.git` entry, is refused,
+  whether or not the file is there and however its folders are spelt. A work tree with no `.git` entry of
+  its own (one named by `GIT_DIR` and `GIT_WORK_TREE`, or by `core.worktree`) is not recognised.
 
 The figure stays out of `repr`, `str` and every message here. An error raised here carries no cause and no
 context, since the parser's and the decoder's own errors hold the file's text (`TOMLDecodeError.doc`,
@@ -83,13 +84,15 @@ def settings_path(environ: Mapping[str, str] | None = None) -> Path:
 
 
 def inside_checkout(path: Path) -> bool:
-    """Whether `path`, there or not, is in this checkout or in any other git checkout, however spelt.
+    """Whether `path`, there or not, resolves to a place in this checkout or under a `.git` entry.
 
-    The rule of `arm_comparison._inside_checkout`, copied since that module imports numpy, pandas and
-    arch: a folder above the path that is this checkout by `samefile` (the device and inode numbers, so
-    another spelling on a volume that does not tell upper case from lower is still found), or that holds
-    a `.git` entry, a folder in a main checkout and a file in a linked worktree
-    (gitrepository-layout(5)). The path is resolved first, so a link is judged where it leads.
+    Three clauses. This checkout by name. Then the two of `arm_comparison._inside_checkout`, copied since
+    that module imports numpy, pandas and arch: a folder above the path that is this checkout by
+    `samefile` (the device and inode numbers, so another spelling on a volume that does not tell upper
+    case from lower is still found), or that holds a `.git` entry that is there, a folder in a main
+    checkout and a file in a linked worktree (gitrepository-layout(5)). Unlike that one, where this
+    checkout cannot be compared this goes on to the `.git` test. The path is resolved first, so a link is
+    judged where it leads. A work tree with no `.git` entry of its own is not recognised.
     """
     resolved = path.resolve()
     if resolved.is_relative_to(CHECKOUT):

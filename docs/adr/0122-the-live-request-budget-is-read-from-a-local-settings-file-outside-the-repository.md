@@ -48,9 +48,11 @@ in a shell's history. Option 2 keeps it one `git add -f` from a commit, and a ne
      repeats nothing of the file, a name it set included; it carries no cause and no context, since the
      parser's and the decoder's own errors hold the file's text; and no frame of the reader in its
      traceback holds what the file held. A wrong value or name may be a slip of the real figure;
-   * a path inside the checkout the module runs from or any other git checkout: refused, there or not,
-     by the rule `arm_comparison._inside_checkout` already holds (the identity of the folders above the
-     path, or a `.git` entry in one).
+   * a path that resolves to a place in the checkout the module runs from, or under a folder holding a
+     `.git` entry that is there: refused, whether or not the file is. Three clauses: the checkout by name,
+     the checkout by the identity of the folders above the path, and a `.git` entry in one of them. The
+     last two are `arm_comparison._inside_checkout`'s; where this checkout cannot be compared, that one
+     raises and this one goes on to the `.git` test.
 4. **The figure is kept out of** `repr`, `str` and every message of the module; `dataclasses.asdict` and
    `astuple` give it, as the field does. A caller that records it does so outside the repository (ADR
    0103, point 6); the node change says where, if anywhere, a run prints it, since `session_window`
@@ -64,17 +66,16 @@ reader bears on the order path and belongs on `scripts/land`'s `TRADING_PATHS`.
 
 ### Consequences
 
-* Good: the default place is outside every checkout, a path under a folder that holds a `.git` entry is
-  refused, and a missing file is visible: the answer's source names it. A work tree whose git folder is
-  kept elsewhere is not recognised.
+* Good: a missing file is visible: the answer's source names which case it was.
 * Bad: the file is one per config folder, not one per machine, and the repository does not back it up. A
   session under another config folder, or a second machine, reads the paper figure until someone writes
   the file there; no message names the folder that was read.
-* Bad: a config folder kept under git is refused by name, since the figure could be committed from it.
+* Bad: a config folder kept under git is refused by name. A work tree with no `.git` entry of its own,
+  one named by `GIT_DIR` and `GIT_WORK_TREE` or by `core.worktree`, is not recognised: the figure is read
+  from it, though git could commit it from there.
 * Bad: whether the paper figure is at, under or over the live account's enforced limit is `UNVERIFIED`
   (Evidence). The reader returns a limit, not a ceiling: the node keeps its own reserve under it.
-* Bad: the figure has no upper bound here, since no page read gives one to hold it to; a slip to a larger
-  whole number is taken as given.
+* Bad: the figure has no upper bound: no page read gives one, so a larger slip is taken as given.
 * Bad: importing the reader imports `request_budget`, whose observation clock starts at its import.
 
 ### Confirmation
@@ -83,9 +84,9 @@ reader bears on the order path and belongs on `scripts/land`'s `TRADING_PATHS`.
 config folder's path with and without `CLAUDE_CONFIG_DIR`, and that the figure is in no `repr` or message.
 One of them, another spelling of the checkout's path, is skipped on a volume that tells upper case from
 lower. With the module absent the file failed at collection; eight test functions of the review's round
-failed before its fix (21 failed, 16 passed, 2026-11-14), and each clause of the checkout rule has a case
-that fails with the clause removed. No test reads this machine's config folder. No paper run applies: the
-module reaches no account.
+failed before its fix (of the 37 cases then, 21 failed and 16 passed, 2026-11-14), and each of the
+checkout rule's three clauses has a case that fails with the clause removed. No test reads this machine's
+config folder. No paper run applies: the module reaches no account.
 
 ## Evidence
 
@@ -125,4 +126,5 @@ Read 2026-11-14.
   effort) corrected this record and the reader before landing: an unknown name and a link without its
   target were read as absent and are now refused; the parser's error stayed on the error's context and no
   longer does; another spelling of the checkout's path, and another checkout, were let through; the limit
-  was written as the ceiling; the Alpaca pages above were not cited.
+  was written as the ceiling; the Alpaca pages above were not cited; what the checkout rule does not
+  recognise was first worded wrongly.
