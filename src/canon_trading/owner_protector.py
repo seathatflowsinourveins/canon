@@ -204,7 +204,9 @@ one file per account label, and each read, merge and replace holds LevelBook.loc
 A write failure is named once per kind.
 An armed long, carried or armed this run, breached through its limit offset is named once at
 ERROR and keeps its level and distances. Once two new observations at or below its level confirm
-the breach (each breach counts its own two, cleared by a quote above the level or our new order),
+the breach (each breach counts its own two, cleared by a new two-sided quote above the level,
+whatever the step then does, or by a trailing order of ours placed; a quote with no usable
+two-sided prices and sizes neither counts nor clears, as main's guard skips it),
 it starts a DAY limit sale using the same exit_price and chase_floor rules as a released sale,
 including the lowest positive venue tick; it never submits a trailing order whose bid-derived
 limit would be nonpositive (F15 and its review).
@@ -473,6 +475,16 @@ def _sane(tick: QuoteTick) -> bool:
     return tick.ts_event - tick.ts_init <= STAMP_AHEAD_MOST_NS
 
 
+def _two_sided(tick: QuoteTick) -> bool:
+    """Prices and sizes on both sides, the quote the guard reads (bid > 0, ask >= bid)."""
+    return (
+        tick.bid_price.as_decimal() > 0
+        and tick.ask_price.as_decimal() >= tick.bid_price.as_decimal()
+        and tick.bid_size.as_decimal() > 0
+        and tick.ask_size.as_decimal() > 0
+    )
+
+
 def _usable(tick: QuoteTick, now: int) -> bool:
     """A sane, fresh arming snapshot; planning also requires the current venue maximum."""
     age = now - min(tick.ts_event, tick.ts_init)
@@ -564,8 +576,9 @@ class Holding:
     limit_offset: Decimal | None = None
     offset_breach_named: bool = False
     # F15's review, 1 (and land-f15's two): the first new sane observation at or below the level
-    # in the current breach; a second newer one starts the sale. Cleared by a new sane observation
-    # above the level and by every trailing order of ours placed, so each breach counts its own two.
+    # in the current breach; a second newer one starts the sale. Cleared by a new two-sided
+    # observation above the level, before any return, and by every trailing order of ours placed,
+    # so each breach counts its own two.
     breach_observation: int | None = None
     fresh: bool = False
     ended: bool = False
@@ -1977,6 +1990,17 @@ class OwnerProtector(Strategy):
                     self._say(f"{instrument_id}: our sale ended {order.status}; sending it again")
                 self.cancel_requested.discard(order.client_order_id)
                 slot.protect_id, order = None, None
+        if (
+            advanced
+            and tick is not None
+            and slot.level is not None
+            and _two_sided(tick)
+            and tick.bid_price.as_decimal() > slot.level.as_decimal()
+        ):
+            # Before every return below (land-f15's round 2, finding 2): a new two-sided
+            # observation above the level ends this breach, frozen or not. A quote main's guard
+            # skips (no usable two-sided prices and sizes) neither counts nor clears.
+            slot.breach_observation = None
         if slot.sale is None:
             # The lock moves the trigger of a trail not yet released; the exit beats the lock (R3).
             self._gain_lock(instrument_id, slot, position, quote, advanced=advanced)
@@ -2050,8 +2074,6 @@ class OwnerProtector(Strategy):
         )
         # F15's review, 4: any armed long, carried or armed this run, can gap through its offset.
         offset_breached = bid <= slot.limit_offset
-        if advanced and _sane(tick) and bid > slot.level.as_decimal():
-            slot.breach_observation = None  # This breach, if any, has ended.
         if offset_breached and not slot.offset_breach_named:
             slot.offset_breach_named = True
             carried = (self.settings.account_label or "", instrument_id) in self.carried
@@ -2093,10 +2115,10 @@ class OwnerProtector(Strategy):
                 # A fresh trailing order would derive a nonpositive limit from this bid; start
                 # the existing sale path instead, on two new sane observations at or below the
                 # level in this breach (ruling 6), whether or not a sell of ours was placed.
-                if not advanced or not _sane(tick):
+                if not advanced:  # _note counts only a sane stamp that raises the maximum.
                     self._wait(instrument_id, "a new observation to confirm the breach")
                     return
-                if slot.breach_observation is None or slot.breach_observation >= tick.ts_event:
+                if slot.breach_observation is None:
                     slot.breach_observation = tick.ts_event
                     self._say(
                         f"{instrument_id}: holding level {slot.level}; one observation cannot elect"

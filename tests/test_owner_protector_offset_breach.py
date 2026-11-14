@@ -19,6 +19,7 @@ from nautilus_trader.model import OrderSide
 from nautilus_trader.model import OrderType
 from nautilus_trader.model import Price
 from nautilus_trader.model import Quantity
+from nautilus_trader.model import QuoteTick
 from nautilus_trader.model import TimeInForce
 
 from canon_trading.owner_protector import OwnerProtector
@@ -258,3 +259,76 @@ def test_a_level_below_its_offset_never_sells_on_one_observation_at_the_level(
     strategy.observe("0.29", START + 3 * h.SECOND)
     (sale,) = strategy.sent
     assert sale.order_type == OrderType.LIMIT and sale.price.as_decimal() == Decimal("0.2899")
+
+
+def expired_then_one_breach(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Recording:
+    """A carried long whose trailing order expired, then one observation through its offset."""
+    strategy = carried_gap(tmp_path, monkeypatch, "2.50")
+    step(strategy)
+    strategy.observe("2.50", START + h.SECOND)
+    strategy.observe("2.50", START + 2 * h.SECOND)
+    (first,) = strategy.sent
+    accepted(first, START + 2 * h.SECOND)
+    terminal(first, START + 3 * h.SECOND, expired=True)
+    strategy.observe("0.35", START + 4 * h.SECOND)  # first observation of a breach
+    assert len(strategy.sent) == 1, strategy.said
+    return strategy
+
+
+def test_a_two_sided_recovery_during_a_foreign_freeze_clears_the_breach_count(
+    tmp_path, monkeypatch
+) -> None:
+    """land-f15's round 2, finding 2: a recovery quote that stopped at the foreign-cover return
+    kept the old count, so the first quote of the next gap sold."""
+    strategy = expired_then_one_breach(tmp_path, monkeypatch)
+    foreign = h.working_sell("owner-limit")
+    strategy.cached.working.append(foreign)
+    strategy.observe("2.50", START + 5 * h.SECOND)  # a two-sided recovery, while frozen
+    assert "foreign" in strategy.frozen.get(h.AAA, ""), strategy.frozen
+    strategy.cached.working.remove(foreign)  # the owner's sell ends
+    strategy.observe("0.35", START + 6 * h.SECOND)  # a new gap: its first observation
+    assert len(strategy.sent) == 1, ("a sale on one observation after a recovery", strategy.said)
+    strategy.observe("0.35", START + 7 * h.SECOND)
+    (_, sale) = strategy.sent
+    assert sale.order_type == OrderType.LIMIT, sale
+
+
+def test_a_one_sided_quote_neither_counts_nor_clears_the_breach_count(
+    tmp_path, monkeypatch
+) -> None:
+    """land-f15's round 2, finding 2, one-sided: main's guard skips a quote with no usable
+    two-sided prices and sizes, so it is no observation: it neither counts nor clears. The next
+    quote through the offset is the breach's second observation and sells."""
+    strategy = expired_then_one_breach(tmp_path, monkeypatch)
+    at = START + 5 * h.SECOND
+    one_sided = QuoteTick(
+        h.AAA,
+        Price.from_str("2.50"),
+        Price.from_str("2.52"),
+        Quantity.from_int(100),
+        Quantity.from_int(0),
+        at,
+        at,
+    )
+    strategy.cached.latest = one_sided
+    strategy.test_clock.set_time(at)
+    strategy.on_quote(one_sided)  # the bid is above the level; the ask side is empty
+    assert len(strategy.sent) == 1, strategy.said
+    strategy.observe("0.35", START + 6 * h.SECOND)
+    (_, sale) = strategy.sent
+    assert sale.order_type == OrderType.LIMIT, sale
+
+
+def test_two_observations_at_or_below_the_level_sell_whether_or_not_through_the_offset(
+    tmp_path, monkeypatch
+) -> None:
+    """land-f15's round 2, finding 1, the rule kept: the count is of new observations at or
+    below the level, as main's guard counts them (a second one there places a trailing order the
+    emulator elects at once); the offset decides only that the sale is a limit."""
+    strategy = carried_gap(tmp_path, monkeypatch, "2.50")
+    step(strategy)
+    strategy.observe("1.90", START + h.SECOND)  # at or below the level, above the offset
+    assert not strategy.sent, strategy.said
+    strategy.observe("0.35", START + 2 * h.SECOND)  # through the offset: the second observation
+    (sale,) = strategy.sent
+    assert sale.order_type == OrderType.LIMIT, sale
