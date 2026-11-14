@@ -56,6 +56,8 @@ if [ "$1 $2 $3" = "run --locked ty" ] && [ -z "$dir" ]; then
 fi
 if [ "$1 $2 $3 $4" = "run --locked pytest --collect-only" ]; then
   [ -z "${FAKE_COLLECT_FAIL:-}" ] || { echo "ERROR collecting tests/test_x.py"; exit 2; }
+  # FAKE_PART_NODES: a file of node IDs and collection skip lines, printed as pytest's collection would
+  if [ -n "${FAKE_PART_NODES:-}" ]; then cat "$FAKE_PART_NODES"; echo "${FAKE_PART_COUNT:-9} tests collected in 0.01s"; exit 0; fi
   # real pytest's form under --no-fold-skipped, printed only when the skip summary is asked for
   if [ -n "${FAKE_COLLECT_SKIP:-}" ]; then
     for a in "$@"; do
@@ -67,6 +69,8 @@ fi
 if [ "$1 $2 $3" = "run --locked pytest" ]; then
   for a in "$@"; do
     case "$a" in -r*s*) echo "SKIPPED tests/test_x.py::test_net - Skipped: no credentials" ;; esac
+    # an argument file (a pytest part's tests): each line is one argument, logged as `arg: <line>`
+    case "$a" in @*) sed 's/^/arg: /' "${a#@}" >>"$UV_LOG" ;; esac
   done
   echo "1 passed, 1 skipped"
 fi
@@ -393,6 +397,102 @@ check "the root's collection shows its skip"       line_after '^  ok    pytest c
 check "a project apart's collection shows its skip" line_after '^  ok    pytest collection in apart$' '^        SKIPPED tests/test_opt.py - Skipped: could not import'
 check "the root's collection asks for its skips"   test "$(grep -cx -- 'run --locked pytest --collect-only -q -rfEs --no-fold-skipped' "$C.uv.log")" = 1
 }
+# --part: the hosted workflow's parts (ADR 0144, amendment of 2026-11-14)
+case_parts() {
+fresh parts
+local nodes="$C.nodes" i all="$C.all"
+# as pytest prints it: the node IDs in collection order (test_two defined before test_one), an empty line,
+# then the summary, where a skipped module and a warning on a class node also look like paths
+printf '%s\n' tests/test_a.py::test_two tests/test_a.py::test_one tests/test_a.py::test_three tests/test_b.py::test_one \
+  'tests/test_c.py::test_p[x::y]' 'tests/test_c.py::test_p[a b]' tests/test_d.py::test_one \
+  packages/p/tests/test_e.py::test_one tests/sub/test_f.py::C::test_one '' \
+  "SKIPPED tests/test_g.py - Skipped: could not import 'optional_dep'" \
+  '=== warnings summary ===' 'tests/test_w.py::TestW' \
+  "  PytestCollectionWarning: cannot collect test class 'TestW' because it has a __init__ constructor" >"$nodes"
+FAKE_PART_NODES=$nodes; export FAKE_PART_NODES
+: >"$all"
+for i in 1 2 3; do
+  runci --part "$i/3"
+  check "part $i of 3 passes"                      test "$RC" = 0
+  check "part $i of 3 has its pytest line"         has "^  ok    pytest, part $i of 3\$"
+  check "part $i of 3 runs no ruff or ty" \
+    test "$(grep -cE '^run --locked (ruff|ty)' "$C.uv.log")" = 0
+  check "part $i of 3 runs no pytest but its own" \
+    test "$(grep -c '^run --locked pytest -q' "$C.uv.log")" = 1
+  check "part $i of 3 leaves ruff to part rest"    has '^  skip  ruff lint \(part rest of this run runs it\)$'
+  check "part $i of 3 leaves the test scripts to part rest" has '^  skip  test-hooks \(part rest of this run runs it\)$'
+  check "part $i of 3 leaves gitleaks to part rest" has '^  skip  gitleaks \(git history\) \(part rest of this run runs it\)$'
+  check "part $i of 3 passes its tests as one argument file" \
+    test "$(grep -cE '^run --locked pytest -q --color=no -rfEs --no-fold-skipped @[^ ]+$' "$C.uv.log")" = 1
+  check "part $i of 3 shows its count"           has "^        part $i of 3: [0-9]+ test functions, of 9 collected tests\$"
+  check "and pytest's summary line"                has '^        1 passed, 1 skipped$'
+  sed -n 's/^arg: //p' "$C.uv.log" >>"$all"; sed -n 's/^arg: //p' "$C.uv.log" >"$C.ids.$i"
+done
+FAKE_PART_COUNT=10; export FAKE_PART_COUNT
+runci --part 1/3
+unset FAKE_PART_COUNT
+check "a count of IDs that differs from pytest's fails the part" has '^  FAIL  pytest, part 1 of 3$'
+check "naming both counts"                         has 'pytest reported 10 collected tests, and 9 node IDs were read'
+check "and fails the run"                          test "$RC" = 1
+printf '%s\n' 'tests/test_a.py: 3' 'tests/test_b.py: 1' >"$C.quiet"
+FAKE_PART_NODES=$C.quiet FAKE_PART_COUNT=4; export FAKE_PART_COUNT
+runci --part 2/3
+unset FAKE_PART_COUNT
+check "a list with no node IDs (another verbosity) fails the part, not passes" has '^  FAIL  pytest, part 2 of 3$'
+unset FAKE_PART_NODES
+check "the parts run every collected test function once, and the file of a module skipped at collection" \
+  test "$(sort "$all" | tr '\n' '|')" = \
+       "packages/p/tests/test_e.py::test_one|tests/sub/test_f.py::C::test_one|tests/test_a.py::test_one|tests/test_a.py::test_three|tests/test_a.py::test_two|tests/test_b.py::test_one|tests/test_c.py::test_p|tests/test_d.py::test_one|tests/test_g.py|"
+check "a part runs its functions in collection order, not sorted" \
+  test "$(grep '^tests/test_a.py::' "$C.ids.2" | tr '\n' '|')" = "tests/test_a.py::test_two|tests/test_a.py::test_one|"
+check "a line of the summary is not taken for a test"  test "$(grep -c 'test_w' "$all")" = 0
+check "a function's parametrized cases go to one part as one name" \
+  test "$(grep -c '^tests/test_c.py::' "$all")" = 1
+check "one file's functions can fall in different parts" \
+  test "$(for p in "$C".ids.*; do grep -l '^tests/test_a.py::' "$p"; done | wc -l | tr -d ' ')" -gt 1
+runci --part rest
+check "part rest passes"                           test "$RC" = 0
+check "part rest runs no root pytest"              test "$(grep -cE '^run --locked pytest' "$C.uv.log")" = 0
+check "part rest says the pytest parts run it"     has '^  skip  pytest \(the pytest parts of this run run it\)$'
+check "part rest runs ruff and ty"                 test "$(grep -cE '^run --locked (ruff|ty)' "$C.uv.log")" = 3
+check "part rest runs the test scripts"            has '^  ok    test-hooks$'
+runci --list-parts
+check "--list-parts prints the parts as one JSON array" test "$OUT" = '["rest","1/4","2/4","3/4","4/4"]'
+check "and needs no uv"                            test ! -s "$C.uv.log"
+for bad in 0/3 4/3 3 x/y foo; do
+  runci --part "$bad"
+  check "--part $bad is refused"                   test "$RC" = 1
+  check "naming what it takes"                     has '^ci: --part takes rest or I/N'
+done
+FAKE_COLLECT_FAIL=1; export FAKE_COLLECT_FAIL
+runci --part 1/2
+unset FAKE_COLLECT_FAIL
+check "a failed collection fails the part"         has '^  FAIL  pytest, part 1 of 2$'
+check "and the run"                                test "$RC" = 1
+}
+# --verdict: the required check's verdict from the needs context (ADR 0144, amendment of 2026-11-14)
+case_verdict() {
+fresh verdict
+local r
+verdict() { OUT=$(cd "$C" && NEEDS_JSON="$1" scripts/ci --verdict 2>&1); RC=$?; }
+verdict '{"plan":{"result":"success","outputs":{}},"check":{"result":"success","outputs":{}}}'
+check "every need a success passes"                test "$RC" = 0
+check "saying so"                                  has '^ci: every required job succeeded$'
+for r in failure cancelled skipped; do
+  verdict '{"plan":{"result":"success","outputs":{}},"check":{"result":"'"$r"'","outputs":{}}}'
+  check "a part's $r fails the required check"     test "$RC" = 1
+  check "naming the job and its result ($r)"       has "^check: $r\$"
+done
+verdict '{"plan":{"result":"cancelled"},"check":{"result":"skipped"}}'
+check "a cancelled plan, its check skipped, fails" test "$RC" = 1
+check "naming the plan"                            has '^plan: cancelled$'
+check "and the check"                              has '^check: skipped$'
+for r in '' '{}' 'not json' '[]'; do
+  verdict "$r"
+  check "NEEDS_JSON '$r' fails"                    test "$RC" = 1
+  check "saying it cannot read it ('$r')"          has '^ci: FAIL: NEEDS_JSON is missing, empty or not a JSON object$'
+done
+}
 case_landingall() {
 fresh landingall
 printf '#!/bin/bash\n: >"%s"\n' "$C.lanes.ran" >"$C/scripts/lanes"
@@ -472,6 +572,13 @@ check "its pytest runs from its folder"            test "$(grep -c -- '^--direct
 check "its pytest skips are listed"                line_after '^  ok    pytest in apart$' '^        SKIPPED .*no credentials'
 check "the root's own checks are unchanged"        test "$(grep -cE '^run --locked (ruff|ty|pytest)' "$C.uv.log")" = 4
 check "it comes after the supply-chain checks"     line_before '^Supply chain:$' '^Project apart, apart '
+printf '%s\n' tests/test_a.py::test_one >"$C.nodes"
+FAKE_PART_NODES=$C.nodes FAKE_PART_COUNT=1; export FAKE_PART_NODES FAKE_PART_COUNT
+runci --part 1/2
+unset FAKE_PART_NODES FAKE_PART_COUNT
+check "a pytest part passes beside a project apart" test "$RC" = 0
+check "it leaves the project apart to part rest"   has '^  skip  project apart apart \(part rest of this run runs it\)$'
+check "and runs nothing from its folder"           test "$(grep -c -- '^--directory apart ' "$C.uv.log")" = 0
 }
 case_apartlock() {
 apart_copy apartlock
@@ -1035,7 +1142,7 @@ done
 
 # Every case above works in its own copy, so they run concurrently; their output prints in this order.
 CASES="yaml noflows shell staged untracked tests testdir testgone notes skipsum died symlink deleted deleted2 lockfail fastfirst fastorder fastnamed commitscope collectfail stagedlock stagedtool stagedapart collectskips landingall landingmac fullall apart apartlock hookenv parallel order missing pathorder strayconfig longfail slots nice priority prioritycapacity"
-CASES="$CASES commitfast commitmodes commitslowfailure commitfastfailure commitpytest commitcanon commitshellfailure"
+CASES="$CASES parts verdict commitfast commitmodes commitslowfailure commitfastfailure commitpytest commitcanon commitshellfailure"
 for c in $CASES; do ( "case_$c" ) >"$TMP/out.$c" 2>&1 & done
 wait
 for c in $CASES; do cat "$TMP/out.$c"; done

@@ -205,7 +205,7 @@ The owner's standing instruction (2026-11-09): work lands automatically once its
    runs every check here (ADR 0144). A branch behind `main` is rebased if it was never pushed;
    once pushed, `origin/main` is merged into it instead, since a rebase could only be pushed with force. With an `origin` remote, `gh` must be signed in, or it stops
    and lands nothing; it checks every address it would publish, pushes, opens a pull request, posts the
-   `review` and `signoff` statuses, and waits up to 95 minutes (`LAND_WAIT_SECONDS`, default 5700) for
+   `review` and `signoff` statuses, and waits up to 45 minutes (`LAND_WAIT_SECONDS`, default 2700) for
    GitHub to squash-merge exactly the checked commit with the checked subject and message. If the wait
    runs out first, it stops and says what it last read; with auto-merge requested, GitHub may still merge
    once the checks pass, so look at the pull request. With no `origin` remote
