@@ -1593,29 +1593,33 @@ def position_status_report(
     shares", and does not say whether a short's quantity is negative
     (https://docs.alpaca.markets/us/reference/getallopenpositions.md, read 2026-11-13): a short's sign is
     UNVERIFIED. So the quantity is read as a finite number before its sign is taken off (`decimal_value`
-    raises `ValueError` naming it otherwise, which fails the whole position report, and at start-up the
-    node's reconciliation, as any position this slice cannot represent), and the position is a short by its `side` or by a quantity
-    below zero; a short is never reported LONG. A position labelled long with a quantity below zero is
-    reported a short of its magnitude and handed to `odd` once, with both fields. Alpaca gives positions
-    no timestamp, so `ts_last` is the time of the request.
+    raises `ValueError` otherwise, which fails the whole position report, and at start-up the node's
+    reconciliation, as any position this slice cannot represent), and the position is a short by its
+    `side` or by a quantity below zero; a short is never reported LONG. Every refusal names the symbol.
+    A position labelled long with a quantity below zero is reported a short of its magnitude and handed
+    to `odd`, with both fields, only once every check has passed, so a refused position is never named
+    as reported. Alpaca gives positions no timestamp, so `ts_last` is the time of the request.
     """
-    qty = decimal_value(position.qty, "position quantity")
+    qty = decimal_value(position.qty, f"{position.symbol} position quantity")
     labelled_short = position.side == AlpacaPositionSide.SHORT
     short = labelled_short or qty < 0
-    if short and not labelled_short and odd is not None:
-        odd(
-            f"Alpaca position in {position.symbol} is labelled long with quantity {position.qty}; "
-            "reported as a short of its magnitude"
-        )
-    return PositionStatusReport(
+    report = PositionStatusReport(
         account_id=ACCOUNT_ID,
         instrument_id=InstrumentId(Symbol(position.symbol), VENUE),
         position_side=PositionSide.SHORT if short else PositionSide.LONG,
         quantity=whole_quantity(abs(qty), f"{position.symbol} position quantity"),
         ts_last=ts_init,
         ts_init=ts_init,
-        avg_px_open=decimal_value(position.avg_entry_price, "average entry price"),
+        avg_px_open=decimal_value(
+            position.avg_entry_price, f"{position.symbol} average entry price"
+        ),
     )
+    if short and not labelled_short and odd is not None:
+        odd(
+            f"Alpaca position in {position.symbol} is labelled long with quantity {position.qty}; "
+            "reported as a short of its magnitude"
+        )
+    return report
 
 
 class AlpacaExecutionClient(ExecutionClient):
@@ -1670,6 +1674,7 @@ class AlpacaExecutionClient(ExecutionClient):
         self._external_reconciliation: set[str] = set()
         self._external_unloaded_symbols: set[str] = set()
         self._advisory_trigger_warned: set[str] = set()
+        self._odd_positions_named: set[str] = set()
         # Clients given here are the caller's: used on every connect, never replaced by ones built from
         # the environment, and not dropped at disconnect (the adapter guide closes what the adapter
         # creates in `_connect`). The live fields below are set in `_connect` and cleared on disconnect.
@@ -5220,6 +5225,18 @@ class AlpacaExecutionClient(ExecutionClient):
             found[order_id] = order if isinstance(order, AlpacaOrder) else None
         return found
 
+    def _odd_once(self, symbol: str) -> Callable[[str], None]:
+        """A warning for `symbol`'s disagreeing position that is logged once for this client's life: the
+        client reports positions at start-up, at each mass status and at each position check, and a
+        disagreement that persists would otherwise be logged at every one."""
+
+        def name(line: str) -> None:
+            if symbol not in self._odd_positions_named:
+                self._odd_positions_named.add(symbol)
+                self._log.warning(line)
+
+        return name
+
     async def _position_status_reports(
         self, command: live.GeneratePositionStatusReports
     ) -> list[PositionStatusReport]:
@@ -5249,7 +5266,9 @@ class AlpacaExecutionClient(ExecutionClient):
                     "loaded; not reported",
                 )
                 continue
-            reports.append(position_status_report(position, ts_init, odd=self._log.warning))
+            reports.append(
+                position_status_report(position, ts_init, odd=self._odd_once(position.symbol))
+            )
         # Alpaca's "All Open Positions" lists the account's open positions, and "Once a position is closed,
         # it will no longer be queryable" (https://docs.alpaca.markets/us/reference/getallopenpositions.md).
         # NautilusTrader takes only "An explicit flat report" as evidence of flat ("Missing reports do not
