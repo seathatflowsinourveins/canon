@@ -30,6 +30,7 @@ import uuid
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
+from typing import cast
 
 import pytest
 from alpaca.trading.models import TradeUpdate
@@ -44,6 +45,7 @@ from nautilus_trader.model import TimeInForce
 from nautilus_trader.trading import Strategy
 
 from canon_trading import owner_protector
+from canon_trading import session_window
 from tests.test_mover import AAA
 from tests.test_mover import BBB
 from tests.test_mover import SECOND
@@ -254,6 +256,71 @@ def test_an_unreadable_new_holding_is_named_and_the_run_goes_on() -> None:
     finally:
         eng.end()
         eng.dispose()
+
+
+def _ended(account: Account, seconds: int = 70) -> tuple[list[tuple[int, str | None]], Any]:
+    guard = protector(account, roster=(AAA,))
+    eng = run((Owner(Account()), guard), tape(range(seconds), later_at=None))
+    try:
+        return list(guard.shutdowns), guard
+    finally:
+        eng.end()
+        eng.dispose()
+
+
+def test_an_unreadable_long_outside_the_roster_keeps_a_new_whole_share_long_from_ending_the_run() -> (
+    None
+):
+    """The successor's start reads the same account and refuses an unreadable position
+    (`session_window.positions`), so an end here would leave every holding with no stop of ours: the run
+    goes on, protecting its roster, and names the new holding and what keeps it from ending."""
+    account = Account(AAA="10", BBB="7", CCC="5")
+    account.unreadable.add("BBB")
+    with pytest.raises(session_window.PositionUnread):
+        session_window.positions(cast(Any, account))
+    shutdowns, guard = _ended(account)
+    assert not shutdowns and guard.ended_for is None, "the run ended into a start that refuses"
+    named = alerts(guard, "CCC")
+    assert len(named) == 1, guard.said
+    assert "does not end" in named[0][1] and "BBB unreadable" in named[0][1]
+
+
+def test_a_roster_holding_turned_unreadable_keeps_a_new_whole_share_long_from_ending_the_run() -> (
+    None
+):
+    account = Account(AAA="10", CCC="5")
+    account.unreadable.add("AAA")
+    with pytest.raises(session_window.PositionUnread):
+        session_window.positions(cast(Any, account))
+    shutdowns, guard = _ended(account)
+    assert not shutdowns, "the run ended into a start that refuses"
+    assert "AAA unreadable" in alerts(guard, "CCC")[0][1]
+
+
+def test_a_fractional_long_keeps_a_new_whole_share_long_from_ending_the_run() -> None:
+    """The adapter's start-up refuses a fractional position in an instrument it loads
+    (`packages/canon-alpaca/src/canon_alpaca/execution.py:372`; that refusal is UNVERIFIED as run here)."""
+    account = Account(AAA="10", BBB="2.5", CCC="5")
+    shutdowns, guard = _ended(account)
+    assert not shutdowns, "the run ended into a start the adapter refuses"
+    assert "BBB 2.5 fractional" in alerts(guard, "CCC")[0][1]
+
+
+def test_the_run_ends_at_the_first_read_once_nothing_would_refuse_the_next_start() -> None:
+    class Clears(Account):
+        def get_all_positions(self) -> list[Any]:
+            listed = super().get_all_positions()
+            self.unreadable.clear()  # the account reads in full from the next read on
+            return listed
+
+    account = Clears(AAA="10", BBB="7", CCC="5")
+    account.unreadable.add("BBB")
+    shutdowns, guard = _ended(account)
+    assert account.reads >= 2
+    assert [reason for _at, reason in shutdowns] == [
+        "new holding outside the roster: BBB 7, CCC 5"
+    ], guard.said
+    assert shutdowns[0][0] - alerts(guard, "CCC")[0][0] >= owner_protector.ROSTER_POLL_SECS * SECOND
 
 
 def test_a_failed_read_is_an_alert_and_is_read_again_at_the_next_interval() -> None:

@@ -221,7 +221,10 @@ live node shuts down on it (crates/live/src/node/mod.rs:1636-1641) as the backte
 (crates/backtest/src/engine.rs:882-884), and the runner's successor reads the account fresh at its
 start, so the holding is on its roster. A fractional or unreadable long outside the roster is named and
 the run goes on: a successor could not start on it (review F2; session_window.positions), and ending
-would cost every other holding its protector. The bound: the buy is named, and the end asked for, at
+would cost every other holding its protector. Nor does a whole-share one end the run while the same read
+shows anything the successor's start would refuse (an unreadable position, or a fractional one, inside or
+outside the roster): the run then protects its roster to its planned end and names the holding and what
+it saw, and a later read with nothing refused ends it. The bound: the buy is named, and the end asked for, at
 the first read after it, so within ROSTER_POLL_SECS and one step of the venue listing it, when the read
 answers within its own bound (the same reader and the same limit as the GETs above). The node's stop,
 the runner's seam and the successor's arming come after that and are not in the bound; how long they
@@ -1572,6 +1575,30 @@ class OwnerProtector(Strategy):
                 continue
             whole.append((symbol, qty))
         if not whole:
+            return
+        # The successor's start reads this same account: `session_window.positions` refuses an unreadable
+        # position, and the adapter's start-up a fractional one in an instrument it loads, which is every
+        # symbol held (execution.py:372; UNVERIFIED as run). An end into that start would leave every
+        # holding, the roster's too, with no stop of ours, so the run goes on to its planned end, protects
+        # its roster and names what it saw; a later read with nothing refused ends it as above.
+        refused = sorted(
+            {f"{symbol} unreadable" for symbol in unread}
+            | {
+                f"{symbol} {qty} fractional"
+                for symbol, qty in held.items()
+                if qty != qty.to_integral_value()
+            }
+        )
+        if refused:
+            because = ", ".join(refused)
+            for symbol, qty in whole:
+                if (symbol, f"blocked: {because}") not in self.roster_named:
+                    self.roster_named.add((symbol, f"blocked: {because}"))
+                    self._say(
+                        f"{symbol}.ALPACA: ALERT: {ROSTER_ENDED}: {qty} held, bought after this run's "
+                        f"start; no exit in this run, and it does not end, since the next start would "
+                        f"refuse the account ({because}); it protects its roster to its planned end"
+                    )
             return
         for symbol, qty in whole:
             self._say(
