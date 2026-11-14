@@ -316,14 +316,21 @@ no_review() {   # no_review <status> <path>: succeeds if the path is on the list
 }
 # The trading path: the paths of ADR 0073 rule 1 that ADR 0074 item 4 calls the trading path (the adapter,
 # the session window and what it runs, the gate), plus the paper runner and the sandbox node on Alpaca's
-# live data, as ADR 0073's addition of 2026-11-11 names them. Unlike NO_REVIEW, * here crosses a /, so a
-# module moved into a subpackage of the adapter stays on the path. scripts/test-land checks that every
-# pattern matches a tracked file.
+# live data, as ADR 0073's addition of 2026-11-11 names them, and every module the protector and the Mover
+# send, size, price or cancel an order through, as its addition of 2026-11-13 names them. Unlike NO_REVIEW,
+# * here crosses a /, so a module moved into a subpackage of the adapter stays on the path.
+# scripts/test-land checks that every pattern matches a tracked file.
 #   packages/canon-alpaca/src/canon_alpaca/*.py                         the adapter
 #   session_window, session_ma_cross, ma_cross, position_cap            the session window and what it runs
 #   paper_node, home/.claude/canon/paper-session.sh, sandbox_node       the paper runner, the sandbox node
 #   ranking, returns_matrix, ledger, variant_study, backtest           the gate
-TRADING_PATHS='packages/canon-alpaca/src/canon_alpaca/*.py src/canon_trading/session_window.py src/canon_trading/session_ma_cross.py src/canon_trading/ma_cross.py src/canon_trading/position_cap.py src/canon_trading/paper_node.py home/.claude/canon/paper-session.sh src/canon_trading/sandbox_node.py src/canon_trading/ranking.py src/canon_trading/returns_matrix.py src/canon_trading/ledger.py src/canon_trading/variant_study.py src/canon_trading/backtest.py'
+#   owner_protector, protector_node, gain_lock, start_level, protect,   the protector and its node, the
+#   protection, custody, scripts/automation                             protect task, the close, the runner
+#   mover, mover_window, arming, sizing, price_step, trail,             the Mover, its entry switch, size,
+#   movers_rank, movers_rank_signal, movers_rank_actor                  price, distance and ranking clock
+# scripts/automation is the whole file, since a pattern cannot pick out its protector runner, so every edit
+# to it is on the trading path.
+TRADING_PATHS='packages/canon-alpaca/src/canon_alpaca/*.py src/canon_trading/session_window.py src/canon_trading/session_ma_cross.py src/canon_trading/ma_cross.py src/canon_trading/position_cap.py src/canon_trading/paper_node.py home/.claude/canon/paper-session.sh src/canon_trading/sandbox_node.py src/canon_trading/ranking.py src/canon_trading/returns_matrix.py src/canon_trading/ledger.py src/canon_trading/variant_study.py src/canon_trading/backtest.py src/canon_trading/owner_protector.py src/canon_trading/protector_node.py src/canon_trading/gain_lock.py src/canon_trading/start_level.py src/canon_trading/protect.py src/canon_trading/protection.py src/canon_trading/custody.py scripts/automation src/canon_trading/mover.py src/canon_trading/mover_window.py src/canon_trading/arming.py src/canon_trading/sizing.py src/canon_trading/price_step.py src/canon_trading/trail.py src/canon_trading/movers_rank.py src/canon_trading/movers_rank_signal.py src/canon_trading/movers_rank_actor.py'
 on_trading_path() {   # on_trading_path <path>
   local pattern
   for pattern in $TRADING_PATHS; do

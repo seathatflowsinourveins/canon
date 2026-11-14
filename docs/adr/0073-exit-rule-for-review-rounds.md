@@ -152,6 +152,19 @@ commits with the two trailers as JSON, parsed by git's `%(trailers)` format. Git
 the one-trailer last paragraph `scripts/land` passed it on #183 to #186; a trailer added by this change
 reaching main through GitHub is UNVERIFIED until the first fix lands with one.
 
+*Addition of 2026-11-13, the protector's and the Mover's order path:* `TRADING_PATHS` also holds every
+module through which the protector or the Mover computes an order's price, trigger, distance, quantity,
+side or time in force, or decides whether one is sent or canceled: the protector, its node, the gain lock
+and the start level (`owner_protector`, `protector_node`, `gain_lock`, `start_level`), the protect task and
+the Protection part (`protect`, `protection`), the close (`custody`), the Mover and its window (`mover`,
+`mover_window`), its entry switch, size, price step and distance (`arming`, `sizing`, `price_step`,
+`trail`), the ranking clock and signal the trail segment, the re-entry date and the Mover's names read
+(`movers_rank`, `movers_rank_signal`, `movers_rank_actor`), and `scripts/automation`, whole, since no
+pattern picks out its protector runner, so every edit to it is on the path. A module that supplies only a
+file write, runs offline or has no importer on `main` is left off (`rank_shared`, `rebuilt_level`,
+`trail_profile`, `ema_cross_protected`, `exit_monitor`), as is `mise.toml`; the sale table is not on
+`main` yet, and the change that lands it adds its pattern. `scripts/test-land` has one case per added path.
+
 ## Evidence
 
 Read 2026-11-10 and 2026-11-11.
@@ -186,3 +199,6 @@ Read 2026-11-10 and 2026-11-11.
 * `git log --format='%s | %(trailers:key=Co-Authored-By,valueonly)' f76675e..349fc9e` (#183 to #186), and
   `scripts/test-land`'s fix-marker cases (run 2026-11-11). An evidence-verifier pass on 2026-11-11
   corrected the convention claim and the trading path's scope.
+* The import graph of `src/canon_trading/` at `e6f8cbd3` (`git grep` of each module's imports and
+  importers, read 2026-11-13) for the addition of 2026-11-13, and `scripts/test-land`'s trading-path cases,
+  red at `e6f8cbd3` and green with the added patterns (run 2026-11-13).

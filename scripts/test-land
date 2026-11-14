@@ -1008,6 +1008,12 @@ t_index_origin() {         # with no revision, the index reads origin/main, whic
   out=$(cd "$W" && scripts/fix-index 2>&1); rc=$?
   [ "$rc" -eq 0 ] && jq -e 'length == 1 and .[0].subject == "Fix the gate'"'"'s finding"' <<<"$out" >/dev/null
 }
+t_fix_protector_path() {  # t_fix_protector_path <path>: a file of the protector's or the Mover's order path is on it
+  new_repo; fix "$1" "Fix the protector's finding"
+  land --reviewed "code-review ran"
+  why="$1 was not reported as on the trading path"
+  [ "$rc" -eq 0 ] && [ "$(warned)" -eq 1 ] && has "touches the trading path ($1)" && has "no Fails-before trailer"
+}
 t_trading_globs() {        # every glob of scripts/land's trading path matches a tracked file here
   local list g n bad=""
   list=$(sed -n "s/^TRADING_PATHS='\(.*\)'$/\1/p" "$ROOT/scripts/land")
@@ -1043,6 +1049,23 @@ case_ "an adapter module in a subpackage is on the trading path" t_fix_subpackag
 case_ "Fails-before naming a class the file lacks warns"   t_fix_wrong_class
 case_ "a fixed seed is not a fix"                           t_fixed_seed
 case_ "fix-index reads origin/main by default"              t_index_origin
+case_ "src/canon_trading/owner_protector.py is on the trading path" t_fix_protector_path src/canon_trading/owner_protector.py
+case_ "src/canon_trading/protector_node.py is on the trading path" t_fix_protector_path src/canon_trading/protector_node.py
+case_ "src/canon_trading/gain_lock.py is on the trading path" t_fix_protector_path src/canon_trading/gain_lock.py
+case_ "src/canon_trading/start_level.py is on the trading path" t_fix_protector_path src/canon_trading/start_level.py
+case_ "src/canon_trading/protect.py is on the trading path" t_fix_protector_path src/canon_trading/protect.py
+case_ "src/canon_trading/protection.py is on the trading path" t_fix_protector_path src/canon_trading/protection.py
+case_ "scripts/automation is on the trading path" t_fix_protector_path scripts/automation
+case_ "src/canon_trading/mover.py is on the trading path" t_fix_protector_path src/canon_trading/mover.py
+case_ "src/canon_trading/mover_window.py is on the trading path" t_fix_protector_path src/canon_trading/mover_window.py
+case_ "src/canon_trading/custody.py is on the trading path" t_fix_protector_path src/canon_trading/custody.py
+case_ "src/canon_trading/price_step.py is on the trading path" t_fix_protector_path src/canon_trading/price_step.py
+case_ "src/canon_trading/sizing.py is on the trading path" t_fix_protector_path src/canon_trading/sizing.py
+case_ "src/canon_trading/trail.py is on the trading path" t_fix_protector_path src/canon_trading/trail.py
+case_ "src/canon_trading/arming.py is on the trading path" t_fix_protector_path src/canon_trading/arming.py
+case_ "src/canon_trading/movers_rank.py is on the trading path" t_fix_protector_path src/canon_trading/movers_rank.py
+case_ "src/canon_trading/movers_rank_signal.py is on the trading path" t_fix_protector_path src/canon_trading/movers_rank_signal.py
+case_ "src/canon_trading/movers_rank_actor.py is on the trading path" t_fix_protector_path src/canon_trading/movers_rank_actor.py
 case_ "every trading-path glob matches a tracked file"      t_trading_globs
 
 wait
