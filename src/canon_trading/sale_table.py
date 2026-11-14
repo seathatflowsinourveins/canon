@@ -3,7 +3,7 @@
 Pin: nautilus-trader v2.0.0rc8 at d53849b216e2, whose order transitions are
 crates/model/src/orders/mod.rs:207-302, with reconciliation at 1314-1325 and
 late fills at 1367-1389. Canonical cells SHA256:
-f7bbb487c49c83ad4545501f31b00a490c8292c439b0d2b332272eeefe8bf1ea.
+046ef1f03b02491e885a24f5c1380de813b84db48f69437971888e46e7835eee.
 Order-event inventory: crates/model/src/events/order/any.rs:39-57 and
 crates/trading/src/strategy/mod.rs:1445-1462. Order events, including local echoes,
 are judged in the following step, in the table's step order.
@@ -23,9 +23,11 @@ holding frozen. A holding that ends ends its slot from every row, a stopped
 sale's included: when its leg ends with the long gone the row is X, and nothing
 of it, its level least of all, is kept. The owner's hold is the stop (ST) and
 its release is RL, which never lifts a recorded fault. A cancel that repeats
-(an ended or stopped holding's open sale) is asked only when `cancel_due`, and
-its refusal's ALERT is written once per leg (`cancel_refusal_told`); the caller
-raises ST at every step while a stopped holding's sale is open.
+is asked only when `cancel_due`: an ended or stopped holding's open sale waits
+the refused sale's pace, a new cause to ask never waits, and the cut for size
+of a working sale waits only its floor. The refusal's ALERT of an ended or
+stopped holding's sale is written once per leg (`cancel_refusal_told`); the
+caller raises ST at every step while a stopped holding's sale is open.
 """
 
 from collections.abc import Iterable

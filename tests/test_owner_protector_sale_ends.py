@@ -144,12 +144,11 @@ def test_a_stopped_sale_whose_cancel_was_refused_is_asked_again_when_its_holding
     strategy.deliver("CancelRejected", leg=ours, ts_event=h.T0 + 5 * h.SECOND)
     step(strategy, 5)
     assert c.row(strategy).row == "TW", c.row(strategy)
-    symbol_hold.remove_hold(tmp_path, "AAA")
     reopen(strategy, 6, 15)
     step(strategy, 6)
-    assert strategy.canceled == [leg.client_order_id], "not before the refusal's wait has passed"
-    step(strategy, 10)
-    assert strategy.canceled == [leg.client_order_id] * 2, "asked again at the holding's end"
+    assert strategy.canceled == [leg.client_order_id] * 2, (
+        "asked again at the holding's end, a new cause: the stop's refused cancel does not hold it"
+    )
     assert c.row(strategy).row == "PCT", c.row(strategy)
 
 
@@ -270,3 +269,102 @@ def test_a_new_leg_starts_the_refused_cancels_pace_and_its_alert_again() -> None
         None,
         False,
     )
+
+
+def held_with_a_refused_cancel(strategy, tmp_path: Path):
+    """A hold with our leg in flight; the cancel asked at the acknowledgement is refused at 5 s."""
+    strategy.observe("9.89", h.T0 + h.SECOND)
+    strategy.observe("9.88", h.T0 + 2 * h.SECOND)
+    (leg,) = strategy.sent
+    symbol_hold.write_hold(tmp_path, "AAA")
+    step(strategy, 3)
+    ours = strategy.cache.order(leg.client_order_id)
+    strategy.deliver("Submitted", leg=ours)
+    strategy.deliver("Accepted", leg=ours)
+    step(strategy, 4)
+    assert strategy.canceled == [leg.client_order_id] and c.row(strategy).row == "PCT"
+    strategy.deliver("CancelRejected", leg=ours, ts_event=h.T0 + 5 * h.SECOND)
+    step(strategy, 5)
+    assert c.row(strategy).row == "TW", c.row(strategy)
+    return leg, ours
+
+
+def test_the_first_ask_for_a_new_cause_never_waits_a_refusals_pace(tmp_path: Path) -> None:
+    """The stop's cancel was refused and its wait runs. The owner then sells the whole long: the
+    holding's end is a new cause to ask, and our sell must not rest beside a flat account for the
+    rest of a wait that another cause started."""
+    strategy = c.counted(symbol_holds_dir=tmp_path)
+    leg, _ours = held_with_a_refused_cancel(strategy, tmp_path)
+    held = strategy.cached.held[0]
+    held.signed_qty, held.quantity = Decimal(0), h.Quantity.from_int(0)
+    strategy.cached.held.clear()
+    step(strategy, 6)
+    assert strategy.canceled == [leg.client_order_id] * 2, "asked in the step the end is seen"
+    assert c.row(strategy).row == "PCT", c.row(strategy)
+
+
+def test_part_fills_after_a_refused_cancel_do_not_ask_at_every_fill() -> None:
+    """An ended holding's sale fills in parts while the venue refuses its cancel: a part fill
+    asks the cancel the end already owes, so it waits the end's pace and does not lengthen it."""
+    strategy = c.counted()
+    c.first_leg(strategy)
+    (leg,) = strategy.sent
+    ours = strategy.cache.order(leg.client_order_id)
+    reopen(strategy, 5, 15)
+    step(strategy, 5)
+    strategy.deliver("CancelRejected", leg=ours, ts_event=h.T0 + 6 * h.SECOND)
+    step(strategy, 6)
+    for seconds in (7, 8, 9):
+        strategy.deliver("Filled", quantity=1, leg=ours)
+        step(strategy, seconds)
+    assert len(strategy.canceled) == 1, "part fills inside the wait ask nothing"
+    assert strategy.slots[h.AAA].cancel_refusals == 1
+    step(strategy, 11)
+    assert len(strategy.canceled) == 2, "asked again when the wait has passed"
+
+
+def test_a_refusal_stamped_ahead_of_the_clock_does_not_postpone_the_next_ask() -> None:
+    """The wait runs from no later than the node's own clock when the refusal is judged."""
+    strategy = c.counted()
+    c.first_leg(strategy)
+    (leg,) = strategy.sent
+    ours = strategy.cache.order(leg.client_order_id)
+    reopen(strategy, 5, 15)
+    step(strategy, 5)
+    strategy.deliver("CancelRejected", leg=ours, ts_event=h.T0 + 3600 * h.SECOND)
+    for seconds in range(6, 12):
+        step(strategy, seconds)
+    assert len(strategy.canceled) == 2, "asked again five seconds after the refusal was judged"
+
+
+def test_each_refused_cancel_after_the_first_is_counted_in_a_line(tmp_path: Path) -> None:
+    strategy = c.counted(symbol_holds_dir=tmp_path)
+    _leg, ours = held_with_a_refused_cancel(strategy, tmp_path)
+    for seconds in range(6, 30):
+        if c.row(strategy).row == "PCT":
+            strategy.deliver("CancelRejected", leg=ours, ts_event=h.T0 + seconds * h.SECOND)
+        step(strategy, seconds)
+    counted = [
+        line
+        for line in strategy.said
+        if "cancel of our sale refused" in line and not line.startswith("ALERT:")
+    ]
+    assert [line.split("refused ")[1].split(" ")[0] for line in counted] == ["1", "2", "3"], counted
+    assert "asked again after 5 s" in counted[0] and "asked again after 20 s" in counted[2]
+    assert len(cancel_alerts(strategy)) == 1
+    assert "asked again after 5 s" in cancel_alerts(strategy)[0], cancel_alerts(strategy)
+
+
+def test_a_stored_order_event_is_judged_before_the_standing_stop_asks(tmp_path: Path) -> None:
+    """The stop that still stands is raised only in a step with no stored order event of the
+    instrument: an Updated stored while the wait ran is judged in the resting row, where it changes
+    nothing, and is never read as a second refusal of a cancel asked in the same step."""
+    strategy = c.counted(symbol_holds_dir=tmp_path)
+    leg, ours = held_with_a_refused_cancel(strategy, tmp_path)
+    strategy.deliver("Updated", leg=ours, ts_event=h.T0 + 11 * h.SECOND)
+    step(strategy, 11)
+    slot = strategy.stopped_sales.get(h.AAA) or strategy.slots[h.AAA]
+    assert slot.cancel_refusals == 1, "the stored update is not a refusal"
+    assert strategy.canceled == [leg.client_order_id] and c.row(strategy).row == "TW"
+    step(strategy, 12)
+    assert strategy.canceled == [leg.client_order_id] * 2 and c.row(strategy).row == "PCT"

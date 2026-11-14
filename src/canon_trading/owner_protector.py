@@ -269,15 +269,23 @@ is dropped, so a holding that waits because its distance is refused reads "no le
 yet"; under the owner's hold a recorded fault is not named and the line says that removing the
 hold re-arms the holding, though the release freezes it again. A holding that never had a usable
 quote reads `counting` (the cold start's follow-up).
-A cancel the venue refused is asked again, never at every step and never never: where the asks
-repeat (an ended holding's open sale, a stopped or held holding's open sale, a release that waits
-for one) the table's `cancel_due` holds each next ask to the refused sale's own pace, counted
-from the later of the refusal's stamp and its receipt, and its ALERT is written once per leg.
-While a stopped holding's sale is open the stop is raised at every step (TW x ST), so the ask
-comes whether or not the holding ends. Named limit: this holds also where our sale has become
-larger than the long (the mismatch in the ended and stopped rows): after a refusal the cut is
-asked again when the wait has passed, five seconds at first, not at the next step. A working
-sale's cut in a live holding is not paced. UNVERIFIED on the engine and on paper: neither can be
+A cancel the venue refused is asked again, never at every step and never never. PACED where the
+cancel follows a holding's end or a stop (an ended holding's open sale, a stopped or held
+holding's open sale, a release that waits for one): the table's `cancel_due` holds each REPEAT of
+an ask to the refused sale's own pace, counted from the later of the refusal's stamp and its
+receipt and never from later than this node's clock when the refusal is judged. The first ask
+for each cause (the stop, the holding's end, our sale larger than the long) is never held by a
+wait another cause started; a part fill and an acknowledgement at last ask what their row
+already owes. Each refusal is counted in a line with its next wait; its ALERT is written once per
+leg. While a stopped holding's sale is open the owner's hold raises the stop at every step
+(TW x ST) in which no order event of the instrument is stored, so the ask comes whether or not
+the holding ends. UNPACED where a sale known to be working is larger than a live or frozen
+holding (the cut for size): an oversell cannot wait. It has a floor: a cut the venue refused is
+asked again no sooner than CUT_FLOOR_SECS after that refusal, at most one cancel a second for
+the holding, so a refusal that persists never becomes a cancel for each quote. Named limits: a
+refused cut writes its ALERT at each refusal; the floor bounds one holding, not the account's
+sum; at a whole-node stop no step runs again, so a cancel refused there is not asked again and
+the next start finds the sell as cover. UNVERIFIED on the engine and on paper: neither can be
 made to refuse a cancel on demand.
 
 Review F1 of #443's max review (the lead's ruling, 2026-11-13 22:47 and 22:52): a holding first bought
@@ -421,12 +429,32 @@ HOLD_ONE_SYMBOL = "hold this symbol: stop the node"
 SALE_FAULT_ROWS = frozenset({"FZ", "FZW", "FZP"})
 # Rows in which the owner's hold asks nothing more of the table: stopped already, ended, or
 # frozen by a fault of ours with nothing open (which sends nothing and must stay frozen).
-HOLD_SETTLED_ROWS = frozenset({"FZ", "X", "T0", "TW", "PCT"})
+HOLD_SETTLED_ROWS = frozenset({"FZ", "X", "T0", "PCT"})
 SALE_STOPPED_ROWS = frozenset({"T0", "TW", "PCT"})
 SALE_NOTHING_OPEN_ROWS = frozenset({"G", "GC", "RW", "FZ", "FC", "T0", "X"})
 SALE_COVER_ROWS = frozenset({"FC", "FCW", "FCP"})
 # Our cancel refused where it is asked again: from the cancel's row back to the row that rests.
 SALE_CANCEL_REFUSED = frozenset({("PCX", "OX"), ("PCT", "TW")})
+# Our cut for size refused in a live or frozen holding: from the cut's row back to its working row.
+SALE_CUT_ROWS = frozenset({"PCO", "FZP", "FCP"})
+SALE_CUT_BACK_ROWS = frozenset({"WK", "PF", "FZW", "FCW"})
+# The floor of the unpaced cut: a cut the venue refused is asked again no sooner than this after
+# the refusal, so a refusal that persists is at most one cancel a second for the holding, never one
+# for each quote. The figure has no measured source: it is the step timer's own interval.
+CUT_FLOOR_SECS = 1
+# Why a cancel is asked: the stop, the holding's end, or our sale larger than the long. A new
+# cause asks at once; only a repeat of a cause already asked for this leg waits the refusal's pace.
+SALE_CANCEL_CAUSES = {"ST": "stop", "HE": "end", "MO": "size"}
+
+
+def sale_cancel_cause(row: str, code: str) -> str | None:
+    """The cause of a cancel asked by `code` in `row`. An acknowledgement at last and a part fill
+    ask the cancel their row already owes: the stop's in the stopped row, the end's otherwise."""
+    if code in {"oACC", "oPF"}:
+        return "stop" if row == "TW" else "end"
+    return SALE_CANCEL_CAUSES.get(code)
+
+
 SALE_CANCEL_ROWS = frozenset({"PCR", "PCO", "PCX", "FZP", "FCP", "PCT"})
 # What answers a cancel of ours: its acknowledgement, its refusal, or the leg's own end.
 SALE_CANCEL_ANSWERS = frozenset({"oCXL", "oCRJ", "oEXP", "oFF", "oREJ", "oDEN"})
@@ -834,7 +862,12 @@ class Holding:
     # at none. The table's `cancel_due` and `cancel_refusal_told` read them.
     cancel_refusals: int = 0
     cancel_refused_ns: int | None = None
+    # The wait the last refused cancel started: the pace's, or the cut's floor.
+    cancel_wait_secs: int = 0
     cancel_refusal_told: bool = False
+    # The causes a cancel of the open leg was already asked for (SALE_CANCEL_CAUSES). The first
+    # ask for a cause is never held by a wait that another cause's refusal started.
+    cancel_asked: set[str] = field(default_factory=set)
     flight_sent_ns: int | None = None
     flight_told: bool = False
     flight_answered: bool = False
@@ -1980,7 +2013,8 @@ class OwnerProtector(Strategy):
             for instrument_id, stopped in list(self.stopped_sales.items()):
                 try:
                     standing = stopped.sale_state is not None and stopped.sale_state.row == "TW"
-                    self._sale_step(instrument_id, ["ST", "NQ"] if standing else ["NQ"])
+                    owed = self._standing_stop(instrument_id, stopped) if standing else []
+                    self._sale_step(instrument_id, [*owed, "NQ"])
                 except Exception as exc:  # noqa: BLE001 - preserve the base's per-holding isolation.
                     self._say(
                         f"{instrument_id}: unprotected: stopped sale step failed: "
@@ -2655,6 +2689,12 @@ class OwnerProtector(Strategy):
             return False
         return True
 
+    def _standing_stop(self, instrument_id: InstrumentId, slot: Holding) -> list[str]:
+        """The stop raised again for a stopped holding's open sale (TW), only in a step with no
+        stored order event of the instrument: ST is judged before order events, and one judged
+        after a cancel asked in the same step would be read as that cancel's refusal."""
+        return [] if self._sale_events.get(instrument_id) else ["ST"]
+
     def _hold_counted(
         self, instrument_id: InstrumentId, slot: Holding, quote: QuoteTick | None
     ) -> bool:
@@ -2671,14 +2711,17 @@ class OwnerProtector(Strategy):
         """
         assert slot.sale_state is not None
         row = slot.sale_state.row
+        timer = ["NQ"] if quote is None else []
         if instrument_id in self.held:
             slot.hold_applied, slot.hold_release_said = True, False
-            if row not in HOLD_SETTLED_ROWS or row == "TW":
-                # In TW the stop still stands with our sale open: the table asks its cancel again
-                # when the sale can take one and the pace allows (TW x ST).
-                self._sale_step(instrument_id, ["ST"] if quote is not None else ["ST", "NQ"])
+            if row == "TW":
+                # The stop still stands with our sale open: the table asks its cancel again when
+                # the sale can take one and the pace allows (TW x ST).
+                self._sale_step(instrument_id, [*self._standing_stop(instrument_id, slot), *timer])
+            elif row not in HOLD_SETTLED_ROWS:
+                self._sale_step(instrument_id, ["ST"])
             else:
-                self._sale_step(instrument_id, ["NQ"] if quote is None else [])
+                self._sale_step(instrument_id, timer)
             return True
         if not slot.hold_applied:
             return False
@@ -2687,8 +2730,8 @@ class OwnerProtector(Strategy):
             return False
         # Until the release is applied the stop's own work is still owed: in TW our sale is open
         # and its cancel is asked again when it can be (TW x ST), or the release would wait for ever.
-        owed = ["ST"] if row == "TW" else []
-        self._sale_step(instrument_id, [*owed, "RL"] if quote is not None else [*owed, "RL", "NQ"])
+        owed = self._standing_stop(instrument_id, slot) if row == "TW" else []
+        self._sale_step(instrument_id, [*owed, "RL", *timer])
         row = slot.sale_state.row
         if row in SALE_STOPPED_ROWS:
             if not slot.hold_release_said:
@@ -2995,7 +3038,8 @@ class OwnerProtector(Strategy):
             # sale's own pace after each refusal: never every step, never never.
             "cancel_due": slot.cancel_refused_ns is None
             or self.clock.timestamp_ns() - slot.cancel_refused_ns
-            >= refusal_wait_secs(slot.cancel_refusals) * SECOND_NS,
+            >= slot.cancel_wait_secs * SECOND_NS
+            or sale_cancel_cause(slot.sale_state.row, code) not in slot.cancel_asked | {None},
             "resend_due": code == "QU"
             and all(
                 at is None or self.clock.timestamp_ns() - at >= wait * SECOND_NS
@@ -3203,10 +3247,27 @@ class OwnerProtector(Strategy):
                     # what the engine reads as one): it is asked again after the pace's wait, and
                     # the table has written its ALERT once for this leg.
                     slot.cancel_refusals += 1
+                    # Never later than this clock: a refusal stamped ahead of it would postpone
+                    # the next ask by the difference, without bound.
+                    judged_ns = self.clock.timestamp_ns()
                     slot.cancel_refused_ns = (
-                        self.clock.timestamp_ns() if wait_from_ns is None else wait_from_ns
+                        judged_ns if wait_from_ns is None else min(wait_from_ns, judged_ns)
                     )
+                    slot.cancel_wait_secs = refusal_wait_secs(slot.cancel_refusals)
                     slot.cancel_refusal_told = True
+                    again = (
+                        f"our cancel of our sale refused {slot.cancel_refusals} times; asked "
+                        f"again after {refusal_wait_secs(slot.cancel_refusals)} s"
+                    )
+                    self._say(f"{instrument_id}: {again}")
+                    action_reason = f"{action_reason}; {again}"
+                if before.row in SALE_CUT_ROWS and result.state.row in SALE_CUT_BACK_ROWS:
+                    # Our cut for size was refused: not paced, but never sooner than its floor.
+                    judged_ns = self.clock.timestamp_ns()
+                    slot.cancel_refused_ns = (
+                        judged_ns if wait_from_ns is None else min(wait_from_ns, judged_ns)
+                    )
+                    slot.cancel_wait_secs = CUT_FLOOR_SECS
                 if event.code == "oREJ" and before.row not in SALE_NOTHING_OPEN_ROWS:
                     # EVERY rejection of an open sale of ours is recorded, whatever the row that
                     # judges it (stopped, held, cover unread), so the pace guards the next leg.
@@ -3295,6 +3356,9 @@ class OwnerProtector(Strategy):
                         before,
                         action_reason,
                     )
+                    cause = sale_cancel_cause(before.row, event.code)
+                    if action == sale_table.Action.CANCEL and cause is not None:
+                        slot.cancel_asked.add(cause)
                     if action == sale_table.Action.ALERT:
                         if "not refusal_told" in terms:
                             slot.refusal_told = True
@@ -3413,6 +3477,7 @@ class OwnerProtector(Strategy):
             slot.sale.order_ids.add(candidate.client_order_id)
             slot.protect_id = candidate.client_order_id
             slot.cancel_refusals, slot.cancel_refused_ns, slot.cancel_refusal_told = 0, None, False
+            slot.cancel_asked, slot.cancel_wait_secs = set(), 0
             slot.flight_sent_ns, slot.flight_told, slot.flight_answered = now, False, False
             ack_ns = slot.flight_answer_ns if before.row == "PCR" else None
             refused_ns = slot.refusal_last_ns if before.row == "RW" else None

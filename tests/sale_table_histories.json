@@ -81,7 +81,7 @@
         {
           "row": "WK",
           "event": "MO",
-          "when": "always",
+          "when": "cancel_due",
           "does": "CANCEL ours; -> PCO",
           "occurs": "yes"
         },
@@ -1356,7 +1356,7 @@
         {
           "row": "FCW",
           "event": "MO",
-          "when": "always",
+          "when": "cancel_due",
           "does": "CANCEL ours; -> FCP",
           "occurs": "yes"
         },
@@ -2171,7 +2171,7 @@
         {
           "row": "WK",
           "event": "MO",
-          "when": "always",
+          "when": "cancel_due",
           "does": "CANCEL ours; -> PCO",
           "occurs": "yes"
         },

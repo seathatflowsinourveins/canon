@@ -69,6 +69,8 @@ class Leg:
     # `cancel_due` is then false; the "c~" step ends it), and its ALERT was written.
     cancel_waits: bool = False
     refusal_told: bool = False
+    # The causes a cancel of this leg was already asked for: a new cause never waits.
+    asked: frozenset[str] = frozenset()
 
     @property
     def remaining(self):
@@ -140,6 +142,19 @@ class Seen:
     reopened: bool = False
 
 
+def cause(row, event):
+    """Why a cancel is asked: the stop, the holding's end, or our sale larger than the long. An
+    acknowledgement at last and a part fill ask the cancel their row already owes."""
+    if event in {"oACC", "oPF"}:
+        return "stop" if row == "TW" else "end"
+    return {"ST": "stop", "HE": "end", "MO": "size"}.get(event)
+
+
+def repeat_waits(leg, row, event):
+    """A cancel refused for this leg whose wait still runs holds only a REPEAT of a cause."""
+    return bool(leg and leg.cancel_waits and cause(row, event) in leg.asked)
+
+
 def facts(account, seen, row):
     leg = account.legs[0] if account.legs else None
     reprice_due = seen.reprice_due
@@ -157,7 +172,7 @@ def facts(account, seen, row):
         "reprice_due": reprice_due,
         "ends_filled": seen.ends_filled,
         "refusal_told": account.told,
-        "cancel_due": not (leg and leg.cancel_waits),
+        "cancel_due": not repeat_waits(leg, row, seen.code),
         "cancel_refusal_told": bool(leg and leg.refusal_told),
         "resend_due": not account.young,
         "flight_alert_due": bool(
@@ -387,12 +402,12 @@ def advance(world, seen, n, table):
         # is asked canceled in that step, whatever the row. A holding reopened at least as large
         # never shows a mismatch, so nothing else would ask. One exception: a cancel the venue
         # refused is asked again only when its wait has passed.
-        if before.legs[0].cancel_waits:
+        if repeat_waits(before.legs[0], origin, "HE"):
             assert sale.Action.CANCEL not in result.actions, "a_refused_cancel_waits_its_pace"
         else:
             assert sale.Action.CANCEL in result.actions, "an_ended_holdings_sale_is_asked_canceled"
     if event == "ST" and origin == "TW" and before.legs:
-        due = before.legs[0].cancelable and not before.legs[0].cancel_waits
+        due = before.legs[0].cancelable and not repeat_waits(before.legs[0], origin, "ST")
         assert (sale.Action.CANCEL in result.actions) == due, (
             "a_standing_stop_asks_again_when_due" if due else "a_refused_cancel_waits_its_pace"
         )
@@ -403,6 +418,9 @@ def advance(world, seen, n, table):
             "a_refused_cancel_is_told_once_per_leg"
         )
         account = replace(account, legs=(replace(refused, cancel_waits=True, refusal_told=True),))
+    if origin in {"PCO", "FZP", "FCP"} and result.state.row in {"WK", "PF", "FZW", "FCW"}:
+        # Our cut for size refused in a live or frozen holding: its floor runs before the next ask.
+        account = replace(account, legs=(replace(account.legs[0], cancel_waits=True),))
     if event == "HE" and origin == "T0":
         assert result.state.row == "X", "a_stopped_holding_that_ends_has_ended"
     if event == "oLF" and world.state.row in {"WK", "PF"} and account.long <= 0:
@@ -455,19 +473,36 @@ def advance(world, seen, n, table):
             )
         account = replace(account, legs=account.legs + (Leg(quantity),))
         assert len(account.legs) <= 1, "one_open_leg"
+    if (
+        world.state.row == "OX"
+        and event in {"oACC", "oPF"}
+        and before.legs
+        and repeat_waits(before.legs[0], origin, event)
+    ):
+        assert sale.Action.CANCEL not in result.actions, "a_refused_cancel_waits_its_pace"
     if world.state.row == "TW" and event in {"oACC", "oPF"}:
-        assert sale.Action.CANCEL in result.actions, "stopped_sale_owes_cancel"
-        assert result.state.row == "PCT", "stopped_sale_cancel_row"
+        if repeat_waits(before.legs[0], origin, event):
+            assert sale.Action.CANCEL not in result.actions, "a_refused_cancel_waits_its_pace"
+        else:
+            assert sale.Action.CANCEL in result.actions, "stopped_sale_owes_cancel"
+            assert result.state.row == "PCT", "stopped_sale_cancel_row"
     if sale.Action.CANCEL in result.actions:
         assert account.legs and account.legs[0].cancelable, "cancel_requires_our_cancelable_leg"
         account = replace(
             account,
             fresh=QUOTE_THAT_ASKED_COUNTS,
             newer=False,
-            legs=(replace(account.legs[0], pending=True, cancel_told=False),),
+            legs=(
+                replace(
+                    account.legs[0],
+                    pending=True,
+                    cancel_told=False,
+                    asked=account.legs[0].asked | ({cause(origin, event)} - {None}),
+                ),
+            ),
         )
     if event == "MO":
-        if before.legs[0].cancel_waits:
+        if repeat_waits(before.legs[0], origin, "MO"):
             assert sale.Action.CANCEL not in result.actions, "a_refused_cancel_waits_its_pace"
         else:
             assert sale.Action.CANCEL in result.actions, "mismatch_cancels_in_same_step"
@@ -558,6 +593,7 @@ def step(world, observations, n=2, table=sale.TABLE, *, sends=None):
         and world.account.legs[0].cancelable
         and not world.account.legs[0].cancel_waits
     )
+    started_waiting = bool(world.account.legs and world.account.legs[0].cancel_waits)
     indexed = {str(i): seen for i, seen in enumerate(observations)}
     tagged = [sale.Event(seen.code, {str(i): True}) for i, seen in enumerate(observations)]
     ordered = sale.order_step(tagged, table=table)
@@ -579,8 +615,7 @@ def step(world, observations, n=2, table=sale.TABLE, *, sends=None):
         actions.extend(asked)
     if any(seen.code in INVALIDATES for seen in observations):
         assert sale.Action.SEND not in actions, "invalidation_first"
-    waits = bool(world.account.legs and world.account.legs[0].cancel_waits)
-    if owed and not waits:
+    if owed and not started_waiting:
         # After a holding ends, from any row and by any history, no sell of ours is left working
         # without a cancel being asked for it: a step that begins with one asks, or the sale ends,
         # or a cancel the venue refused waits its pace. A backstop over whole steps.
@@ -1180,7 +1215,7 @@ UNREAD = WORKING + (Seen("FRZ"),)
         (
             "FCW",
             "MO",
-            "always",
+            "cancel_due",
             {"next": "FCW", "cancel": False},
             UNREAD + (Seen("HS"),),
             "mismatch_cancels_in_same_step",
@@ -1498,7 +1533,8 @@ def test_a_stopped_sales_end_asks_its_cancel_where_the_stop_did_not():
 
 
 REFUSED_AT_END = WORKING + (Seen("HE", reopened=True), Seen("oCRJ"))
-REFUSED_FLAT = WORKING + (Seen("HE"), Seen("oCRJ"))
+# A flat holding's end also shows our sale larger than the long: two causes, each asked once.
+REFUSED_FLAT = WORKING + (Seen("HE"), Seen("oCRJ"), Seen("oCRJ"))
 REFUSED_UNDER_STOP = WORKING + (Seen("ST"), Seen("oCRJ"))
 
 
@@ -1586,6 +1622,41 @@ def test_a_refused_cancel_is_asked_again_only_when_its_wait_has_passed():
             {"alert": False},
             REFUSED_UNDER_STOP,
             "a_refused_cancel_is_told_once_per_leg",
+        ),
+        # A part fill inside a refusal's wait asks the cancel its row already owes.
+        (
+            "OX",
+            "oPF",
+            "not cancel_due",
+            {"next": "PCX", "cancel": True},
+            REFUSED_AT_END + (Seen("oPF"),),
+            "a_refused_cancel_waits_its_pace",
+        ),
+        (
+            "TW",
+            "oPF",
+            "not cancel_due",
+            {"next": "PCT", "cancel": True},
+            REFUSED_UNDER_STOP + (Seen("oPF"),),
+            "a_refused_cancel_waits_its_pace",
+        ),
+        # The cut for size with no floor: asked again in the step its refusal is judged.
+        (
+            "WK",
+            "MO",
+            "not cancel_due",
+            {"next": "PCO", "cancel": True},
+            WORKING + (Seen("HS"), Seen("oCRJ")),
+            "a_refused_cancel_waits_its_pace",
+        ),
+        # The floor never ends: the cut is not asked again once its wait has passed.
+        (
+            "WK",
+            "MO",
+            "cancel_due",
+            {"next": "WK", "cancel": False},
+            WORKING + (Seen("HS"), Seen("oCRJ"), Seen("c~"), Seen("NQ")),
+            "mismatch_cancels_in_same_step",
         ),
     ],
 )
