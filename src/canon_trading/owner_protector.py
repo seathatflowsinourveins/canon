@@ -276,12 +276,14 @@ from .start_level import Entry
 from .start_level import Horizon
 from .start_level import Key
 from .start_level import LevelBook
+from .start_level import Unread
 from .start_level import baseline
 from .start_level import book_path
 from .start_level import bought_since
 from .start_level import holding_reading
 from .start_level import leg_key
 from .start_level import overnight_answer
+from .start_level import raw_key
 from .start_level import start_level
 
 if TYPE_CHECKING:
@@ -610,6 +612,10 @@ STREAM_LOGGER = "alpaca.data.live.websocket"
 STREAM_ERROR = "error during websocket communication"
 
 
+class BookUnreadable(Exception):
+    """The level book exists and cannot be read at a write: it is left as it is (F13)."""
+
+
 class _StreamErrors(logging.Handler):
     """Test b (the lead, 2026-11-13 19:01:48), an upstream named limit: a stream message alpaca-py
     cannot parse ends its received batch, and the rest of that batch is lost, logged as STREAM_ERROR
@@ -694,6 +700,8 @@ class OwnerProtector(Strategy):
         self.book_entries: dict[Key, Entry] = {}
         # Item 4: a write failure is named once per kind (exception type and text).
         self.write_failures: set[tuple[str, str]] = set()
+        # F13 (#443's max review): each note a read of the book gave, start or re-read, said once.
+        self.book_notes: set[str] = set()
         self.last_step_ns: int | None = None
         # P11: supplied levels and book entries that armed a holding this run.
         self.applied: set[InstrumentId] = set()
@@ -1299,7 +1307,7 @@ class OwnerProtector(Strategy):
                 if self.settings.level_book_path is None
                 else Path(self.settings.level_book_path)
             )
-            self.previous_levels = LevelBook.read(self.level_book_path, report=self._say)
+            self.previous_levels = LevelBook.read(self.level_book_path, report=self._say_book_note)
             self.book_entries = dict(self.previous_levels)
             # 3d's cell 0c (the lead, 2026-11-13 19:12): the book's state is said at every start.
             self._say(f"level book enabled for account {self.settings.account_label}")
@@ -2644,6 +2652,45 @@ class OwnerProtector(Strategy):
             entries.setdefault(key, retired)  # Review F3: unless a new holding's entry replaced it.
         return entries
 
+    def _say_book_note(self, note: str) -> None:
+        if note not in self.book_notes:
+            self.book_notes.add(note)
+            self._say(note)
+
+    def _merged_book(self, on_disk: dict[Key, Entry], unread: Unread, changed: dict[Key, Entry]):
+        """F13 (#443's max review; the lead, 2026-11-13 22:47): what the write holds. A row the
+        re-read rejected is carried unchanged, never replaced by this run's older copy of it,
+        unless this run changed that holding; and a higher level for the same holding (the same
+        protection start) that another run wrote since this run last read or wrote the book is never
+        lowered by this run's write. An entry this run read and judged not the holding held now
+        (the venue's clock, DeepSeek P2-2) is replaced as before."""
+        for key, entry in list(changed.items()):
+            disk = on_disk.get(key)
+            if (
+                disk is not None
+                and disk != self.book_entries.get(key)  # written by another run since
+                and disk.run != entry.run
+                and disk.protection_start_ns == entry.protection_start_ns
+                and disk.last_level is not None
+                and entry.last_level is not None
+                and disk.last_level > entry.last_level
+            ):
+                self._say_book_note(
+                    f"{key[1]}: level book keeps run {disk.run}'s level {disk.last_level} for "
+                    f"the same holding over this run's {entry.last_level}; a level is never "
+                    "lowered across a write"
+                )
+                changed[key] = disk
+        mine = {(account, str(instrument)) for account, instrument in changed}
+        skipped = {raw_key(row) for row in unread.rows}
+        kept = {
+            key: entry
+            for key, entry in self.book_entries.items()
+            if (key[0], str(key[1])) not in skipped
+        }
+        carried = [row for row in unread.rows if raw_key(row) not in mine]
+        return {**kept, **on_disk, **changed}, carried
+
     def _save_levels(self, *, final: bool = False, step_ns: int | None = None) -> None:
         """Write the book when a holding's level or state changed (P10, item 4), every holding's
         at stop (P5), and the step's time at most once per step (item 4).
@@ -2670,12 +2717,21 @@ class OwnerProtector(Strategy):
             # Review F5: the read, merge and replace hold the book's lock, so a writer sharing
             # the path can neither lose this run's entries nor have its own lost.
             with LevelBook.locked(self.level_book_path):
-                on_disk = LevelBook.read(self.level_book_path, report=lambda _note: None)
-                entries = {**self.book_entries, **on_disk, **changed}
+                unread = Unread()
+                on_disk = LevelBook.read(
+                    self.level_book_path, report=self._say_book_note, unread=unread
+                )
+                if unread.book is not None:
+                    raise BookUnreadable(
+                        f"ALERT: level book {self.level_book_path} unreadable ({unread.book}); "
+                        "not overwritten, so no other run's entry is lost; this run's levels "
+                        "are not saved until it reads"
+                    )
+                entries, carried = self._merged_book(on_disk, unread, changed)
                 steps = LevelBook.last_steps(self.level_book_path)
                 if self.last_step_ns is not None:
                     steps[self.settings.account_label] = self.last_step_ns
-                LevelBook.write(self.level_book_path, entries, last_step_ns=steps)
+                LevelBook.write(self.level_book_path, entries, last_step_ns=steps, carried=carried)
             self.written_keys.update(k for k, e in changed.items() if e.run == self.run)
         except Exception as exc:  # noqa: BLE001 - persistence must not replace the run's outcome.
             kind = (type(exc).__name__, str(exc))

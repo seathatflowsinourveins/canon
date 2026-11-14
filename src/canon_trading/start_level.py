@@ -39,8 +39,10 @@ import re
 from collections.abc import Callable
 from collections.abc import Generator
 from collections.abc import Mapping
+from collections.abc import Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
+from dataclasses import field
 from datetime import UTC
 from datetime import datetime
 from datetime import timedelta
@@ -64,6 +66,24 @@ SCHEMAS_READ = (1, 2, SCHEMA)
 read through this one tuple, so the two never disagree on a format (the lead, 21:23: a book
 the composed commit wrote is read, never refused)."""
 type Reporter = Callable[[str], None]
+
+
+@dataclass
+class Unread:
+    """What one read of the book could not use, for a writer to carry, never to replace (#443's
+    max review F13; the lead, 2026-11-13 22:47: a row this build cannot read is carried through a
+    write unchanged). `rows` holds each rejected row as it was on disk; `book` names why the whole
+    file could not be read, and a writer then writes nothing over it."""
+
+    rows: list[Any] = field(default_factory=list)
+    book: str | None = None
+
+
+def raw_key(row: Any) -> tuple[Any, Any] | None:
+    """A rejected row's (account label, instrument id) as text, or None when it has neither."""
+    if not isinstance(row, dict):
+        return None
+    return (row.get("account_label"), row.get("instrument_id"))
 
 
 def _positive(value: Decimal, name: str) -> None:
@@ -291,7 +311,12 @@ class LevelBook:
                 fcntl.flock(lock, fcntl.LOCK_UN)
 
     @staticmethod
-    def read(path: Path | str, *, report: Reporter | None = None) -> dict[Key, Entry]:
+    def read(
+        path: Path | str, *, report: Reporter | None = None, unread: Unread | None = None
+    ) -> dict[Key, Entry]:
+        """Every readable entry. With `unread`, each rejected row is collected there too, and a
+        file that exists but cannot be read is named in `unread.book` for the writer to name,
+        instead of through `report`."""
         report = report or logging.getLogger(__name__).warning
         try:
             data = json.loads(Path(path).read_text())
@@ -309,6 +334,9 @@ class LevelBook:
             report(f"previous level book unavailable: {type(exc).__name__}: {exc}")
             return {}
         except (OSError, ValueError) as exc:
+            if unread is not None:
+                unread.book = f"{type(exc).__name__}: {exc}"
+                return {}
             # A book that exists but cannot be read costs every carried level: never at INFO.
             report(f"ALERT: previous level book unreadable: {type(exc).__name__}: {exc}")
             return {}
@@ -331,6 +359,9 @@ class LevelBook:
         def rejected(index: int, row: Any, why: object) -> None:
             # The lead's ruling on land-composed's F4 (2026-11-13 20:45): every row this read
             # rejects costs that holding its carried level only, with an ALERT carrying the row.
+            # A schema 1 row is replaced in schema 3 at the next save, so it is not carried.
+            if unread is not None and not old:
+                unread.rows.append(row)
             label = (
                 row.get("instrument_id", "unknown holding")
                 if isinstance(row, dict)
@@ -392,8 +423,11 @@ class LevelBook:
         entries: Mapping[Key, Entry],
         *,
         last_step_ns: Mapping[str, int] | None = None,
+        carried: Sequence[Any] = (),
     ) -> None:
-        rows = []
+        """`carried` rows are rows a read rejected (`Unread.rows`), written back as they were read,
+        after the entries."""
+        rows: list[Any] = []
         for (account, instrument), entry in sorted(
             entries.items(), key=lambda item: (item[0][0], str(item[0][1]))
         ):
@@ -425,6 +459,7 @@ class LevelBook:
                 ]
             _entry(row)
             rows.append(row)
+        rows.extend(carried)
         path = Path(path)
         book: dict[str, Any] = {"schema": SCHEMA, "entries": rows}
         if last_step_ns:

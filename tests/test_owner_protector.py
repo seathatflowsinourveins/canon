@@ -2498,7 +2498,9 @@ def test_two_accounts_sharing_a_book_keep_a_step_each_under_the_lock(
     held: list[bool] = []
     write = start_level.LevelBook.write
 
-    def locked_write(book: Path, entries: Any, *, last_step_ns: Any = None) -> None:
+    def locked_write(
+        book: Path, entries: Any, *, last_step_ns: Any = None, carried: Any = ()
+    ) -> None:
         with (Path(book).parent / f"{Path(book).name}.lock").open("a") as other:
             try:
                 fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -2507,7 +2509,7 @@ def test_two_accounts_sharing_a_book_keep_a_step_each_under_the_lock(
             else:
                 fcntl.flock(other, fcntl.LOCK_UN)
                 held.append(False)
-        write(book, entries, last_step_ns=last_step_ns)
+        write(book, entries, last_step_ns=last_step_ns, carried=carried)
 
     monkeypatch.setattr(start_level.LevelBook, "write", staticmethod(locked_write))
     first, second = restart_harness(path), restart_harness(path)
