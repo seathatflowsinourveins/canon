@@ -215,3 +215,32 @@ def test_a_trail_held_before_its_release_and_canceled_as_a_limit_is_not_sent_aga
         -10:
     ]
     assert strategy.slots[h.AAA].sale is None
+
+
+def test_a_cancel_rejected_after_the_held_leg_expired_still_ends_its_sale(tmp_path):
+    """Code review F1 (high, 2026-11-14): the leg the hold canceled expires at the same time, and
+    the venue answers the cancel with a reject. The mark names a leg that has ended, so the reject
+    leaves it: the release re-arms the trail and never sends the sale again."""
+    strategy, sale = released()
+    strategy.settings.symbol_holds_dir = tmp_path / "holds"
+    symbol_hold.write_hold(strategy.settings.symbol_holds_dir, "AAA")
+    step(strategy, h.T0 + 2 * h.SECOND)
+    assert strategy.slots[h.AAA].held_cancel == sale.client_order_id
+    strategy.observe("10.00", h.T0 + 3 * h.SECOND)
+    terminal(sale, h.T0 + 4 * h.SECOND, expired=True)
+    rejected = SimpleNamespace(
+        instrument_id=h.AAA, client_order_id=sale.client_order_id, reason="not cancelable"
+    )
+    strategy.on_order_cancel_rejected(cast(Any, rejected))
+    symbol_hold.remove_hold(strategy.settings.symbol_holds_dir, "AAA")
+    step(strategy, h.T0 + 5 * h.SECOND)
+    new_orders = strategy.sent[1:]
+    assert all(o.order_type != OrderType.LIMIT for o in new_orders), (
+        "the sale whose leg expired under the hold was sent again after its release",
+        [(o.order_type, o.price) for o in new_orders],
+        strategy.said[-10:],
+    )
+    assert new_orders and new_orders[-1].order_type == OrderType.TRAILING_STOP_LIMIT, strategy.said[
+        -10:
+    ]
+    assert strategy.slots[h.AAA].sale is None

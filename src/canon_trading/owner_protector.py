@@ -1899,7 +1899,11 @@ class OwnerProtector(Strategy):
         self.cancel_requested.discard(event.client_order_id)
         slot = self.slots.get(event.instrument_id)
         if slot is not None and slot.held_cancel == event.client_order_id:
-            slot.held_cancel = None  # The leg works on; a step still held cancels it again.
+            order = self.cache.order(event.client_order_id)
+            if order is not None and not order.is_closed:
+                # The leg works on; a step still held cancels it again. A leg that ended across
+                # the cancel (an expiry, say) keeps the mark, so its sale ends with it (review F1).
+                slot.held_cancel = None
         self.deferred_lines.append(
             f"{event.instrument_id}: our cancel rejected: {event.reason}; "
             "re-evaluate on the next quote or step"
