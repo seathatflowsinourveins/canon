@@ -50,8 +50,8 @@ without changing its custody decisions. An own run is a measurement, never a cou
 Optional latency ({"insert_ns", "update_ns", "delete_ns"}, whole nanoseconds) gives the venue
 send_latency.SendLatency, a named departure from v1's none; absent, the venue has no latency model.
 Optional gain_lock (a JSON boolean, default false) asks the protector's gain lock, which is off
-unless asked for; the report carries the value, so a report written before the key existed can be
-told apart from one written after.
+unless asked for; the JSON report carries the value. A report without the field was written before
+the key existed, and its lock state is not known from the report: on before #479, off after it.
 Timestamps are integer nanoseconds, decimal
 nanosecond strings, or timezone-aware ISO strings with at most microsecond precision. Paths
 are local; relative paths in a CLI spec are relative to that spec's directory. Segments use

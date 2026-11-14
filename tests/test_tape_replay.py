@@ -610,7 +610,7 @@ def test_the_builder_passes_gain_lock_to_the_protectors_config(shape, given, exp
 
 def test_an_absent_gain_lock_is_false_and_replays_as_it_does_today(shape) -> None:
     # No gain_lock key: the lock is off and the replay's decisions are the ones it had before
-    # the key existed, so a pre-#479 report and a post-#479 one can be told apart by the value.
+    # the key existed; the report now names the lock's state, which a keyless report did not.
     module = runner()
     assert "gain_lock" not in shape["spec"]
     report = module.replay(shape["spec"])
