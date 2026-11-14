@@ -245,7 +245,7 @@ class OwnedLimit(Strategy):
         self.released.append(event.client_order_id)
 
 
-@pytest.mark.parametrize("arm,expected", [("touch", [10]), ("tape", [3, 3, 3, 1])])
+@pytest.mark.parametrize("arm,expected", [("touch", [10]), ("tape", [1, 3, 3, 3])])
 def test_venue_presets_release_owned_limit_at_touch_or_print_size(alpaca_bars, arm, expected):
     from canon_trading.window_replay import add_replay_venue
     from canon_trading.window_replay import venue_preset
@@ -262,6 +262,7 @@ def test_venue_presets_release_owned_limit_at_touch_or_print_size(alpaca_bars, a
         "bar_execution": False,
         "trade_execution": arm == "tape",
         "liquidity_consumption": arm == "tape",
+        "queue_position": arm == "tape",
     }
     instrument = alpaca_bars.equity("LLL")
     engine = BacktestEngine(BacktestEngineConfig(logging=LoggerConfig(bypass_logging=True)))
@@ -275,11 +276,16 @@ def test_venue_presets_release_owned_limit_at_touch_or_print_size(alpaca_bars, a
         [
             quote(instrument, at, 9.99, 10.01),
             quote(instrument, at + SECOND, 9.99, 10.01),
+            # The ask reaches the sell's limit with 2 displayed ahead of it. Under tape's queue
+            # tracking an L1 limit behind the best price is not filled until the price reaches it
+            # (matching_engine/mod.rs:645-658 at d53849b216e2), and then only once the prints
+            # have taken the quantity displayed ahead (mod.rs:700-828): 1 of the first print.
+            quote(instrument, at + SECOND + SECOND // 2, 10.99, 11.00, 2),
             trade(instrument, at + 2 * SECOND, 11, 3),
             trade(instrument, at + 3 * SECOND, 11, 3),
             trade(instrument, at + 4 * SECOND, 11, 3),
             # A later minute supplies enough quoted liquidity to finish. During the print
-            # minute tape can fill only nine of the ten shares. Touch waits for this quote
+            # minute tape can fill only seven of the ten shares. Touch waits for this quote
             # and fills the whole sell; neither preset is a trade-only venue.
             quote(instrument, at + 61 * SECOND, 11.01, 11.02, 10),
         ]
@@ -294,11 +300,140 @@ def test_venue_presets_release_owned_limit_at_touch_or_print_size(alpaca_bars, a
         ]
         assert sizes == expected
         if arm == "tape":
-            assert sum(sizes[:-1]) == 9
+            assert sum(sizes[:-1]) == 7
             assert all(size <= 3 for size in sizes[:-1])
         assert engine.portfolio.net_position(instrument.id) == Decimal(10 - sum(expected))
     finally:
         engine.dispose()
+
+
+@pytest.mark.parametrize("arm", ["touch", "tape"])
+def test_the_tape_preset_tracks_queue_position_as_the_profile_registers(monkeypatch, arm):
+    """alpaca-paper-sim-v1 sets queue_position with trade_execution (trade-execution.md:114-118 at
+    d53849b216e2; add_venue's default is False, backtest/__init__.pyi:473), as tape_replay's venue
+    does. The window replay's tape preset passes it, and its report names it; touch leaves it off."""
+    from canon_trading import window_replay
+
+    seen = []
+    monkeypatch.setattr(
+        window_replay.BacktestEngine, "add_venue", lambda self, *a, **kw: seen.append(kw)
+    )
+    engine = BacktestEngine(BacktestEngineConfig(logging=LoggerConfig(bypass_logging=True)))
+    try:
+        window_replay.add_replay_venue(engine, arm, "5000 USD")
+    finally:
+        engine.dispose()
+    assert seen[0]["queue_position"] is (arm == "tape")
+    assert window_replay.venue_preset(arm)["queue_position"] is (arm == "tape")
+
+
+MS = 1_000_000
+LATENCY = {"insert_ns": 5 * MS, "update_ns": 7 * MS, "delete_ns": 7 * MS}
+
+
+def _event_times(order) -> dict[str, int]:
+    """Each event type's first time, so a later partial fill never stands for the first."""
+    times: dict[str, int] = {}
+    for event in order.events():
+        times.setdefault(type(event).__name__, event.ts_event)
+    return times
+
+
+def _latency_run(alpaca_bars, latency) -> tuple[dict[str, int], dict[str, int]]:
+    """OwnedLimit's market BUY (a direct submit) and its emulated SELL, sent at one second with its
+    trigger (bid 10) not yet touched and released when the bid falls to it a second later, on a venue
+    with the given latency. A quote of the same instrument follows every send by 20 ms, so each
+    command settles on its own instrument's data, not on a later timer step (exchange.rs:99-107)."""
+    from canon_trading.window_replay import add_replay_venue
+
+    instrument = alpaca_bars.equity("LLL")
+    engine = BacktestEngine(BacktestEngineConfig(logging=LoggerConfig(bypass_logging=True)))
+    add_replay_venue(engine, "touch", "5000 USD", latency=latency)
+    engine.add_instrument(instrument)
+    strategy = OwnedLimit(StrategyConfig())
+    strategy.instrument = instrument
+    engine.add_strategy(strategy)
+    at = ns(START)
+    engine.add_data(
+        [
+            quote(instrument, at, 9.99, 10.01),
+            quote(instrument, at + 20 * MS, 9.99, 10.01),
+            quote(instrument, at + SECOND, 10.50, 10.51),
+            quote(instrument, at + SECOND + 20 * MS, 10.50, 10.51),
+            quote(instrument, at + 2 * SECOND, 9.99, 10.01),
+            quote(instrument, at + 2 * SECOND + 20 * MS, 9.99, 10.01),
+        ]
+    )
+    try:
+        engine.run()
+        assert strategy.sell is not None
+        assert strategy.released == [strategy.sell.client_order_id]
+        orders = {order.side: order for order in engine.cache.orders()}
+        return _event_times(orders[OrderSide.BUY]), _event_times(orders[OrderSide.SELL])
+    finally:
+        engine.dispose()
+
+
+def _bounds(**extra) -> dict[str, Any]:
+    return {
+        "trade_date": START.date().isoformat(),
+        "window_start": START.isoformat(),
+        "window_end": END.isoformat(),
+        "wind_down_at": (END - timedelta(seconds=2)).isoformat(),
+        "trail_arm": "OWN1",
+        **extra,
+    }
+
+
+@pytest.mark.parametrize(
+    "spec,reason",
+    [
+        (_bounds(latancy=LATENCY), "unknown latency key"),
+        (_bounds(latency_ms=27), "unknown latency key"),
+        (_bounds(latency={**LATENCY, "insert_ns": 2 * SECOND}), "longest latency"),
+        (_bounds(latency={**LATENCY, "insert_ns": 2**64}), "nanoseconds from 0"),
+    ],
+)
+def test_a_latency_the_window_cannot_honour_is_refused_before_any_read(spec, reason):
+    """A misnamed key is never a silent zero-latency run; a delay that would land the wind-down's
+    exit after the replay's flat check (one market-exit interval before window_end) is refused; a
+    delay beyond the module's bound never reaches upstream's u64 arithmetic mid-run."""
+    from canon_trading.window_replay import _run_replay
+
+    with pytest.raises(ValueError, match=reason):
+        _run_replay(spec)
+
+
+def test_a_released_order_meets_the_insert_latency_from_its_release(alpaca_bars, monkeypatch):
+    """The emulator resends a released order's first SubmitOrder, keeping its ts_init
+    (emulator.rs:1522-1594), so a fixed latency, counted from that ts_init, is past by the release.
+    The replay's model counts from the send: the released SELL is accepted no sooner than the insert
+    latency after its release, and the direct BUY is answered as a fixed latency answers it."""
+    from nautilus_trader.execution import StaticLatencyModel
+
+    from canon_trading import window_replay
+
+    buy, sell = _latency_run(alpaca_bars, LATENCY)
+    assert sell["OrderAccepted"] - sell["OrderReleased"] >= LATENCY["insert_ns"]
+    assert buy["OrderFilled"] - buy["OrderSubmitted"] >= LATENCY["insert_ns"]
+
+    static = StaticLatencyModel(
+        base_latency_nanos=0,
+        insert_latency_nanos=LATENCY["insert_ns"],
+        update_latency_nanos=LATENCY["update_ns"],
+        cancel_latency_nanos=LATENCY["delete_ns"],
+    )
+    original = window_replay.BacktestEngine.add_venue
+
+    def fixed(self, *args, **kwargs):
+        kwargs["latency_model"] = static
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(window_replay.BacktestEngine, "add_venue", fixed)
+    fixed_buy, fixed_sell = _latency_run(alpaca_bars, LATENCY)
+    assert fixed_buy == buy
+    # The upstream behaviour this model corrects: under a fixed latency the release is accepted at once.
+    assert fixed_sell["OrderAccepted"] == fixed_sell["OrderReleased"]
 
 
 def test_every_generation_matches_pure_rank_over_the_same_prefix(neutral_catalogs, monkeypatch):
