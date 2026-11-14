@@ -894,17 +894,26 @@ class OwnerProtector(Strategy):
                 slot.seed_error = "seed empty: no two-sided quote; wait"
 
         end = now - OVERNIGHT_HISTORY_DELAY if self.settings.feed == OVERNIGHT_HISTORY_FEED else now
-        try:
-            self.request_bars(
-                BarType.from_str(f"{instrument_id}-1-MINUTE-LAST-EXTERNAL"),
-                # never after its end (code-review-high/7): 04:00-04:15 New York on boats
-                start=min(protect.session_start(now), end),
-                end=end,
-                params={"feed": self.settings.feed},
-                callback=bars_done,
+        start = protect.session_start(now)
+        if start >= end:
+            # 04:00-04:15 New York on boats: no window ends 15 minutes ago inside the session day,
+            # so nothing is asked and the cold rule stands until a full ATR's worth of live bars
+            # exists (code-review-high/7, -high-2/2).
+            self._say(
+                f"{instrument_id}: no session day's bars to ask before {start + OVERNIGHT_HISTORY_DELAY:%H:%M} "
+                "UTC on boats; the cold rule stands until a full ATR's worth of bars exists"
             )
-        except (ValueError, RuntimeError) as exc:
-            slot.history_error = str(exc)
+        else:
+            try:
+                self.request_bars(
+                    BarType.from_str(f"{instrument_id}-1-MINUTE-LAST-EXTERNAL"),
+                    start=start,
+                    end=end,
+                    params={"feed": self.settings.feed},
+                    callback=bars_done,
+                )
+            except (ValueError, RuntimeError) as exc:
+                slot.history_error = str(exc)
         self.seeds_in_flight.setdefault(instrument_id, []).append(token)
         try:
             self.request_quotes(
@@ -1821,14 +1830,15 @@ class OwnerProtector(Strategy):
             # Bars allow a plan only on the slice the planner is given (code-review-high/4), and
             # only once the session day's answer is in, or a full ATR's worth has been seen: one
             # live bar while the answer is pending never fixes the run's distance (-high/1).
-            answered = slot.history_ready or slot.history_error is not None
+            # A failed read is no answer one live bar may warm (code-review-high-2/1).
+            answered = slot.history_ready
             sound = [b for b in complete[-protect.ATR_BARS :] if protect._sound(b)]
             has_bars = bool(sound) and (answered or len(sound) >= protect.ATR_BARS)
-            newest = sound[-1].ts_event if has_bars else None
+            latest_bar_ns = sound[-1].ts_event if has_bars else None
             replanning = slot.cold and slot.distance is not None
             # A cold plan is planned again only on a newer sound bar than it last saw: no replan
             # on every quote or step for the same bars (code-review-high/2, /8).
-            if replanning and (not has_bars or newest == slot.cold_seen):
+            if replanning and (not has_bars or latest_bar_ns == slot.cold_seen):
                 self._name_history_failure(instrument_id, slot)
                 return True  # Keep the first cold plan until bars allow a new one.
             instrument = self.cache.instrument(instrument_id)
@@ -1865,12 +1875,13 @@ class OwnerProtector(Strategy):
                     [] if cold else complete[-protect.ATR_BARS :],
                 )
                 plan = replace(plan, quote_age=age)
-                if carried is not None and plan.fallback:
-                    # The lead's ruling (2026-11-13, 23:2x): a carried long whose record has no
-                    # distance is covered by the cold rule, never left bare; flat bars give the
-                    # same fixed fallback as none (code-review-high/3), planned again on bars.
-                    cold = True
                 if plan.fallback:
+                    # The fixed fallback is the cold rule, carried or not, and is planned again
+                    # on bars (code-review-high-2/6). The lead's ruling (2026-11-13, 23:2x): a
+                    # carried long whose record has no distance takes it, never left bare; flat
+                    # bars give the same fallback as none (code-review-high/3).
+                    cold = True
+                if plan.fallback and not replanning:  # counted per holding (-high-2/4)
                     self.fallbacks[instrument_id] = self.fallbacks.get(instrument_id, 0) + 1
                     if plan.bars:
                         self.flat_fallbacks[instrument_id] = (
@@ -1905,7 +1916,8 @@ class OwnerProtector(Strategy):
                     # The pin cannot modify a trailing offset. Keep this working sell whole;
                     # warming is never a cancel/re-place gap or a second sell of these shares.
                     slot.level = instrument.make_price(retained)
-                    slot.cold = False
+                    # still cold if the new plan is the fallback again (code-review-high-2/5)
+                    slot.cold, slot.cold_seen = cold, latest_bar_ns
                     self._say(
                         f"{instrument_id}: replanned distance {distance}; {source}; "
                         f"working sell keeps distance {slot.distance.distance}, limit offset "
@@ -1938,7 +1950,7 @@ class OwnerProtector(Strategy):
                     )
             slot.level = level
             slot.distance, slot.limit_offset = plan, limit
-            slot.cold, slot.cold_seen = cold, newest
+            slot.cold, slot.cold_seen = cold, latest_bar_ns
             self._say(
                 f"{instrument_id}: {'replanned' if replanning else 'armed'} distance {distance}; {source}; "
                 f"quote age {age.total_seconds():.0f} s"

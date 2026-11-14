@@ -50,6 +50,7 @@ from tests.test_owner_protector import equity
 from tests.test_owner_protector import isolated_level_books  # noqa: F401 -- temp state only
 from tests.test_owner_protector import quote
 from tests.test_owner_protector import restart_record
+from tests.test_owner_protector_cold_start import MINUTE
 from tests.test_owner_protector_cold_start import Cold
 from tests.test_owner_protector_cold_start import bar
 from tests.test_owner_protector_cold_start import said
@@ -134,35 +135,30 @@ def test_bars_replan_a_cold_holding_without_lowering_its_level(answer: str, widt
     initial = slot.level
     assert slot.distance is not None
     initial_distance = slot.distance.distance
-    strategy.test_clock.set_time(OPEN + 61 * SECOND)
+    # After a failed read only a full ATR's worth of live bars plans again (code-review-high-2/1).
+    count = protect.ATR_BARS if answer == "refused" else 1
+    strategy.test_clock.set_time(OPEN + (count * 60 + 1) * SECOND)
     # A narrower new quote cannot re-plan a cold distance by itself.
     strategy.seed(ask="10.02", age_s=0)
     assert slot.distance.distance == initial_distance
-    strategy.on_historical_bars([bar(OPEN, width)])
+    strategy.on_historical_bars([bar(OPEN + k * MINUTE, width) for k in range(count)])
     strategy.step()
     assert slot.level is not None and slot.level.as_decimal() >= initial.as_decimal()
-    assert slot.distance is not None and slot.distance.bars == 1
+    assert slot.distance is not None and slot.distance.bars == count
     if width == "0.02":
         assert slot.distance.distance < initial_distance
         assert slot.level.as_decimal() > initial.as_decimal()
     else:
         assert slot.distance.distance > initial_distance
         assert slot.level == initial
-    assert said(strategy, "replanned", "ATR over 1 bars"), strategy.said
+    assert said(strategy, "replanned", f"ATR over {count} bars"), strategy.said
     assert not strategy.sent
     assert not strategy.canceled
 
 
-def test_warming_keeps_the_working_sell_and_never_sends_more_than_held() -> None:
-    strategy = overnight()
-    strategy.on_start()
-    strategy.answer("bars", [])
-    strategy.seed(ask="10.05", age_s=0)
-    strategy.observe("10.00", START + SECOND)
-    strategy.observe("10.00", START + 2 * SECOND)
-    assert len(strategy.sent) == 1
+def hold_working(strategy: Cold) -> Any:
+    """The one protective sell sent, held as working on the venue; returns it."""
     working = strategy.sent[0]
-    before = working.trigger_price
     strategy.cached.working = [
         SimpleNamespace(
             **{
@@ -185,10 +181,27 @@ def test_warming_keeps_the_working_sell_and_never_sends_more_than_held() -> None
                 )
             },
             status=OrderStatus.EMULATED,
-            trigger_price=before,
+            trigger_price=working.trigger_price,
             is_closed=False,
         )
     ]
+    return working
+
+
+def cold_with_working_sell() -> Cold:
+    strategy = overnight()
+    strategy.on_start()
+    strategy.answer("bars", [])
+    strategy.seed(ask="10.05", age_s=0)
+    strategy.observe("10.00", START + SECOND)
+    strategy.observe("10.00", START + 2 * SECOND)
+    assert len(strategy.sent) == 1
+    return strategy
+
+
+def test_warming_keeps_the_working_sell_and_never_sends_more_than_held() -> None:
+    strategy = cold_with_working_sell()
+    before = hold_working(strategy).trigger_price
     changes = []
     strategy.modify_order = lambda *args, **kwargs: changes.append((args, kwargs))
     strategy.test_clock.set_time(OPEN + 61 * SECOND)
@@ -263,9 +276,11 @@ def test_carried_level_without_distance_uses_cold_rule_at_once_then_replans(
     assert said(strategy, "carried level", "no carried distance", "cold rule", "when bars exist"), (
         strategy.said
     )
-    strategy.test_clock.set_time(OPEN + 61 * SECOND)
+    # After a failed read only a full ATR's worth of live bars plans again (code-review-high-2/1).
+    count = protect.ATR_BARS if answer == "refused" else 1
+    strategy.test_clock.set_time(OPEN + (count * 60 + 1) * SECOND)
     strategy.seed(bid, ask=ask, age_s=0)
-    bars = [bar(OPEN, "0.02")]
+    bars = [bar(OPEN + k * MINUTE, "0.02") for k in range(count)]
     warm_distance, warm = protect.distance_for("AAA", row, Decimal(bid), Decimal(ask), bars)
     if answer == "pending":  # the day's answer, not a bar ahead of it (code-review-high/1)
         strategy.answer("bars", bars)
@@ -275,7 +290,7 @@ def test_carried_level_without_distance_uses_cold_rule_at_once_then_replans(
     assert slot.level is not None
     assert slot.level.as_decimal() == max(initial, up_on_step(Decimal(bid) - warm_distance))
     assert slot.distance is not None and slot.distance.distance == warm_distance
-    assert slot.distance.bars == warm.bars == 1
+    assert slot.distance.bars == warm.bars == count
     assert not slot.distance.fallback
     assert said(strategy, "replanned", slot.distance.source()), strategy.said
     assert not strategy.sent and not strategy.canceled
@@ -452,10 +467,99 @@ def test_unsound_last_bars_plan_cold_and_a_carried_long_without_distance_is_cove
 
 
 def test_a_boats_request_at_0405_never_starts_after_it_ends() -> None:
-    """code-review-high/7: at 04:05 New York the latest 04:00 is after now less the delay; the
-    window is never inverted."""
+    """code-review-high/7: at 04:05 New York the latest 04:00 is after now less the delay; no
+    window is inverted: none is sent (code-review-high-2/2)."""
     strategy = Cold(feed="boats")
     strategy.test_clock.set_time(int(datetime(2026, 11, 16, 9, 5, tzinfo=UTC).timestamp()) * SECOND)
     strategy.on_start()
-    request = strategy.bar_requests[0]
-    assert request["start"] <= request["end"], request
+    assert all(r["start"] <= r["end"] for r in strategy.bar_requests), strategy.bar_requests
+
+
+def test_a_failed_read_keeps_the_cold_plan_until_a_full_atr_of_live_bars() -> None:
+    """code-review-high-2/1: a failed read is no answer that one live bar may warm; the cold rule
+    stands until a full ATR's worth of bars exists."""
+    strategy = overnight()
+    strategy.on_start()
+    strategy.answer("bars", [], "synthetic refusal")
+    strategy.seed(ask="10.05", age_s=0)
+    slot = strategy.slots[AAA]
+    assert slot.cold and slot.distance is not None, strategy.said
+    cold_distance = slot.distance.distance
+    strategy.test_clock.set_time(OPEN + 61 * SECOND)
+    strategy.cached.history = [bar(OPEN, "0.02")]
+    strategy.seed(ask="10.05", age_s=0)
+    strategy.step()
+    assert slot.cold and slot.distance.distance == cold_distance, strategy.said
+    n = protect.ATR_BARS
+    strategy.test_clock.set_time(OPEN + (n + 1) * 60 * SECOND)
+    strategy.cached.history = [bar(OPEN + i * 60 * SECOND, "0.02") for i in range(n)]
+    strategy.seed(ask="10.05", age_s=0)
+    strategy.step()
+    assert not slot.cold and slot.distance.bars == n, strategy.said
+
+
+def test_a_boats_start_before_0415_asks_nothing_and_stays_cold_on_one_live_bar() -> None:
+    """code-review-high-2/2: before 04:15 New York there is no boats window to ask; nothing is
+    sent, and one live bar does not end the cold plan."""
+    strategy = Cold(feed="boats")
+    at = int(datetime(2026, 11, 16, 9, 5, tzinfo=UTC).timestamp()) * SECOND
+    strategy.test_clock.set_time(at)
+    strategy.on_start()
+    assert not strategy.bar_requests, strategy.bar_requests
+    strategy.seed(ask="10.05", age_s=0)
+    slot = strategy.slots[AAA]
+    assert slot.cold and slot.distance is not None, strategy.said
+    strategy.test_clock.set_time(at + 61 * SECOND)
+    strategy.cached.history = [bar(at, "0.02")]
+    strategy.seed(ask="10.05", age_s=0)
+    strategy.step()
+    assert slot.cold, strategy.said
+
+
+def test_a_new_holding_on_flat_bars_stays_cold_and_is_planned_again_on_real_bars() -> None:
+    """code-review-high-2/6: one rule for the fixed fallback, carried or not: a holding planned on
+    it is cold and is planned again when sound bars with a range arrive, never lower."""
+    strategy = overnight()
+    strategy.on_start()
+    strategy.test_clock.set_time(OPEN + 61 * SECOND)
+    strategy.answer("bars", [bar(OPEN, "0")])
+    strategy.seed("10.00", ask="10.00", age_s=0)
+    slot = strategy.slots[AAA]
+    assert slot.distance is not None and slot.distance.fallback, strategy.said
+    assert slot.cold, strategy.said
+    assert slot.level is not None
+    before = slot.level
+    strategy.test_clock.set_time(OPEN + 121 * SECOND)
+    strategy.on_historical_bars([bar(OPEN + 60 * SECOND, "0.02")])
+    strategy.seed("10.00", ask="10.02", age_s=0)
+    strategy.step()
+    assert not slot.distance.fallback, strategy.said
+    assert slot.level.as_decimal() >= before.as_decimal()
+
+
+def test_a_working_sell_replanned_on_the_fallback_again_stays_cold_and_replans_once_per_bar() -> (
+    None
+):
+    """code-review-high-2/5, /7: with a working sell, a replan that is the fixed fallback again
+    keeps the holding cold, the same bars never replan twice, and real bars then plan it."""
+    strategy = cold_with_working_sell()
+    hold_working(strategy)
+    slot = strategy.slots[AAA]
+    strategy.modify_order = lambda *args, **kwargs: None
+    strategy.test_clock.set_time(OPEN + 61 * SECOND)
+    strategy.on_historical_bars([bar(OPEN, "0")])
+    strategy.seed("10.00", ask="10.00", age_s=0)  # no spread: flat bars give the fallback
+    strategy.step()
+    replans = [line for line in strategy.said if "replanned" in line]
+    assert len(replans) == 1 and "working sell keeps" in replans[0], strategy.said
+    assert "fixed fallback" in replans[0] and slot.cold, replans
+    strategy.step()
+    assert len([line for line in strategy.said if "replanned" in line]) == 1, strategy.said
+    strategy.test_clock.set_time(OPEN + 121 * SECOND)
+    strategy.on_historical_bars([bar(OPEN + MINUTE, "0.02")])
+    strategy.seed("10.00", ask="10.02", age_s=0)
+    strategy.step()
+    replans = [line for line in strategy.said if "replanned" in line]
+    assert len(replans) == 2 and "ATR over 2 bars" in replans[1], strategy.said
+    assert not slot.cold
+    assert len(strategy.sent) == 1 and not strategy.canceled
