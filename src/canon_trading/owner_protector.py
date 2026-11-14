@@ -916,7 +916,7 @@ class OwnerProtector(Strategy):
     def _say(self, text: str) -> None:
         # An ALERT must reach a person, so it is logged as an error, never at INFO (the lead's
         # addendum on land-composed's F6, 2026-11-13 20:46).
-        if ": ALERT: " in text:
+        if "ALERT:" in text:
             self.log.error(text)
         else:
             self.log.info(text)

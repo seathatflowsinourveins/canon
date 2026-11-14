@@ -3425,3 +3425,49 @@ def test_an_alert_line_is_logged_as_an_error_and_any_other_at_info():
     OwnerProtector._say(speaker, f"{AAA}: ALERT: our protective sell was refused by the venue")
     OwnerProtector._say(speaker, f"{AAA}: armed distance 0.04")
     assert [level for level, _ in logged] == ["error", "info"]
+
+
+def test_an_unreadable_book_alert_with_no_holding_prefix_is_logged_as_an_error(tmp_path):
+    """land-composed's re-read of 901dba88: the whole-book ALERT has no '<id>: ' before it, so the
+    ': ALERT: ' match left it at INFO, against the lead's F6 ruling that every ALERT is an error."""
+    logged: list[tuple[str, str]] = []
+    log = SimpleNamespace(
+        info=lambda text: logged.append(("info", text)),
+        error=lambda text: logged.append(("error", text)),
+    )
+    speaker = cast(Any, SimpleNamespace(log=log))
+    path = tmp_path / "levels.json"
+    path.write_text("{not json")
+    assert LevelBook.read(path, report=lambda text: OwnerProtector._say(speaker, text)) == {}
+    assert [level for level, _ in logged] == ["error"], logged
+    assert logged[0][1].startswith("ALERT: previous level book unreadable: JSONDecodeError")
+
+
+def test_every_alert_the_protector_or_its_book_reader_prints_is_logged_as_an_error():
+    """The lead's F6 property (2026-11-13 20:58): every line the protector or its start-up reader
+    prints as an ALERT reaches the error level. Each string literal in either module that names an
+    ALERT is read from the source and sent through _say, so a new ALERT in any other form fails."""
+    import ast
+    import inspect
+
+    from canon_trading import owner_protector
+    from canon_trading import start_level
+
+    literals = [
+        node.value
+        for module in (owner_protector, start_level)
+        for node in ast.walk(ast.parse(inspect.getsource(module)))
+        if isinstance(node, ast.Constant) and isinstance(node.value, str) and "ALERT" in node.value
+    ]
+    # The refused sell, discovery, the bars read, a rejected row, the unreadable book, the rule.
+    assert len(literals) >= 6, literals
+    assert all("ALERT:" in text for text in literals), "an ALERT in a form _say does not route"
+    alerts = literals
+    logged: list[str] = []
+    log = SimpleNamespace(
+        info=lambda _text: logged.append("info"), error=lambda _text: logged.append("error")
+    )
+    speaker = cast(Any, SimpleNamespace(log=log))
+    for text in alerts:
+        OwnerProtector._say(speaker, text)
+    assert logged == ["error"] * len(alerts), list(zip(alerts, logged, strict=True))
