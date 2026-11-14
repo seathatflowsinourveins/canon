@@ -298,3 +298,68 @@ def test_record_refuses_a_changed_reference_root(rank_spec, alpaca_bars, tmp_pat
     catalog.write_bars(repaired)
     with pytest.raises(ValueError, match="reference_root"):
         rank_record.read_record(target, spec)
+
+
+def test_a_differing_record_published_meanwhile_is_refused_naming_the_race(rank_spec, monkeypatch):
+    from canon_trading import rank_record
+
+    target = Path(rank_spec["bars_root"]) / "rank.json"
+    other = rank_record.record_rankings(rank_spec, target)
+    other["commit"] = "1" * 40
+    published = json.dumps(other)
+    target.unlink()
+    real_link = os.link
+
+    def racing_link(src, dst, *args, **kwargs):
+        # Another recorder, at another commit, publishes just before this one links its own.
+        if Path(dst).name == target.name:
+            target.write_text(published)
+        return real_link(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(rank_record.os, "link", racing_link)
+    with pytest.raises(ValueError, match="another recorder published"):
+        rank_record.record_rankings(rank_spec, target)
+    assert target.read_text() == published
+    assert sorted(p.name for p in target.parent.iterdir() if p.name.endswith(".partial")) == []
+
+
+@pytest.mark.parametrize(
+    "key,value",
+    [
+        ("unreferenced", "ABCD"),
+        ("unreferenced", [1]),
+        ("configuration", None),
+        ("generations", None),
+        ("records", "x"),
+        ("engine_errors", {}),
+        ("bars_read", "12"),
+    ],
+)
+def test_record_refuses_a_malformed_body_by_name(rank_spec, key, value):
+    from canon_trading import rank_record
+
+    target = Path(rank_spec["bars_root"]) / "rank.json"
+    record = rank_record.record_rankings(rank_spec, target)
+    target.write_text(json.dumps({**record, key: value}))
+    with pytest.raises(ValueError, match=key):
+        rank_record.read_record(target, rank_spec)
+
+
+def test_a_recording_reads_its_inputs_digests_only_in_the_ranking_process(rank_spec, monkeypatch):
+    from canon_trading import rank_record
+
+    calls = []
+    real = rank_record.configuration
+    monkeypatch.setattr(rank_record, "configuration", lambda spec: calls.append(1) or real(spec))
+    rank_record.record_rankings(rank_spec, Path(rank_spec["bars_root"]) / "rank.json")
+    assert calls == []
+
+
+def test_a_published_record_has_the_mode_a_plain_create_gives(rank_spec):
+    from canon_trading import rank_record
+
+    target = Path(rank_spec["bars_root"]) / "rank.json"
+    rank_record.record_rankings(rank_spec, target)
+    mask = os.umask(0)
+    os.umask(mask)
+    assert target.stat().st_mode & 0o777 == 0o666 & ~mask

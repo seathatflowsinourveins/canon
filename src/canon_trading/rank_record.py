@@ -37,13 +37,20 @@ Named limits:
 - The reference root's digest covers every daily-bar file under it, so appending a session
   to the root voids the recordings of earlier dates too. Published snapshots are never
   appended to; a new day is a new version.
-- A recording killed outright (SIGKILL) leaves its `.partial` probe beside its target.
+- A recording killed outright (SIGKILL) leaves its `.partial` probe beside its target, and
+  its `.partial.link` too if killed inside the probe; its ranking process, a child the
+  killed parent can no longer stop, runs on until it ends or fails writing its output.
 - In recorded mode the roster's reference refusal reads the recording's `unreferenced`
   list, which the digests above tie to the same inputs; and a roster with no defined name
   and an empty recording is refused with the catalog's message, not the roster's.
-- In the default path the baseline and reference refusals come after the instrument load
-  (make_actor), not before it as at 8a51cacd: the same refusals, later and possibly behind
-  another one.
+- In the default path the baseline refusal comes after the instrument load, the roster
+  check and _contexts' catalog queries (make_actor), where at 8a51cacd it came first; the
+  reference refusal comes after _contexts and mover_universe_parts, where at 8a51cacd it
+  came after the instrument load only. The same refusals, later, and a _contexts refusal
+  can now be reported in place of either.
+- A recorder that finds the target published by another recorder meanwhile returns that
+  record only if it passes read_record; otherwise it is refused naming the race, and this
+  run's record is discarded, as every failed run's is.
 """
 
 from __future__ import annotations
@@ -288,6 +295,19 @@ def read_record(path: str | Path, spec: Mapping[str, Any]) -> dict[str, Any]:
     from .window_replay import _ns
 
     record = json.loads(Path(path).read_text())
+    # A malformed file is a refused record, as a mismatched one is: ValueError, by name.
+    shapes = {"configuration": dict, "generations": list, "records": list}
+    shapes |= {"unreferenced": list, "engine_errors": list}
+    found = record if type(record) is dict else {}
+    malformed = [key for key, kind in shapes.items() if type(found.get(key)) is not kind]
+    if malformed:
+        raise ValueError(
+            f"rank record {malformed[0]} is missing or not a {shapes[malformed[0]].__name__}"
+        )
+    if not all(type(name) is str for name in record["unreferenced"]):
+        raise ValueError("rank record unreferenced holds a name that is not text")
+    if type(record.get("bars_read")) is not int:
+        raise ValueError("rank record bars_read is not an int")
     for key, expected in (
         ("schema", 2),
         ("trade_date", spec["trade_date"]),
@@ -418,7 +438,8 @@ def record_rankings(spec: Mapping[str, Any], path: str | Path) -> dict[str, Any]
             raise RuntimeError(f"rank file repository check failed: {ignored.stderr}")
     if target.exists():
         return read_record(target, spec)
-    configuration(spec)
+    # Cheap refusals here; the input digests are read once, in the ranking process.
+    check_settings(spec)
     clean_commit()
     # Probe the folder before the long ranking process: a folder that takes no file is refused
     # now, not after the whole day is ranked.
@@ -443,12 +464,22 @@ def record_rankings(spec: Mapping[str, Any], path: str | Path) -> dict[str, Any]
             raise RuntimeError(f"ranking process failed ({result.returncode}):\n{result.stderr}")
         record = json.loads(result.stdout)
         partial.write_text(json.dumps(record, indent=2, allow_nan=False) + "\n")
+        # The mode a plain create gives (open(2) with 0o666 under the umask), not mkstemp's 0600.
+        mask = os.umask(0)
+        os.umask(mask)
+        partial.chmod(0o666 & ~mask)
         # Exclusive: a record another recorder published meanwhile is never overwritten; it
         # is read and validated instead, as an existing file is.
         try:
             os.link(partial, target)
         except FileExistsError:
-            return read_record(target, spec)
+            try:
+                return read_record(target, spec)
+            except ValueError as error:
+                raise ValueError(
+                    f"another recorder published {target} while this one ranked, and its record"
+                    f" is refused here ({error}); this run's record is discarded"
+                ) from error
     finally:
         partial.unlink(missing_ok=True)
     return record
