@@ -8,9 +8,19 @@ submit/cancel commands (rc8 trading/__init__.pyi:538-612); trailing_stop_limit
 accepts reduce_only (common/__init__.pyi:1523-1547), and the emulator retains
 submit params on release (crates/execution/src/order_emulator/emulator.rs:1522-1536).
 
+The callback host's on_stop delegates to on_stop(instrument_id) here. Stop releases
+an emulated trailing sell by modifying its trigger/limit in place (emulator.rs:
+814-917,1450-1487), then sells only shares no outstanding sell reserves. The pin
+allows modification while pending update but refuses it while pending cancel
+(crates/trading/src/strategy/mod.rs:340-417,773-829). A pending cancel is reserved,
+not durable cover: it is named as uncovered, since this synchronous stop hook
+cannot wait for the venue acknowledgement, and stopped strategies receive no
+order events (same file:1395-1399). The Mover keeps its separate stop_mover path.
+
 The Mover lends its existing state to this part, preserving every scheduling and
 order decision. Other strategies use the position/quote callbacks with private
-holding state. The fixed default distances are MoverConfig's defaults; no template
+holding state. The default arm is the deployed Mover's OWN1 (session_window.py's
+DEFAULT_ARM), using Mover._entry_trail and _cold_plan unchanged; no template
 selects or derives a separate trail. Advanced Mover arms retain their existing
 context, calculations and records. The retained method entry points on Mover are
 forwarders so the existing override and method-only test seams keep working.
@@ -21,20 +31,27 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass
 from dataclasses import replace
+from decimal import ROUND_FLOOR
 from decimal import Decimal
 from typing import Any
 
+from nautilus_trader.indicators import AverageTrueRange
+from nautilus_trader.model import Bar
+from nautilus_trader.model import BarAggregation
 from nautilus_trader.model import BarType
 from nautilus_trader.model import ClientOrderId
 from nautilus_trader.model import InstrumentId
 from nautilus_trader.model import OrderReleased
 from nautilus_trader.model import OrderSide
+from nautilus_trader.model import OrderType
 from nautilus_trader.model import Price
+from nautilus_trader.model import PriceType
 from nautilus_trader.model import TimeInForce
 from nautilus_trader.model import TrailingOffsetType
 from nautilus_trader.model import TriggerType
 
 from . import mover
+from . import sizing
 from .mover import EXTENDED_HOURS
 from .mover import FLOOR_WAIT_SECS
 from .mover import HOLD_MOST_SECS
@@ -65,11 +82,16 @@ from .mover import up_on_step
 from .price_step import down_on_step
 from .price_step import exit_price
 from .price_step import stop_trigger_price
+from .price_step import tick
 
 
 @dataclass(frozen=True)
 class ProtectionConfig:
-    """The default Mover arm, with reduce-only sells for a composed template."""
+    """The deployed Mover's OWN1 arm, with reduce-only sells for a composed template.
+
+    session_window.TRAIL_ARMS/DEFAULT_ARM names ATR at k=1 with the own cap arm.
+    The 2% value is its named cold-ATR fallback, not selection of the F2 arm.
+    """
 
     trail: Decimal = Decimal("0.02")
     exit_through: Decimal = Decimal("0.005")
@@ -77,10 +99,21 @@ class ProtectionConfig:
     chase_secs: int = 5
     exit_ticks: int = 1
     reduce_only: bool = True
+    atr_k: Decimal = Decimal(1)
+    atr_n: int = 14
+    spread_floor_m: Decimal = Decimal(2)
 
     @property
     def trail_mode(self) -> str:
-        return "fixed"
+        return "atr"
+
+    @property
+    def trail_cap(self) -> str:
+        return "own"
+
+    @property
+    def size_from_budget(self) -> bool:
+        return False  # the shared selector is called with found_holding=True
 
     @property
     def trigger(self) -> TriggerType:
@@ -108,6 +141,7 @@ class _HoldingContext:
         self.fills: list[tuple[str, str, str, str, int]] = []
         self.notes: dict[InstrumentId, list[str]] = {}
         self.dropped: list[str] = []
+        self.baseline_dollar_volume_per_minute: dict[InstrumentId, Decimal] = {}
 
     def __getattr__(self, name: str) -> Any:
         if name.startswith("_"):
@@ -128,44 +162,134 @@ class Protection:
         self.strategy = strategy
         self.config = config
         # Mover's state and method-only stand-ins include the optional advanced arms;
-        # the callback context below only runs the fixed default arm.
+        # the callback context below only runs the deployed default arm, OWN1.
         self._context: Any = _HoldingContext(self, strategy, config) if context is None else context
+        self._arming_quotes: dict[InstrumentId, tuple[int, int] | None] = {}
+        self._closing_slots: dict[InstrumentId, Slot] = {}
 
     def on_position_opened(self, event: Any) -> None:
         """Arm from the owning long position; later partial fills reuse its one slot."""
         if event.strategy_id != self.strategy.strategy_id or event.signed_qty <= 0:
             return
-        state = self._context
-        slot = state.slots.get(event.instrument_id)
-        if slot is None:
-            slot = Slot(
-                event.instrument_id,
-                BarType.from_str(f"{event.instrument_id}-1-MINUTE-LAST-EXTERNAL"),
-                deque(),
-                deque(),
-            )
-            state.slots[event.instrument_id] = slot
+        slot = self._position_slot(event.instrument_id, event.ts_init)
+        if not slot.was_held:
+            self._arming_quotes[event.instrument_id] = None
             slot.entry_id = event.opening_order_id
             slot.entry_received_ns = event.ts_init
             slot.was_held = True
         held = self._held(slot)
         if held > 0:
-            self._protect(slot, held, event.ts_init)
+            self._position_step(slot, held, event.ts_init)
 
     def on_position_changed(self, event: Any) -> None:
         self.on_position_opened(event)
 
+    def _position_slot(self, instrument_id: InstrumentId, now: int) -> Slot:
+        state = self._context
+        slot = state.slots.get(instrument_id)
+        if slot is None:
+            slot = Slot(
+                instrument_id,
+                BarType.from_str(f"{instrument_id}-1-MINUTE-LAST-EXTERNAL"),
+                deque(maxlen=state.settings.atr_n + 1),
+                deque(maxlen=state.settings.atr_n + 1),
+                atr=AverageTrueRange(state.settings.atr_n),
+                subscribed_ns=now,
+            )
+            state.slots[instrument_id] = slot
+            mover.Mover._warm_atr(state, slot, self.strategy.cache.bars(slot.bar_type) or [], now)
+        return slot
+
+    def on_bar(self, bar: Bar) -> None:
+        """Feed complete minute bars once, using the Mover's interval and ATR contracts."""
+        spec = bar.bar_type.spec
+        if (
+            spec.step != 1
+            or spec.aggregation != BarAggregation.MINUTE
+            or spec.price_type != PriceType.LAST
+        ):
+            return
+        slot = self._position_slot(bar.bar_type.instrument_id, bar.ts_init)
+        opened, closed = mover.bar_opened_ns(bar), mover.bar_closed_ns(bar)
+        if bar.bar_type.is_internally_aggregated() and opened < slot.subscribed_ns:
+            self._holding_note(
+                slot, f"{slot.instrument_id}: skipping the first partial INTERNAL minute"
+            )
+            return
+        if closed > bar.ts_init:
+            return
+        if slot.last_bar_closed_ns is not None and closed <= slot.last_bar_closed_ns:
+            return
+        slot.last_bar_closed_ns = closed
+        if opened not in slot.atr_minutes:
+            slot.atr_minutes.add(opened)
+            if slot.atr is not None:
+                slot.atr.handle_bar(bar)
+        slot.closes.append(bar.close.as_decimal())
+        if slot.was_held and (held := self._held(slot)) > 0:
+            self._position_step(slot, held, bar.ts_init)
+
+    def _entry_trail(self, slot: Slot, price: Decimal, quote: Any, **kwargs: Any) -> TrailPlan:
+        """Use the existing Mover selector for a holding, including its OWN1 fallback."""
+        return mover.Mover._entry_trail(
+            self._context, slot, price, quote, found_holding=True, **kwargs
+        )
+
+    def _cold_plan(self, *args: Any, **kwargs: Any) -> TrailPlan:
+        return mover.Mover._cold_plan(self._context, *args, **kwargs)
+
+    def _plan_distance(self, plan: TrailPlan, price: Decimal) -> Decimal:
+        return offsets(
+            price,
+            plan.trail,
+            plan.exit_through,
+            least=None
+            if plan.spread is None
+            else self._context.settings.spread_floor_m * plan.spread,
+            chase_cap=plan.chase_cap,
+        )[0]
+
+    def entry_allowed(self, instrument_id: InstrumentId, now: int) -> bool:
+        """Check the shared plan at the entry's ask, before there is a holding to protect."""
+        slot = self._position_slot(instrument_id, now)
+        quote = self.strategy.cache.quote(instrument_id)
+        if quote is None or quote.ask_price.as_decimal() <= 0:
+            self._holding_note(slot, f"{instrument_id}: entry refused: no positive ask")
+            return False
+        price = quote.ask_price.as_decimal()
+        plan = self._entry_trail(slot, price, quote, now=now)
+        distance = self._plan_distance(plan, price)
+        if plan.trail > sizing.DISTANCE_CEILING or distance > price * sizing.DISTANCE_CEILING:
+            self._holding_note(
+                slot,
+                f"{instrument_id}: distance_over_ceiling: entry refused; trail {plan.trail} "
+                f"({plan.bound}), distance {distance} at {price}, ceiling {sizing.DISTANCE_CEILING}",
+            )
+            return False
+        return True
+
     def on_position_closed(self, event: Any) -> None:
         if event.strategy_id != self.strategy.strategy_id:
             return
-        slot = self._context.slots.get(event.instrument_id)
-        if slot is not None:
-            self.cancel_flat(slot)
-            order = self._order(slot.protect_id)
-            if order is None or order.is_closed:
-                self._context.slots.pop(event.instrument_id)
+        self._arming_quotes.pop(event.instrument_id, None)
+        slot = self._context.slots.pop(event.instrument_id, None)
+        if slot is not None and self.cancel_flat(slot):
+            # Keep only the old cancel to await. A re-entry gets new holding state,
+            # including its plan, exit record and first-observation guard.
+            self._closing_slots[event.instrument_id] = slot
+
+    def _previous_closed(self, instrument_id: InstrumentId) -> bool:
+        previous = self._closing_slots.get(instrument_id)
+        if previous is None:
+            return True
+        if self.cancel_flat(previous):
+            return False
+        del self._closing_slots[instrument_id]
+        return True
 
     def on_quote(self, quote: Any) -> None:
+        if not self._previous_closed(quote.instrument_id):
+            return
         slot = self._context.slots.get(quote.instrument_id)
         if slot is None:
             return
@@ -176,9 +300,72 @@ class Protection:
         self._read_released_triggers()
         held = self._held(slot)
         if held > 0:
-            self._protect(slot, held, quote.ts_init)
+            self._position_step(slot, held, quote.ts_init)
         elif held == 0:
             self.cancel_flat(slot)
+
+    def _position_step(self, slot: Slot, held: Decimal, now: int) -> None:
+        """A level already met when armed needs a further quote before selling.
+
+        Ruling B bounds the guard to arming: once safely emulated, the native
+        Mover path elects on one observation. Repeated callbacks for the quote
+        that filled the entry are still that one observation, including partial
+        fills. No later-step persistence count or time span is introduced here.
+        """
+        if not self._previous_closed(slot.instrument_id):
+            return
+        quote = self.strategy.cache.quote(slot.instrument_id)
+        average = self._position_average(slot)
+        if slot.trail_plan is None and quote is not None and average is not None:
+            plan = self._entry_trail(slot, average, quote, now=now)
+            # No template distance: the shared Mover plan supplies L under the fill,
+            # including its ATR fallback and the spread floor it selected. Without
+            # a quote the existing _hold path protects the known holding meanwhile.
+            distance = self._plan_distance(plan, average)
+            # _entry_trail(found_holding=True) leaves this caller's ceiling to it,
+            # as protect.row_distance does, before and after price-step rounding.
+            if plan.trail > sizing.DISTANCE_CEILING or distance > average * sizing.DISTANCE_CEILING:
+                capped = (average * sizing.DISTANCE_CEILING).quantize(
+                    tick(average), rounding=ROUND_FLOOR
+                )
+                self._holding_note(
+                    slot,
+                    f"{slot.instrument_id}: distance_over_ceiling: the trail {plan.trail} "
+                    f"({plan.bound}), distance {distance} at {average}, exceeds "
+                    f"{sizing.DISTANCE_CEILING}; protecting at capped distance {capped}",
+                )
+                plan = replace(plan, trail=capped / average, bound="distance ceiling")
+                distance = capped
+                # The long already exists. A breached capped level sells now;
+                # with no whole price step below the ceiling, use the existing
+                # positive-price limit exit instead of an unarmable zero trail.
+                self._arming_quotes.pop(slot.instrument_id, None)
+                if capped == 0:
+                    slot.exiting = True
+            slot.trail_plan = slot.initial_trail = plan
+            slot.sized_loss = distance
+        if slot.held_since is not None or slot.exiting:
+            # A hold is already protection. Its first followed breach is a sale,
+            # not a new arming step (Mover._hold/_trail's existing contract).
+            self._arming_quotes.pop(slot.instrument_id, None)
+        if slot.instrument_id in self._arming_quotes:
+            level = None if average is None else fill_trigger(average, slot.sized_loss)
+            if quote is not None and quote.bid_price.as_decimal() > 0 and level is not None:
+                observed = (int(quote.ts_event), int(quote.ts_init))
+                first = self._arming_quotes[slot.instrument_id]
+                if first == observed:
+                    return
+                if first is None and quote.bid_price.as_decimal() <= level:
+                    self._arming_quotes[slot.instrument_id] = observed
+                    return
+                del self._arming_quotes[slot.instrument_id]
+        self._protect(slot, held, now)
+
+    def _holding_note(self, slot: Slot, reason: str) -> None:
+        """Expose a template refusal in its strategy log once as well as its notes."""
+        if reason not in self._context.notes.get(slot.instrument_id, []):
+            self._note(slot, reason)
+            self._say(reason)
 
     def cancel_flat(self, slot: Slot) -> bool:
         """Withdraw the previous holding's sell; report whether it was still working."""
@@ -196,6 +383,129 @@ class Protection:
         for slot in state.slots.values():
             if state._working(slot):
                 state.cancel_all_orders(slot.instrument_id)
+
+    def on_stop(self, instrument_id: InstrumentId) -> None:
+        """Move local cover to the venue and sell only unreserved shares of this host.
+
+        The caller cancels its BUY entries first. A sell pending cancellation
+        cannot be amended or counted as lasting cover, but still reserves its
+        shares. Name that gap instead of sending a competing sale. Cover after
+        this hook means a venue sell or a release/submit in progress, not an
+        emulated order which disappears with the node.
+        """
+        host = self.strategy
+        held, sells = self._stop_holding(instrument_id)
+        if held <= 0:
+            host.cancel_all_orders(instrument_id, order_side=OrderSide.SELL)
+            return
+        instrument = host.cache.instrument(instrument_id)
+        if instrument is None:
+            self._stop_note(instrument_id, held, sells, "no instrument to price a sale")
+            return
+        quote = host.cache.quote(instrument_id)
+        bid = None if quote is None else quote.bid_price.as_decimal()
+        quoted = bid is not None and bid > 0
+
+        now = host.clock.timestamp_ns()
+        slot = self._position_slot(instrument_id, now)
+        slot.exiting = True
+        self._ensure_exit(slot, held)
+        self._mark_exit(slot, now, bid if quoted else None, "strategy stop")
+        if quoted:
+            price = instrument.make_price(exit_price(bid, self._context.settings.exit_ticks, None))
+            for order in sells:
+                if order.is_pending_cancel:
+                    continue
+                if order.is_emulated and order.order_type == OrderType.TRAILING_STOP_LIMIT:
+                    trigger = max(
+                        bid,
+                        Decimal(0)
+                        if order.trigger_price is None
+                        else order.trigger_price.as_decimal(),
+                    )
+                    host.modify_order(
+                        order.client_order_id,
+                        price=price,
+                        trigger_price=instrument.make_price(up_on_step(trigger)),
+                    )
+                elif order.is_open and order.order_type == OrderType.LIMIT and order.price > price:
+                    host.modify_order(order.client_order_id, price=price)
+
+        # A local release can fill synchronously. Re-read both the position and
+        # leaves quantities before sizing a second, disjoint sale (F3). A sell still
+        # emulated here (no bid to release it at, or a trail the emulator did not
+        # release, emulator.rs:877-900) is local and ends with the node, so it reserves
+        # no venue shares and is no lasting cover: its shares are sold at the venue, and
+        # only once that sale is sent is it canceled, locally and at once (pin
+        # crates/execution/src/order_emulator/emulator.rs:936-966, :1202-1240). Nothing
+        # pending is sold twice: every other open sell keeps its shares reserved.
+        held, sells = self._stop_holding(instrument_id)
+        local = [o for o in sells if o.is_emulated and not o.is_pending_cancel]
+        kept = {o.client_order_id for o in local}
+        reserved = sum(
+            (o.leaves_qty.as_decimal() for o in sells if o.client_order_id not in kept), Decimal(0)
+        )
+        remainder = held - reserved
+        if remainder > 0:
+            before = slot.protect_id
+            self._limit_sell(slot, remainder, now, None)
+            if slot.protect_id != before:
+                for order in local:
+                    host.cancel_order(order.client_order_id)
+        held, sells = self._stop_holding(instrument_id)
+        if held > 0:
+            self._stop_note(instrument_id, held, sells, "stop-time sell coverage")
+
+    def _stop_holding(self, instrument_id: InstrumentId) -> tuple[Decimal, list[Any]]:
+        host = self.strategy
+        positions = host.cache.positions_open(
+            instrument_id=instrument_id, strategy_id=host.strategy_id
+        )
+        held = sum((position.signed_qty for position in positions), Decimal(0))
+        sells = [
+            order
+            for order in host.cache.orders(
+                instrument_id=instrument_id, strategy_id=host.strategy_id
+            )
+            if order.side == OrderSide.SELL and not order.is_closed
+        ]
+        return held, sells
+
+    def _stop_note(
+        self, instrument_id: InstrumentId, held: Decimal, sells: list[Any], reason: str
+    ) -> None:
+        # Released/initialized orders already in the cache may be queued for
+        # submission. Local emulation ends with the node; a pending cancel is
+        # not lasting cover even though it may still reserve shares.
+        covered = sum(
+            (
+                order.leaves_qty.as_decimal()
+                for order in sells
+                if not order.is_pending_cancel
+                and not order.is_emulated
+                and order.emulation_trigger is None
+            ),
+            Decimal(0),
+        )
+        if covered >= held:
+            self.strategy.log.info(
+                f"{instrument_id}: stop retains protection for long {held}; {reason}"
+            )
+            return
+        pending = "" if not any(o.is_pending_cancel for o in sells) else "; sell pending cancel"
+        self.strategy.log.warning(
+            f"{instrument_id}: stop long {held}, uncovered {held - covered}; {reason}{pending}"
+        )
+        # The lead's ruling (a), 2026-11-13 21:13: a cancel in flight at stop cannot be settled here
+        # (pin crates/trading/src/strategy/mod.rs:1395-1399, :400-405). Its shares stay reserved, so
+        # no second sell is sent for them; the order is named instead.
+        for order in sells:
+            if order.is_pending_cancel:
+                self.strategy.log.error(
+                    f"ALERT {instrument_id}: sell {order.client_order_id} for "
+                    f"{order.leaves_qty} is pending cancel at stop; the long {held} may be left "
+                    "without a working sell if that cancel succeeds"
+                )
 
     def _sale_sent(
         self,

@@ -27,6 +27,7 @@
 #                                                            once, nothing when there is none (ADR 0089)
 #
 # Usage: scripts/automation status | install [--defer-paper] | uninstall | differs | mark-user-config
+#        scripts/automation install-protector <tests|windows|protect> <OWN1|OWN3> | uninstall-protector <account>
 # `install --defer-paper` installs everything but the paper session's runner, plist and clone, and leaves its
 # agent loaded as it is: the maintenance agent's round while a window runs from them, which defers that part
 # to the session boundary (home/.claude/canon/maintenance.sh, ADR 0065).
@@ -131,6 +132,18 @@ RECORDER_LOCK_SECS=${CANON_RECORDER_LOCK_SECS:-60}     # UNCALIBRATED; wait for 
 RECORDER_HEADROOM=$((300 + 600 + 30 + 388))
 RECORDER_STOP_ROOM=60                                # staggered cleanup bounds plus launching the command
 RECORDER_SILENT=6600                                  # longest outer bound (6093), fetch (120), interval and margin
+PROTECTOR_HELPER="$CANON_HOME/protector-checkout.sh"   # the runner's copy of paper-session.sh (--recorder-checkout)
+PROTECTOR_INTERVAL=60                                 # launchd's pause after a firing ends (StartInterval)
+PROTECTOR_STOP_GRACE=785                              # session_window.STOP_GRACE_SECS (tests/test_protector_node.py)
+PROTECTOR_LEAD=${CANON_PROTECTOR_LEAD:-60}            # launch the successor this long before the planned end
+PROTECTOR_STOP_BUDGET=${CANON_PROTECTOR_STOP_BUDGET:-30}  # the predecessor's stop at its end (UNCALIBRATED)
+PROTECTOR_RETRY_SECS=${CANON_PROTECTOR_RETRY_SECS:-5}  # a start refused by a lock the runner did not take
+PROTECTOR_RETRY_BOUND=${CANON_PROTECTOR_RETRY_BOUND:-$((PROTECTOR_STOP_GRACE + 60))}
+# mise's start (300, paper-session.sh START_SECS), uv's sync in a new worktree (600, paper:data's) and the
+# start reads (300): the longest before a run's start line (UNCALIBRATED)
+PROTECTOR_ENDS_SECS=${CANON_PROTECTOR_ENDS_SECS:-1200}
+PROTECTOR_POLL=${CANON_PROTECTOR_POLL:-1}
+PROTECTOR_RUN_SECS=$((58800 + 785 + 300))             # paper:protector's deadline and kill grace, and mise's start
 BASELINE_LABEL="local.canon.movers-baseline"
 BASELINE_PLIST="$AGENTS_DIR/$BASELINE_LABEL.plist"
 BASELINE_RUNNER="$CANON_HOME/movers-baseline.sh"
@@ -913,6 +926,488 @@ show_recorder_status() {
     v="$v; installed recorder differs from this tree: run scripts/automation install"
   fi
   check_row "movers recorder" "$label" "$v | weekdays 04:00-20:00 New York; log $recorder_canon/watch/movers-recorder.log"
+}
+
+# run-protector <mise> <clone> <origin> <instance folder>: the protector runner (U-g). One firing starts
+# `mise run paper:protector` back to back for the one account its instance folder names (`instance`:
+# account=tests|windows|protect, row=OWN1|OWN3), each run in a detached linked worktree of the runner's own
+# clone of origin's main at the commit fetched for it (the protector refuses a main checkout), removed after
+# the run. Each start reads, in its step, its instance's holds/ and inbox/ (any entry stops the runner: the
+# owner's word outranks the go and the schedule, and nothing retries around it), on C the lead's standing go
+# in `go` ("protect <row>", read at every start). The level book (start_level.book_path()) is read by the
+# node itself once it holds the account's locks (the lead's ruling, 2026-11-13, 17:10), so the runner reads
+# none: it names the book's path in CANON_PROTECTOR_LEVEL_BOOK (protector_node.LEVEL_BOOK_ENV). The seam
+# (the lead's ruling (d)4, 2026-11-13): the runner learns each run's planned end from the protector's own
+# start line (its epoch, from Alpaca's clock and calendar), launches the successor PROTECTOR_LEAD s before it with --lock-wait bounded at that end and
+# PROTECTOR_STOP_BUDGET, so the successor takes the account's locks only once the predecessor's process has
+# let them go (flock(2), released at exit). It records the interval from the earlier of planned end and
+# observed exit to an observed successor log line, across firings too. The lead's quote seam runs from
+# the predecessor's last judged quote to the successor's first quote judged against the book level;
+# these node logs supply neither endpoint, so the record names both as missing and gives no quote gap.
+# A start refused by a lock it did not expect
+# is retried every PROTECTOR_RETRY_SECS for at most PROTECTOR_RETRY_BOUND, each refusal logged; then the
+# firing ends by name. It kills nothing and reads no credential: the task keeps its keychain reads. Account
+# A is not started on weekdays 04:00-20:00 New York (the movers recorder's hours). Contracts: lockf(1)
+# descriptor locks, git-worktree(1) add --detach / remove --force / prune, paper-session.sh's
+# --recorder-checkout, date(1) -r. CANON_PROTECTOR_* replace the bounds and date(1): tests only
+# (scripts/test-protector-runner).
+pr_say() { echo "protector-runner[$P_ACCOUNT]: $(/bin/date -u +%Y-%m-%dT%H:%M:%SZ) $*"; }
+pr_status() { # <outcome> <note>
+  local t rec note=$2 outcome=$1
+  if [ "$outcome" = running ] && [ -n "${P_PREPARE_WHY:-}" ]; then
+    outcome=failed; note="$P_PREPARE_WHY; $note"
+  fi
+  [ "$P_FROZEN" = '[]' ] || note="FROZEN: $(jq -r 'join("; ")' <<< "$P_FROZEN"); armed again by the next start; $note"
+  rec=$(jq -n --argjson e "$(/bin/date +%s)" --arg a "$P_ACCOUNT" --arg r "$P_ROW" --arg o "$outcome" --arg n "$note" \
+    --arg c "${P_COMMIT:-none: nothing ran}" --argjson s "${P_SEAM:-null}" --argjson f "$P_FROZEN" --argjson end "${P_LAST_END:-null}" \
+    --argjson g "${P_GAP:-null}" \
+    '{at_epoch: $e, account: $a, row: $r, outcome: $o, note: $n, commit: $c, last_seam: $s, last_gap: $g, last_end: $end, frozen: $f}') || return 1
+  mkdir -p "${P_STATUS%/*}" && t=$(mktemp "$P_STATUS.XXXXXX") || return 1
+  if printf '%s\n' "$rec" > "$t" && mv -f "$t" "$P_STATUS"; then return 0; fi
+  rm -f "$t"; return 1
+}
+# the DENIED and REJECTED ends a run's log shows (NautilusTrader's OrderDenied/OrderRejected event lines,
+# with their reason; the line format is UNVERIFIED against a paper run)
+# shellcheck disable=SC2016  # jq program, not shell
+PROTECTOR_ENDS_JQ='[inputs | select(test("Order(Denied|Rejected)[(]"))
+  | {kind: (capture("Order(?<k>Denied|Rejected)[(]").k | ascii_upcase),
+     reason: (try (capture("reason=[\\x27\"](?<r>[^\\x27\"]*)").r) catch "not shown")}]'
+pr_gate() { # <epoch>: may a start be made at that moment, by New York's weekday and hour
+  local u h
+  read -r u h <<< "$(TZ=America/New_York "$P_DATE" -r "$1" '+%u %H' 2>/dev/null)"
+  [[ "$u" =~ ^[1-7]$ && "$h" =~ ^[0-2][0-9]$ ]] || { P_WHY="time_failed: New York time unavailable"; return 1; }
+  h=$((10#$h))
+  if [ "$P_ACCOUNT" = tests ] && [ "$u" -lt 6 ] && [ "$h" -ge 4 ] && [ "$h" -lt 20 ]; then
+    P_WHY="account A is not started on weekdays 04:00-20:00 New York: the movers recorder streams on its pair"; return 1
+  fi
+  if [ "$u" = 6 ] || { [ "$u" = 7 ] && [ "$h" -lt 20 ]; } || { [ "$u" = 5 ] && [ "$h" -ge 20 ]; }; then
+    P_WHY="no SIP or BOATS span from Friday 20:00 to Sunday 20:00 New York"; return 1
+  fi
+}
+pr_controls() {
+  local found
+  found=$(ls -A "$P_INST/holds" 2>/dev/null) || { P_WHY="hold: $P_INST/holds unread; stopped until it reads empty"; return 1; }
+  [ -z "$found" ] || { P_WHY="hold: $P_INST/holds is not empty; stopped while it is"; return 1; }
+  found=$(ls -A "$P_INST/inbox" 2>/dev/null) || { P_WHY="hold: $P_INST/inbox unread; stopped until it reads empty"; return 1; }
+  [ -z "$found" ] || { P_WHY="hold: $P_INST/inbox is not empty; stopped while it is"; return 1; }
+}
+pr_go() {
+  local go
+  [ "$P_ACCOUNT" = protect ] || return 0
+  [ -f "$P_INST/go" ] || { P_WHY="no_go: C starts nothing without the lead's standing go in $P_INST/go"; return 1; }
+  go=$(cat "$P_INST/go" 2>/dev/null) || { P_WHY="go_unreadable: $P_INST/go"; return 1; }
+  [ "$go" = "protect $P_ROW" ] || { P_WHY="go_mismatch: $P_INST/go does not name 'protect $P_ROW'; nothing started"; return 1; }
+}
+# pr_remove_wt <worktree>: remove it only when no run holds its lock (<worktree>.lock, which each run takes
+# on descriptor 8 and every process of the run inherits, as paper-session.sh's clone lock): a node the
+# runner lost (an uninstall's bootout, a crash) runs on in its own process group, from that worktree
+pr_remove_wt() {
+  local rc=0
+  case "${1:-}" in "$P_CLONE"-run-a|"$P_CLONE"-run-b) ;; *) return 0 ;; esac
+  [ -e "$1" ] || { git -C "$P_CLONE" -c core.hooksPath=/dev/null worktree prune >/dev/null 2>&1; return 0; }
+  exec 7>>"$1.lock" || return 1
+  "$LOCKF" -t 0 7 2>/dev/null || rc=$?
+  if [ "$rc" = 0 ]; then
+    git -C "$P_CLONE" -c core.hooksPath=/dev/null worktree remove --force "$1" >/dev/null 2>&1
+    rm -rf "$1"; git -C "$P_CLONE" -c core.hooksPath=/dev/null worktree prune >/dev/null 2>&1
+  fi
+  exec 7>&-
+  [ "$rc" = 0 ] || { pr_say "worktree_busy: $1 is still used by a run (its lock is held); left in place"; return 1; }
+}
+pr_prepare() {
+  local out
+  # the helper makes the clone anew (renaming .git) only when it is not its own marked clone of this origin,
+  # which would orphan a live run's worktree: refused while one runs
+  if [ -n "$P_PRED_PID" ] && { [ "$(git config --file "$P_CLONE/.git/config" --get canon.paperCheckout 2>/dev/null)" != true ] \
+       || [ "$(git config --file "$P_CLONE/.git/config" --get remote.origin.url 2>/dev/null)" != "$P_URL" ]; }; then
+    P_WHY="clone_unfit: $P_CLONE is not the runner's marked clone of its origin while a run is live; no successor prepared"; return 1
+  fi
+  out=$(/bin/bash "$PROTECTOR_HELPER" --recorder-checkout "$P_MISE" "$P_CLONE" "$P_URL" 9>&- 2>&1) \
+    || { P_WHY="checkout_failed: ${out//$'\n'/; }"; return 1; }
+  P_NEXT_COMMIT=$(git -C "$P_CLONE" -c core.hooksPath=/dev/null rev-parse --verify HEAD) || { P_WHY="could not read the clone's commit"; return 1; }
+  if [ "$P_SLOT" = a ]; then P_SLOT=b; else P_SLOT=a; fi
+  P_NEXT_WT="$P_CLONE-run-$P_SLOT"
+  if ! pr_remove_wt "$P_NEXT_WT"; then   # a lost run holds this one: the other slot, if its lock is free
+    if [ "$P_SLOT" = a ]; then P_SLOT=b; else P_SLOT=a; fi
+    P_NEXT_WT="$P_CLONE-run-$P_SLOT"
+    if ! pr_remove_wt "$P_NEXT_WT"; then
+      P_WHY="worktree_busy: both of $P_CLONE's run worktrees are still used by runs (their locks are held); nothing started"; return 1
+    fi
+  fi
+  out=$(git -C "$P_CLONE" -c core.hooksPath=/dev/null worktree add -q --detach "$P_NEXT_WT" "$P_NEXT_COMMIT" 2>&1) \
+    || { P_WHY="worktree_failed: ${out//$'\n'/; }"; return 1; }
+}
+pr_launch() { # <lock wait s>
+  local -a args
+  P_CUR_LOG="$P_LOGS/$(/bin/date +%s)-$P_SLOT.log"
+  args=(paper:protector "$P_ACCOUNT" --row "$P_ROW" --holds-dir "$P_INST/holds" --inbox "$P_INST/inbox" --minutes 960)
+  [ "$P_ACCOUNT" != protect ] || args+=(--lead-go "protect $P_ROW")
+  [ "$1" = 0 ] || args+=(--lock-wait "$1")
+  (if ! { exec 8>>"$P_NEXT_WT.lock" && "$LOCKF" -t 0 8 2>/dev/null; }; then
+     echo "paper:protector: failed: worktree_busy: another run uses $P_NEXT_WT"; exit 1
+   fi
+   cd "$P_NEXT_WT" && MISE_CEILING_PATHS="$P_CEILING" MISE_TASK_RUN_AUTO_INSTALL=false CANON_COMMIT="$P_NEXT_COMMIT" \
+    CANON_PROTECTOR_LEVEL_BOOK="$P_BOOK" /usr/bin/timeout -k 30 "$PROTECTOR_RUN_SECS" "$P_MISE" run "${args[@]}" < /dev/null
+   rc=$?
+   /bin/date +%s > "$P_CUR_LOG.exit"   # the run's own exit stamp: a checkout the runner prepares meanwhile cannot delay it
+   exit "$rc") > "$P_CUR_LOG" 2>&1 9>&- &
+  P_CUR_PID=$!; P_CUR_WT=$P_NEXT_WT; P_CUR_COMMIT=$P_NEXT_COMMIT; P_CUR_WAIT=$1; P_CUR_LAUNCHED=$(/bin/date +%s)
+  pr_say "launched ${P_NEXT_COMMIT:0:12} in $P_NEXT_WT, lock wait $1 s"
+}
+pr_set_seam() { # a seam is the runner's number (last_seam); a pause, a hold gap or a refusal gap is not (last_gap)
+  if [ "${P_SEAM_KIND:-seam}" = seam ]; then P_SEAM=$(pr_seam_json); else P_GAP=$(pr_seam_json); fi
+}
+pr_cur_seam() { # the current start's measurement for its run record: a seam, or null with the gap kept apart
+  if [ -z "$P_SEAM_FROM" ] || [ "${P_SEAM_KIND:-seam}" != seam ]; then echo null; else pr_seam_json; fi
+}
+pr_cur_gap() {
+  if [ -z "$P_SEAM_FROM" ] || [ "${P_SEAM_KIND:-seam}" = seam ]; then echo null; else pr_seam_json; fi
+}
+pr_seam_json() {
+  [ -n "$P_SEAM_FROM" ] || { echo null; return; }
+  jq -nc --argjson f "$P_SEAM_FROM" --argjson s "$P_SEAM_START" --argjson t "${P_SEAM_TO:-null}" --arg l "$P_SEAM_LINE" --argjson p "$PROTECTOR_POLL" \
+    --arg k "${P_SEAM_KIND:-seam}" --arg after "${P_SEAM_AFTER:-boundary}" --arg why "${P_SEAM_WHY:-}" --arg held "${P_SEAM_HELD:-}" '
+    {kind: $k, after: $after, end_note: (if $why == "" then null else $why end),
+     held_by: (if $held == "" then null else $held end),
+     measurement: "run_end_to_observed_line",
+     from_epoch: $f, successor_started_epoch: $s, to_epoch: $t, run_to_line_secs: (if $t == null then null else $t - $f end),
+     to_line: (if $t == null then "none seen" else $l end),
+     quote_seam: {from_epoch: null, to_epoch: null, gap_secs: null,
+       missing_endpoints: ["predecessor last judged quote"],
+       successor_first_judged: "its line is seen (to_line, to_epoch: the scan time), not its quote stamp",
+       bound: "run_to_line_secs bounds the quote seam neither above nor below"},
+     how: ("from the earlier of the predecessor planned end and its observed exit, to the first line of the successor protector the runner saw"
+           + " (armed, waiting, submit or unprotected), stamped on a scan (poll interval " + ($p | tostring)
+           + " s; checkout preparation can delay the scan); these are run/log observations, not quote judgement endpoints (UNCALIBRATED)")}'
+}
+pr_scan() { # freezes and the seam, read from the running predecessor's log
+  local f s
+  [ -n "$P_PRED_LOG" ] || return 0
+  f=$(grep -oE '[^ ]+: frozen: our protective sell ended [A-Z]+' "$P_PRED_LOG" 2>/dev/null | jq -Rsc 'split("\n") | map(select(length > 0)) | unique') || f='[]'
+  if [ "$f" != "$P_FROZEN" ] && [ "$f" != '[]' ]; then
+    P_FROZEN=$f; pr_say "FROZEN: $(jq -r 'join("; ")' <<< "$f"); armed again by the next start"
+    pr_status running "run ends at epoch $P_PRED_END"
+  fi
+  if [ -n "$P_SEAM_FROM" ] && [ -z "$P_SEAM_TO" ]; then
+    s=$(grep -m1 -oE 'armed distance|one observation cannot elect|waiting for a fresh quote|SubmitOrder|unprotected' "$P_PRED_LOG" 2>/dev/null)
+    if [ -n "$s" ]; then
+      P_SEAM_TO=$(/bin/date +%s); P_SEAM_LINE=$s; pr_set_seam
+      pr_say "${P_SEAM_KIND:-seam} after ${P_SEAM_AFTER:-boundary}: the predecessor's last judged quote is not logged; run end to observed '$s' line $((P_SEAM_TO - P_SEAM_FROM)) s"
+      pr_status running "run ends at epoch $P_PRED_END"
+    fi
+  fi
+}
+pr_record() { # <log> <rc> <launched> <started or null> <planned end or null> <commit> <wait> <worktree> <seam json> [exit epoch] [gap json]
+  local ends rec
+  ends=$(jq -Rnc "$PROTECTOR_ENDS_JQ" < "$1" 2>/dev/null) || ends='[]'
+  rec=$(jq -nc --arg a "$P_ACCOUNT" --arg r "$P_ROW" --arg log "$1" --argjson rc "$2" --argjson l "$3" --argjson s "$4" \
+    --argjson e "$5" --arg c "$6" --argjson w "$7" --arg wt "$8" --argjson seam "$9" --argjson x "${10:-$(/bin/date +%s)}" --argjson gap "${11:-null}" --argjson ends "$ends" '
+    {account: $a, row: $r, commit: $c, worktree: $wt, launched_epoch: $l, started_epoch: $s, planned_end_epoch: $e,
+     exit_epoch: $x, exit_code: $rc, lock_wait: $w, seam: $seam, gap: $gap, log: $log,
+     denied: ($ends | map(select(.kind == "DENIED")) | length), rejected: ($ends | map(select(.kind == "REJECTED")) | length),
+     ends: $ends}') || return 1
+  printf '%s\n' "$rec" >> "$P_RECORDS"
+}
+pr_finish_pred() { # wait for the running predecessor, scanning its log, then record it and remove its worktree
+  local rc=0
+  [ -n "$P_PRED_PID" ] || return 0
+  while kill -0 "$P_PRED_PID" 2>/dev/null; do pr_scan; sleep "$PROTECTOR_POLL"; done
+  P_PRED_EXIT=$(cat "$P_PRED_LOG.exit" 2>/dev/null)
+  case "$P_PRED_EXIT" in ''|*[!0-9]*) P_PRED_EXIT=$(/bin/date +%s) ;; esac   # no stamp: seen now, at worst late
+  pr_scan
+  wait "$P_PRED_PID" || rc=$?
+  P_LAST_END=$(jq -nc --argjson e "$P_PRED_END" --argjson x "$P_PRED_EXIT" --arg log "$P_PRED_LOG" \
+    '{planned_end_epoch: $e, exit_epoch: $x, log: $log, end_reason: "boundary", end_note: null}')
+  P_ENDED_HERE=1
+  pr_say "run ended (exit $rc), planned end epoch $P_PRED_END"
+  pr_status running "run ended (exit $rc); awaiting successor"
+  pr_record "$P_PRED_LOG" "$rc" "$P_PRED_LAUNCHED" "$P_PRED_STARTED" "$P_PRED_END" "$P_PRED_COMMIT" "$P_PRED_WAIT" "$P_PRED_WT" "$(pr_cur_seam)" "$P_PRED_EXIT" "$(pr_cur_gap)"
+  pr_remove_wt "$P_PRED_WT"
+  P_PRED_PID="" P_PRED_LOG="" P_SEAM_FROM="" P_SEAM_TO=""
+}
+pr_end() { # <outcome> <note> [rc]: the firing ends by name, after a live predecessor ends by itself
+  pr_finish_pred
+  pr_end_reason "$1" "$2"
+  pr_say "$1: $2"
+  pr_status "$1" "$2"
+  return "${3:-0}"
+}
+# pr_end_reason <outcome> <note>: the reason a firing that ran a node ended, kept on the saved run end so
+# the next start records a seam, a pause or a hold gap (the lead's ruling, 2026-11-13 18:42): a schedule's
+# end is a pause, a hold's end a hold gap naming the hold, and a boundary, a failure or a kill a seam.
+# A start refused by the node (no holding to protect, a missing go) is a refusal gap naming the refusal.
+# A firing that ran no node keeps the reason of the end it found; if it was held, the hold is marked on that
+# end (held_by), so the gap that follows is a hold gap naming the hold, its first end's reason still kept
+# (the lead, 18:42: case 13 is restated, a hold's gap is recorded as a hold gap).
+pr_end_reason() {
+  local reason
+  if [ "${P_ENDED_HERE:-}" != 1 ] && [ "$1" = held ] && [ "$P_LAST_END" != null ]; then
+    P_LAST_END=$(jq -c --arg n "$2" '.held_by = $n' <<< "$P_LAST_END") || P_LAST_END=null
+    return 0
+  fi
+  [ "${P_ENDED_HERE:-}" = 1 ] && [ "$P_LAST_END" != null ] || return 0
+  case "$1" in
+    idle) case "$2" in time_failed*) reason=failure ;; *) reason=schedule ;; esac ;;
+    held) reason=hold ;;
+    refused) reason=refusal ;;
+    *) reason=failure ;;
+  esac
+  P_LAST_END=$(jq -c --arg r "$reason" --arg n "$2" '.end_reason = $r | .end_note = $n' <<< "$P_LAST_END") || return 0
+}
+do_run_protector() {
+  [ "$#" = 4 ] || { echo "usage: automation run-protector <mise> <clone> <origin> <instance folder>" >&2; return 2; }
+  P_MISE=$1 P_CLONE=$2 P_URL=$3 P_INST=$4 P_DATE=${CANON_PROTECTOR_DATE:-/bin/date}
+  P_ACCOUNT="" P_ROW="" P_COMMIT="" P_FROZEN='[]' P_SEAM=null P_LAST_END=null P_SLOT=b P_WHY="" P_PREPARE_WHY=""
+  P_PRED_PID="" P_PRED_LOG="" P_PRED_END="" P_SEAM_FROM="" P_SEAM_TO="" P_SEAM_START="" P_SEAM_LINE=""
+  local k v now wait err rc retry_from="" retry_wt="" started prepare_at prepare_by
+  export PATH=/usr/bin:/bin:/usr/sbin:/sbin
+  if [ -f "$P_INST/instance" ]; then
+    while IFS='=' read -r k v; do case "$k" in account) P_ACCOUNT=$v ;; row) P_ROW=$v ;; esac; done < "$P_INST/instance"
+  fi
+  case "$P_ACCOUNT" in tests|windows|protect) ;; *) echo "protector-runner: no instance at $P_INST/instance (account=tests|windows|protect); nothing started" >&2; return 1 ;; esac
+  P_STATUS="$CANON_HOME/watch/protector-$P_ACCOUNT.json" P_BOOK="$CANON_HOME/watch/owner-levels.json"
+  P_RECORDS="$P_INST/runs.jsonl" P_LOGS="$P_INST/runs"
+  [ ! -f "$P_STATUS" ] || P_SEAM=$(jq -c '.last_seam // null' "$P_STATUS" 2>/dev/null) || P_SEAM=null
+  [ -n "$P_SEAM" ] || P_SEAM=null
+  [ ! -f "$P_STATUS" ] || P_LAST_END=$(jq -c '.last_end // null' "$P_STATUS" 2>/dev/null) || P_LAST_END=null
+  [ -n "$P_LAST_END" ] || P_LAST_END=null
+  P_GAP=null P_ENDED_HERE="" P_SEAM_KIND="" P_SEAM_AFTER="" P_SEAM_WHY="" P_SEAM_HELD=""
+  [ ! -f "$P_STATUS" ] || P_GAP=$(jq -c '.last_gap // null' "$P_STATUS" 2>/dev/null) || P_GAP=null
+  [ -n "$P_GAP" ] || P_GAP=null
+  P_PREV_OUTCOME=""
+  [ ! -f "$P_STATUS" ] || P_PREV_OUTCOME=$(jq -r '.outcome // ""' "$P_STATUS" 2>/dev/null) || P_PREV_OUTCOME=""
+  case "$P_ROW" in OWN1|OWN3) ;; *) pr_end refused "row must name OWN1 or OWN3 in $P_INST/instance; nothing started"; return $? ;; esac
+  case "$P_CLONE" in /*) ;; *) pr_end failed "the clone must be absolute; nothing started" 1; return $? ;; esac
+  mkdir -p "$P_LOGS" "$(dirname "$P_CLONE")" || { pr_end failed "could not create $P_LOGS; nothing started" 1; return $?; }
+  P_CEILING=$(cd "$(dirname "$P_CLONE")" && pwd -P) || { pr_end failed "could not resolve the clone's parent" 1; return $?; }
+  case "$P_CEILING" in *:*|*,*) pr_end failed "the clone's parent holds a mise ceiling list separator" 1; return $? ;; esac
+  exec 9>>"$P_INST/runner.lock" || { pr_end failed "could not open $P_INST/runner.lock" 1; return $?; }
+  "$LOCKF" -t 0 9 2>/dev/null || { pr_end failed "runner_lock_held: another runner for $P_ACCOUNT holds $P_INST/runner.lock; nothing started" 1; return $?; }
+  if [ "$P_PREV_OUTCOME" = running ] && [ "$P_LAST_END" != null ]; then
+    # the runner that wrote "running" never ended by name: it was killed; its last run may still have run on
+    # (a named limit: the end kept is the last one that runner saw)
+    P_LAST_END=$(jq -c '.end_reason = "kill" | .end_note = "the previous runner ended without naming its end"' <<< "$P_LAST_END") || P_LAST_END=null
+  fi
+  while :; do
+    now=$(/bin/date +%s)
+    pr_gate "${P_PRED_END:-$now}" || { pr_remove_wt "$retry_wt"; pr_end idle "$P_WHY"; return $?; }
+    if [ -n "$retry_wt" ]; then P_NEXT_WT=$retry_wt; retry_wt=""   # a lock retry reuses its worktree
+    else
+      while ! pr_prepare; do
+        P_PREPARE_WHY=$P_WHY
+        pr_say "$P_WHY"
+        pr_status failed "$P_WHY"
+        [ -n "$P_PRED_PID" ] || { pr_end failed "$P_WHY" 1; return $?; }
+        prepare_by=$((P_PRED_END - PROTECTOR_LEAD))
+        prepare_at=$(( $(/bin/date +%s) + PROTECTOR_RETRY_SECS ))
+        pr_say "prepare retry in $PROTECTOR_RETRY_SECS s, only before epoch $prepare_by and while the predecessor runs"
+        while kill -0 "$P_PRED_PID" 2>/dev/null; do
+          now=$(/bin/date +%s)
+          [ "$now" -lt "$prepare_at" ] && [ "$now" -lt "$prepare_by" ] || break
+          pr_scan; sleep "$PROTECTOR_POLL"
+        done
+        if ! kill -0 "$P_PRED_PID" 2>/dev/null || [ "$(/bin/date +%s)" -ge "$prepare_by" ]; then
+          pr_end failed "prepare_retry_bound: $P_PREPARE_WHY; no successor prepared before epoch $prepare_by or the predecessor's exit" 1; return $?
+        fi
+      done
+      if [ -n "$P_PREPARE_WHY" ]; then
+        P_PREPARE_WHY=""
+        pr_say "checkout recovered; successor prepared"
+        pr_status running "run ends at epoch $P_PRED_END"
+      fi
+    fi
+    wait=0
+    if [ -n "$P_PRED_PID" ]; then
+      while kill -0 "$P_PRED_PID" 2>/dev/null && [ "$(/bin/date +%s)" -lt $((P_PRED_END - PROTECTOR_LEAD)) ]; do pr_scan; sleep "$PROTECTOR_POLL"; done
+      wait=$((P_PRED_END - $(/bin/date +%s) + PROTECTOR_STOP_BUDGET))
+      [ "$wait" -ge 1 ] || wait=1
+      [ "$wait" -le 300 ] || wait=300
+    fi
+    # the start's step: the owner's word and the go, read here for this start (the book: by the node, locked)
+    pr_controls || { pr_remove_wt "$P_NEXT_WT"; pr_end held "$P_WHY"; return $?; }
+    pr_go || { pr_remove_wt "$P_NEXT_WT"; pr_end refused "$P_WHY"; return $?; }
+    pr_launch "$wait"
+    pr_finish_pred
+    # the start line names the run's planned end (protector_node); without it the runner cannot sequence
+    started="" rc=0
+    while :; do
+      err=$(grep -m1 -oE '; ends [^ ]+ [(]epoch [0-9]+[)]$' "$P_CUR_LOG" 2>/dev/null)
+      if [ -n "$err" ]; then started=${err##*epoch }; started=${started%)}; break; fi
+      kill -0 "$P_CUR_PID" 2>/dev/null || { err=$(grep -m1 -oE '; ends [^ ]+ [(]epoch [0-9]+[)]$' "$P_CUR_LOG" 2>/dev/null); [ -z "$err" ] || { started=${err##*epoch }; started=${started%)}; }; break; }
+      [ "$(/bin/date +%s)" -lt $((P_CUR_LAUNCHED + PROTECTOR_ENDS_SECS + P_CUR_WAIT)) ] || break
+      sleep "$PROTECTOR_POLL"
+    done
+    if [ -n "$started" ]; then
+      if [ "$P_LAST_END" != null ]; then
+        P_SEAM_FROM=$(jq -r '[.planned_end_epoch, .exit_epoch] | map(select(type == "number")) | min' <<< "$P_LAST_END")
+        P_SEAM_START=$(/bin/date +%s); P_SEAM_TO="" P_SEAM_LINE=""
+        P_SEAM_AFTER=$(jq -r '.end_reason // "boundary"' <<< "$P_LAST_END")
+        P_SEAM_WHY=$(jq -r '.end_note // ""' <<< "$P_LAST_END")
+        P_SEAM_HELD=$(jq -r '.held_by // ""' <<< "$P_LAST_END")
+        case "$P_SEAM_AFTER" in
+          schedule) P_SEAM_KIND=pause ;;
+          hold) P_SEAM_KIND=hold_gap ;;
+          refusal) P_SEAM_KIND=refusal_gap ;;
+          *) P_SEAM_KIND=seam ;;
+        esac
+        [ -z "$P_SEAM_HELD" ] || P_SEAM_KIND=hold_gap   # a hold between the end and this start: a hold gap
+        pr_set_seam
+      fi
+      P_PRED_PID=$P_CUR_PID P_PRED_LOG=$P_CUR_LOG P_PRED_END=$started P_PRED_WT=$P_CUR_WT P_PRED_COMMIT=$P_CUR_COMMIT
+      P_PRED_LAUNCHED=$P_CUR_LAUNCHED P_PRED_STARTED=$(/bin/date +%s) P_PRED_WAIT=$P_CUR_WAIT
+      P_COMMIT=$P_CUR_COMMIT P_FROZEN='[]' retry_from=""
+      pr_say "started; planned end epoch $started"
+      pr_status running "run ends at epoch $started"
+      continue
+    fi
+    if kill -0 "$P_CUR_PID" 2>/dev/null; then   # no start line within its bound: it runs on, unsequenced
+      P_PRED_PID=$P_CUR_PID P_PRED_LOG=$P_CUR_LOG P_PRED_END=null P_PRED_WT=$P_CUR_WT P_PRED_COMMIT=$P_CUR_COMMIT
+      P_PRED_LAUNCHED=$P_CUR_LAUNCHED P_PRED_STARTED=null P_PRED_WAIT=$P_CUR_WAIT
+      pr_end failed "no_start_line: the run gave no planned end within $PROTECTOR_ENDS_SECS s, so no successor can be sequenced; it ran to its own end" 1; return $?
+    fi
+    wait "$P_CUR_PID" || rc=$?
+    pr_record "$P_CUR_LOG" "$rc" "$P_CUR_LAUNCHED" null null "$P_CUR_COMMIT" "$P_CUR_WAIT" "$P_CUR_WT" null
+    err=$(grep -E 'paper:protector: (refused|failed)' "$P_CUR_LOG" 2>/dev/null | tail -n 1)
+    case "$err" in *"lock is held"*) ;; *) pr_remove_wt "$P_CUR_WT" ;; esac   # the lock arms below decide
+    case "$err" in
+      *"lock is held after waiting"*)
+        pr_remove_wt "$P_CUR_WT"
+        pr_end failed "seam_wait_ran_out: the predecessor held the account's lock past its end and the stop budget: $err" 1; return $? ;;
+      *"lock is held"*)
+        now=$(/bin/date +%s); [ -n "$retry_from" ] || retry_from=$now
+        if [ $((now - retry_from)) -ge "$PROTECTOR_RETRY_BOUND" ]; then
+          pr_remove_wt "$P_CUR_WT"
+          pr_end failed "lock_held_bound: a lock the runner did not take was still held after $PROTECTOR_RETRY_BOUND s: $err; no node started" 1; return $?
+        fi
+        retry_wt=$P_CUR_WT
+        pr_say "lock_held: $err; retry in $PROTECTOR_RETRY_SECS s"
+        P_PRED_END=""; sleep "$PROTECTOR_RETRY_SECS"; continue ;;
+      *"holds folder"*|*"inbox"*) pr_end held "hold: $err"; return $? ;;
+      '') pr_end failed "start_failed: exit $rc with no refusal named; see $P_CUR_LOG" 1; return $? ;;
+      *) pr_end refused "start_refused: $err"; return $? ;;
+    esac
+  done
+}
+
+# The protector runner's launchd agent, one per account (launchd.plist(5) StartInterval, as the recorder's):
+# local.canon.protector-<account>, running this script's run-protector from its own installed copy. Nothing
+# installs it but `scripts/automation install-protector <tests|windows|protect> <OWN1|OWN3>`, which the owner
+# runs (ADR 0028): plain `install`, which the maintenance agent runs, does not, so it starts nothing by itself.
+# The instance folder ~/.claude/canon/protector/<account>/ holds `instance`, holds/, inbox/, C's `go` (the
+# lead's, never written here), runs.jsonl and runs/; the status is watch/protector-<account>.json.
+PROTECTOR_RUNNER="$CANON_HOME/protector-runner.sh"
+protector_label() { printf 'local.canon.protector-%s\n' "$1"; }
+write_protector_plist() { # <account> <mise> <origin> <file>
+  cat > "$4" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$(protector_label "$1")</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>$(xml "$PROTECTOR_RUNNER")</string>
+    <string>run-protector</string>
+    <string>$(xml "$2")</string>
+    <string>$(xml "$CANON_HOME/protector-$1-checkout")</string>
+    <string>$(xml "$3")</string>
+    <string>$(xml "$CANON_HOME/protector/$1")</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>CLAUDE_CONFIG_DIR</key><string>$(xml "$CLAUDE_HOME")</string>
+  </dict>
+  <key>WorkingDirectory</key><string>$(xml "$CANON_HOME")</string>
+  <key>StartInterval</key><integer>$PROTECTOR_INTERVAL</integer>
+  <key>RunAtLoad</key><false/>
+  <key>ProcessType</key><string>Background</string>
+  <key>StandardOutPath</key><string>$(xml "$CANON_HOME/watch/protector-$1.log")</string>
+  <key>StandardErrorPath</key><string>$(xml "$CANON_HOME/watch/protector-$1.log")</string>
+</dict>
+</plist>
+PLIST
+}
+do_install_protector() {
+  [ "$#" = 2 ] || { note "usage: scripts/automation install-protector <tests|windows|protect> <OWN1|OWN3>"; return 2; }
+  local account=$1 row=$2 m url inst t plist rc=0
+  case "$account" in tests|windows|protect) ;; *) note "  FAILED: no such paper account: $account"; return 2 ;; esac
+  case "$row" in OWN1|OWN3) ;; *) note "  FAILED: the row must name OWN1 or OWN3 (F2 is refused by name)"; return 2 ;; esac
+  inst="$CANON_HOME/protector/$account"; plist="$AGENTS_DIR/$(protector_label "$account").plist"
+  m=$(find_mise 2>&1) || { note "  FAILED: $m"; return 1; }
+  url=$(git -C "$ROOT" remote get-url origin 2>/dev/null) && [ -n "$url" ] || { note "  FAILED: no origin remote for the protector runner"; return 1; }
+  case "$url" in https://*|/*) ;; *) note "  FAILED: the protector runner's origin must be https"; return 1 ;; esac
+  if [[ "$url" =~ ^https://[^/?#]*@ ]]; then note "  FAILED: the protector runner's origin carries credentials"; return 1; fi
+  case "$url" in *[?#]*) note "  FAILED: the protector runner's origin has a query or fragment"; return 1 ;; esac
+  mkdir -p "$inst/holds" "$inst/inbox" "$AGENTS_DIR" "$CANON_HOME/watch" || { note "  FAILED: could not create $inst"; return 1; }
+  # a running firing holds the instance's runner lock for as long as it protects: never replace its files then
+  exec 6>>"$inst/runner.lock" || { note "  FAILED: could not open $inst/runner.lock"; return 1; }
+  "$LOCKF" -t 0 6 2>/dev/null || rc=$?
+  if [ "$rc" = 75 ]; then exec 6>&-; note "  deferred   protector runner for $account: a firing is running; retry when it has ended"; return 0; fi
+  [ "$rc" = 0 ] || { exec 6>&-; note "  FAILED: could not take $inst/runner.lock (exit $rc)"; return 1; }
+  t=$(mktemp "$AGENTS_DIR/.protector.XXXXXX") || { exec 6>&-; note "  FAILED: could not write $plist"; return 1; }
+  if ! write_protector_plist "$account" "$m" "$url" "$t" || ! plutil -lint "$t" >/dev/null; then
+    rm -f "$t"; exec 6>&-; note "  FAILED: could not write $plist"; return 1
+  fi
+  if [ "${AUTOMATION_SKIP_LAUNCHD:-0}" != 1 ]; then unload "$(protector_label "$account")" || { rc=$?; rm -f "$t"; exec 6>&-; unload_note "$(protector_label "$account")" "$rc"; return 1; }; fi
+  # the node refuses a missing book by name; an empty one (U-e's schema 1) is written only when none exists
+  if [ ! -e "$CANON_HOME/watch/owner-levels.json" ]; then
+    if ! { mkdir -p "$CANON_HOME/watch" \
+           && printf '{"schema": 1, "entries": []}\n' > "$CANON_HOME/watch/.owner-levels.json.new" \
+           && mv -n "$CANON_HOME/watch/.owner-levels.json.new" "$CANON_HOME/watch/owner-levels.json" \
+           && [ -e "$CANON_HOME/watch/owner-levels.json" ]; }; then
+      rm -f "$CANON_HOME/watch/.owner-levels.json.new"
+      echo "automation: the empty level book $CANON_HOME/watch/owner-levels.json could not be written; nothing installed" >&2
+      return 1
+    fi
+    rm -f "$CANON_HOME/watch/.owner-levels.json.new"
+  fi
+  if ! { printf 'account=%s\nrow=%s\n' "$account" "$row" > "$inst/instance" \
+         && /usr/bin/install -m 755 "$ROOT/home/.claude/canon/paper-session.sh" "$PROTECTOR_HELPER" \
+         && /usr/bin/install -m 755 "$ROOT/scripts/automation" "$PROTECTOR_RUNNER" && mv -f "$t" "$plist"; }; then
+    rm -f "$t"; exec 6>&-; note "  FAILED: could not install the protector runner for $account"; return 1
+  fi
+  exec 6>&-
+  t="holds $inst/holds, inbox $inst/inbox"
+  [ "$account" != protect ] || t="$t; the lead's standing go in $inst/go"
+  note "  wrote      $plist (account $account, row $row; $t)"
+  if [ "${AUTOMATION_SKIP_LAUNCHD:-0}" = 1 ]; then note "  not loaded (AUTOMATION_SKIP_LAUNCHD=1)"; return 0; fi
+  boot "$(protector_label "$account")" "$plist" "(first firing in $PROTECTOR_INTERVAL s)"
+}
+do_uninstall_protector() {
+  [ "$#" = 1 ] || { note "usage: scripts/automation uninstall-protector <tests|windows|protect>"; return 2; }
+  local plist rc=0
+  case "$1" in tests|windows|protect) ;; *) note "  FAILED: no such paper account: $1"; return 2 ;; esac
+  plist="$AGENTS_DIR/$(protector_label "$1").plist"
+  if [ "${AUTOMATION_SKIP_LAUNCHD:-0}" != 1 ]; then unload "$(protector_label "$1")" || rc=$?; fi
+  [ "$rc" = 0 ] || { unload_note "$(protector_label "$1")" "$rc"; return 1; }
+  rm -f "$plist" || { note "  FAILED: could not remove $plist"; return 1; }
+  note "  removed    $plist; left: $CANON_HOME/protector/$1 (its records), its clone and the runner's copy; a run already started runs on to its own end (the runner kills nothing)"
+}
+# One row per installed protector runner, none when there is none (so status does not fail for it).
+show_protector_status() {
+  local plist account status v label
+  for plist in "$AGENTS_DIR"/local.canon.protector-*.plist; do
+    [ -f "$plist" ] || continue
+    account=${plist##*/local.canon.protector-}; account=${account%.plist}
+    status="$CANON_HOME/watch/protector-$account.json"
+    # shellcheck disable=SC2016  # jq program, not shell
+    v=$(jq -er --argjson now "$(date +%s)" --argjson silent $((PROTECTOR_INTERVAL + PROTECTOR_ENDS_SECS + 300)) '
+        select(type == "object" and (.at_epoch | type) == "number")
+        | (if (.frozen | length) > 0 then "FROZEN" elif .outcome == "failed" then "FAILED" elif .outcome == "refused" then "REFUSED"
+           elif .outcome == "held" then "HELD" elif .outcome != "running" and $now - .at_epoch > $silent then "STALE" else "ok" end)
+          + "\t" + .outcome + "; " + (.note // "") + "; row " + (.row // "?")
+          + "; quote seam " + (if .last_seam.quote_seam.gap_secs == null then "not measured" else (.last_seam.quote_seam.gap_secs | tostring) + " s" end)
+          + (if (.last_seam.quote_seam.missing_endpoints | length) > 0 then ": " + (.last_seam.quote_seam.missing_endpoints | join("; ")) + " not logged" else "" end)
+          + "; run end to observed line " + (if .last_seam.run_to_line_secs == null then "not measured" else (.last_seam.run_to_line_secs | tostring) + " s" end)
+          + (if .last_gap.kind then "; last " + .last_gap.kind + " after " + .last_gap.after + ": " + ((.last_gap.run_to_line_secs // "not measured") | tostring) + " s" else "" end)' "$status" 2>/dev/null) || v=""
+    if [ -n "$v" ]; then label=${v%%$'\t'*}; v=${v#*$'\t'}; else label=UNKNOWN; v="no readable status at $status (first firing $PROTECTOR_INTERVAL s after install)"; fi
+    if ! cmp -s "$ROOT/scripts/automation" "$PROTECTOR_RUNNER"; then
+      [ "$(paper_rank OUTDATED)" -le "$(paper_rank "$label")" ] || label=OUTDATED
+      v="$v; installed runner differs from this tree: run scripts/automation install-protector $account <row>"
+    fi
+    check_row "protector $account" "$label" "$v | log $CANON_HOME/watch/protector-$account.log"
+  done
 }
 
 # The collector agent runs otelcol with the config from home/.claude/canon/otel/, kept alive by launchd
@@ -1760,6 +2255,7 @@ do_status() {
   else check_row "paper session" OFF "run: scripts/automation install"; fi
 
   show_recorder_status
+  show_protector_status
   show_baseline_status
 
   # The collector: launchd must show it running (KeepAlive restarts it); the file's age is shown, not judged,
@@ -2035,6 +2531,9 @@ do_status() {
 case "${1:-}" in
   recorder-lock-path) recorder_lock_path ;;
   record-movers) shift; do_record_movers "$@" ;;
+  run-protector) shift; do_run_protector "$@" ;;
+  install-protector) shift; do_install_protector "$@"; exit $? ;;
+  uninstall-protector) shift; do_uninstall_protector "$@"; exit $? ;;
   build-movers-baseline) shift; do_baseline_movers "$@" ;;
   status)    do_status ;;
   # the failures again after the status table, the last lines the owner sees, and the exit code with them
