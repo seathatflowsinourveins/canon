@@ -6,12 +6,16 @@ the three engine reports. trade-execution.md:52-75 and fill-prices-and-matching.
 define the touch/tape presets. Composition is mover_window.mover_universe_parts and
 window_rank; reference_reader/inline_reads are MoversRankActor's offline contract.
 
-Shutdown uses common/__init__.pyi:640-653 (clock alerts), trading/__init__.pyi:511
-(managed Strategy.stop) and crates/backtest/src/engine.rs:1049-1078 (end's timer flush).
-The replay requests the Mover's stop one market-exit interval before window_end, so a
-flat Mover's exit check can finalize it at the boundary (strategy/mod.rs:1861-2004).
-Its regular wind-down and paper managed stop are unchanged; no data or timer is replayed
-past window_end.
+Shutdown: the pinned docs/concepts/strategies.md:768-774 warn that a managed stop requested
+at a backtest's end cannot complete, since its first exit check falls past the end. So the
+replay, through a clock alert (common/__init__.pyi:640-653), requests the Mover's managed
+stop (trading/__init__.pyi:511) one market-exit interval before window_end, and the end's
+timer flush (crates/backtest/src/engine.rs:1049-1078) runs that check at the boundary
+(strategy/mod.rs:1861-2004). It does so only when the Mover is flat with no open order
+(Cache.positions_open and orders_open, common/__init__.pyi:450-457,568-575). A Mover still
+holding or working an order then is left as it is and named in the report's replay_stop,
+because paper's market exit runs after window_end, on data the replay does not have.
+Its wind-down and the paper managed stop are unchanged; no data or timer runs past window_end.
 
 The JSON spec names bars_root, quotes_roots (a list), trades_root, baseline_path,
 trade_date, timezone-aware window_start/window_end/wind_down_at, trail_arm, fill_arm,
@@ -111,11 +115,12 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
     from collections.abc import Sequence
 
-    from nautilus_trader.common import TimeEvent
     from nautilus_trader.model import Bar
 
 NY = ZoneInfo("America/New_York")
 SECOND = 1_000_000_000
+EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
+EXIT_INTERVAL_MS = session_window.MARKET_EXIT_INTERVAL_MS
 MINUTE = 60 * SECOND
 BAR_SPEC = "1-MINUTE-LAST-EXTERNAL"
 CHOICES = "pre-node choice taken from the record"
@@ -272,8 +277,26 @@ def _at(value: str) -> datetime:
     return result.astimezone(NY)
 
 
+def _stop_if_flat(strategy: Any) -> dict[str, Any]:
+    """Request the Mover's managed stop only if it is running, flat and has no open order."""
+    if not strategy.is_running():
+        return {"requested": False, "reason": "not running"}
+    positions = strategy.cache.positions_open(strategy_id=strategy.strategy_id)
+    orders = strategy.cache.orders_open(strategy_id=strategy.strategy_id)
+    if positions or orders:
+        return {
+            "requested": False,
+            "reason": "not flat one market-exit interval before window_end",
+            "open_positions": len(positions),
+            "open_orders": len(orders),
+        }
+    strategy.stop()
+    return {"requested": True}
+
+
 def _ns(value: datetime) -> int:
-    return int(value.timestamp() * SECOND)
+    # Exact: a float timestamp is off by about 100 ns for a time with a fractional second.
+    return (value - EPOCH) // timedelta(microseconds=1) * 1000
 
 
 def _local(value: str | Path, *, directory: bool) -> Path:
@@ -497,6 +520,11 @@ def _run_replay(spec: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError("window bounds must be ordered within one regular session")
     if not start < wind_down < end or end - start > timedelta(minutes=60):
         raise ValueError("a window lasts at most 60 minutes and includes its wind-down")
+    if end - wind_down < timedelta(milliseconds=EXIT_INTERVAL_MS):
+        raise ValueError(
+            "wind_down_at must be at least one market-exit interval "
+            f"({EXIT_INTERVAL_MS} ms) before window_end, where the replay stops the Mover"
+        )
     arm = spec["trail_arm"]
     if arm not in session_window.TRAIL_ARMS:
         raise ValueError("trail_arm must be F2, OWN1 or OWN3")
@@ -552,7 +580,7 @@ def _run_replay(spec: Mapping[str, Any]) -> dict[str, Any]:
         extended=False,
         feed="sip",
         wind_down_at=wind_down,
-        market_exit_interval_ms=session_window.MARKET_EXIT_INTERVAL_MS,
+        market_exit_interval_ms=EXIT_INTERVAL_MS,
         market_exit_max_attempts=session_window.MARKET_EXIT_MAX_ATTEMPTS,
         slots=part_slots("regular", spec["slots"]),
         entry_arm="registered",
@@ -593,16 +621,12 @@ def _run_replay(spec: Mapping[str, Any]) -> dict[str, Any]:
         for cap in caps:
             engine.add_strategy(cap)
 
-        def stop_window(_event: TimeEvent) -> None:
-            if strategy.is_running():
-                strategy.stop()
-
-        # Use run()'s same integer boundary: datetime alerts can otherwise leave the
-        # first exit check a fraction of a microsecond beyond a rounded end timestamp.
+        replay_stop: dict[str, Any] = {}
+        # run()'s own integer boundary, less the interval the Mover was built with.
         strategy.clock.set_time_alert_ns(
             "window-replay-stop",
-            _ns(end) - session_window.MARKET_EXIT_INTERVAL_MS * (SECOND // 1000),
-            stop_window,
+            _ns(end) - EXIT_INTERVAL_MS * (SECOND // 1000),
+            lambda _event: replay_stop.update(_stop_if_flat(strategy)),
         )
         bar_types = [f"{i.id}-{BAR_SPEC}" for i in instruments]
         for instrument, bar_type in zip(instruments, bar_types, strict=True):
@@ -689,6 +713,7 @@ def _run_replay(spec: Mapping[str, Any]) -> dict[str, Any]:
             "catalog": evidence,
             "batches": batches,
             "engine_errors": engine_errors,
+            "replay_stop": replay_stop,
             "unreferenced": unreferenced,
             "orders": _records(engine.generate_orders_report()),
             "fills": _records(engine.generate_fills_report()),
