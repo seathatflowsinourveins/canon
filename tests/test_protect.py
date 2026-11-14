@@ -448,6 +448,45 @@ def test_a_short_is_named_and_left_untouched_and_the_long_beside_it_is_protected
     assert "a short of 5" in line and "nothing sent" in line
 
 
+def test_the_sizing_read_leaves_a_below_zero_quantity_labelled_long_alone_as_a_short(
+    capsys,
+) -> None:
+    """The sizing read goes through session_window.positions(), which reads by custody's one rule
+    (the lead's ruling, 2026-11-13 21:19): a quantity below zero is a short whatever its label, so it
+    gets no stop; the long beside it is protected."""
+    paper = Paper(
+        positions=[_position("AAA", "10"), _position("BBB", "-5", "long", available="-5")],
+        no_shorting=False,
+    )
+    data = Data({"AAA": AAA_BOOK, "BBB": BBB_BOOK})
+    code, lines = _run(paper, data, capsys)
+    assert code == 0, lines
+    _no_sale_open_or_cancel(paper)
+    assert [r.symbol for r in paper.submitted] == ["AAA"], lines
+    (line,) = [x for x in lines if x.startswith("left alone BBB:")]
+    assert "a short of 5" in line and "nothing sent" in line
+
+
+@pytest.mark.parametrize(
+    ("qty", "available"),
+    [("NaN", None), ("Infinity", None), ("-Infinity", None), ("many", None), ("7", "-1")],
+)
+def test_one_unreadable_position_is_skipped_by_name_and_every_other_long_is_protected(
+    qty, available, capsys
+) -> None:
+    """The one rule reads each position by itself (the lead, 2026-11-13 21:27): a position whose quantity
+    is no finite number, or whose listed qty_available custody does not accept, is skipped with an ALERT
+    naming it, and the long beside it still gets its stop. The run is not a success: it exits 2, a long
+    left unprotected."""
+    paper = Paper(positions=[_position("AAA", "10"), _position("BBB", qty, available=available)])
+    code, lines = _run(paper, Data({"AAA": AAA_BOOK, "BBB": BBB_BOOK}), capsys)
+    assert code == 2, lines
+    _no_sale_open_or_cancel(paper)
+    assert [r.symbol for r in paper.submitted] == ["AAA"], lines
+    (line,) = [x for x in lines if x.startswith("ALERT BBB:")]
+    assert "position in BBB" in line and "nothing sent" in line, line
+
+
 BIG_BOOK = ("499.99", "500.00", "500.00", "0.10")
 """A $500 name a cent wide with a 10-cent ATR: the Mover's distance is far under 0.1% of the price."""
 

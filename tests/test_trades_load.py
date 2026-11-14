@@ -333,6 +333,53 @@ def test_canceled_and_incorrect_prints_are_named_and_corrected_prints_are_kept(
     assert any("canceled=1" in line and "incorrect=1" in line for line in lines)
 
 
+def test_a_size_zero_print_is_skipped_and_named_and_the_load_goes_on(venue, catalog) -> None:
+    """An after-hours print of size 0 (seen in a 2026-11-13 load) cannot become a TradeTick at the
+    pin (its size must be positive); it is skipped and counted, never fatal to the symbol's load."""
+    venue.rows = [trade(1, FIRST, s=0), trade(2, FIRST), trade(3, LAST, s=0)]
+    lines: list[str] = []
+    assert run(catalog, symbols=["AAPL"], out=lines.append) == 1
+    assert [str(t.trade_id) for t in ticks_in(catalog)] == ["2"]
+    assert any("Skipped 2 size-0" in line and "AAPL" in line for line in lines), lines
+
+
+def test_a_cut_part_of_only_size_zero_prints_does_not_end_the_interval(venue, catalog) -> None:
+    """Review of 37789e60: a part cut at the row bound whose rows before the cut are all size 0
+    writes nothing, but the interval still goes on from the cut, and the skip is counted."""
+    venue.rows = [trade(1, FIRST, s=0), trade(2, FIRST, s=0), trade(3, LAST)]
+    lines: list[str] = []
+    skipped: dict[str, int] = {}
+    assert run(catalog, symbols=["AAPL"], max_rows=2, out=lines.append, skipped=skipped) == 1
+    assert [str(t.trade_id) for t in ticks_in(catalog)] == ["3"]
+    assert skipped == {"size-0 prints": 2}, (skipped, lines)
+    assert any("coverage not recorded" in line for line in lines), lines
+
+
+def test_size_zero_prints_at_a_cut_are_counted_once_across_parts(venue, catalog) -> None:
+    """A cut part with written prints and size-0 prints before and at the cut: the ones at the cut
+    are fetched again by the next part and counted there, not twice."""
+    venue.rows = [trade(1, FIRST), trade(2, FIRST, s=0), trade(3, LAST, s=0), trade(4, LAST)]
+    skipped: dict[str, int] = {}
+    assert run(catalog, symbols=["AAPL"], max_rows=3, out=lambda _: None, skipped=skipped) == 2
+    assert sorted(str(t.trade_id) for t in ticks_in(catalog)) == ["1", "4"]
+    assert skipped == {"size-0 prints": 2}, skipped
+
+
+def test_a_print_with_another_unusable_size_still_stops_by_name(venue, catalog) -> None:
+    """Only size 0 is skipped; a negative size reaches parse_trade and stops the load by name."""
+    venue.rows = [trade(1, FIRST, s=-100)]
+    with pytest.raises(HistoryStopped, match=r"parsing trades of AAPL"):
+        run(catalog, symbols=["AAPL"])
+
+
+def test_the_done_line_counts_the_size_zero_prints_skipped(venue, catalog, monkeypatch, capsys):
+    venue.rows = [trade(1, FIRST, s=0), trade(2, FIRST)]
+    monkeypatch.setattr(history_load, "utc_now", lambda: NOW)
+    assert history_load.main([*cli(catalog), "--symbols", "AAPL"]) == 0
+    out = capsys.readouterr().out
+    assert "done, 1 trades written" in out and ", 1 size-0 prints skipped" in out, out
+
+
 def test_rounding_is_named_once_per_symbol_with_the_first_example(venue, catalog) -> None:
     venue.rows = [trade(1, FIRST, p=126.553488)]
     lines: list[str] = []

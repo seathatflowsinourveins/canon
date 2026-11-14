@@ -1,0 +1,580 @@
+diff --git a/docs/adr/0035-trial-ledger-in-an-optuna-study.md b/docs/adr/0035-trial-ledger-in-an-optuna-study.md
+index 286d822..6ca10a7 100644
+--- a/docs/adr/0035-trial-ledger-in-an-optuna-study.md
++++ b/docs/adr/0035-trial-ledger-in-an-optuna-study.md
+@@ -58,9 +58,10 @@ trial store that meets every driver. Leaving it is cheap, since every trial read
+ 3. **Entry.** User attributes `config`, `config_key`, `run_config_id`, `backtest_start`, `backtest_end`,
+    `returns_series` (keyed by nanoseconds as text), and `session_days`, this record's addition: the UTC
+    days on which a bar of the run arrived (one at exactly 00:00 counts for the day ending there, as
+-   NautilusTrader's daily series books it), read from the catalog, since `BacktestResult` has none.
+-   ADR 0010's `BacktestRunConfig` cannot be stored as an object, so `config` stands for it in the form
+-   ADR 0041 term 4 gives; `sample` and `data_digest` are ADR 0041's too.
++   NautilusTrader's daily series books it), read from the bars the run replayed, the engine's cache
++   read before the node is disposed, since `BacktestResult` has none. ADR 0010's `BacktestRunConfig`
++   cannot be stored as an object, so `config` stands for it in the form ADR 0041 term 4 gives; `sample`
++   and `data_digest` are ADR 0041's too.
+ 4. **Identity.** `id` defaults to a fresh UUID4, and no config identity reaches Python. `config_key` is
+    the SHA-256 hex digest of the UTF-8 bytes of `json.dumps(config, sort_keys=True,
+    separators=(",", ":"), ensure_ascii=True, allow_nan=False)`, passed as `BacktestRunConfig(id=…)`.
+diff --git a/docs/adr/0041-trial-ledger-sample-and-data-identity.md b/docs/adr/0041-trial-ledger-sample-and-data-identity.md
+index 1c52a99..fd31388 100644
+--- a/docs/adr/0041-trial-ledger-sample-and-data-identity.md
++++ b/docs/adr/0041-trial-ledger-sample-and-data-identity.md
+@@ -38,22 +38,30 @@ with what was tried.
+ 1. **Sample.** A study is created with one: a range [start, end] in UTC nanoseconds, both ends included,
+    and a sequence number from 0, kept as the study user attribute `samples`, oldest first
+    (`canon_trading.ledger.create_ledger_study`). A date with no time is its midnight. A sample the
+-   catalog's stored bars do not reach is refused before a trial is asked for. `record_trial` runs every trial with
+-   `BacktestRunConfig(start, end)` set to the current sample, and records its number as `sample`.
++   catalog's recorded intervals do not cover in full is refused before a trial is asked for, naming the
++   first missing instant; a gap between intervals is closed by consolidating the catalog
++   (`ParquetDataCatalog.consolidate_data`). A creation interrupted after the study name was committed
++   and before its sample was written is completed by the next `create_ledger_study` of that name.
++   `record_trial` runs every trial with `BacktestRunConfig(start, end)` set to the current sample, and
++   records its number as `sample`.
+ 2. **The whole sample.** Every trial the ranking reads must have the same session days over the sample.
+    A trial that lacks one stops the ranking, named with its number, how many days it lacks and the days
+-   it covers; nothing is trimmed. This supersedes the clause of ADR 0010 step 2 that trims every variant
+-   to a common range. Different instruments may share a study when their session days agree.
++   it covers; nothing is trimmed. A session day with no return in a trial's series is refused and named
++   too, so the day is never dropped from the calendar. This supersedes the clause of ADR 0010 step 2
++   that trims every variant to a common range. Different instruments may share a study when their
++   session days agree.
+ 3. **Data identity.** A trial's data is its sample and `data_digest`: for each bar type the run read,
+    the SHA-256 hex digest of the UTF-8 bytes of one line per bar,
+    `bar_type|open|high|low|close|volume|ts_event|ts_init`, each field as NautilusTrader prints it, the
+-   bars sorted by `ts_init` and `ts_event`, the lines joined by `\n`. The bars are those of the run's bar types with `ts_init` in the sample, read
+-   with the same `ParquetDataCatalog.query` that gives the session days. Nothing upstream identifies data,
+-   so this is local glue like the config key. It is taken from the bars, not the catalog's file layout, so
+-   a writer that adds, rewrites or consolidates files moves no digest unless a bar of the range changes.
+-   Records of one key on one sample that differ in range, returns, session days or digest disagree and
+-   stop the ranking (ADR 0035 term 5), and so do any two records on one sample that read one bar type
+-   as different bars, whatever their keys.
++   bars sorted by `ts_init` and `ts_event`, the lines joined by `\n`. The bars are those the run
++   replayed, read from the engine's cache before the node is disposed (`Cache.bars`), with `ts_init` in
++   the sample; `BacktestResult.iterations` must account for every one of them. A cache that holds a
++   different count, or a bar outside the sample, is a run whose data cannot be accounted for, and it is
++   told failed. Nothing upstream identifies data, so this is local glue like the config key. It is taken
++   from the bars, not the catalog's file layout, so a writer that adds, rewrites or consolidates files
++   moves no digest unless a bar of the range changes. Records of one key on one sample that differ in
++   range, returns, session days or digest disagree and stop the ranking (ADR 0035 term 5), and so do any
++   two records on one sample that read one bar type as different bars, whatever their keys.
+ 4. **The key is the configuration.** This term supersedes what ADR 0035 term 4 said `config` holds,
+    which was every property upstream reflects and the run's range. `config` now holds what this repo
+    sets: each strategy's class (`module:Class`) and its config's own fields, the venue's name,
+@@ -64,7 +72,10 @@ with what was tried.
+ 5. **Moving the sample.** `move_sample(study, start, end)` appends a sample numbered after the last; the
+    same range again is a new sample, the way a corrected catalog is taken in. No record is overwritten or
+    deleted. The ranking reads only records on the current sample, and stops, naming it, on a key with no
+-   record there: every configuration the study tried is run again before a ranking.
++   record there: every configuration the study tried is run again before a ranking. A keyed record with
++   no sample number is what a run that failed before the ledger wrote it leaves: it stops the ranking
++   until a later record of its key runs to the end. A record that ran with a sample number the study
++   does not have stops it too, named; it cannot be placed on any sample.
+ 6. **A record with no key ran no backtest.** `record_trial` writes the key before the run starts, so a
+    record without one is what a process killed between `ask` and that write leaves. The ranking stops,
+    naming it, until `mark_not_run(study, number)` clears it: a `RUNNING` one is told `FAIL`, its number
+@@ -108,15 +119,21 @@ Who decided. The orchestrator chose option 2 and its terms under the owner's del
+ * `tests/test_ledger.py` records real backtests: the run is bounded by the sample with both ends
+   replayed; bars appended after the sample change no trial on it; a moved sample stops the ranking on
+   each configuration not run on it and ranks T = 70 once all are; a corrected catalog disagrees until
+-  the sample moves.
++  the sample moves. A catalog replaced between the replay and the digest changes no earlier record's
++  digest; a cache short of the iterations, or holding a bar outside the sample, is told failed; a
++  sample the catalog covers in part is refused before a trial exists, naming the gap, and consolidation
++  closes a hole; a creation interrupted before its sample is completed by the next.
+ * `tests/test_ranking.py` and `tests/test_returns_matrix.py`: a trial over a shorter range, and trials
+   with no day in common, stop the ranking naming each; N counts keys across samples; a keyless record
+-  stops until marked, then N leaves it out, and marking a record with a key is refused.
++  stops until marked, then N leaves it out, and marking a record with a key is refused. A session day
++  with no return, a keyed record with no sample number that no later record resolves, and a record that
++  ran with a sample number the study does not have stop it too, each named.
+ 
+ ## Evidence
+ 
+-Read 2026-11-10. Fetched means read in this session as raw text or source; bundled, in the installed
+-package; run, executed in this checkout.
++Read 2026-11-10; the engine-cache, coverage and consolidation symbols re-read 2026-11-13. Fetched means
++read in this session as raw text or source; bundled, in the installed package; run, executed in this
++checkout.
+ 
+ * https://www.davidhbailey.com/dhbpapers/deflated-sharpe.pdf — version of 2014-07-31. p. 7: a trial is
+   one of "a set of N independent backtests"; p. 8: "T is the sample length", listed among the selected
+@@ -131,9 +148,12 @@ package; run, executed in this checkout.
+ * Optuna 5.0.0 in `.venv`, `optuna/study/study.py`: `Study.tell` takes a `Trial` or a trial number, so
+   a `RUNNING` record left by a dead process can be told `FAIL` from another; `Study.set_user_attr`
+   keeps study-level JSON; `create_study` without `load_if_exists` raises `DuplicatedStudyError`. `bundled`.
+-* nautilus-trader 2.0.0rc8 in `.venv`, `backtest/__init__.pyi`: `BacktestRunConfig(start, end)`;
+-  `persistence/__init__.pyi`: `ParquetDataCatalog.query(start, end)`, no content hash. `bundled`. A run
+-  with `start` and `end` on two bars' `ts_init` replayed both (`iterations` 25 of 25). Run.
++* nautilus-trader 2.0.0rc8 in `.venv`, `backtest/__init__.pyi`: `BacktestRunConfig(start, end)`,
++  `BacktestResult.iterations` and `BacktestNode.get_engine_cache`; `common/__init__.pyi`: `Cache.bars`;
++  `persistence/__init__.pyi`: `ParquetDataCatalog.get_intervals`, `query` and `consolidate_data`, no
++  content hash. `bundled`. A run with `start` and `end` on two bars' `ts_init` replayed both
++  (`iterations` 25 of 25). A run's cache held its bars in reverse replay order; the digest sorts them by
++  `ts_init` and `ts_event`, as term 3 says. Run.
+ * The full review of 2026-11-10 of the ledger, the returns matrix and the gate (`/code-review`): one short
+   trial set T for every trial, and new bars left a study on two ranges with a stop nothing cleared. The
+   choices above answer those findings; the owner's delegation is ADR 0010's Evidence line.
+diff --git a/src/canon_trading/backtest.py b/src/canon_trading/backtest.py
+index a981b30..f8b3516 100644
+--- a/src/canon_trading/backtest.py
++++ b/src/canon_trading/backtest.py
+@@ -19,6 +19,12 @@ v2.0.0rc8. Read 2026-11-10:
+   ("Adds a constructed Python strategy to the engine for the given run config"), `BacktestNode.run`
+   (with `raise_exception` off, a failed run is logged and its result left out) and
+   `ParquetDataCatalog.get_intervals`.
++* `BacktestResult.iterations` counts the data points a run replayed, `BacktestNode.get_engine_cache`
++  gives the run's cache, and `Cache.bars` holds its bars. `canon_trading.ledger` reads those bars
++  before the node is disposed and identifies the data the run read by them.
++* `ParquetDataCatalog.get_intervals` returns the `ts_init` ranges the catalog records as covered, and
++  `ParquetDataCatalog.consolidate_data` rewrites a bar type's files as one contiguous range; a gap
++  between two loads is closed by it.
+ 
+ The instrument is not built here. The node reads it from the catalog, so a backtest sees whatever was
+ stored, and what `canon_alpaca.providers.parse_equity` stores is the definition a paper run would load.
+@@ -65,6 +71,7 @@ from pathlib import Path
+ from typing import TYPE_CHECKING
+ from typing import Any
+ 
++import pandas as pd
+ from canon_alpaca.constants import VENUE
+ from nautilus_trader.backtest import BacktestNode
+ from nautilus_trader.config import BacktestDataConfig
+@@ -74,6 +81,7 @@ from nautilus_trader.config import BacktestVenueConfig
+ from nautilus_trader.config import DataCatalogConfig
+ from nautilus_trader.execution import MakerTakerFeeModel
+ from nautilus_trader.model import AccountType
++from nautilus_trader.model import BarType
+ from nautilus_trader.model import BookType
+ from nautilus_trader.model import NautilusDataType
+ from nautilus_trader.model import OmsType
+@@ -84,6 +92,7 @@ if TYPE_CHECKING:
+ 
+     from nautilus_trader.backtest import BacktestResult
+     from nautilus_trader.config import LoggerConfig
++    from nautilus_trader.model import Bar
+     from nautilus_trader.model import Position
+ 
+     from .ma_cross import MaCross
+@@ -93,12 +102,15 @@ if TYPE_CHECKING:
+ class BacktestRun:
+     """What one run left behind, as the engine's own objects, read before the node was disposed.
+ 
+-    `result` is the node's `BacktestResult`. `orders` is every order in the engine's cache, `positions`
+-    its positions in their final state, `position_snapshots` the earlier round trips of positions that
+-    reopened, and `account` the simulated venue's account. Nothing here is computed by this repo.
++    `result` is the node's `BacktestResult`. `bars` is every bar in the engine's cache, which is what
++    the run replayed for the bar types its data config loads. `orders` is every order in the engine's
++    cache, `positions` its positions in their final state, `position_snapshots` the earlier round
++    trips of positions that reopened, and `account` the simulated venue's account. Nothing here is
++    computed by this repo.
+     """
+ 
+     result: BacktestResult
++    bars: list[Bar]
+     orders: list[Any]
+     positions: list[Position]
+     position_snapshots: list[Position]
+@@ -130,6 +142,31 @@ def simulated_alpaca_venue(starting_balances: Sequence[str]) -> BacktestVenueCon
+     )
+ 
+ 
++def _first_uncovered(intervals: Sequence[tuple[int, int]], start: int, end: int) -> int | None:
++    """The first instant in [start, end] that none of `intervals` covers, or `None` if all are."""
++    at = start
++    for first, last in sorted(intervals):
++        if last < at:
++            continue
++        if first > at:
++            return at
++        if last >= end:
++            return None
++        at = last + 1
++    return at if at <= end else None
++
++
++def _between_intervals(intervals: Sequence[tuple[int, int]], instant: int) -> bool:
++    """Whether `instant` lies between two of `intervals`, where consolidation can close the gap."""
++    return any(last < instant for _, last in intervals) and any(
++        first > instant for first, _ in intervals
++    )
++
++
++def _stamp(ns: int) -> str:
++    return pd.Timestamp(ns, unit="ns", tz="UTC").isoformat()
++
++
+ def backtest_run_config(
+     catalog_path: Path,
+     strategies: Sequence[MaCross],
+@@ -154,7 +191,10 @@ def backtest_run_config(
+ 
+     `start` and `end`, UTC nanoseconds, bound the bars the node replays (`BacktestRunConfig.start` and
+     `end`); with none, it replays every bar the catalog holds. `canon_trading.ledger` passes its study's
+-    sample (ADR 0041). A catalog whose stored intervals of a bar type miss that range is refused too.
++    sample (ADR 0041). With both, the catalog's recorded intervals must cover every instant of the
++    sample; a part they miss is refused before the run is built, naming the first missing instant, and
++    a gap between two intervals is closed by `ParquetDataCatalog.consolidate_data`. With one bound, only
++    an overlap with the catalog is needed, since the other side is open.
+     """
+     _require_strategies(strategies)
+     bar_types: dict[str, str] = {}  # instrument ID to its one bar type, in the strategies' order
+@@ -175,14 +215,28 @@ def backtest_run_config(
+     path = str(Path(catalog_path).resolve())
+     catalog = ParquetDataCatalog(path)
+     for bar_type in bar_types.values():
+-        intervals = catalog.get_intervals(NautilusDataType.Bar, bar_type)
++        intervals = sorted(catalog.get_intervals(NautilusDataType.Bar, bar_type))
+         if not intervals:
+             raise LookupError(f"The catalog at {path} holds no {bar_type} bars")
+-        low, high = start if start is not None else -1, end if end is not None else 2**63
+-        if not any(first <= high and last >= low for first, last in intervals):
+-            raise LookupError(
+-                f"The catalog at {path} holds no {bar_type} bars from {start} to {end}",
+-            )
++        if start is not None and end is not None:
++            missing = _first_uncovered(intervals, start, end)
++            if missing is not None:
++                hint = (
++                    "; a stretch a load recorded with no bar is closed by consolidating the "
++                    "catalog with ParquetDataCatalog.consolidate_data"
++                    if _between_intervals(intervals, missing)
++                    else ""
++                )
++                raise LookupError(
++                    f"The catalog at {path} does not cover the sample: missing {_stamp(missing)} "
++                    f"for {bar_type}{hint}",
++                )
++        else:
++            low, high = start if start is not None else -1, end if end is not None else 2**63
++            if not any(first <= high and last >= low for first, last in intervals):
++                raise LookupError(
++                    f"The catalog at {path} holds no {bar_type} bars from {start} to {end}",
++                )
+ 
+     return BacktestRunConfig(
+         venues=[simulated_alpaca_venue(starting_balances)],
+@@ -247,7 +301,9 @@ def run_backtest_config(config: BacktestRunConfig, strategies: Sequence[MaCross]
+ 
+     `canon_trading.ledger` calls this with the config whose key it recorded, so the config hashed is
+     the config run. No strategies is refused, as `backtest_run_config` refuses it: the node would run
+-    the bars with nothing to trade them and return an empty result without an error.
++    the bars with nothing to trade them and return an empty result without an error. The bars of every
++    bar type the data config loads are read from the engine's cache before the node is disposed, which
++    empties it (`Cache.bars`), and returned in `BacktestRun.bars`.
+     """
+     _require_strategies(strategies)
+     node = BacktestNode([config])
+@@ -257,8 +313,15 @@ def run_backtest_config(config: BacktestRunConfig, strategies: Sequence[MaCross]
+             node.add_strategy(config.id, strategy)
+         [result] = node.run()
+         cache = node.get_engine_cache(config.id)
++        bars: list[Bar] = []
++        for data in config.data:
++            for bar_type in data.bar_types or ():
++                found = cache.bars(BarType.from_str(bar_type))
++                if found is not None:
++                    bars.extend(found)
+         return BacktestRun(
+             result=result,
++            bars=bars,
+             orders=cache.orders(),
+             positions=cache.positions(),
+             position_snapshots=cache.position_snapshots(),
+diff --git a/src/canon_trading/ledger.py b/src/canon_trading/ledger.py
+index d6fa7cd..281338f 100644
+--- a/src/canon_trading/ledger.py
++++ b/src/canon_trading/ledger.py
+@@ -39,9 +39,13 @@ lock guards first creation only, not recording; Optuna's FAQ keeps `JournalFileB
+ optimisation, and ADR 0035 keeps `RDBStorage` on SQLite for the reasons it gives.
+ 
+ A session day (ADR 0035 term 3) is a UTC day on which a bar of the run became available, its `ts_init`,
+-a bar at exactly 00:00 UTC counting for the day ending there, as the daily series books it; read with
+-`ParquetDataCatalog.query` (the installed `nautilus_trader/persistence/__init__.pyi`) from the catalog
+-the run read, over the study's sample. `BacktestResult` has no such list.
++a bar at exactly 00:00 UTC counting for the day ending there, as the daily series books it. It is read
++from the bars the run replayed, not from the catalog afterwards: `BacktestResult.iterations` counts
++those bars, `BacktestNode.get_engine_cache` gives the run's cache before the node is disposed, and
++`Cache.bars` (the installed `nautilus_trader/common/__init__.pyi`) holds them. `BacktestResult` has no
++such list. The same bars give `data_digest`, so a catalog replaced between the replay and the digest
++cannot pass one run's bars off as another's. A cache that does not hold one bar per iteration, or a
++bar outside the study's sample, is a run whose data cannot be accounted for: it is told failed.
+ """
+ 
+ from __future__ import annotations
+@@ -65,8 +69,6 @@ import optuna
+ import pandas as pd
+ from canon_alpaca.constants import VENUE
+ from nautilus_trader.model import Money
+-from nautilus_trader.model import NautilusDataType
+-from nautilus_trader.persistence import ParquetDataCatalog
+ from optuna.trial import TrialState
+ 
+ from .backtest import FEE_RATES
+@@ -173,7 +175,9 @@ def create_ledger_study(
+ ) -> Generator[optuna.Study]:
+     """Create the study `name` over the sample [start, end] and open it; create the file if need be.
+ 
+-    ADR 0041. A study of that name already in the file raises Optuna's `DuplicatedStudyError`. `start`
++    ADR 0041. A study of that name already in the file raises Optuna's `DuplicatedStudyError`. One
++    whose creation was interrupted after the name was committed and before its sample was written is
++    the exception: it holds no sample, so this call completes it with the sample asked for. `start`
+     and `end` are UTC nanoseconds, or a date or time that `pandas.Timestamp` reads, taken as UTC when it
+     has no offset. Both are instants and both are included: a date with no time is its midnight, so an
+     `end` of `"2025-06-16"` leaves out a bar of that day stamped after 00:00. With no `path`, the ledger
+@@ -187,7 +191,14 @@ def create_ledger_study(
+             fcntl.flock(lock, fcntl.LOCK_EX)
+             try:
+                 storage = opened.enter_context(_storage(path, "rwc"))
+-                study = optuna.create_study(study_name=name, storage=storage, direction="maximize")
++                try:
++                    study = optuna.create_study(
++                        study_name=name, storage=storage, direction="maximize"
++                    )
++                except optuna.exceptions.DuplicatedStudyError:
++                    study = optuna.load_study(study_name=name, storage=storage)
++                    if study.user_attrs.get(SAMPLES) not in (None, []):
++                        raise
+                 study.set_user_attr(SAMPLES, [_sample_attr(sample)])
+             finally:
+                 fcntl.flock(lock, fcntl.LOCK_UN)
+@@ -251,7 +262,16 @@ def samples(study: optuna.Study) -> list[Sample]:
+         ]
+     except TypeError, KeyError, ValueError:
+         found = []
+-    if not found or [s.number for s in found] != list(range(len(found))):
++    if not found:
++        if stored is None or stored == []:
++            raise LedgerNotFound(
++                f"study {study.study_name!r} was created without a sample; create_ledger_study "
++                "completes it",
++            )
++        raise LedgerNotFound(
++            f"study {study.study_name!r} has no sample in the form ADR 0041 gives: {stored!r}",
++        )
++    if [s.number for s in found] != list(range(len(found))):
+         raise LedgerNotFound(
+             f"study {study.study_name!r} has no sample in the form ADR 0041 gives: {stored!r}",
+         )
+@@ -378,18 +398,6 @@ def config_key(config: dict[str, Any]) -> str:
+     return hashlib.sha256(canonical_json(config).encode("utf-8")).hexdigest()
+ 
+ 
+-def bars_read(catalog_path: Path, bar_types: Sequence[str], start: int, end: int) -> list[Bar]:
+-    """The bars of `bar_types` in the catalog with `ts_init` in [start, end], in a stable order.
+-
+-    The catalog is asked for that range only (`ParquetDataCatalog.query`, `start` and `end`, the bounds
+-    the node is given); the bars it returns are checked against the range again by their `ts_init`.
+-    """
+-    catalog = ParquetDataCatalog(str(Path(catalog_path).resolve()))
+-    bars = catalog.query(NautilusDataType.Bar, identifiers=list(bar_types), start=start, end=end)
+-    kept = [bar for bar in bars if start <= bar.ts_init <= end]
+-    return sorted(kept, key=lambda bar: (str(bar.bar_type), bar.ts_init, bar.ts_event))
+-
+-
+ def session_day(ts: int) -> int:
+     """The UTC day, its midnight in nanoseconds, that NautilusTrader's daily series books `ts` on.
+ 
+@@ -409,14 +417,15 @@ def session_days(bars: Sequence[Bar]) -> list[str]:
+ def data_digest(bars: Sequence[Bar]) -> dict[str, str]:
+     """ADR 0041's identity of the data a run read: for each bar type, a SHA-256 of its bars.
+ 
+-    The digest of a bar type is that of the UTF-8 bytes of one line per bar, in `bars`' order,
+-    `bar_type|open|high|low|close|volume|ts_event|ts_init`, the prices and the volume as NautilusTrader
+-    prints them (their precision included), joined by `\\n`. It is taken from the bars themselves, not
+-    from the catalog's files, so rewriting or consolidating files moves no digest. Kept per bar type, so
+-    two trials on one sample that read one bar type can be checked to have read the same bars.
++    The digest of a bar type is that of the UTF-8 bytes of one line per bar, in a stable order by
++    `ts_init` and `ts_event`, `bar_type|open|high|low|close|volume|ts_event|ts_init`, the prices and
++    the volume as NautilusTrader prints them (their precision included), joined by `\\n`. It is taken
++    from the bars themselves, not from the catalog's files, so rewriting or consolidating files moves
++    no digest. Kept per bar type, so two trials on one sample that read one bar type can be checked to
++    have read the same bars.
+     """
+     lines: dict[str, list[str]] = {}
+-    for bar in bars:
++    for bar in sorted(bars, key=lambda found: (str(found.bar_type), found.ts_init, found.ts_event)):
+         lines.setdefault(str(bar.bar_type), []).append(
+             f"{bar.bar_type}|{bar.open}|{bar.high}|{bar.low}|{bar.close}|{bar.volume}|"
+             f"{bar.ts_event}|{bar.ts_init}",
+@@ -452,9 +461,12 @@ def record_trial(
+     nothing. What `backtest_run_config` refuses, or a value with no stable text form, raises before
+     anything is recorded: such a call is not a trial. The trial is then asked for, so a run that never
+     returns stays in the study as `RUNNING`. The run is bounded by the study's current sample and built
+-    with the key as its `id`. A run that raises, or whose result cannot be recorded, is told `FAIL` with
+-    outcome `failed` and its error, and the exception passes through. A run with no filled order is told
+-    `FAIL` with outcome `idle`; any other `COMPLETE` with `traded`, or `FAIL`, still `traded`, if its
++    with the key as its `id`. Its bars are read from the engine's cache before the node is disposed; a
++    cache that does not hold one bar per `BacktestResult.iterations`, or that holds a bar outside the
++    sample, is a run whose data cannot be accounted for, and it is told `FAIL` with outcome `failed`
++    before any digest is written. A run that raises, or whose result cannot be recorded, is told `FAIL`
++    with outcome `failed` and its error, and the exception passes through. A run with no filled order is
++    told `FAIL` with outcome `idle`; any other `COMPLETE` with `traded`, or `FAIL`, still `traded`, if its
+     Sharpe ratio is not finite. The outcome is written last, so a record that has one ran to the end.
+     Every write after the trial is asked for, the outcome and the `tell` included, is inside the `try`
+     that tells a failure, so an error or `KeyboardInterrupt` there is told `FAIL` with its error. Only
+@@ -489,8 +501,18 @@ def record_trial(
+         trial.set_user_attr("config", config)
+         run = run_backtest_config(run_config, built)
+         result = run.result
++        bars = list(run.bars)
++        if len(bars) != result.iterations:
++            raise RuntimeError(
++                f"the engine's cache holds {len(bars)} bars and the run replayed "
++                f"{result.iterations}",
++            )
++        outside = [bar for bar in bars if not sample.start <= bar.ts_init <= sample.end]
++        if outside:
++            raise RuntimeError(
++                f"the run replayed {len(outside)} bars outside {sample.describe()}",
++            )
+         returns = {str(ns): value for ns, value in sorted(result.returns_series.items())}
+-        bars = bars_read(catalog_path, bar_types, sample.start, sample.end)
+         days = session_days(bars)
+         trial.set_user_attr("run_config_id", result.run_config_id)
+         trial.set_user_attr("backtest_start", result.backtest_start)
+diff --git a/src/canon_trading/ranking.py b/src/canon_trading/ranking.py
+index 901b658..1ebd3f8 100644
+--- a/src/canon_trading/ranking.py
++++ b/src/canon_trading/ranking.py
+@@ -27,6 +27,9 @@ It also stops on what ADR 0035 terms 5 and 6 and ADR 0041 add: a configuration w
+ disagree, one not run on the study's current sample, returns ADR 0010 step 2 rejects or a record not in
+ the shape `record_trial` writes, records that read one bar type as different bars, trials that do not
+ cover the same session days over the sample, and a record with no key not marked by `mark_not_run`.
++A keyed record with no sample number is what a run that failed before the ledger wrote it leaves: it
++stops the ranking until a later record of its key runs to the end. A record that ran with a sample
++number the study does not have stops it too, named; it cannot be placed on any sample.
+ Every such stop is gathered before one is raised. Configurations tied at the highest Sharpe ratio with
+ the same returns are one pick; tied with other returns, they leave no single pick and stop it. N-hat
+ below 1 is raised to 1, skfolio's least, and the DSR at N-hat is withheld when its benchmark is below
+@@ -49,9 +52,9 @@ from .ledger import NOT_RUN
+ from .ledger import OUTCOME
+ from .ledger import TRADED
+ from .ledger import Sample
+-from .ledger import current_sample
+ from .ledger import has_key
+ from .ledger import ran_something
++from .ledger import samples
+ from .returns_matrix import ReturnsRejected
+ from .returns_matrix import daily_series
+ from .returns_matrix import returns_matrix
+@@ -154,7 +157,9 @@ def rank(study: optuna.Study) -> RankingReport:
+     trials = study.get_trials(deepcopy=False)  # read only; a copy of every series is not needed
+     if not trials:
+         raise RankingStopped(f"study {study.study_name!r} has no trials")
+-    sample = current_sample(study)
++    history = samples(study)
++    sample = history[-1]
++    sample_numbers = {found.number for found in history}
+     not_run = set(study.user_attrs.get(NOT_RUN, []))
+     by_key: dict[str, list[FrozenTrial]] = defaultdict(list)
+     stops: list[str] = []
+@@ -179,24 +184,52 @@ def rank(study: optuna.Study) -> RankingReport:
+     on_sample: dict[str, list[FrozenTrial]] = {}
+     read: list[FrozenTrial] = []  # every record on the current sample that ran to the end
+     for key, every in by_key.items():
+-        records = [t for t in every if t.user_attrs.get("sample") == sample.number]
+-        if not records:
++        current: list[FrozenTrial] = []
++        unknown: list[FrozenTrial] = []
++        invalid: list[FrozenTrial] = []
++        for trial in every:
++            if "sample" not in trial.user_attrs:
++                unknown.append(trial)
++                continue
++            number = trial.user_attrs["sample"]
++            if (
++                isinstance(number, bool)
++                or not isinstance(number, int)
++                or number not in sample_numbers
++            ):
++                invalid.append(trial)
++            elif number == sample.number:
++                current.append(trial)
++        for trial in invalid:
++            state = trial.user_attrs.get(OUTCOME, trial.state.name.lower())
++            verb = "ran with sample " if _ran(trial) else "has sample "
++            stops.append(
++                f"{key}: #{trial.number} ({state}) {verb}{trial.user_attrs['sample']!r}, not a "
++                "sample number of the study (ADR 0041)",
++            )
++        for trial in unknown:
++            if _ran(trial):
++                stops.append(
++                    f"{key}: #{trial.number} ({trial.user_attrs.get(OUTCOME)}) ran with no sample "
++                    "number, which record_trial writes before the run (ADR 0041)",
++                )
++        if not current:
+             stops.append(
+                 f"{key}: tried ({', '.join(map(_describe, every))}) but not run on the current "
+                 f"{sample.describe()}; run it on this sample (ADR 0041)",
+             )
+             continue
+-        on_sample[key] = records
+-        ran = [trial for trial in records if _ran(trial)]
++        on_sample[key] = current
++        ran = [trial for trial in current if _ran(trial)]
+         read.extend(ran)
+         if not ran:
+             stops.append(
+-                f"{key}: no record ran to the end ({', '.join(map(_describe, records))})",
++                f"{key}: no record ran to the end ({', '.join(map(_describe, current))})",
+             )
+             continue
+         unresolved = [
+             trial
+-            for trial in records
++            for trial in (*current, *unknown)
+             if not _ran(trial) and not any(other.number > trial.number for other in ran)
+         ]
+         if unresolved:
+diff --git a/src/canon_trading/returns_matrix.py b/src/canon_trading/returns_matrix.py
+index e9062b2..e25c0aa 100644
+--- a/src/canon_trading/returns_matrix.py
++++ b/src/canon_trading/returns_matrix.py
+@@ -4,7 +4,9 @@ Contract: ADR 0010, protocol step 2. Accept a trial's `returns_series` only as t
+ with one key per UTC day, reject any other shape, and drop the days the venue was closed. Every trial
+ runs over its study's sample and must have the same session days on it (ADR 0041, which supersedes
+ step 2's trim to a common range): the matrix is refused, naming every trial that lacks a day another
+-has, and never trimmed.
++has, and never trimmed. A session day with no return in a trial's series is refused too, naming the
++trial, how many of its session days it lacks and the first: it used to be dropped from the calendar, so
++the trial ranked on fewer days than it had sessions.
+ 
+ The shape accepted is NautilusTrader's daily series (v2.0.0rc8, `crates/analysis/src/analyzer.rs` at the
+ pinned commit, `calculate_daily_returns`): a return for every UTC day from the first to the last, keyed
+@@ -21,7 +23,8 @@ return of the pick to be finite, and skfolio's `Portfolio` does not raise on one
+ Which upstream call does what:
+ 
+ * `pandas.to_datetime(..., unit="ns", utc=True)` and `pandas.Series`: each trial's session returns,
+-  indexed by UTC date. Closed days are dropped before the series is built, by keeping only session days.
++  indexed by UTC date. Closed days are dropped before the series is built, by keeping only session days;
++  a session day with no return in the series is refused before that.
+ * skfolio 1.12.8 (`portfolio/_portfolio.py`, `population/_population.py`): each series becomes a
+   one-asset `Portfolio` with weight 1, whose returns are the series itself and whose dates come from
+   the frame's index (`Series.to_frame`); `Population.returns_df` joins them on their dates, NaN where a
+@@ -67,7 +70,8 @@ def daily_series(name: str, returns: object, session_days: object) -> pd.Series:
+     `returns` is a ledger entry's `returns_series` (nanoseconds as text to a return) and `session_days`
+     its `session_days`, in the shape `canon_trading.ledger.record_trial` writes them: each key and day
+     the decimal text of a whole number, as `str(int)` gives it, and each return a number. Anything
+-    else came from another writer and is refused, naming `name`.
++    else came from another writer and is refused, naming `name`. Every session day must have a return:
++    one that has none is refused, naming the day, rather than dropped from the series.
+     """
+     returns, session_days = _check_shape(name, returns, session_days)
+     if not returns:
+@@ -93,6 +97,13 @@ def daily_series(name: str, returns: object, session_days: object) -> pd.Series:
+             f"{pd.to_datetime(day, unit='ns', utc=True).date()} is not finite",
+         )
+     open_days = {int(day) for day in session_days}
++    missing_days = sorted(open_days - set(keys))
++    if missing_days:
++        day = missing_days[0]
++        raise ReturnsRejected(
++            f"{name}: no return on {len(missing_days)} of its {len(open_days)} session days, the "
++            f"first {pd.to_datetime(day, unit='ns', utc=True).date()}",
++        )
+     moved_while_closed = [key for key in keys if key not in open_days and returns[str(key)] != 0.0]
+     if moved_while_closed:
+         day = moved_while_closed[0]
