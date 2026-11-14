@@ -888,6 +888,33 @@ echo "account: $usage_account"
 exec /usr/bin/timeout -s KILL 300 uv run --locked python -c 'from canon_trading.custody import account_task; raise SystemExit(account_task())'
 '''
 
+# Exit monitor unit one: one account per process, no account or stream lock.
+# The keychain reads are paper:account's pattern. Missing pairs reach the module
+# so it records an unknown pass. Unit two owns the all-hours 60-second schedule.
+[tasks."paper:exit-monitor"]
+description = "Write one paper account's exit status, record and alert outbox (GET only; no orders)"
+shell = "bash -c"
+timeout = "2m"
+usage = '''
+arg "<account>" help="tests: account A; windows: account B; C has no standing authorization" {
+  choices "tests" "windows"
+}
+'''
+run = '''
+case "${usage_account:-}" in
+  tests) svc=canon-alpaca-paper; label=A ;;
+  windows) svc=canon-alpaca-paper-windows; label=B ;;
+  *) echo "paper:exit-monitor: account refused; C needs the lead's named word; nothing read" >&2; exit 3 ;;
+esac
+ALPACA_API_KEY="$(/usr/bin/timeout 10 /usr/bin/security find-generic-password -s "$svc" -a ALPACA_API_KEY -w 2>/dev/null)" || ALPACA_API_KEY=""
+ALPACA_SECRET_KEY="$(/usr/bin/timeout 10 /usr/bin/security find-generic-password -s "$svc" -a ALPACA_SECRET_KEY -w 2>/dev/null)" || ALPACA_SECRET_KEY=""
+if [ -z "$ALPACA_API_KEY" ] || [ -z "$ALPACA_SECRET_KEY" ]; then
+  unset ALPACA_API_KEY ALPACA_SECRET_KEY
+fi
+export ALPACA_API_KEY ALPACA_SECRET_KEY CANON_PAPER_ACCOUNT="$usage_account" CANON_ALPACA_DATA_ONLY=1
+exec /usr/bin/timeout -s KILL 50 uv run --locked python -m canon_trading.exit_monitor "$label"
+'''
+
 [tasks."paper:close"]
 description = "Cancel and close only what our nodes' lineage wrote on one paper account; freeze and report anything else"
 shell = "bash -c"
