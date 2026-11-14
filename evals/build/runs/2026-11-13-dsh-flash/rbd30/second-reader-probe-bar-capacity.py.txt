@@ -1,0 +1,130 @@
+"""Probe: record_trial over a sample holding more one-minute bars than the cache's default capacity.
+
+Run from a tree's root with that tree's environment:
+    mise exec -- uv run --locked python <this file> <scratch dir> [sessions]
+
+27 New York regular sessions of 390 one-minute AAPL bars (10,530 bars) from Monday 2025-03-10, built
+the way tests/conftest.py builds bars (an Alpaca payload through canon_alpaca.data.parse_bar), written
+with the window they cover, as a load by bars_to_catalog records it. One study over that window, one
+MaCross(3, 8) trial. Prints the trial's state, outcome, error and iterations.
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+from datetime import UTC
+from datetime import datetime
+from datetime import timedelta
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+import optuna
+from alpaca.data.models import Bar as AlpacaBar
+from canon_alpaca.data import parse_bar
+from canon_alpaca.providers import parse_equity
+from nautilus_trader.config import CacheConfig
+from nautilus_trader.model import BarType
+from nautilus_trader.model import NautilusDataType
+from nautilus_trader.model import Quantity
+from nautilus_trader.persistence import ParquetDataCatalog
+
+from canon_trading import ledger
+from canon_trading.ma_cross import MaCrossConfig
+
+optuna.logging.set_verbosity(optuna.logging.WARNING)
+NEW_YORK = ZoneInfo("America/New_York")
+DAY = 86_400 * 1_000_000_000
+
+
+def equity():
+    """The instrument tests/conftest.py builds, read from that file's AlpacaBars.ASSET."""
+    sys.path.insert(0, str(Path(os.getcwd()) / "tests"))
+    from alpaca.trading.models import Asset
+    from conftest import AlpacaBars
+
+    return parse_equity(Asset.model_validate(AlpacaBars.ASSET), 0)
+
+
+def main() -> None:
+    scratch = Path(sys.argv[1])
+    sessions_wanted = int(sys.argv[2]) if len(sys.argv) > 2 else 27
+    scratch.mkdir(parents=True, exist_ok=False)
+    print("canon_trading from", ledger.__file__)
+    print("CacheConfig().bar_capacity =", CacheConfig().bar_capacity)
+    if len(sys.argv) > 3 and sys.argv[3] == "sized":
+        # Upstream's own knob: the engine config's CacheConfig(bar_capacity), raised to 20,000.
+        from canon_trading import backtest
+
+        real = backtest.BacktestEngineConfig
+
+        def sized(**kwargs: object) -> object:
+            return real(**kwargs, cache=CacheConfig(bar_capacity=20_000))
+
+        backtest.BacktestEngineConfig = sized
+        print("engine cache sized to bar_capacity 20000")
+    instrument = equity()
+    bar_type = BarType.from_str(f"{instrument.id}-1-MINUTE-LAST-EXTERNAL")
+    bars = []
+    day = datetime(2025, 3, 10, tzinfo=NEW_YORK)
+    previous = 100.0
+    i = 0
+    sessions = 0
+    while sessions < sessions_wanted:
+        if day.weekday() < 5:
+            opening = day.replace(hour=9, minute=30)
+            for minute in range(390):
+                step = i % 40 if (i // 40) % 2 == 0 else 40 - i % 40
+                close = 100.0 + step * 0.25
+                stamp = (opening + timedelta(minutes=minute)).astimezone(UTC)
+                payload = {
+                    "t": stamp.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "o": previous,
+                    "h": max(previous, close),
+                    "l": min(previous, close),
+                    "c": close,
+                    "v": 1_000,
+                    "n": 10,
+                    "vw": close,
+                }
+                bars.append(parse_bar(AlpacaBar("AAPL", payload), bar_type, instrument))
+                previous = close
+                i += 1
+            sessions += 1
+        day += timedelta(days=1)
+    catalog_path = scratch / "catalog"
+    catalog_path.mkdir()
+    catalog = ParquetDataCatalog(str(catalog_path))
+    catalog.write_instruments([instrument])
+    start = (bars[0].ts_init - DAY) // DAY * DAY
+    end = bars[-1].ts_init // DAY * DAY + DAY
+    catalog.write_bars(bars, start=start, end=end)
+    intervals = catalog.get_intervals(NautilusDataType.Bar, str(bar_type))
+    print("bars written", len(bars), "intervals", intervals)
+    config = MaCrossConfig(
+        bar_type=bar_type, trade_size=Quantity.from_int(10), fast_period=3, slow_period=8
+    )
+    with ledger.create_ledger_study(
+        "minute", start=start, end=end, path=scratch / "trials.db"
+    ) as study:
+        error = None
+        recorded = None
+        try:
+            recorded = ledger.record_trial(
+                study, catalog_path, [config], starting_balances=["100000 USD"]
+            )
+        except RuntimeError as caught:
+            error = caught
+        [trial] = study.trials
+        print("raised:", repr(error))
+        print("state:", trial.state.name, "outcome:", trial.user_attrs.get("outcome"))
+        print("error attr:", trial.user_attrs.get("error"))
+        print("has data_digest:", "data_digest" in trial.user_attrs)
+        print("session days:", len(trial.user_attrs.get("session_days", [])))
+        if recorded is not None:
+            print("iterations:", recorded.run.result.iterations)
+            print("cached bars:", len(getattr(recorded.run, "bars", []) or []))
+
+
+if __name__ == "__main__":
+    main()
