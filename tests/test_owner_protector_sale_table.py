@@ -629,8 +629,11 @@ def test_every_row_round_trips_real_level_book(target, tmp_path):
 @pytest.mark.parametrize("target", ["G", "GC", "WK", "PCR", "FZ", "RW", "FC", "FCW", "FCP"])
 def test_real_start_keeps_saved_level_and_resets_count(target, tmp_path):
     path = tmp_path / "book"
-    previous = counted(account_label="example", level_book_path=path)
+    previous = counted(account_label="example", level_book_path=path, trading=h.VenueOrders())
     previous.level_book_path, previous.run = path, "previous"
+    # An entry with no venue reading of its holding's fills is never carried: the run that saves
+    # takes its reading as every step does, through the protector's own read.
+    previous._read_venue(h.AAA)
     slot = previous.slots[h.AAA]
     slot.level = h.Price.from_str("12.00")
     slot.sale_state = sale_table.State(target, 1 if target == "G" else None)
@@ -1949,3 +1952,34 @@ def test_timer_still_observes_a_stopped_sale_after_cancel_refusal():
     strategy.cached.held[0].quantity = h.Quantity.from_int(5)
     strategy._on_step(SimpleNamespace(ts_event=h.T0 + 60 * h.SECOND))
     assert row(strategy).row == "PCT" and len(strategy.canceled) == 2
+
+
+def test_real_start_does_not_carry_an_entry_with_no_venue_reading(tmp_path):
+    """Where the venue-clock judgment of a book entry meets the two-quote sale: an entry saved with
+    no venue reading of its holding's fills is never the same holding, at a count of two as at one.
+    It is named once, the holding is armed afresh at a count of zero, and this run's own entry,
+    with its reading, replaces it."""
+    path = tmp_path / "book"
+    previous = counted(account_label="example", level_book_path=path)
+    previous.level_book_path, previous.run = path, "previous"
+    previous.slots[h.AAA].level = h.Price.from_str("12.00")
+    previous._save_levels()
+    assert LevelBook.read(path)["example", h.AAA].horizon is None
+    strategy = Counted(
+        breach_count=2,
+        confirm_gap_ms=0,
+        account_label="example",
+        level_book_path=path,
+        trading=h.VenueOrders(),
+    )
+    strategy.test_clock.set_time(h.T0 + 180 * h.SECOND)
+    strategy.cached.latest = h.quote("10.00", h.T0 + 180 * h.SECOND)
+    strategy.on_start()
+    level = strategy.slots[h.AAA].level
+    assert level is not None and level.as_decimal() < Decimal("12.00"), "armed afresh, not carried"
+    assert row(strategy) == sale_table.State("G", 0)
+    named = [text for text in strategy.said if "previous level not carried" in text]
+    assert len(named) == 1, strategy.said
+    strategy._save_levels()
+    assert LevelBook.read(path)["example", h.AAA].horizon is not None
+    strategy.on_stop()

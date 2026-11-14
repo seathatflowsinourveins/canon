@@ -187,12 +187,16 @@ def test_t2_waiting_rereads_holdings_and_foreign_cover_before_any_send(change):
 
 def test_t3_real_save_and_restart_from_waiting_retains_level_only(tmp_path):
     path = tmp_path / "levels.json"
-    strategy = counted(account_label="example", level_book_path=path)
+    strategy = counted(account_label="example", level_book_path=path, trading=h.VenueOrders())
     strategy.level_book_path, strategy.run = path, "before"
+    # An entry with no venue reading of its holding's fills is never carried: the run that saves
+    # takes its reading as every step does, through the protector's own read.
+    strategy._read_venue(h.AAA)
     sent(strategy)
     refuse(strategy)
     strategy._save_levels()
     saved = LevelBook.read(path)["example", h.AAA]
+    assert saved.horizon is not None
     # Nothing of ours works at the venue in the waiting row, so the book must not say `armed`
     # (a reader takes that for a working sell): it is the entry counting gives, at zero.
     assert (saved.state, saved.count, saved.reason) == ("counting", 0, None)
