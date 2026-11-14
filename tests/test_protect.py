@@ -448,6 +448,42 @@ def test_a_short_is_named_and_left_untouched_and_the_long_beside_it_is_protected
     assert "a short of 5" in line and "nothing sent" in line
 
 
+def test_the_sizing_read_leaves_a_below_zero_quantity_labelled_long_alone_as_a_short(
+    capsys,
+) -> None:
+    """The sizing read goes through session_window.positions(), which reads by custody's one rule
+    (the lead's ruling, 2026-11-13 21:19): a quantity below zero is a short whatever its label, so it
+    gets no stop; the long beside it is protected."""
+    paper = Paper(
+        positions=[_position("AAA", "10"), _position("BBB", "-5", "long", available="-5")],
+        no_shorting=False,
+    )
+    data = Data({"AAA": AAA_BOOK, "BBB": BBB_BOOK})
+    code, lines = _run(paper, data, capsys)
+    assert code == 0, lines
+    _no_sale_open_or_cancel(paper)
+    assert [r.symbol for r in paper.submitted] == ["AAA"], lines
+    (line,) = [x for x in lines if x.startswith("left alone BBB:")]
+    assert "a short of 5" in line and "nothing sent" in line
+
+
+@pytest.mark.parametrize("qty", ["NaN", "Infinity", "-Infinity", "many"])
+def test_the_sizing_read_stops_by_name_on_a_quantity_that_is_no_finite_number(qty, capsys) -> None:
+    """Through the same one rule, a listed quantity that is no finite number stops the run by name and
+    nothing is sent for any long. The name is the read's and the refusal's: custody's ReadFailed names
+    a failed read by its type, never by what it carried (custody.py ReadFailed), so the symbol is not
+    in this line."""
+    paper = Paper(positions=[_position("AAA", "10"), _position("BBB", qty, available=None)])
+    code, lines = _run(paper, Data({"AAA": AAA_BOOK, "BBB": BBB_BOOK}), capsys)
+    assert code != 0, lines
+    assert paper.submitted == [], lines
+    assert any(
+        "failed part way: the positions failed: PositionUnread" in x
+        and "nothing more was sent" in x
+        for x in lines
+    ), lines
+
+
 BIG_BOOK = ("499.99", "500.00", "500.00", "0.10")
 """A $500 name a cent wide with a 10-cent ATR: the Mover's distance is far under 0.1% of the price."""
 
