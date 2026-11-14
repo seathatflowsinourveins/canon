@@ -28,7 +28,8 @@ How requests and answers reach the protector:
 - The pin's crates/common/src/python/response.rs:145-171,300,311-340,381-425 dispatches the
   historical payload, on_data_response metadata (including failure_reason), then a terminal
   callback receiving the request ID string. Empty failures complete without historical data.
-  The fake follows that order; the bars gate opens only on its request's terminal callback.
+  The fake follows that order; completion belongs to that holding's request. The overnight
+  amendment arms cold before completion and replans when complete bars exist, never lowering.
 - Every distance here is compared with an oracle the change does not touch:
   - for a warm book, today's `protect.plan_distance` on 14 consecutive bars of the same width;
   - for the cold case, its fixed fallback.
@@ -375,21 +376,21 @@ def test_a_late_seed_in_the_cache_prices_nothing_on_a_step() -> None:
     assert not said(strategy, "0.01")
 
 
-def test_planning_waits_for_the_days_bars_and_says_so_at_every_step() -> None:
-    """The cause of tonight's fallback: a level planned before the history could answer. With the
-    seed in hand and the bars request unanswered, nothing is armed, and each step names the wait."""
+def test_planning_arms_cold_while_the_days_bars_are_unanswered() -> None:
+    """The overnight amendment removes the wait and keeps the task's shared cold distance."""
     strategy = Cold()
     strategy.on_start()
     strategy.seed("10.00", age_s=20)
-    for n in (1, 2, 3):
+    initial = up_on_step(Decimal("10.00") - fixed_distance())
+    for _ in (1, 2, 3):
         strategy.step()
-        assert strategy.slots[AAA].level is None
-        assert "unprotected" in strategy.frozen[AAA]
-        assert len(said(strategy, "AAA.ALPACA", "bars")) >= n
-    assert not said(strategy, "fixed fallback")
+        assert strategy.slots[AAA].level == Price.from_str(str(initial))
+    assert said(strategy, "self-armed", "cold rule", "fixed fallback")
     strategy.history(quiet_day())
     strategy.step()
-    assert strategy.slots[AAA].level is not None
+    level = strategy.slots[AAA].level
+    assert level is not None and level.as_decimal() >= initial
+    assert said(strategy, "replanned", "ATR over 6 bars")
 
 
 def test_no_bars_in_the_session_day_takes_the_fixed_fallback_named_and_counted() -> None:
@@ -692,7 +693,7 @@ def test_end_keeps_counts_after_a_holding_has_ended() -> None:
     assert said(strategy, "END", "AAA.ALPACA", "not-raised=1", "fixed fallback=1")
 
 
-def test_request_completions_are_per_holding_and_only_terminal_opens_the_bars_gate() -> None:
+def test_request_completions_are_per_holding_while_cold_protection_keeps_its_level() -> None:
     from tests.test_owner_protector import BBB
 
     strategy = Cold()
@@ -701,12 +702,17 @@ def test_request_completions_are_per_holding_and_only_terminal_opens_the_bars_ga
     strategy.cached.held.append(second)
     strategy.on_start()
     strategy.seed()
-    # A payload is only a chunk. Its arrival and another holding's terminal completion cannot
-    # make AAA ready; the callback supplied with AAA's request alone completes that request.
+    initial = strategy.slots[AAA].level
+    assert initial is not None
+    # A complete bar in a payload can replan cold protection before the terminal callback;
+    # another holding's completion still cannot complete AAA's request.
     strategy.on_historical_bars(quiet_day())
     strategy.bar_requests[1]["callback"]("bars-2")
     strategy.step()
-    assert strategy.slots[AAA].level is None
+    level = strategy.slots[AAA].level
+    assert level is not None and level.as_decimal() >= initial.as_decimal()
+    assert not strategy.slots[AAA].history_ready
+    assert strategy.slots[BBB].history_ready
     strategy.bar_requests[0]["callback"]("bars-1")
     assert strategy.slots[AAA].level is not None
 

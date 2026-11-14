@@ -184,8 +184,12 @@ def entry(
     written_ns: int = T0,
     run: str = "earlier-run",
     distance: str | None = "0.04",
+    reading: bool = True,
 ) -> Any:
-    """The book's entry for one holding, constructed through the module's public name."""
+    """The book's entry for one holding, constructed through the module's public name.
+
+    DeepSeek P2-2: an entry carries the venue's reading of its fills, here at its write;
+    reading=False is an entry written before readings were kept, never the same holding."""
     # landing lane, 2026-11-13: review F9: an entry carries the distance it was armed with (the
     # 17:43 ruling), so the carry cases take the carried-distance path; distance=None is an entry
     # written before distances were kept (ruling (a)); see FIXROUND-L1.md §Review fix round
@@ -196,6 +200,7 @@ def entry(
         written_ns=written_ns,
         run=run,
         distance=None if distance is None else Decimal(distance),
+        horizon=start_level_module().Horizon(written_ns) if reading else None,
     )
 
 

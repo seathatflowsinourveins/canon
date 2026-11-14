@@ -17,7 +17,7 @@ Read at NautilusTrader d53849b216e2, v2.0.0rc8:
   `canon-protect-`), never one of our nodes' (the lead's ruling, 2026-11-13, 16:04:49).
 * crates/live/src/python/node.rs:1326-1370: add_strategy registers the constructed strategy and
   its config. The level-book keywords implement OwnerProtectorConfig's composed U-e contract;
-  start_level.book_path names its account file and start_level.SCHEMA names its written format.
+  start_level.book_path names its account file and start_level.SCHEMAS_READ the formats both readers accept.
 
 owner_execution_config enables the adapter's reduce_only_sells and external reports; execution.py
 checks the reduce-only side/type at :2542-2553 and writes SELL_TO_CLOSE at :2594-2595. The emulator
@@ -28,6 +28,14 @@ C's go is procedural in ADR 0142, not an existing code token: --lead-go carries 
 caller must still run C from reviewed main. The base session has no holds/inbox paths, so both
 are required inputs and unread/nonempty controls refuse. No default empty folder is invented.
 A new owner fill after start on B is SIMULATION ONLY today; its paper showing comes later on A.
+
+Review F1 of #443's max review: the roster is the start's instruments, handed to the protector, which
+reads the account at its first step and every owner_protector.ROSTER_POLL_SECS, names a long outside
+the roster by an ALERT and, for a whole-share one, ends the run by name (owner_protector.ROSTER_ENDED,
+through Strategy.shutdown_system; module header there). The run then returns as at its planned end,
+saying `paper:protector: ended: <reason>`, and exits 0, since the runner launches its successor once a
+run exits, on any exit code (scripts/automation, do_run_protector), and that successor reads the
+account at its start. The runner records the end as a boundary; naming it there is the runner's.
 """
 
 from __future__ import annotations
@@ -69,7 +77,7 @@ from .owner_protector import OwnerProtector
 from .owner_protector import OwnerProtectorConfig
 from .owner_protector import owner_execution_config
 from .protect import ROWS
-from .start_level import SCHEMA
+from .start_level import SCHEMAS_READ
 from .start_level import book_path
 
 if TYPE_CHECKING:
@@ -204,6 +212,8 @@ def protector_node(
         # The span's part (window.protection_span), so U-e's overnight eligibility check runs on an
         # overnight run (OwnerProtectorConfig.session_part; composition, L6 2026-11-13).
         session_part=session_part,
+        # Review F1: the instruments this node loads; a long outside them is named, the run ended.
+        roster=tuple(instruments),
         **book_settings,
     )
     node = paper_node.alpaca_paper_builder(
@@ -316,8 +326,8 @@ start_level.book_path()'s file. Read only once both locks are held (the lead's r
 def _book_levels(path: Path, account: str) -> dict[InstrumentId, Price]:
     """Check the runner's supplied book and count this account's priced rows under the locks.
 
-    Accept both formats read by start_level.LevelBook: legacy schema 1 and the composed writer's
-    SCHEMA. A missing or unreadable runner-supplied book refuses the start; a malformed level is
+    Accept every format start_level.LevelBook reads (start_level.SCHEMAS_READ, one tuple for both
+    readers). A missing or unreadable runner-supplied book refuses the start; a malformed level is
     skipped by name. This summary selects no carried holding: OwnerProtector reads the whole book
     through LevelBook.read and decides identity through its venue reader.
     """
@@ -326,10 +336,12 @@ def _book_levels(path: Path, account: str) -> dict[InstrumentId, Price]:
         entries = data["entries"] if isinstance(data, dict) else None
         if (
             type(data.get("schema")) is not int
-            or data["schema"] not in (1, SCHEMA)
+            or data["schema"] not in SCHEMAS_READ
             or not isinstance(entries, list)
         ):
-            raise ValueError(f"expected schema 1 or {SCHEMA} and an entries array")
+            raise ValueError(
+                f"expected schema {', '.join(map(str, SCHEMAS_READ))} and an entries array"
+            )
     except (OSError, ValueError, KeyError, AttributeError) as e:
         raise window.WindowRefused(
             f"level book unreadable at {path}: {type(e).__name__}; nothing started"
@@ -520,13 +532,12 @@ def run_protector(
         # its label or by its sign, is below zero and never read as a long, and one that cannot be read
         # is named with an ALERT and skipped, its symbol and any level for it left out of the node, so
         # every other long is still covered (the lead, 2026-11-13 21:27 and 21:35).
-        held, unread = window.position_reads(trading)
         # A zero quantity (a short read as -0 among them) is no holding this node can protect: it is
-        # named and skipped like an unreadable one, never a refusal of every other long.
-        for symbol, qty in sorted(held.items()):
-            if qty == 0:
-                unread[symbol] = f"position in {symbol} is listed with quantity {qty}, no holding"
-                del held[symbol]
+        # named and skipped like an unreadable one, never a refusal of every other long. What the start
+        # skips and refuses is one predicate, `window.start_account`, which the running protector's
+        # roster read calls too (review F1; the lead's term (a), 2026-11-13 23:49).
+        start = window.start_account(*window.position_reads(trading))
+        held, unread = dict(start.held), dict(start.skipped)
         for symbol, why in sorted(unread.items()):
             print(
                 f"ALERT {symbol}: {why}, so this node does not protect it; skipped, nothing sent for it",
@@ -539,6 +550,12 @@ def run_protector(
             )
         if not held:
             raise window.WindowRefused("no starting holding; no protector node started")
+        if start.refused:
+            # Named here, before any node: the adapter's start-up would fail on it (execution.py:372).
+            raise window.WindowRefused(
+                "; ".join(start.refused[s] for s in sorted(start.refused))
+                + "; no protector node started"
+            )
         for instrument in config.levels:
             if held.get(instrument.symbol.value, 0) <= 0:
                 raise window.WindowRefused(
@@ -620,6 +637,9 @@ def run_protector(
                 errors.append(f"end orders read failed: {type(e).__name__}")
             if errors:
                 print(f"paper:protector: {'; '.join(errors)}; no cleanup sale", file=sys.stderr)
+            ended = getattr(strategy, "ended_for", None)
+            if ended:
+                print(f"paper:protector: ended: {ended}; the next start reads the account fresh")
         if failure is not None:
             raise failure
         if errors:
