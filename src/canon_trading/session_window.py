@@ -1993,10 +1993,10 @@ class WindowRefused(RuntimeError):
     open when one was named). Nothing was placed. Recorded as the latest result; the run exits 1."""
 
 
-class PositionUnread(WindowRefused, ValueError):
-    """A position whose quantity cannot be read by custody's one rule (`custody._listed`): before the
-    window's start a refusal naming the symbol (`WindowRefused`); after the stop a failed read
-    (`ValueError`, in `FAILED`), which the account check notes and polls past, since a window ran."""
+class PositionUnread(WindowRefused):
+    """A position whose quantity cannot be read by custody's one rule (`custody._listed`), raised by
+    `positions` before a window's start: a refusal naming the symbol. The check after the stop does not
+    raise it; it reads each position by itself (`position_reads`)."""
 
 
 class StopTimedOut(RuntimeError):
@@ -2260,23 +2260,37 @@ def open_orders(trading: TradingClient) -> list:
     return orders
 
 
-def positions(trading: TradingClient) -> dict[str, Decimal]:
-    """The signed quantity Alpaca holds in each symbol of the account (alpaca-py's `get_all_positions`,
-    `GET /v2/positions`); a symbol with none is absent. Each is read by custody's one quantity rule
-    (`custody._listed`): a short, by its side or by its sign, is below zero and never read as a long, and
-    a quantity that is no finite number, or a listed `qty_available` that is not one custody accepts,
-    raises `PositionUnread` naming the symbol."""
+def position_reads(trading: TradingClient) -> tuple[dict[str, Decimal], dict[str, str]]:
+    """Each Alpaca position (alpaca-py's `get_all_positions`, `GET /v2/positions`) read by itself through
+    custody's one quantity rule (`custody._listed`): the signed quantity of each readable symbol, a
+    short, by its side or by its sign, below zero and never read as a long; and for each symbol whose
+    quantity is no finite number, or whose listed `qty_available` is not one custody accepts, custody's
+    reason, which names it. What an unreadable position means is the caller's (the lead, 2026-11-13
+    21:27): a window does not start (`positions`); the check after the stop keeps what it last knew held
+    and names it (`_AccountCheck.read`); protect skips that symbol by name and covers every other long."""
     from .custody import _listed  # imported here: custody imports this module as it loads
 
     found = trading.get_all_positions()
     assert isinstance(found, list)
     held: dict[str, Decimal] = {}
+    unread: dict[str, str] = {}
     for position in found:
         assert isinstance(position, AlpacaPosition)
         listed = _listed(position)
         if listed.held is None or listed.unknown:
-            raise PositionUnread(str(listed.unknown))
-        held[position.symbol] = listed.held
+            unread[str(position.symbol)] = str(listed.unknown)
+        else:
+            held[str(position.symbol)] = listed.held
+    return held, unread
+
+
+def positions(trading: TradingClient) -> dict[str, Decimal]:
+    """The signed quantity Alpaca holds in each symbol of the account, a symbol with none absent, each
+    read by `position_reads`; any position that cannot be read raises `PositionUnread` naming it, so a
+    window does not start on an account it cannot read in full."""
+    held, unread = position_reads(trading)
+    if unread:
+        raise PositionUnread("; ".join(unread[s] for s in sorted(unread)) + "; not starting")
     return held
 
 
@@ -4221,6 +4235,7 @@ class _AccountCheck:
         self.held = dict.fromkeys(self.symbols, Decimal(0))
         self.others: list = []  # the open orders in other symbols of the last reading
         self.others_held: dict[str, Decimal] = {}  # the positions in other symbols, likewise
+        self.unread: dict[str, str] = {}  # each position the last reading could not read, and why
         self.tried: dict[str, int] = {}  # the cancels sent for each order
         self.close_tries: Counter[str] = Counter()  # the closes sent or left unpriced in each name
         self.open_until: float | None = None  # by the clock's last answer; None before any
@@ -4240,7 +4255,16 @@ class _AccountCheck:
         for order in self.listed:  # the listing shows a request as its lookup does
             if (request := self.requests.get(str(order.client_order_id))) is not None:
                 self._seen(request, order)
-        self.others_held = positions(self.trading)
+        read, self.unread = position_reads(self.trading)
+        for reason in self.unread.values():
+            _note(self.report, f"checking the account after the stop: {reason}")
+        # A position that cannot be read keeps what was last known held there (none before any reading)
+        # and is named in `left`, so a failed read never turns a held long into flat (the lead,
+        # 2026-11-13 21:27); no close is sent in its symbol (`act`).
+        last = {**self.others_held, **self.held}
+        for symbol in self.unread:
+            read.setdefault(symbol, last.get(symbol, Decimal(0)))
+        self.others_held = read
         self.held = {s: self.others_held.pop(s, Decimal(0)) for s in self.symbols}
         return self.left()
 
@@ -4251,6 +4275,7 @@ class _AccountCheck:
             [item for s, qty in self.held.items() for item in described(self.working(s), qty, s)]
             + [r.missing() for r in self.requests.values() if r.order is None]
             + elsewhere(self.others, self.others_held)
+            + [f"position in {s} not read: {why}" for s, why in sorted(self.unread.items())]
         )
 
     def working(self, symbol: str | None = None) -> list:
@@ -4425,7 +4450,10 @@ class _AccountCheck:
         working = self.working()
         busy = {o.symbol for o in working}
         closable = any(
-            held and symbol not in busy and symbol not in self.extended_refused
+            held
+            and symbol not in busy
+            and symbol not in self.extended_refused
+            and symbol not in self.unread
             for symbol, held in self.held.items()
         )
         if working and not (self.close_turn and closable) and self.cancel():
@@ -4442,8 +4470,8 @@ class _AccountCheck:
         open_now: bool | None = None
         part: str | None = None
         for symbol, held in sorted(self.held.items(), key=lambda item: self.close_tries[item[0]]):
-            if not held or symbol in self.extended_refused:
-                continue
+            if not held or symbol in self.extended_refused or symbol in self.unread:
+                continue  # a position that cannot be read is named, never closed on a stale count
             if symbol in busy:
                 continue
             side = _closing_side(held)

@@ -6718,10 +6718,10 @@ def test_a_position_quantity_that_is_no_finite_number_stops_the_start_by_name(
     """A quantity that is no finite number passed as one (NaN, Infinity), or raised a bare decimal error
     (no number at all), where custody's rule says what is held there is not known."""
     trading = cast(TradingClient, Listing(listed_position("AAA", qty, "long")))
-    with pytest.raises(session_window.WindowRefused, match="position in AAA"):
+    with pytest.raises(session_window.WindowRefused, match="position in AAA.*not starting"):
         session_window.positions(trading)
     monkeypatch.setattr(session_window, "window_node", lambda *a, **k: pytest.fail("built"))
-    with pytest.raises(session_window.WindowRefused, match="position in AAA"):
+    with pytest.raises(session_window.WindowRefused, match="position in AAA.*not starting"):
         session_window.run_window(WindowConfig(log_dir=tmp_path), trading=trading)
 
 
@@ -6750,19 +6750,54 @@ def test_a_listed_quantity_no_order_holds_is_checked_as_custody_checks_it(
             session_window.positions(trading)
 
 
-def test_an_unreadable_position_after_the_stop_fails_the_check_and_is_no_refusal(
+def test_an_unreadable_position_after_the_stop_is_named_and_never_reported_flat(
     fake_time, tmp_path
 ) -> None:
-    """After the stop a window has run, so a quantity that cannot be read is a failed read, which the
-    check notes and polls past (`FAILED`), not a refusal, which would record that nothing was placed."""
-    trading = cast(TradingClient, Listing(listed_position("AAA", "NaN", "long")))
+    """After the stop a window has run, so a quantity that cannot be read is no refusal, which would
+    record that nothing was placed: the check reads each position by itself, names this one in what is
+    left and in its errors, and sends no close on a count it cannot read."""
+    trading = Listing(listed_position("AAA", "NaN", "long"))  # no submit_order: a close would fail
     report = session_window.WindowReport("regular", "AAA", started="t")
-    with pytest.raises(RuntimeError, match="could not be read.*position in AAA") as failed:
-        session_window._flatten_after_stop(
-            trading, WindowConfig(symbol="AAA", log_dir=tmp_path), report
-        )
-    assert not isinstance(failed.value, session_window.WindowRefused)
+    left = session_window._flatten_after_stop(
+        cast(TradingClient, trading), WindowConfig(symbol="AAA", log_dir=tmp_path), report
+    )
+    assert any(item.startswith("position in AAA not read:") for item in left), left
     assert any("position in AAA" in error for error in report.errors)
+
+
+class ListsNoCount(Venue):
+    """The venue, its one position listed with a qty_available custody does not accept for a long."""
+
+    def get_all_positions(self) -> list[Position]:
+        return [p.model_copy(update={"qty_available": "-1"}) for p in super().get_all_positions()]
+
+
+def test_a_fill_then_an_unreadable_listing_is_never_reported_flat_while_held(fake_time) -> None:
+    """The landing review's P1 (2026-11-13): the check updated its orders and requests, then raised on
+    the position, so `held` kept the reading before the fill and the final path reported the account
+    flat while 10 were held. A failed position read never turns a held long into flat, on any path (the
+    lead, 2026-11-13 21:27)."""
+    venue = ListsNoCount(fake_time)
+    venue.order("entry-1", "buy", qty=10, fills=3.0, cancel_after=60.0)
+    left, report = check(venue, {"entry-1": "buy"})
+    assert venue.qty == 10
+    assert any("position in SPY" in error for error in report.errors)
+    assert any(item.startswith("position in SPY not read:") for item in left), left
+    assert not venue.did("close"), "no close is sent on a count that cannot be read"
+
+
+def test_what_was_last_known_held_stays_held_when_a_later_read_fails(fake_time, tmp_path) -> None:
+    """What the check last read held in a symbol stays held there until a reading says otherwise: a
+    later reading that cannot read it keeps that count and names the position."""
+    trading = Listing(listed_position("AAA", "7", "long"))
+    report = session_window.WindowReport("regular", "AAA", started="t")
+    account = session_window._AccountCheck(cast(TradingClient, trading), "AAA", report, {})
+    assert account.read() == ["position of 7 AAA"]
+    trading.listed = [listed_position("AAA", "7", "long", "-1")]
+    left = account.read()
+    assert account.held == {"AAA": Decimal(7)}
+    assert left[0] == "position of 7 AAA"
+    assert left[1].startswith("position in AAA not read:"), left
 
 
 class MultiWindowAccount(Account):
