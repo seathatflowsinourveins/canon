@@ -96,6 +96,7 @@ from alpaca.trading.requests import GetCalendarRequest
 from alpaca.trading.requests import GetOrdersRequest
 from canon_alpaca.providers import DATA_ONLY_ENV
 from canon_alpaca.providers import MethodRefused
+from canon_alpaca.providers import data_only
 from canon_alpaca.providers import require_get_only
 
 from . import custody
@@ -564,7 +565,12 @@ def _guard(client: Any, *, paper: bool) -> None:
     # The transport-free assess/run_pass test seam can use in-memory stand-ins.
     # Every real SDK client, injected or built here, must carry the adapter guard.
     if isinstance(client, RESTClient):
-        os.environ[DATA_ONLY_ENV] = "1"
+        # The switch is the entry point's alone (monitor_task); a pass never sets it, so a
+        # process that is not data-only is refused here rather than turned data-only unasked.
+        if not data_only():
+            raise ReadFailed(
+                f"GET-only monitor requires data-only mode ({DATA_ONLY_ENV}=1); no reads started"
+            )
         if paper and (client._base_url != BaseURL.TRADING_PAPER or not client._sandbox):
             raise ReadFailed("GET-only monitor requires paper=True and no URL override")
         try:

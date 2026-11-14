@@ -127,8 +127,17 @@ class Paper:
 
 @pytest.fixture
 def em(tmp_path, monkeypatch):
+    from canon_alpaca import providers
+
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
     monkeypatch.setenv("NETRC", str(tmp_path / "no-netrc"))
+    # No test leaves the data-only switch set: setting it here records its prior state, which
+    # teardown restores whatever a case or the module did to it after.
+    monkeypatch.setenv(providers.DATA_ONLY_ENV, "")
+    monkeypatch.delenv(providers.DATA_ONLY_ENV)
+    # The process's request counter is shared with every window's record (a stand-in 429 here
+    # must not read as Alpaca's answer there); each case counts into its own, as other tests do.
+    monkeypatch.setattr(providers, "REQUESTS", providers.RequestCounter())
     return importlib.import_module("canon_trading.exit_monitor")
 
 
@@ -1239,3 +1248,53 @@ def test_a_torn_record_line_does_not_stop_later_passes(em, tmp_path):
     assert last["at"] == result["at"]
     assert last["totals"]["passes"] == 2
     assert len(alerts(tmp_path)) == 1
+
+
+# The data-only switch never leaks (the lead's order, 2026-11-13 20:34): it is set only at the monitor's
+# own entry point, never at import and never by a pass; no test leaves it set.
+
+
+def test_importing_the_monitor_leaves_the_environment_as_it_was(tmp_path):
+    import os
+    import subprocess
+    import sys
+
+    from canon_alpaca.providers import DATA_ONLY_ENV
+
+    env = {k: v for k, v in os.environ.items() if k != DATA_ONLY_ENV}
+    probe = (
+        "import os, json; before = dict(os.environ); import canon_trading.exit_monitor; "
+        "print(json.dumps(dict(os.environ) == before))"
+    )
+    out = subprocess.run(
+        [sys.executable, "-c", probe],
+        check=False,
+        env=env,
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+    )
+    assert out.returncode == 0, out.stderr[-2000:]
+    assert out.stdout.strip() == "true"
+
+
+def test_a_pass_never_turns_the_process_data_only(em, tmp_path, monkeypatch):
+    """A guarded client handed to a pass in a process that is not data-only is refused by name, and the
+    pass leaves the switch unset: only the entry point turns a process data-only."""
+    import os
+
+    from alpaca.trading.client import TradingClient
+    from canon_alpaca.providers import DATA_ONLY_ENV
+    from canon_alpaca.providers import with_http_timeout
+
+    monkeypatch.delenv(DATA_ONLY_ENV, raising=False)
+    client = with_http_timeout(TradingClient("made-up-key", "made-up-secret", paper=True))
+
+    def never(*args, **kwargs):
+        pytest.fail("a client reached transport outside data-only mode")
+
+    monkeypatch.setattr(client._session, "request", never)
+    result = run(em, tmp_path, client)
+    assert DATA_ONLY_ENV not in os.environ
+    assert not result["ok"]
+    assert "data-only" in result["summary"]
