@@ -232,6 +232,46 @@ limit would be nonpositive (F15 and its review).
 An omitted account label disables persistence by name; no guessed account shares a book key.
 There is no runner here to start nodes back to back or supply their history and session bounds.
 
+At breach_count above one, sale_table.json alone decides the sale's transitions and actions;
+the driver stores its destination before submit/cancel echoes (strategy/mod.rs:2419, 836-862).
+Named limit: the pin does not dispatch order events to a strategy that is not running
+(crates/trading/src/strategy/mod.rs:1395-1399). A leg in flight at a whole-node stop is left working,
+with an `ALERT:` line naming its instrument, side, quantity and limit, with no order ID; the next start
+counts it as cover and does not chase with it, so while the market is under its limit the holding
+has NO EFFECTIVE EXIT until that leg expires at the session part's end. The stop's owed cancel is
+asked only where the instrument is stopped and the strategy runs on.
+Named limit: a predecessor's working sell, including our lineage, is cover; its remainder is
+subtracted from the long, never canceled or re-priced here, and a wholly covered long accrues no count.
+Named limit: until the adapter's ran-out-path repair is on main, a next leg can be sized from a
+count short by the fills lost there.
+Named limit: a configured confirm span is refused at a count above one.
+At a count above one confirm_gap_ms is required, including an explicit zero. Its value has
+no measured source (UNCALIBRATED); 1000 ms is the node configuration's starting value.
+U-c2 ruling 15/16: a venue refusal waits for a counted quote after its backoff wait; an unanswered
+leg is told once after FLIGHT_SECS and never duplicated. Refusal data lives on the holding,
+not the sale or level book. Native statuses follow model/src/orders/mod.rs:207-302.
+Named limits at a count above one: added shares wait for the next leg; while the chase floor
+holds, one ALERT names the uncovered quantity beside the working remainder. An acknowledgement
+waits for the next quote or timer step, up to STEP_NS, before its next leg is sent; the send line
+records ack_to_send_ms. An event on an ended holding's leg judges the following holding's row:
+its late fill resets the count and its voided fill freezes the new holding. After a fill void
+that did not reopen its order, remaining quantity cannot be read back by _remaining; the holding
+is already frozen and a subsequent fill is read as its last. The adapter builds no voided fill.
+Order handlers only enqueue event payloads. Steps replay them on independent native LimitOrders,
+in arrival order (python/orders/limit.rs:463-466, 470-572), so a later cached state cannot supply
+an earlier event's facts. Local echoes produced by a step wait for the following step too.
+Every wait after a refusal or an outside cancel is counted from the later of the event's own
+stamp and its receipt here, and a send line's refusal_to_send_ms from the same moment. Named
+limit: a stamp ahead of the node's clock lengthens the wait by the difference, with no cap.
+Named limits of the status at a count above one (_holding_state), each held by an
+expected-failure case that names its follow-up: a frozen reason outside the fault and cover rows
+is dropped, so a holding that waits because its distance is refused reads "no level planned
+yet"; under the owner's hold a recorded fault is not named and the line says that removing the
+hold re-arms the holding, though the release freezes it again. A holding that never had a usable
+quote reads `counting` (the cold start's follow-up). Named limit, held the same way: a refused
+cancel at a holding's end is asked again at every step with no pace; a held symbol's refused
+cancel is asked again only at its holding's end.
+
 Review F1 of #443's max review (the lead's ruling, 2026-11-13 22:47 and 22:52): a holding first bought
 after the start, in a symbol the node did not load, is named at once and has its exit within a bound.
 The node loads the account's symbols once, at its start (protector_node.run_protector), and the
@@ -276,6 +316,7 @@ from datetime import UTC
 from datetime import datetime
 from datetime import timedelta
 from decimal import ROUND_FLOOR
+from decimal import ROUND_HALF_EVEN
 from decimal import Decimal
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -291,6 +332,7 @@ from nautilus_trader.model import BarType
 from nautilus_trader.model import ClientOrderId
 from nautilus_trader.model import ContingencyType
 from nautilus_trader.model import InstrumentId
+from nautilus_trader.model import LimitOrder
 from nautilus_trader.model import OmsType
 from nautilus_trader.model import OrderReleased
 from nautilus_trader.model import OrderSide
@@ -306,6 +348,7 @@ from nautilus_trader.trading import Strategy
 
 from . import gain_lock
 from . import protect
+from . import sale_table
 from . import session_window
 from . import symbol_hold
 from .custody import OURS
@@ -354,6 +397,33 @@ REFUSED_KEPT = 64
 WAITING = "unprotected: waiting"
 STEP_NS = 1_000_000_000  # The step timer's interval (on_start), the floor between step writes.
 OVERNIGHT_RETRY_NS = 60 * STEP_NS  # Review F7: an unread eligibility is read again after a minute.
+# A refused sale is sent again at a growing wait: the chase interval, doubled for each refusal in a
+# row, held at this cap, and started again only by a fill of the open leg: 5, 10, 20, 40, then
+# 60 s. The form is NautilusTrader's ExponentialBackoff (nt@d53849b216e2
+# crates/network/src/backoff.rs:95-208: an initial delay, a factor, a maximum, a reset), which is
+# Rust and not reachable from a strategy, so this is glue in its form; no jitter, one client per
+# account. UNCALIBRATED: the cap is the bound of about sixty refused orders an hour (U-c2 ruling
+# 15), which this pace keeps: about 63 in an hour of standing refusal.
+REFUSAL_RETRY_MOST_SECS = 60
+# After a cancel of our leg that we did not ask, no leg of that holding leaves for this long. It is
+# its own constant: that minute is the owner's hand, not a refusal by the venue. UNCALIBRATED.
+OUTSIDE_CANCEL_WAIT_SECS = 60
+# Replaced by the per-symbol control unit when that control exists.
+HOLD_ONE_SYMBOL = "hold this symbol: stop the node"
+SALE_FAULT_ROWS = frozenset({"FZ", "FZW", "FZP"})
+# Rows in which the owner's hold asks nothing more of the table: stopped already, ended, or
+# frozen by a fault of ours with nothing open (which sends nothing and must stay frozen).
+HOLD_SETTLED_ROWS = frozenset({"FZ", "X", "T0", "TW", "PCT"})
+SALE_STOPPED_ROWS = frozenset({"T0", "TW", "PCT"})
+SALE_NOTHING_OPEN_ROWS = frozenset({"G", "GC", "RW", "FZ", "FC", "T0", "X"})
+SALE_COVER_ROWS = frozenset({"FC", "FCW", "FCP"})
+SALE_CANCEL_ROWS = frozenset({"PCR", "PCO", "PCX", "FZP", "FCP", "PCT"})
+# What answers a cancel of ours: its acknowledgement, its refusal, or the leg's own end.
+SALE_CANCEL_ANSWERS = frozenset({"oCXL", "oCRJ", "oEXP", "oFF", "oREJ", "oDEN"})
+# UNCALIBRATED (U-c2 ruling 16). paper_node.exec_engine_config deliberately retains
+# unresolved submits: Alpaca's timeout instruction there says never resend one.
+# The venue may hold it; a second sell beside it could sell more than is held.
+FLIGHT_SECS = 60
 ROSTER_POLL_SECS = 30
 """Review F1: how often the account's positions are read for a holding outside the roster. With a read
 that answers in its bound, a new holding is named and the run's end asked for within this and one step
@@ -374,6 +444,9 @@ SUMMABLE_TYPES = frozenset(
         OrderType.TRAILING_STOP_LIMIT,
     }
 )
+
+
+_GAP_OMITTED = object()
 
 
 class OwnerProtectorConfig(StrategyConfig):
@@ -401,6 +474,8 @@ class OwnerProtectorConfig(StrategyConfig):
         run: str = "",
         session_part: str = "regular",
         trading: Any = None,
+        breach_count: int = 1,
+        confirm_gap_ms: Any = _GAP_OMITTED,
         roster: Sequence[InstrumentId] | None = None,
         **_kwargs: Any,
     ) -> None:
@@ -417,11 +492,26 @@ class OwnerProtectorConfig(StrategyConfig):
         self.run = run
         self.session_part = session_part
         self.trading = trading
+        self.breach_count = breach_count
+        self._gap_given = confirm_gap_ms is not _GAP_OMITTED
+        self.confirm_gap_ms = confirm_gap_ms if self._gap_given else None
         # Review F1: the instruments the node loaded at its start; None reads no account.
         self.roster = None if roster is None else tuple(roster)
         self.validate_protection()
 
     def validate_protection(self) -> None:
+        if type(self.breach_count) is not int or self.breach_count < 1:
+            raise ValueError("breach_count must be a whole number of at least one")
+        if self._gap_given and (type(self.confirm_gap_ms) is not int or self.confirm_gap_ms < 0):
+            raise ValueError("confirm_gap_ms must be a nonnegative whole number")
+        if self.breach_count == 1 and self._gap_given:
+            raise ValueError("confirm_gap_ms is refused at breach_count one")
+        if self.breach_count > 1 and not self._gap_given:
+            raise ValueError("confirm_gap_ms is required at breach_count above one")
+        if self.breach_count > 2 and (
+            self.level_book_path is not None or self.account_label is not None
+        ):
+            raise ValueError("breach_count above two cannot be represented by the level book")
         if self.account_label is not None and (
             not isinstance(self.account_label, str) or not self.account_label.strip()
         ):
@@ -504,6 +594,14 @@ def _quantity(value: Any) -> Decimal | None:
     except ValueError, ArithmeticError:
         return None
     return result if result.is_finite() else None
+
+
+def refusal_wait_secs(refusals: int) -> int:
+    """The wait before a sale refused `refusals` times in a row is sent again: the chase interval,
+    doubled for each refusal after the first, held at `REFUSAL_RETRY_MOST_SECS`; never under a
+    second, so a chase interval of zero cannot make it zero."""
+    first = max(1, protect.PLANNER.chase_secs)
+    return min(REFUSAL_RETRY_MOST_SECS, first * 2 ** max(0, min(refusals, 16) - 1))
 
 
 def _remaining(order: Any) -> Decimal | None:
@@ -624,6 +722,10 @@ class Sale:
     floor_release_price: Decimal | None = None
     filled_ns: int | None = None
     order_ids: set[ClientOrderId] = field(default_factory=set)
+    end_recorded: bool = False
+    resends: int = 0
+    cancel_ns: int | None = None
+    growth_told: bool = False
 
     def record(self, now: int) -> dict[str, Any]:
         return {
@@ -651,6 +753,7 @@ class Holding:
     # The venue stamp of the last quote counted (V3).
     last_observation: int | None = None
     distance: protect.Distance | None = None
+    plan_chase_cap: Decimal | None = None
     limit_offset: Decimal | None = None
     offset_breach_named: bool = False
     # F15's review, 1 (and land-f15's two): the first new sane observation at or below the level
@@ -698,9 +801,38 @@ class Holding:
     # newer maximum held when it returned. A read requested before the holding opened sets neither.
     seed_requested_at: int | None = None
     current_from: int | None = None
+    sale_state: sale_table.State | None = None
+    counted_quote: QuoteTick | None = None
+    usable_quote: QuoteTick | None = None
+    opening_quantity: Decimal = Decimal(0)
+    # Observed quantities identify changes, net of all our fills; never cached predicates.
+    observed_quantities: tuple[Decimal, Decimal] | None = None
+    # Run-local holding data: recounting and a new first leg do not reset a refusal.
+    refusal_told: bool = False
+    refusal_last_ns: int | None = None
+    external_cancel_ns: int | None = None
+    level_instrument_unread: bool = False
+    refusal_reason: str | None = None
+    refusal_first: str | None = None
+    refusals: int = 0
+    # Refusals in a row for the PACE alone: started again only by a fill or by a leg that ends
+    # without a refusal. An acceptance alone does not: a venue that accepts and then rejects every
+    # leg would otherwise hold the wait at its first step.
+    refusal_streak: int = 0
+    flight_sent_ns: int | None = None
+    flight_told: bool = False
+    flight_answered: bool = False
+    flight_command: str = "submit"
+    flight_answer_ns: int | None = None
     # Set when the owner's word held this holding after its sell was placed: its release re-places
     # the sell at the next step while the bid is above the level, with no new observation.
     rearm_at_step: bool = False
+    # The owner's hold at a count above one (`_hold_counted`): applied to this holding, and its
+    # waiting release already said.
+    hold_applied: bool = False
+    hold_release_said: bool = False
+    # The table's `faulted`: a fault of ours was recorded for this holding in this run.
+    sale_faulted: bool = False
 
 
 STREAM_LOGGER = "alpaca.data.live.websocket"
@@ -850,11 +982,34 @@ class OwnerProtector(Strategy):
         self.fallbacks: dict[InstrumentId, int] = {}
         self.flat_fallbacks: dict[InstrumentId, int] = {}
         self.quote_refusals: dict[InstrumentId, str] = {}
+        self.stopped_sales: dict[InstrumentId, Holding] = {}
+        self.readoption_named: set[InstrumentId] = set()
+        self._sale_reading: set[InstrumentId] = set()
+        self._sale_events: dict[InstrumentId, list[Any]] = {}
+        self._sale_orders: dict[ClientOrderId, Any] = {}
         # Review F1: the step that last read the account for the roster, the run's end by name once
         # asked for, and the holdings outside the roster already named, by symbol and kind.
         self.roster_read_ns: int | None = None
         self.ended_for: str | None = None
         self.roster_named: set[tuple[str, str]] = set()
+
+    @property
+    def cache(self) -> Any:
+        # py_submit_order holds &mut self while publishing Initialized. py_cache returns
+        # an independent shared handle (python/strategy.rs:1750-1753, 2018-2036;
+        # common/src/python/cache.rs:80-86, 733-740), never a snapshot of facts.
+        handle = getattr(self, "_counted_cache", None)
+        return super().cache if handle is None else handle
+
+    @property
+    def strategy_id(self) -> StrategyId:
+        identity = getattr(self, "_counted_identity", None)
+        return super().strategy_id if identity is None else identity
+
+    @property
+    def log(self) -> Any:
+        logger = getattr(self, "_counted_logger", None)
+        return super().log if logger is None else logger
 
     def _note(self, tick: QuoteTick | None) -> bool:
         """Record every quote; return whether it raises an already established venue clock.
@@ -1091,6 +1246,17 @@ class OwnerProtector(Strategy):
             self.log.info(text)
 
     def _freeze(self, instrument_id: InstrumentId, reason: str) -> None:
+        if self.settings.breach_count > 1:
+            slot = self.slots.get(instrument_id) or self.stopped_sales.get(instrument_id)
+            if (
+                slot is None
+                or slot.sale_state is None
+                or slot.sale_state.row not in SALE_FAULT_ROWS
+            ):
+                self.frozen[instrument_id] = reason
+            if instrument_id not in self._sale_reading:
+                self._sale_step(instrument_id, ["FRZ"], reason=reason)
+            return
         if self.frozen.get(instrument_id) != reason:
             self._say(f"{instrument_id}: frozen: {reason}; no new sell")
         self.frozen[instrument_id] = reason
@@ -1211,6 +1377,13 @@ class OwnerProtector(Strategy):
         Repeating adoption never duplicates a sale or resets its observation guard. A later fresh
         quote confirms a startup breach; absent/duplicate/out-of-order observations do not.
         """
+        if self.settings.breach_count > 1 and instrument_id in self.stopped_sales:
+            if instrument_id not in self.readoption_named:
+                self.readoption_named.add(instrument_id)
+                self._say(
+                    f"{instrument_id}: previous sale still open; stopped instrument stays stopped until the next start"
+                )
+            return
         if (
             self.stopping
             or instrument_id in self.stopped_instruments
@@ -1707,6 +1880,8 @@ class OwnerProtector(Strategy):
     def on_order_cancel_rejected(self, event: OrderCancelRejected) -> None:
         """Stores only (`released_at`'s note): our own IDs are `sent_ids`; the line is said at the
         next quote or step."""
+        if self.settings.breach_count > 1:
+            return  # The pin calls on_order_event after the specific hook, exactly once.
         if event.client_order_id not in self.sent_ids:
             return
         self.cancel_requested.discard(event.client_order_id)
@@ -1720,6 +1895,8 @@ class OwnerProtector(Strategy):
         `_observe_sale`, stamped at this release: a trail already through the bid is released
         inside our own submit, where the engine cannot be read (`released_at`'s note). A sale the
         applied gain lock protected also keeps the spread at its release (measure 1)."""
+        if self.settings.breach_count > 1:
+            return
         slot = self.slots.get(event.instrument_id)
         if slot is None or event.client_order_id != slot.protect_id:
             return
@@ -1739,6 +1916,8 @@ class OwnerProtector(Strategy):
         (crates/execution/src/engine/mod.rs:3261, :3266), so `_manage` here withdraws a working
         leg for size in this event, not at the next quote or step (the lead, 2026-11-13 19:17).
         """
+        if self.settings.breach_count > 1:
+            return
         slot = self.slots.get(event.instrument_id)
         if slot is None or not (
             event.client_order_id == slot.protect_id
@@ -1781,6 +1960,15 @@ class OwnerProtector(Strategy):
         if self.stopping:
             return
         self._read_symbol_holds()  # The owner's word, read at every step before any holding.
+        if self.settings.breach_count > 1:
+            for instrument_id in list(self.stopped_sales):
+                try:
+                    self._sale_step(instrument_id, ["NQ"])
+                except Exception as exc:  # noqa: BLE001 - preserve the base's per-holding isolation.
+                    self._say(
+                        f"{instrument_id}: unprotected: stopped sale step failed: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
         lost = len(self.stream_errors.lines)
         if lost > self.stream_errors_said:
             # Said once per new stream error, for each holding: its quotes may be among those lost.
@@ -1965,6 +2153,8 @@ class OwnerProtector(Strategy):
             self._hold_begins(instrument_id)
         for instrument_id in sorted(self.held - now, key=str):
             self.held.discard(instrument_id)
+            if self.settings.breach_count > 1:
+                continue  # Said where the release is applied, with what it finds (_hold_counted).
             slot = self.slots.get(instrument_id)
             level = None if slot is None else slot.level
             self._say(
@@ -2431,10 +2621,16 @@ class OwnerProtector(Strategy):
                     )
             slot.level = level
             slot.distance, slot.limit_offset = plan, limit
+            slot.plan_chase_cap = plan.plan.chase_cap
             slot.cold, slot.cold_seen = cold, latest_bar_ns
             self._say(
                 f"{instrument_id}: {'replanned' if replanning else 'armed'} distance {distance}; {source}; "
                 f"quote age {age.total_seconds():.0f} s"
+                + (
+                    f"; confirm_gap_ms={self.settings.confirm_gap_ms}"
+                    if self.settings.breach_count > 1
+                    else ""
+                )
             )
             self._name_history_failure(instrument_id, slot)
         except ValueError as exc:
@@ -2442,9 +2638,845 @@ class OwnerProtector(Strategy):
             return False
         return True
 
+    def _hold_counted(
+        self, instrument_id: InstrumentId, slot: Holding, quote: QuoteTick | None
+    ) -> bool:
+        """The owner's word for this symbol at a count above one; True where it governs this call.
+
+        Both halves act through the table. A hold is its stop of the instrument (ST): a count is
+        dropped, a working sell of ours is asked to cancel, a leg in flight is told, and nothing
+        is counted or sent while the hold stands; quotes are not judged, so the level stays where
+        it was. Stored order events are judged on quote calls too, so an owed cancel is not left
+        to the next timer step. The release is the table's RL, emitted in every call while a
+        holding the hold stopped is no longer held: with nothing of ours open the count begins
+        again at zero at the kept level, a recorded fault of ours stays a freeze, and a refusal's
+        wait still guards the first leg. A row frozen with nothing open is left as it is.
+        """
+        assert slot.sale_state is not None
+        row = slot.sale_state.row
+        if instrument_id in self.held:
+            slot.hold_applied, slot.hold_release_said = True, False
+            if row not in HOLD_SETTLED_ROWS:
+                self._sale_step(instrument_id, ["ST"])
+            else:
+                self._sale_step(instrument_id, ["NQ"] if quote is None else [])
+            return True
+        if not slot.hold_applied:
+            return False
+        if row not in SALE_STOPPED_ROWS:
+            slot.hold_applied = False  # ended, or frozen with nothing open: the hold asked nothing
+            return False
+        self._sale_step(instrument_id, ["RL"] if quote is not None else ["RL", "NQ"])
+        row = slot.sale_state.row
+        if row in SALE_STOPPED_ROWS:
+            if not slot.hold_release_said:
+                slot.hold_release_said = True
+                self._say(
+                    f"{instrument_id}: hold removed: our sell of it is still open (sale row {row}); "
+                    "the count starts again once it has ended"
+                )
+            return True
+        slot.hold_applied = False
+        if row in {"G", "GC"}:
+            slot.counted_quote = slot.usable_quote = None
+            self._say(
+                f"{instrument_id}: hold removed: the count starts again at zero at its level "
+                f"{slot.level}, never lowered; a sale needs {self.settings.breach_count} counted "
+                f"quotes under it; confirm_gap_ms={self.settings.confirm_gap_ms}"
+            )
+        return True
+
+    def _manage_counted(
+        self, instrument_id: InstrumentId, quote: QuoteTick | None, *, advanced: bool
+    ) -> None:
+        """Plan as before; only a counted stream quote can enter the sale's quote handler."""
+        slot = self.slots[instrument_id]
+        if slot.sale_state == sale_table.State("X"):
+            positions = self.cache.positions_open(instrument_id=instrument_id, strategy_id=EXTERNAL)
+            if (
+                len(positions) == 1
+                and positions[0].signed_qty > 0
+                and (positions[0].ts_opened, positions[0].ts_init)
+                != (slot.opened_at, slot.initialized_at)
+            ):
+                self._reset_holding(instrument_id)
+                slot = self._new_holding(instrument_id, positions[0])
+                self.slots[instrument_id] = slot
+                self._request_seed(instrument_id)
+        if slot.sale_state is None:
+            slot.sale_state = sale_table.State("G", 0)
+            self._say(
+                f"{instrument_id}: sale count starts again at zero; "
+                f"confirm_gap_ms={self.settings.confirm_gap_ms}"
+            )
+        tick = self.venue_quotes.get(instrument_id)
+        was_unplanned = slot.level is None
+        if slot.distance is None:
+            if tick is None:
+                self._record_unprotected(
+                    instrument_id, slot.seed_error or "no two-sided quote to plan protection"
+                )
+            else:
+                self._plan_holding(instrument_id, slot, tick)
+        if self._hold_counted(instrument_id, slot, quote):
+            return
+        events = []
+        if quote is None:
+            events.append("NQ")
+        elif slot.level is not None and slot.distance is not None:
+            code = self._sale_quote(instrument_id, slot, quote, advanced and not was_unplanned)
+            if code is not None:
+                events.append(code)
+        self._sale_step(instrument_id, events)
+
+    def _sale_quote(
+        self, instrument_id: InstrumentId, slot: Holding, quote: QuoteTick, advanced: bool
+    ) -> str | None:
+        """One quote judge: the base venue clock, arming, shape, gap and pin's trail rounding."""
+        assert slot.level is not None and slot.distance is not None
+        bid, ask = quote.bid_price.as_decimal(), quote.ask_price.as_decimal()
+        reason = None
+        if (
+            bid <= 0
+            or ask < bid
+            or min(quote.bid_size.as_decimal(), quote.ask_size.as_decimal()) <= 0
+        ):
+            reason = "one-sided, crossed or zero bid quote not counted"
+        elif not advanced or not _sane(quote):
+            reason = "quote refused by the venue clock; not counted"
+        if reason is not None:
+            self._say(f"{instrument_id}: {reason}")
+            return None
+        # Pricing uses every usable stream maximum, independently of arming and count gap.
+        slot.usable_quote = quote
+        if slot.armed_at is None or quote.ts_init <= slot.armed_at:
+            reason = "quote before the arming; not counted"
+        elif slot.armed_event is not None and quote.ts_event < slot.armed_event:
+            reason = "quote before the arming's venue stamp; not counted"
+        elif (
+            bid <= slot.level.as_decimal()
+            and slot.last_observation is not None
+            and quote.ts_event - slot.last_observation
+            < (self.settings.confirm_gap_ms or 0) * 1_000_000
+        ):
+            reason = "gap not reached; quote not counted"
+        if reason is not None:
+            self._say(f"{instrument_id}: {reason}")
+            return None
+        slot.counted_quote = quote
+        slot.last_observation = quote.ts_event
+        above = bid > slot.level.as_decimal()
+        order = None if slot.protect_id is None else self.cache.order(slot.protect_id)
+        if above and (order is None or order.is_closed):
+            instrument = self.cache.instrument(instrument_id)
+            if instrument is None:
+                slot.level_instrument_unread = True
+                self._freeze(instrument_id, "instrument is absent from cache")
+                return None
+            # trailing.rs:182-220: precision first, then a coarser increment, nearest even.
+            increment = instrument.price_increment
+            candidate = bid - slot.distance.distance
+            level = Price.from_decimal_dp(candidate, increment.precision)
+            if level.raw % increment.raw:
+                candidate = (candidate / increment.as_decimal()).to_integral_value(
+                    rounding=ROUND_HALF_EVEN
+                ) * increment.as_decimal()
+                level = Price.from_decimal_dp(candidate, increment.precision)
+            if level.as_decimal() > slot.level.as_decimal():
+                slot.level = level
+            position = self._external_long(instrument_id)
+            if position is not None:
+                self._gain_lock(instrument_id, slot, position, quote, advanced=True)
+        return "QA" if above else "QU"
+
+    def _sale_snapshot(self, instrument_id: InstrumentId, slot: Holding) -> tuple[Any, ...]:
+        """Read coverage through the unchanged base function; suppress recursive freeze delivery."""
+        positions = self.cache.positions_open(instrument_id=instrument_id, strategy_id=EXTERNAL)
+        position = positions[0] if len(positions) == 1 else None
+        held = max(Decimal(0), position.signed_qty) if position is not None else Decimal(0)
+        order = None if slot.protect_id is None else self.cache.order(slot.protect_id)
+        position_readable = True
+        self._sale_reading.add(instrument_id)
+        try:
+            uncovered = (
+                self._uncovered(instrument_id, held, slot.protect_id) if held > 0 else Decimal(0)
+            )
+            if any(
+                p.strategy_id != EXTERNAL
+                for p in self.cache.positions_open(instrument_id=instrument_id)
+            ):
+                self._freeze(instrument_id, "open position belongs to another strategy")
+                uncovered = None
+                position_readable = False
+            if len(positions) > 1 or (position is not None and position.signed_qty < 0):
+                self._freeze(instrument_id, "requires exactly one EXTERNAL long")
+                uncovered = None
+                position_readable = False
+            if slot.protect_id is not None and order is None:
+                self._freeze(instrument_id, "our sent sell is absent from cache")
+                uncovered = None
+            if slot.level_instrument_unread:
+                if self.cache.instrument(instrument_id) is None:
+                    self._freeze(instrument_id, "instrument is absent from cache")
+                    uncovered = None
+                else:
+                    slot.level_instrument_unread = False
+        finally:
+            self._sale_reading.discard(instrument_id)
+        return position, held, uncovered, order, position_readable
+
+    def _sale_sold(self, instrument_id: InstrumentId, ids: set[ClientOrderId]) -> Decimal:
+        """All legs, ended as well as working; filled_qty includes the pin's void corrections."""
+        return sum(
+            (
+                order.filled_qty.as_decimal()
+                for order in self.cache.orders(instrument_id=instrument_id)
+                if order.client_order_id in ids
+            ),
+            Decimal(0),
+        )
+
+    def _sale_reprice_due(
+        self, instrument_id: InstrumentId, slot: Holding, order: Any, uncovered: Decimal | None
+    ) -> bool:
+        """The base chase arithmetic as a question, asked only for a counted QU."""
+        sale, quote = slot.sale, slot.counted_quote
+        if (
+            sale is None
+            or quote is None
+            or order is None
+            or order.status not in (OrderStatus.ACCEPTED, OrderStatus.PARTIALLY_FILLED)
+        ):
+            return False
+        now = self.clock.timestamp_ns()
+        bid = quote.bid_price.as_decimal()
+        through = exit_price(bid, protect.PLANNER.exit_ticks, None)
+        if (
+            sale.floor is not None
+            and order.price.as_decimal() == sale.floor
+            and through < sale.floor
+        ):
+            sale.floor_reached = True
+            if sale.floor_since is None:
+                sale.floor_since = now
+            remaining = _remaining(order)
+            if (
+                not sale.growth_told
+                and uncovered is not None
+                and remaining is not None
+                and uncovered > remaining
+            ):
+                self._sale_alert(
+                    instrument_id,
+                    f"floor wait: uncovered {uncovered}, working remainder {remaining}; "
+                    "the rest is sold with the next leg",
+                )
+                sale.growth_told = True
+            if now - sale.floor_since >= FLOOR_WAIT_SECS * SECOND_NS:
+                sale.floor_wait_ns += now - sale.floor_since
+                sale.floor_since, sale.floor, sale.floor_release_price = None, None, through
+                self._log_sale(instrument_id, sale)
+        elif sale.floor_since is not None:
+            sale.floor_wait_ns += now - sale.floor_since
+            sale.floor_since = None
+            self._log_sale(instrument_id, sale)
+        return (
+            now - sale.priced_ns >= protect.PLANNER.chase_secs * SECOND_NS
+            and (
+                sale.cancel_ns is None
+                or now - sale.cancel_ns >= protect.PLANNER.chase_secs * SECOND_NS
+            )
+            and exit_price(bid, protect.PLANNER.exit_ticks, sale.floor) < order.price.as_decimal()
+        )
+
+    def _sale_facts(
+        self,
+        instrument_id: InstrumentId,
+        slot: Holding,
+        code: str,
+        snapshot: tuple[Any, ...],
+        *,
+        judged: bool = False,
+        event_held: Decimal | None = None,
+    ) -> tuple[dict[str, bool], Any]:
+        assert slot.sale_state is not None
+        _, held, uncovered, _, _ = snapshot
+        # Actions can replace the leg inside this callback. Coverage is read once;
+        # the current leg is always read after the preceding action.
+        order = (
+            self._sale_orders.get(slot.protect_id)
+            if judged
+            else None
+            if slot.protect_id is None
+            else self.cache.order(slot.protect_id)
+        )
+        quantity = uncovered or Decimal(0)
+        event_uncovered = uncovered
+        if event_held is not None and uncovered is not None:
+            # A later queued fill must not turn an earlier cancellation/expiry into
+            # whole cover. Candidate sizes still use the actual uncovered quantity.
+            event_uncovered = max(Decimal(0), uncovered + event_held - held)
+        candidate = None
+        cell = sale_table.TABLE.cells[slot.sale_state.row, code]
+        if quantity > 0 and any(sale_table.Action.SEND in b.actions for b in cell.branches):
+            quote = slot.usable_quote
+            instrument = self.cache.instrument(instrument_id)
+            if slot.level is not None and instrument is not None:
+                first = slot.sale_state.row == "G"
+                floor = (
+                    (
+                        None
+                        if slot.gain_applied_floor is None
+                        else slot.gain_applied_floor.as_decimal()
+                    )
+                    if first
+                    else (None if slot.sale is None else slot.sale.floor)
+                )
+                price = sale_table.leg_limit(
+                    None
+                    if quote is None
+                    else exit_price(quote.bid_price.as_decimal(), protect.PLANNER.exit_ticks, None),
+                    level=slot.level.as_decimal(),
+                    previous=None if first or slot.sale is None else slot.sale.last_price,
+                    floor=floor,
+                )
+                try:
+                    size = instrument.make_qty(quantity)
+                    limit = None if price is None else instrument.make_price(price)
+                except ValueError, OverflowError:
+                    size = limit = None  # The table's formable predicate is false.
+                if (
+                    price is not None
+                    and price > 0
+                    and size is not None
+                    and limit is not None
+                    and size.as_decimal() == quantity
+                    and limit.as_decimal() == price
+                ):
+                    candidate = (size, limit)
+        return {
+            "whole_cover": event_uncovered == 0,
+            "faulted": slot.sale_faulted,
+            "filled_part": order is not None and order.filled_qty.as_decimal() > 0,
+            "long_remains": (held if event_held is None else event_held) > 0 and not slot.ended,
+            "leg_positive": quantity > 0,
+            "cancelable": order is not None
+            and order.status in (OrderStatus.ACCEPTED, OrderStatus.PARTIALLY_FILLED),
+            "formable": candidate is not None,
+            "reprice_due": self._sale_reprice_due(instrument_id, slot, order, uncovered)
+            if code == "QU" and slot.sale_state.row in {"WK", "PF"}
+            else False,
+            "ends_filled": order is not None and order.status == OrderStatus.FILLED,
+            "refusal_told": slot.refusal_told,
+            "resend_due": code == "QU"
+            and all(
+                at is None or self.clock.timestamp_ns() - at >= wait * SECOND_NS
+                for at, wait in (
+                    (slot.refusal_last_ns, refusal_wait_secs(slot.refusal_streak)),
+                    (slot.external_cancel_ns, OUTSIDE_CANCEL_WAIT_SECS),
+                )
+            ),
+            "flight_alert_due": code in {"QU", "QA", "NQ"}
+            and slot.sale_state.row in SALE_CANCEL_ROWS | {"FL"}
+            and not slot.flight_told
+            and not slot.flight_answered
+            and slot.flight_sent_ns is not None
+            and self.clock.timestamp_ns() - slot.flight_sent_ns >= FLIGHT_SECS * SECOND_NS,
+        }, candidate
+
+    def _sale_step(
+        self,
+        instrument_id: InstrumentId,
+        events: list[str],
+        *,
+        reason: str = "",
+        order_event_ns: int | None = None,
+    ) -> None:
+        """Take one event batch, invalidate first, replay arrivals, cut, then judge the quote."""
+        slot = self.slots.get(instrument_id) or self.stopped_sales.get(instrument_id)
+        if slot is None:
+            return
+        if slot.sale_state is None:
+            slot.sale_state = sale_table.State("G", 0)
+        # Detach before doing any work. Submit/cancel echoes append to the next batch.
+        queued = self._sale_events.pop(instrument_id, [])
+        taken: set[int] = set()
+        try:
+            self._sale_batch(
+                instrument_id,
+                slot,
+                list(events),
+                queued,
+                taken,
+                reason=reason,
+                order_event_ns=order_event_ns,
+            )
+        finally:
+            # Whatever was raised, by the table or by anything else, the stored events not yet
+            # judged go back, in their order and ahead of this step's echoes, for the next step.
+            # A lost acknowledgement or fill would leave the holding with no leg and a false line.
+            # The event during whose judging something was raised is not judged again.
+            left = [item for item in queued if id(item) not in taken]
+            if left:
+                self._sale_events[instrument_id] = left + self._sale_events.get(instrument_id, [])
+
+    def _sale_batch(
+        self,
+        instrument_id: InstrumentId,
+        slot: Holding,
+        events: list[str],
+        queued: list[Any],
+        taken: set[int],
+        *,
+        reason: str,
+        order_event_ns: int | None,
+    ) -> None:
+        """One step's work on a detached batch; `taken` names each stored event once it is judged."""
+        assert slot.sale_state is not None
+        snapshot = self._sale_snapshot(instrument_id, slot)
+        position, held, uncovered, order, position_readable = snapshot
+        net = held + self._sale_sold(instrument_id, self.sent_ids)
+        previous = slot.observed_quantities
+        foreign = (
+            held - uncovered if uncovered is not None else (previous[1] if previous else Decimal(0))
+        )
+        # Store observations before actions: their nested callbacks see this same cache snapshot.
+        # An unread position is FRZ, not evidence that the holding shrank or ended.
+        # Keep the last answer until the position can actually be read again.
+        if position_readable:
+            slot.observed_quantities = net, foreign
+        if previous is not None and position_readable:
+            if net < previous[0]:
+                events.append("HE" if held == 0 else "HS")
+            elif net > previous[0]:
+                events.append("HG")
+            if foreign != previous[1]:
+                events.append("CP" if foreign > previous[1] else "CL")
+        elif uncovered == 0 and held > 0:
+            events.append("CP")
+        if (
+            position_readable
+            and position is not None
+            and "HE" not in events
+            and (position.ts_opened, position.ts_init)
+            != (
+                slot.opened_at,
+                slot.initialized_at,
+            )
+        ):
+            events.append("HE")
+        if uncovered is None and "FRZ" not in events:
+            events.append("FRZ")
+        elif (
+            uncovered is not None and "FRZ" not in events and slot.sale_state.row in SALE_COVER_ROWS
+        ):
+            events.append("UFZ")
+        # The position already includes the entire batch. Undo its fills for the event
+        # projection, then consume them in arrival order; invalidations above still use
+        # the actual holding net of ALL native fills. Sends use actual uncovered shares.
+        event_held = held + sum(
+            (item.last_qty.as_decimal() for item in queued if type(item).__name__ == "OrderFilled"),
+            Decimal(0),
+        )
+        entries = [(code, None) for code in events]
+        entries.extend(
+            (sale_table.order_event_column(type(item).__name__), item) for item in queued
+        )
+        derive_mismatch = "MO" not in events
+        if derive_mismatch:
+            entries.append(("MO", None))
+        cell = f"{slot.sale_state.row} x {events[-1] if events else 'step'}"
+        try:
+            for tagged in sale_table.order_step(
+                sale_table.Event(code, {str(index): True})
+                for index, (code, _) in enumerate(entries)
+            ):
+                code, item = entries[int(next(iter(tagged.facts)))]
+                current_reason, current_ns = reason, order_event_ns
+                wait_from_ns = order_event_ns
+                if item is not None:
+                    taken.add(id(item))
+                    code = self._judge_sale_event(slot, item)
+                    current_reason = str(getattr(item, "reason", None) or "")
+                    current_ns = item.ts_event
+                    # A wait is a pace toward the venue as the node can keep it: counted from
+                    # the later of the event's own time and its receipt here.
+                    wait_from_ns = max(current_ns, getattr(item, "ts_init", current_ns))
+                    # Each order event of ours, with the node's own lag from its receipt to this
+                    # step: the cost of judging in a step, measured on every event.
+                    lag = self.clock.timestamp_ns() - getattr(item, "ts_init", current_ns)
+                    self._say(
+                        f"{instrument_id}: sale event {code} in {slot.sale_state.row}; "
+                        f"judged_after_ms={lag / 1_000_000:g}"
+                    )
+                    if type(item).__name__ == "OrderFilled":
+                        event_held -= item.last_qty.as_decimal()
+                if code == "MO" and derive_mismatch:
+                    current = self._sale_orders.get(slot.protect_id)
+                    if current is None:
+                        current = (
+                            None if slot.protect_id is None else self.cache.order(slot.protect_id)
+                        )
+                    if (
+                        current is None
+                        or slot.sale_state.row in SALE_CANCEL_ROWS
+                        or current.client_order_id in self.cancel_requested
+                        or current.status
+                        not in (OrderStatus.ACCEPTED, OrderStatus.PARTIALLY_FILLED)
+                    ):
+                        continue
+                    remaining = _remaining(current)
+                    too_large = (
+                        remaining is not None and remaining > uncovered
+                        if uncovered is not None
+                        else self._oversell_possible(instrument_id)
+                    )
+                    if not too_large:
+                        continue
+                event = sale_table.Event(code, {})
+                cell = f"{slot.sale_state.row} x {event.code}"
+                facts, candidate = self._sale_facts(
+                    instrument_id,
+                    slot,
+                    event.code,
+                    snapshot,
+                    judged=bool(queued),
+                    event_held=event_held if item is not None else None,
+                )
+                before = slot.sale_state
+                result = sale_table.transition(
+                    before, self.settings.breach_count, event.code, facts
+                )
+                slot.sale_state = (
+                    result.state
+                )  # Initialized/PendingCancel can reenter inside actions.
+                table_cell = sale_table.TABLE.cells[before.row, event.code]
+                cell_reason = (
+                    result.named or f"{cell}: {table_cell.note or f'sale row {result.state.row}'}"
+                )
+                if event.code == "FRZ":
+                    cell_reason = (
+                        f"{cell}: {self.frozen.get(instrument_id, reason or 'cover unread')}"
+                    )
+                action_reason = cell_reason + (f"; {current_reason}" if current_reason else "")
+                if event.code == "ST" and current_reason:
+                    action_reason = current_reason
+                terms = set(result.when.split(" and "))
+                refusal = event.code == "oREJ" and bool(
+                    terms & {"refusal_told", "not refusal_told"}
+                )
+                silence = "flight_alert_due" in terms
+                unformed = "not formable" in result.when
+                external_cancel = event.code == "oCXL" and before.row in {"FL", "WK", "PF", "FCW"}
+                if result.state.row in SALE_FAULT_ROWS or event.code in {"oDEN", "oVOID", "oOTH"}:
+                    slot.sale_faulted = True
+                if event.code == "oREJ" and before.row not in SALE_NOTHING_OPEN_ROWS:
+                    # EVERY rejection of an open sale of ours is recorded, whatever the row that
+                    # judges it (stopped, held, cover unread), so the pace guards the next leg.
+                    now = self.clock.timestamp_ns() if current_ns is None else current_ns
+                    slot.refusal_last_ns = now if wait_from_ns is None else wait_from_ns
+                    if slot.refusal_first is None:
+                        slot.refusal_first = datetime.fromtimestamp(
+                            now / SECOND_NS, UTC
+                        ).isoformat()
+                    slot.refusal_reason = self._sale_reason(instrument_id, current_reason)
+                    slot.refusals += 1
+                    slot.refusal_streak += 1
+                if refusal:
+                    wait = refusal_wait_secs(slot.refusal_streak)
+                    action_reason = (
+                        f"{cell}: venue refused our sale (REJECTED); sent again on a counted quote "
+                        f"under the level after {wait} s; {current_reason}"
+                    )
+                    if slot.refusal_told:
+                        self._say(
+                            f"{instrument_id}: our sale refusal {slot.refusals} "
+                            f"since {slot.refusal_first}; REJECTED; sent again after {wait} s"
+                        )
+                elif silence:
+                    action_reason = (
+                        f"our sale {slot.flight_command} has no answer after {FLIGHT_SECS} s; "
+                        "outcome unknown, never sent again while unresolved"
+                    )
+                elif unformed:
+                    action_reason = (
+                        f"{cell}: our sale cannot be formed; next counted quote judged again"
+                    )
+                elif external_cancel:
+                    slot.external_cancel_ns = (
+                        self.clock.timestamp_ns() if wait_from_ns is None else wait_from_ns
+                    )
+                    action_reason = (
+                        f"{cell}: our sale canceled, and not by us (the venue or another hand); no sale for "
+                        f"{OUTSIDE_CANCEL_WAIT_SECS} s; then a full new count; {HOLD_ONE_SYMBOL}"
+                    )
+                if result.state.row in SALE_FAULT_ROWS and before.row not in SALE_FAULT_ROWS:
+                    self.frozen[instrument_id] = action_reason
+                if (
+                    event.code == "UFZ"
+                    and before.row in SALE_COVER_ROWS
+                    and result.state.row not in SALE_COVER_ROWS
+                ):
+                    self.frozen.pop(instrument_id, None)
+                    follows = (
+                        "a new count"
+                        if result.state.row in {"G", "GC"}
+                        else "our leg, still working"
+                    )
+                    self._say(
+                        f"{instrument_id}: cover reads again; {follows}; sale row {result.state.row}"
+                    )
+                if result.state.row in (
+                    SALE_FAULT_ROWS
+                    | SALE_COVER_ROWS
+                    | {"G", "GC", "T0", "X", "OX", "PCX", "PCT", "TW"}
+                ):
+                    self._finish_counted_sale(instrument_id, slot, current_ns)
+                if before.row == "G" and event.code in {"QU", "QA"}:
+                    count = result.state.count
+                    if count is None:
+                        count = (
+                            self.settings.breach_count
+                            if sale_table.Action.SEND in result.actions
+                            else 0
+                        )
+                    # Only a count that changed is said: a holding above its level, or one held
+                    # by the interval, would otherwise write a line for every quote.
+                    if count != before.count:
+                        self._say(
+                            f"{instrument_id}: counted quote count={count}; "
+                            f"confirm_gap_ms={self.settings.confirm_gap_ms}"
+                        )
+                if result.named and sale_table.Action.ALERT not in result.actions:
+                    self._say(f"{instrument_id}: {result.named}")
+                for action in result.actions:
+                    self._sale_action(
+                        instrument_id,
+                        slot,
+                        action,
+                        candidate,
+                        before,
+                        action_reason,
+                    )
+                    if action == sale_table.Action.ALERT:
+                        if "not refusal_told" in terms:
+                            slot.refusal_told = True
+                        elif silence:
+                            slot.flight_told = True
+                if refusal and slot.sale is not None:
+                    self._log_sale(instrument_id, slot.sale)
+                if slot.sale_state.row in {"G", "GC", "FZ", "FC", "T0", "X"}:
+                    slot.protect_id = None
+                    slot.sale = None
+                if slot.sale_state.row == "X" and not slot.ended:
+                    slot.ended = True
+                    self._retire(instrument_id)
+                    self.levels.pop(instrument_id, None)
+                if slot.sale_state.row in {"T0", "X"}:
+                    self.stopped_sales.pop(instrument_id, None)
+        except sale_table.SaleTableError as exc:
+            slot.sale_faulted = True
+            self.frozen[instrument_id] = f"{cell}: {type(exc).__name__}: {exc}"
+            order = None if slot.protect_id is None else self.cache.order(slot.protect_id)
+            slot.sale_state = sale_table.State(
+                ("FZP" if order.client_order_id in self.cancel_requested else "FZW")
+                if order is not None and not order.is_closed
+                else "FZ"
+            )
+            self._finish_counted_sale(instrument_id, slot, order_event_ns)
+            self._sale_alert(instrument_id, self.frozen[instrument_id])
+
+    def _finish_counted_sale(
+        self, instrument_id: InstrumentId, slot: Holding, event_ns: int | None
+    ) -> None:
+        """Record an episode's end once, retaining an open leg for its later callbacks."""
+        sale = slot.sale
+        if sale is None or sale.end_recorded:
+            return
+        filled = [
+            getattr(order, "ts_closed", None) or event_ns or self.clock.timestamp_ns()
+            for cid in sale.order_ids
+            if (order := self._sale_orders.get(cid)) is not None
+            and order.status == OrderStatus.FILLED
+        ]
+        if filled:
+            sale.filled_ns = max(filled)
+        sale.end_recorded = True
+        self._log_sale(instrument_id, sale)
+
+    def _sale_reason(self, instrument_id: InstrumentId, reason: str) -> str:
+        """The same bounded, ID-free venue text in alerts and sale records."""
+        identities = {str(cid) for cid in self.sent_ids}
+        for order in self.cache.orders(instrument_id=instrument_id):
+            identities.add(str(order.client_order_id))
+            venue_id = getattr(order, "venue_order_id", None)
+            if venue_id is not None:
+                identities.add(str(venue_id))
+        for identity in sorted(identities, key=len, reverse=True):
+            reason = reason.replace(identity, "our leg")
+        return (reason.splitlines() or [""])[0][:160]
+
+    def _sale_alert(self, instrument_id: InstrumentId, reason: str) -> None:
+        self._say(f"ALERT: {instrument_id}: {self._sale_reason(instrument_id, reason)}")
+
+    def _sale_action(
+        self,
+        instrument_id: InstrumentId,
+        slot: Holding,
+        action: sale_table.Action,
+        candidate: Any,
+        before: sale_table.State,
+        reason: str,
+    ) -> None:
+        """The only count-above-one entry to submit or cancel; no modify is used."""
+        self._counted_cache = self.cache
+        self._counted_identity = self.strategy_id
+        self._counted_logger = self.log
+        if action == sale_table.Action.ALERT:
+            self._sale_alert(instrument_id, reason)
+        elif action == sale_table.Action.CANCEL:
+            now = self.clock.timestamp_ns()
+            if slot.sale is not None:
+                slot.sale.cancel_ns = now
+            slot.flight_sent_ns, slot.flight_told, slot.flight_answered = now, False, False
+            slot.flight_command, slot.flight_answer_ns = "cancel", None
+            self._cancel_own(slot)
+        elif action == sale_table.Action.SEND:
+            assert candidate is not None
+            size, limit = candidate
+            cid = self._protect_id()
+            if self.cache.order(cid) is not None:
+                raise sale_table.InvalidFacts("new sale ID already exists in cache")
+            candidate = self.order_factory.limit(
+                instrument_id,
+                OrderSide.SELL,
+                size,
+                limit,
+                time_in_force=TimeInForce.DAY,
+                reduce_only=True,
+                client_order_id=cid,
+            )
+            now, price = self.clock.timestamp_ns(), candidate.price.as_decimal()
+            if before.row == "G":
+                slot.opening_quantity = candidate.quantity.as_decimal()
+                slot.sale = Sale(
+                    now, price, self._sale_floor(instrument_id, slot, price), now, price
+                )
+                quote = slot.counted_quote
+                slot.gain_release_spread = (
+                    None
+                    if quote is None
+                    else quote.ask_price.as_decimal() - quote.bid_price.as_decimal()
+                )
+            assert slot.sale is not None
+            previous = None if before.row == "G" else slot.sale.last_price
+            slot.sale.reprices += int(before.row == "PCR")
+            slot.sale.resends += int(before.row == "RW")
+            slot.sale.last_price, slot.sale.priced_ns = price, now
+            slot.sale.order_ids.add(candidate.client_order_id)
+            slot.protect_id = candidate.client_order_id
+            slot.flight_sent_ns, slot.flight_told, slot.flight_answered = now, False, False
+            ack_ns = slot.flight_answer_ns if before.row == "PCR" else None
+            refused_ns = slot.refusal_last_ns if before.row == "RW" else None
+            slot.flight_command, slot.flight_answer_ns = "submit", None
+            self.sent_ids.add(candidate.client_order_id)
+            self._sale_orders[candidate.client_order_id] = LimitOrder.from_dict(candidate.to_dict())
+            floor = slot.gain_applied_floor if before.row == "G" else slot.sale.floor
+            self._say(
+                f"{instrument_id}: sale send limit={price} level={slot.level} "
+                f"previous={previous} floor={floor}"
+                + ("" if ack_ns is None else f" ack_to_send_ms={(now - ack_ns) / 1_000_000:g}")
+                + (
+                    ""
+                    if refused_ns is None
+                    else f" refusal_to_send_ms={(now - refused_ns) / 1_000_000:g}"
+                )
+            )
+            self._log_sale(instrument_id, slot.sale)
+            self.submit_order(candidate, params={"extended_hours": True})
+
+    def on_order_event(self, event: Any) -> None:
+        if self.settings.breach_count == 1 or event.client_order_id not in self.sent_ids:
+            return
+        self._sale_events.setdefault(event.instrument_id, []).append(event)
+
+    def _judge_sale_event(self, slot: Holding, event: Any) -> str:
+        """Replay only arrivals already detached for this step, using the pinned order machine."""
+        order = self._sale_orders.get(event.client_order_id)
+        if order is None:
+            raise sale_table.InvalidFacts("our queued event has no sent leg to replay")
+        ended = any(
+            type(prior).__name__ in {"OrderCanceled", "OrderExpired"} for prior in order.events()
+        )
+        column = sale_table.order_event_column(type(event).__name__)
+        if column not in {"oINI", "oOTH"}:
+            try:
+                order.apply(event)
+            except (ValueError, RuntimeError, TypeError) as exc:
+                raise sale_table.InvalidFacts(
+                    f"native order replay refused {type(event).__name__}: {exc}"
+                ) from exc
+        if order.status != OrderStatus.PENDING_CANCEL:
+            self.cancel_requested.discard(event.client_order_id)
+        code = sale_table.order_event_column(
+            type(event).__name__,
+            leg_ended=ended,
+            leaves_remainder=(_remaining(order) or Decimal(0)) > 0,
+        )
+        if slot is not None:
+            # A cancel is answered only by what ends the leg or refuses the cancel: a part fill, an
+            # acceptance or an update while it is pending says nothing of the cancel.
+            answers = (
+                code in SALE_CANCEL_ANSWERS
+                if slot.flight_command == "cancel"
+                else code not in {"oINI", "oSUB", "oPCN"}
+            )
+            if event.client_order_id == slot.protect_id and answers:
+                slot.flight_answered = True
+                # A lag is the node's own, counted from its receipt of the answer.
+                slot.flight_answer_ns = getattr(event, "ts_init", event.ts_event)
+            open_leg = event.client_order_id == slot.protect_id
+            if open_leg and code in {"oPF", "oFF"}:
+                # Within a holding ONLY a fill of the open leg starts the pace again. A leg we
+                # cancel, a cancel by another hand, an expiry, an acceptance and a late fill of an
+                # earlier leg neither start it again nor add to it; a new holding starts at none.
+                slot.refusal_streak = 0
+            if open_leg and code in {"oACC", "oPF", "oFF"}:
+                if slot.refusals and code == "oACC":
+                    self._say(
+                        f"{event.instrument_id}: our sale was accepted after {slot.refusals} "
+                        f"refusals since {slot.refusal_first}"
+                    )
+                had_refusal = slot.refusals > 0
+                slot.refusal_told = False
+                slot.refusal_reason, slot.refusal_first, slot.refusals = None, None, 0
+                if had_refusal and slot.sale is not None:
+                    self._log_sale(event.instrument_id, slot.sale)
+            if (
+                type(event).__name__ == "OrderFilled"
+                and slot.sale is not None
+                and event.client_order_id in slot.sale.order_ids
+                and slot.gain_armed_at is not None
+                and slot.gain_entry is not None
+            ):
+                self._gain_lock_sale(event, slot)
+        return code
+
+    def on_position_event(self, event: Any) -> None:
+        """Not delivered for these EXTERNAL holdings at d53849b216e2.
+
+        engine/mod.rs:4109-4118 publishes to the position's strategy ID. Each
+        quote and each timer step reads the holding, independently of this hook.
+        """
+        if self.settings.breach_count > 1:
+            self._sale_step(event.instrument_id, [])
+
     def _manage(
         self, instrument_id: InstrumentId, quote: QuoteTick | None = None, *, advanced: bool = False
     ) -> None:
+        if self.settings.breach_count > 1:
+            self._manage_counted(instrument_id, quote, advanced=advanced)
+            return
         tick = quote if quote is not None else self.venue_quotes.get(instrument_id)
         slot = self.slots[instrument_id]
         order = None if slot.protect_id is None else self.cache.order(slot.protect_id)
@@ -2760,7 +3792,7 @@ class OwnerProtector(Strategy):
                 else self.released_at.get(order.client_order_id, self.clock.timestamp_ns())
             )
             first = order.price.as_decimal()
-            slot.sale = Sale(at, first, chase_floor(first, protect.PLANNER.chase_cap), at, first)
+            slot.sale = Sale(at, first, self._sale_floor(instrument_id, slot, first), at, first)
             self._log_sale(instrument_id, slot.sale)
         sale = slot.sale
         if owned_limit:
@@ -2781,8 +3813,26 @@ class OwnerProtector(Strategy):
                 sale.floor_since = None
             self._log_sale(instrument_id, sale)
 
+    def _sale_floor(self, instrument_id: InstrumentId, slot: Holding, price: Decimal) -> Decimal:
+        cap = protect.PLANNER.chase_cap
+        source = "registered row"
+        if slot.plan_chase_cap is not None and slot.plan_chase_cap >= cap:
+            cap, source = slot.plan_chase_cap, "holding plan"
+        floor = chase_floor(price, cap)
+        self._say(f"{instrument_id}: sale floor {floor}; {source} cap={cap}")
+        return floor
+
     def _log_sale(self, instrument_id: InstrumentId, sale: Sale) -> None:
         record = sale.record(self.clock.timestamp_ns())
+        if self.settings.breach_count > 1:
+            slot = self.slots.get(instrument_id) or self.stopped_sales.get(instrument_id)
+            record.update(
+                confirm_gap_ms=self.settings.confirm_gap_ms,
+                resends=sale.resends,
+                refusal_reason=None if slot is None else slot.refusal_reason,
+                refusal_first=None if slot is None else slot.refusal_first,
+                refusals=0 if slot is None else slot.refusals,
+            )
         self._say(f"{instrument_id}: sale record {json.dumps(record, sort_keys=True)}")
 
     def _sale_stalled(self, instrument_id: InstrumentId, reason: str) -> None:
@@ -2959,6 +4009,22 @@ class OwnerProtector(Strategy):
 
     def stop_instrument(self, instrument_id: InstrumentId) -> None:
         """Stop this instrument by canceling only the sell this instance sent, with no liquidation."""
+        if self.settings.breach_count > 1:
+            self.stopped_instruments.add(instrument_id)
+            slot = self.slots.pop(instrument_id, None)
+            if slot is not None:
+                self.stopped_sales[instrument_id] = slot
+                order = None if slot.protect_id is None else self.cache.order(slot.protect_id)
+                reason = ""
+                if self.stopping and order is not None and not order.is_closed:
+                    reason = (
+                        f"{order.side.name} {order.quantity} LIMIT {order.price}; "
+                        "left working at whole-node stop; next start: cover; below limit "
+                        "NO EFFECTIVE EXIT until session part end expiry"
+                    )
+                self._sale_step(instrument_id, ["ST"], reason=reason)
+            self.levels.pop(instrument_id, None)
+            return
         self.stopped_instruments.add(instrument_id)
         self.refused_stamps.pop(instrument_id, None)
         self.venue_quotes.pop(instrument_id, None)
@@ -3004,6 +4070,12 @@ class OwnerProtector(Strategy):
                     f"{symbol_hold.HELD} at end"
                     if instrument_id in self.held
                     else "not held at end"
+                )
+                + (
+                    f"; refusals={0 if slot is None else slot.refusals}, "
+                    f"refusal_first={None if slot is None else slot.refusal_first}"
+                    if self.settings.breach_count > 1
+                    else ""
                 )
             )
             self.stop_instrument(instrument_id)
@@ -3059,6 +4131,35 @@ class OwnerProtector(Strategy):
         freeze) is `waiting` with its reason until a level and distance are planned, and after
         that maps as the planned slot does: `guarded` or `counting`.
         """
+        if self.settings.breach_count > 1 and slot is not None:
+            row = None if slot.sale_state is None else slot.sale_state.row
+            held = instrument_id in self.held
+            if row in SALE_FAULT_ROWS | SALE_COVER_ROWS:
+                reason = self.frozen.get(instrument_id, f"sale row {row}")
+                return "frozen", None, f"{reason}; {symbol_hold.HELD}" if held else reason
+            if held:
+                if row in {None, "G", "GC", "RW", "T0", "X"}:
+                    return (
+                        "held",
+                        None,
+                        f"{symbol_hold.HELD}: not armed; removing the hold re-arms it",
+                    )
+                # Our sell still rests, its cancel asked: told as it is until the cancel ends it.
+                return "waiting", None, f"sale row {row}; {symbol_hold.HELD}"
+            if row == "GC":
+                return "waiting", None, "foreign sells cover the whole long; no count accrues"
+            if slot.level is None or slot.distance is None or slot.sale_state is None:
+                return "waiting", None, "no level planned yet"
+            row = slot.sale_state.row
+            if row == "G":
+                return "counting", slot.sale_state.count, None
+            if row == "RW":
+                # Nothing of ours works at the venue: never `armed`. The book holds what counting
+                # holds, at zero, and nothing of the refusal (the lead's T3, 2026-11-13 22:34).
+                return "counting", 0, None
+            if row in {"FL", "WK", "PF"}:
+                return "armed", None, None
+            return "waiting", None, f"sale row {row}"
         if instrument_id in self.held:
             frozen = self.frozen.get(instrument_id)
             if frozen is not None and not frozen.startswith(WAITING):
